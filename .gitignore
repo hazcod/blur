@@ -4,3 +4,6 @@ research_notes/
 .DS_Store
 dist/
 coverage.out
+*.exe
+*.test
+/blur
