@@ -75,8 +75,8 @@ func TestUnavailablePortsFailClosed(t *testing.T) {
 func TestAvailableFakesReturnConfiguredResults(t *testing.T) {
 	ctx := context.Background()
 	r := platform.CapabilityReport{State: platform.Available, Reason: "ready", Evidence: "fixture"}
-	c := fake.CaptureSource{Report: r, ProbeResult: platform.CaptureProbe{TargetID: "opaque", Secure: true}, NextResult: platform.CaptureEvent{Kind: "focus_changed"}}
-	if p, err := c.Probe(ctx); err != nil || p.TargetID != "opaque" {
+	c := fake.CaptureSource{Report: r, ProbeResult: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.Editor", Domain: "example.test", Private: true, Secure: true}, NextResult: platform.CaptureEvent{Kind: "focus_changed"}}
+	if p, err := c.Probe(ctx); err != nil || p.TargetID != "opaque" || p.AppID != "org.example.Editor" || p.Domain != "example.test" || !p.Private {
 		t.Fatalf("probe = %+v, %v", p, err)
 	}
 	if e, err := c.Next(ctx); err != nil || e.Kind != "focus_changed" {
@@ -138,6 +138,15 @@ func TestAvailableFakesReturnConfiguredResults(t *testing.T) {
 	ss := fake.SessionState{Report: r, Snapshot: platform.SessionSnapshot{Locked: true}}
 	if v, err := ss.Current(ctx); err != nil || !v.Locked {
 		t.Fatalf("session = %+v, %v", v, err)
+	}
+}
+
+func TestCaptureProbeErrorHasNoResult(t *testing.T) {
+	denied := errors.New("synthetic denied probe")
+	c := fake.CaptureSource{Report: platform.CapabilityReport{State: platform.Available, Reason: "ready", Evidence: "fixture"}, ProbeResult: platform.CaptureProbe{TargetID: "t"}, ProbeError: denied}
+	probe, err := c.Probe(context.Background())
+	if !errors.Is(err, denied) || probe != (platform.CaptureProbe{}) {
+		t.Fatalf("probe=%+v err=%v", probe, err)
 	}
 }
 

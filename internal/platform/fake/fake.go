@@ -38,6 +38,7 @@ func guard(ctx context.Context, r platform.CapabilityReport, id string) error {
 type CaptureSource struct {
 	Report      platform.CapabilityReport
 	ProbeResult platform.CaptureProbe
+	ProbeError  error
 	NextResult  platform.CaptureEvent
 	NextWait    <-chan platform.CaptureEvent
 	Calls       int
@@ -53,6 +54,9 @@ func (f *CaptureSource) Probe(ctx context.Context) (platform.CaptureProbe, error
 		return platform.CaptureProbe{}, err
 	}
 	f.Calls++
+	if f.ProbeError != nil {
+		return platform.CaptureProbe{}, f.ProbeError
+	}
 	return f.ProbeResult, nil
 }
 func (f *CaptureSource) Next(ctx context.Context) (platform.CaptureEvent, error) {

@@ -11,6 +11,9 @@ type CapabilityReporter interface {
 // TargetID is an opaque adapter-issued identity, never a title, URL, or hostname.
 type CaptureProbe struct {
 	TargetID string
+	AppID    string
+	Domain   string
+	Private  bool
 	Secure   bool
 	Elevated bool
 }

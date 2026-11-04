@@ -1,0 +1,269 @@
+// Package capture enforces the probe, policy, bounded read, and redaction boundary.
+package capture
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"hash"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/nielsgroen/blur/internal/privacy"
+)
+
+type Limits struct {
+	MaxBytes    int
+	MaxNodes    int
+	MaxDepth    int
+	MaxDuration time.Duration
+}
+
+func (l Limits) valid() bool {
+	return l.MaxBytes > 0 && l.MaxNodes > 0 && l.MaxDepth > 0 && l.MaxDuration > 0
+}
+
+type Exclusions struct {
+	Apps    []string
+	Domains []string
+}
+
+type ErrorCode string
+
+const (
+	InvalidLimits ErrorCode = "invalid_limits"
+	Unavailable   ErrorCode = "unavailable"
+	ProbeFailed   ErrorCode = "probe_failed"
+	Excluded      ErrorCode = "excluded"
+	InvalidProbe  ErrorCode = "invalid_probe"
+	ReadFailed    ErrorCode = "read_failed"
+	LimitExceeded ErrorCode = "limit_exceeded"
+	Cancelled     ErrorCode = "cancelled"
+	TimedOut      ErrorCode = "timed_out"
+)
+
+type CaptureError struct {
+	Code  ErrorCode
+	cause error
+}
+
+func (e *CaptureError) Error() string              { return "capture: " + string(e.Code) }
+func (e *CaptureError) Unwrap() error              { return e.cause }
+func captureError(code ErrorCode, err error) error { return &CaptureError{Code: code, cause: err} }
+func contextError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return captureError(Cancelled, context.Canceled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return captureError(TimedOut, context.DeadlineExceeded)
+	}
+	return nil
+}
+
+// The only capture value allowed to leave this package.
+type SanitizedObservation struct {
+	ContentID        string          `json:"content_id"`
+	AppID            string          `json:"app_id"`
+	Domain           string          `json:"domain"`
+	Text             string          `json:"text"`
+	Truncated        bool            `json:"truncated"`
+	RedactionVersion int             `json:"redaction_version"`
+	RedactionCounts  []privacy.Count `json:"redaction_counts"`
+}
+
+// The frame and node deliberately have no exported representation or JSON tags.
+type rawFrame struct{ roots []*rawNode }
+type rawNode struct {
+	declaredBytes int
+	children      []*rawNode
+	value         func(context.Context, int) (string, error)
+}
+type readBounded func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error)
+
+type Pipeline struct {
+	Source     platform.CaptureSource
+	Read       readBounded
+	Limits     Limits
+	Exclusions Exclusions
+}
+
+func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
+	var empty SanitizedObservation
+	if !p.Limits.valid() {
+		return empty, captureError(InvalidLimits, nil)
+	}
+	if err := contextError(ctx.Err()); err != nil {
+		return empty, err
+	}
+	if p.Source == nil || p.Read == nil {
+		return empty, captureError(ReadFailed, nil)
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.Limits.MaxDuration)
+	defer cancel()
+	report, err := p.Source.Capability(ctx)
+	if ce := contextError(ctx.Err()); ce != nil {
+		return empty, ce
+	}
+	if err != nil || report.Validate() != nil || report.ID != "capture" || report.State != platform.Available {
+		return empty, captureError(Unavailable, nil)
+	}
+	probe, err := p.Source.Probe(ctx)
+	if ce := contextError(ctx.Err()); ce != nil {
+		return empty, ce
+	}
+	if err != nil {
+		return empty, captureError(ProbeFailed, nil)
+	}
+	app, domain, ok := normalizeProbe(probe)
+	if !ok {
+		return empty, captureError(InvalidProbe, nil)
+	}
+	if probe.Secure || probe.Elevated || probe.Private || excluded(app, domain, p.Exclusions) {
+		return empty, captureError(Excluded, nil)
+	}
+	frame, err := p.Read(ctx, probe, p.Limits)
+	if ce := contextError(ctx.Err()); ce != nil {
+		return empty, ce
+	}
+	if err != nil {
+		return empty, captureError(ReadFailed, nil)
+	}
+	nodes, err := validateFrame(frame, p.Limits)
+	if err != nil {
+		return empty, captureError(LimitExceeded, nil)
+	}
+	var b strings.Builder
+	remaining := p.Limits.MaxBytes
+	for _, node := range nodes {
+		if ce := contextError(ctx.Err()); ce != nil {
+			return empty, ce
+		}
+		if node.value == nil {
+			continue
+		}
+		value, readErr := node.value(ctx, remaining)
+		if ce := contextError(ctx.Err()); ce != nil {
+			return empty, ce
+		}
+		if readErr != nil {
+			return empty, captureError(ReadFailed, nil)
+		}
+		if !utf8.ValidString(value) {
+			return empty, captureError(ReadFailed, nil)
+		}
+		if len(value) > remaining || len(value) > node.declaredBytes {
+			return empty, captureError(LimitExceeded, nil)
+		}
+		remaining -= len(value)
+		if b.Len() > 0 && value != "" {
+			b.WriteByte('\n')
+		}
+		b.WriteString(value)
+	}
+	text, counts := privacy.Redact(b.String())
+	text, truncated := truncateUTF8(text, p.Limits.MaxBytes)
+	obs := SanitizedObservation{AppID: app, Domain: domain, Text: text, Truncated: truncated, RedactionVersion: privacy.Version, RedactionCounts: counts}
+	obs.ContentID = contentID(obs)
+	return obs, nil
+}
+
+func normalizeProbe(probe platform.CaptureProbe) (string, string, bool) {
+	if probe.TargetID == "" || len(probe.TargetID) > 256 || len(probe.AppID) > 128 || len(probe.Domain) > 253 {
+		return "", "", false
+	}
+	app := strings.ToLower(strings.TrimSpace(probe.AppID))
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(probe.Domain), "."))
+	if !identifier(app) || !identifier(domain) || strings.Contains(domain, "..") || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+		return "", "", false
+	}
+	return app, domain, true
+}
+func identifier(s string) bool {
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '.' && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+func excluded(app, domain string, e Exclusions) bool {
+	for _, x := range e.Apps {
+		if app != "" && app == strings.ToLower(strings.TrimSpace(x)) {
+			return true
+		}
+	}
+	for _, x := range e.Domains {
+		x = strings.ToLower(strings.TrimSpace(x))
+		if x != "" && domain != "" && (domain == x || strings.HasSuffix(domain, "."+x)) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateFrame(f rawFrame, l Limits) ([]*rawNode, error) {
+	var out []*rawNode
+	seen := map[*rawNode]bool{}
+	bytes := 0
+	var walk func(*rawNode, int) error
+	walk = func(n *rawNode, depth int) error {
+		if n == nil || seen[n] || depth > l.MaxDepth || len(out) >= l.MaxNodes || n.declaredBytes < 0 || n.declaredBytes > l.MaxBytes-bytes {
+			return platform.ErrReadLimit
+		}
+		seen[n] = true
+		bytes += n.declaredBytes
+		out = append(out, n)
+		for _, child := range n.children {
+			if err := walk(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, root := range f.roots {
+		if err := walk(root, 1); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func truncateUTF8(s string, max int) (string, bool) {
+	if len(s) <= max {
+		return s, false
+	}
+	end := max
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end], true
+}
+func writePart(h hash.Hash, s string) {
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+	h.Write(n[:])
+	h.Write([]byte(s))
+}
+func contentID(o SanitizedObservation) string {
+	h := sha256.New()
+	writePart(h, o.AppID)
+	writePart(h, o.Domain)
+	writePart(h, o.Text)
+	if o.Truncated {
+		writePart(h, "1")
+	} else {
+		writePart(h, "0")
+	}
+	writePart(h, string(rune(o.RedactionVersion)))
+	for _, c := range o.RedactionCounts {
+		writePart(h, c.Rule)
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(c.Count))
+		h.Write(n[:])
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
