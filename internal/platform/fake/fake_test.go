@@ -107,14 +107,17 @@ func TestAvailableFakesReturnConfiguredResults(t *testing.T) {
 	if err := a.Stop(ctx); err != nil || a.Calls != 3 {
 		t.Fatalf("audio: %v", err)
 	}
-	sec := fake.SecretStore{Report: r, Value: []byte("fixture")}
+	sec := fake.SecretStore{Report: r}
+	if err := sec.Put(ctx, "key", []byte("fixture")); err != nil {
+		t.Fatal(err)
+	}
 	if v, err := sec.Get(ctx, "key", 7); err != nil || string(v) != "fixture" {
 		t.Fatalf("secret: %q, %v", v, err)
 	}
 	if err := sec.Put(ctx, "key", []byte("updated")); err != nil {
 		t.Fatal(err)
 	}
-	if err := sec.Delete(ctx, "key"); err != nil || sec.Calls != 3 {
+	if err := sec.Delete(ctx, "key"); err != nil || sec.Calls != 4 {
 		t.Fatalf("secret lifecycle: %v", err)
 	}
 	tr := fake.LocalTransport{Report: r}
@@ -144,8 +147,11 @@ func TestBoundedReadsRejectOversizeWithoutEffects(t *testing.T) {
 	if _, err := a.Read(context.Background(), 4); !errors.Is(err, platform.ErrReadLimit) || a.Calls != 0 {
 		t.Fatalf("audio limit = %v, calls %d", err, a.Calls)
 	}
-	s := fake.SecretStore{Report: r, Value: []byte("secret")}
-	if _, err := s.Get(context.Background(), "key", 5); !errors.Is(err, platform.ErrReadLimit) || s.Calls != 0 {
+	s := fake.SecretStore{Report: r}
+	if err := s.Put(context.Background(), "key", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(context.Background(), "key", 5); !errors.Is(err, platform.ErrReadLimit) || s.Calls != 1 {
 		t.Fatalf("secret limit = %v, calls %d", err, s.Calls)
 	}
 }
@@ -178,5 +184,126 @@ func TestWaitingCaptureEventStopsOnCancellation(t *testing.T) {
 	}
 	if c.Calls != 0 {
 		t.Fatalf("cancelled wait recorded %d effects", c.Calls)
+	}
+}
+
+func TestTextTargetsRejectsUnissuedAndStaleLeases(t *testing.T) {
+	ctx := context.Background()
+	f := fake.TextTargets{Report: platform.CapabilityReport{State: platform.Available, Reason: "ready", Evidence: "fixture"}, LeaseResult: platform.TargetLease{ID: "first"}}
+	for _, lease := range []platform.TargetLease{{}, {ID: "first"}, {ID: "other"}} {
+		if err := f.Replace(ctx, lease, "draft"); !errors.Is(err, platform.ErrInvalidLease) || f.Calls != 0 {
+			t.Fatalf("unissued replace = %v, calls %d", err, f.Calls)
+		}
+	}
+	issued, err := f.Lease(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Replace(ctx, issued, "draft"); err != nil || f.Calls != 2 {
+		t.Fatalf("valid replace = %v, calls %d", err, f.Calls)
+	}
+	f.LeaseResult = platform.TargetLease{ID: "second"}
+	if err := f.Replace(ctx, issued, "draft"); !errors.Is(err, platform.ErrInvalidLease) || f.Calls != 2 {
+		t.Fatalf("stale replace = %v, calls %d", err, f.Calls)
+	}
+}
+
+func TestSecretStoreIsolatesKeysAndCopiesValues(t *testing.T) {
+	ctx := context.Background()
+	f := fake.SecretStore{Report: platform.CapabilityReport{State: platform.Available, Reason: "ready", Evidence: "fixture"}}
+	input := []byte("alpha")
+	if err := f.Put(ctx, "one", input); err != nil {
+		t.Fatal(err)
+	}
+	input[0] = 'X'
+	if err := f.Put(ctx, "two", []byte("beta")); err != nil {
+		t.Fatal(err)
+	}
+	one, err := f.Get(ctx, "one", 5)
+	if err != nil || string(one) != "alpha" {
+		t.Fatalf("key one = %q, %v", one, err)
+	}
+	one[0] = 'X'
+	again, err := f.Get(ctx, "one", 5)
+	if err != nil || string(again) != "alpha" {
+		t.Fatalf("aliased key one = %q, %v", again, err)
+	}
+	if err := f.Delete(ctx, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if other, err := f.Get(ctx, "two", 5); err != nil || other != nil {
+		t.Fatalf("deleted key two = %q, %v", other, err)
+	}
+	if remaining, err := f.Get(ctx, "one", 5); err != nil || string(remaining) != "alpha" {
+		t.Fatalf("remaining key one = %q, %v", remaining, err)
+	}
+}
+
+func TestInvalidFakeReportsFailClosed(t *testing.T) {
+	ctx := context.Background()
+	for _, configured := range []platform.CapabilityReport{{}, {State: "unexpected", Reason: "ready", Evidence: "fixture"}, {State: platform.Available, Reason: "not a code", Evidence: "fixture"}, {ID: "wrong", State: platform.Available, Reason: "ready", Evidence: "fixture"}} {
+		f := fake.CaptureSource{Report: configured}
+		report, err := f.Capability(ctx)
+		if !errors.Is(err, platform.ErrInvalidCapabilityReport) || report.Validate() != nil || report.State == platform.Available {
+			t.Fatalf("invalid report = %+v, %v", report, err)
+		}
+		_, err = f.Probe(ctx)
+		var unavailable *platform.UnavailableError
+		if !errors.As(err, &unavailable) || unavailable.Report.Validate() != nil || unavailable.Report.State == platform.Available || f.Calls != 0 {
+			t.Fatalf("invalid operation = %v, calls %d", err, f.Calls)
+		}
+	}
+}
+
+func TestValidReasonNamedInvalidReportRemainsAvailable(t *testing.T) {
+	f := fake.CaptureSource{Report: platform.CapabilityReport{State: platform.Available, Reason: "invalid_report", Evidence: "fixture"}}
+	r, err := f.Capability(context.Background())
+	if err != nil || r.State != platform.Available {
+		t.Fatalf("valid report = %+v, %v", r, err)
+	}
+}
+
+func TestEveryPortRejectsInvalidReports(t *testing.T) {
+	ctx := context.Background()
+	for _, configured := range []platform.CapabilityReport{{}, {State: "unknown", Reason: "ready", Evidence: "fixture"}, {State: platform.Available, Reason: "not a code", Evidence: "fixture"}, {ID: "wrong", State: platform.Available, Reason: "ready", Evidence: "fixture"}} {
+		c := &fake.CaptureSource{Report: configured}
+		tt := &fake.TextTargets{Report: configured}
+		h := &fake.GestureHotkeys{Report: configured}
+		s := &fake.SurfaceManager{Report: configured}
+		a := &fake.AudioRecorder{Report: configured}
+		sec := &fake.SecretStore{Report: configured}
+		tr := &fake.LocalTransport{Report: configured}
+		p := &fake.PrivatePath{Report: configured}
+		au := &fake.Autostart{Report: configured}
+		ss := &fake.SessionState{Report: configured}
+		ports := []struct {
+			name     string
+			reporter platform.CapabilityReporter
+			op       func() (error, int)
+		}{
+			{"capture", c, func() (error, int) { _, err := c.Probe(ctx); return err, c.Calls }},
+			{"text_targets", tt, func() (error, int) { _, err := tt.Lease(ctx); return err, tt.Calls }},
+			{"gesture_hotkeys", h, func() (error, int) { _, err := h.Next(ctx); return err, h.Calls }},
+			{"surface_manager", s, func() (error, int) { err := s.Show(ctx, platform.SurfaceRequest{}); return err, s.Calls }},
+			{"audio_recorder", a, func() (error, int) { err := a.Start(ctx); return err, a.Calls }},
+			{"secret_store", sec, func() (error, int) { _, err := sec.Get(ctx, "key", 32); return err, sec.Calls }},
+			{"local_transport", tr, func() (error, int) { err := tr.Start(ctx); return err, tr.Calls }},
+			{"private_path", p, func() (error, int) { _, err := p.Ensure(ctx, "data"); return err, p.Calls }},
+			{"autostart", au, func() (error, int) { err := au.SetEnabled(ctx, true); return err, au.Calls }},
+			{"session_state", ss, func() (error, int) { _, err := ss.Current(ctx); return err, ss.Calls }},
+		}
+		for _, port := range ports {
+			t.Run(port.name+"/"+string(configured.State), func(t *testing.T) {
+				report, err := port.reporter.Capability(ctx)
+				if !errors.Is(err, platform.ErrInvalidCapabilityReport) || report.Validate() != nil || report.State == platform.Available {
+					t.Fatalf("report = %+v, %v", report, err)
+				}
+				err, calls := port.op()
+				var unavailable *platform.UnavailableError
+				if !errors.As(err, &unavailable) || unavailable.Report.Validate() != nil || unavailable.Report.State == platform.Available || calls != 0 {
+					t.Fatalf("operation = %v, calls %d", err, calls)
+				}
+			})
+		}
 	}
 }

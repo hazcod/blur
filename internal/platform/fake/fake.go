@@ -7,13 +7,28 @@ import (
 	"github.com/nielsgroen/blur/internal/platform"
 )
 
-func report(r platform.CapabilityReport, id string) platform.CapabilityReport {
+func report(r platform.CapabilityReport, id string) (platform.CapabilityReport, bool) {
+	wrongID := r.ID != "" && r.ID != id
 	r.ID = id
-	return r
+	if wrongID || r.Validate() != nil {
+		return platform.CapabilityReport{ID: id, State: platform.TemporarilyUnresponsive, Reason: "invalid_report", Evidence: "fake configuration rejected"}, false
+	}
+	return r, true
+}
+
+func capability(ctx context.Context, configured platform.CapabilityReport, id string) (platform.CapabilityReport, error) {
+	r, valid := report(configured, id)
+	if err := ctx.Err(); err != nil {
+		return r, err
+	}
+	if !valid {
+		return r, platform.ErrInvalidCapabilityReport
+	}
+	return r, nil
 }
 
 func guard(ctx context.Context, r platform.CapabilityReport, id string) error {
-	r = report(r, id)
+	r, _ = report(r, id)
 	if r.State != platform.Available {
 		return &platform.UnavailableError{Report: r}
 	}
@@ -31,7 +46,7 @@ type CaptureSource struct {
 var _ platform.CaptureSource = (*CaptureSource)(nil)
 
 func (f *CaptureSource) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "capture"), ctx.Err()
+	return capability(ctx, f.Report, "capture")
 }
 func (f *CaptureSource) Probe(ctx context.Context) (platform.CaptureProbe, error) {
 	if err := guard(ctx, f.Report, "capture"); err != nil {
@@ -61,23 +76,28 @@ type TextTargets struct {
 	Report      platform.CapabilityReport
 	LeaseResult platform.TargetLease
 	Calls       int
+	issued      string
 }
 
 var _ platform.TextTargets = (*TextTargets)(nil)
 
 func (f *TextTargets) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "text_targets"), ctx.Err()
+	return capability(ctx, f.Report, "text_targets")
 }
 func (f *TextTargets) Lease(ctx context.Context) (platform.TargetLease, error) {
 	if err := guard(ctx, f.Report, "text_targets"); err != nil {
 		return platform.TargetLease{}, err
 	}
 	f.Calls++
+	f.issued = f.LeaseResult.ID
 	return f.LeaseResult, nil
 }
-func (f *TextTargets) Replace(ctx context.Context, _ platform.TargetLease, _ string) error {
+func (f *TextTargets) Replace(ctx context.Context, lease platform.TargetLease, _ string) error {
 	if err := guard(ctx, f.Report, "text_targets"); err != nil {
 		return err
+	}
+	if lease.ID == "" || lease.ID != f.issued || lease.ID != f.LeaseResult.ID {
+		return platform.ErrInvalidLease
 	}
 	f.Calls++
 	return nil
@@ -92,7 +112,7 @@ type GestureHotkeys struct {
 var _ platform.GestureHotkeys = (*GestureHotkeys)(nil)
 
 func (f *GestureHotkeys) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "gesture_hotkeys"), ctx.Err()
+	return capability(ctx, f.Report, "gesture_hotkeys")
 }
 func (f *GestureHotkeys) Next(ctx context.Context) (platform.GestureEvent, error) {
 	if err := guard(ctx, f.Report, "gesture_hotkeys"); err != nil {
@@ -110,7 +130,7 @@ type SurfaceManager struct {
 var _ platform.SurfaceManager = (*SurfaceManager)(nil)
 
 func (f *SurfaceManager) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "surface_manager"), ctx.Err()
+	return capability(ctx, f.Report, "surface_manager")
 }
 func (f *SurfaceManager) Show(ctx context.Context, _ platform.SurfaceRequest) error {
 	if err := guard(ctx, f.Report, "surface_manager"); err != nil {
@@ -129,7 +149,7 @@ type AudioRecorder struct {
 var _ platform.AudioRecorder = (*AudioRecorder)(nil)
 
 func (f *AudioRecorder) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "audio_recorder"), ctx.Err()
+	return capability(ctx, f.Report, "audio_recorder")
 }
 func (f *AudioRecorder) Start(ctx context.Context) error {
 	if err := guard(ctx, f.Report, "audio_recorder"); err != nil {
@@ -158,39 +178,43 @@ func (f *AudioRecorder) Stop(ctx context.Context) error {
 
 type SecretStore struct {
 	Report platform.CapabilityReport
-	Value  []byte
 	Calls  int
+	values map[string][]byte
 }
 
 var _ platform.SecretStore = (*SecretStore)(nil)
 
 func (f *SecretStore) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "secret_store"), ctx.Err()
+	return capability(ctx, f.Report, "secret_store")
 }
-func (f *SecretStore) Get(ctx context.Context, _ string, maxBytes int) ([]byte, error) {
+func (f *SecretStore) Get(ctx context.Context, key string, maxBytes int) ([]byte, error) {
 	if err := guard(ctx, f.Report, "secret_store"); err != nil {
 		return nil, err
 	}
-	if maxBytes < 0 || len(f.Value) > maxBytes {
+	v := f.values[key]
+	if maxBytes < 0 || len(v) > maxBytes {
 		return nil, platform.ErrReadLimit
 	}
 	f.Calls++
-	return append([]byte(nil), f.Value...), nil
+	return append([]byte(nil), v...), nil
 }
-func (f *SecretStore) Put(ctx context.Context, _ string, v []byte) error {
+func (f *SecretStore) Put(ctx context.Context, key string, v []byte) error {
 	if err := guard(ctx, f.Report, "secret_store"); err != nil {
 		return err
 	}
 	f.Calls++
-	f.Value = append([]byte(nil), v...)
+	if f.values == nil {
+		f.values = make(map[string][]byte)
+	}
+	f.values[key] = append([]byte(nil), v...)
 	return nil
 }
-func (f *SecretStore) Delete(ctx context.Context, _ string) error {
+func (f *SecretStore) Delete(ctx context.Context, key string) error {
 	if err := guard(ctx, f.Report, "secret_store"); err != nil {
 		return err
 	}
 	f.Calls++
-	f.Value = nil
+	delete(f.values, key)
 	return nil
 }
 
@@ -202,7 +226,7 @@ type LocalTransport struct {
 var _ platform.LocalTransport = (*LocalTransport)(nil)
 
 func (f *LocalTransport) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "local_transport"), ctx.Err()
+	return capability(ctx, f.Report, "local_transport")
 }
 func (f *LocalTransport) Start(ctx context.Context) error {
 	if err := guard(ctx, f.Report, "local_transport"); err != nil {
@@ -228,7 +252,7 @@ type PrivatePath struct {
 var _ platform.PrivatePath = (*PrivatePath)(nil)
 
 func (f *PrivatePath) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "private_path"), ctx.Err()
+	return capability(ctx, f.Report, "private_path")
 }
 func (f *PrivatePath) Ensure(ctx context.Context, _ string) (string, error) {
 	if err := guard(ctx, f.Report, "private_path"); err != nil {
@@ -246,7 +270,7 @@ type Autostart struct {
 var _ platform.Autostart = (*Autostart)(nil)
 
 func (f *Autostart) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "autostart"), ctx.Err()
+	return capability(ctx, f.Report, "autostart")
 }
 func (f *Autostart) SetEnabled(ctx context.Context, _ bool) error {
 	if err := guard(ctx, f.Report, "autostart"); err != nil {
@@ -265,7 +289,7 @@ type SessionState struct {
 var _ platform.SessionState = (*SessionState)(nil)
 
 func (f *SessionState) Capability(ctx context.Context) (platform.CapabilityReport, error) {
-	return report(f.Report, "session_state"), ctx.Err()
+	return capability(ctx, f.Report, "session_state")
 }
 func (f *SessionState) Current(ctx context.Context) (platform.SessionSnapshot, error) {
 	if err := guard(ctx, f.Report, "session_state"); err != nil {

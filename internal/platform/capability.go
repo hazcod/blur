@@ -7,6 +7,8 @@ import (
 )
 
 var ErrReadLimit = errors.New("read exceeds requested limit")
+var ErrInvalidLease = errors.New("target lease is invalid or stale")
+var ErrInvalidCapabilityReport = errors.New("capability report is invalid")
 
 // CapabilityState is a closed vocabulary. Unknown states fail closed.
 type CapabilityState string
