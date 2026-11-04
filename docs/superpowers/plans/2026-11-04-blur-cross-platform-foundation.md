@@ -28,6 +28,11 @@ behind an owned facade in a later phase. Apache-2.0.
   observations can be ingested.
 - No dependency may silently perform network I/O. Remote provider support is
   absent from this foundation.
+- Shipped Go binaries and dependencies are cgo-free. Release/cross-build gates
+  use `CGO_ENABLED=0`; CI audits dependency Cgo files and rejects `import "C"`.
+- Prefer the standard library, including `log/slog` for structured content-free
+  events. Add a dependency only for a measured capability the standard library
+  cannot safely provide.
 - Capability absence is structured data, never a hidden fallback.
 - All packages pass race tests and compile for Darwin, Windows, and Linux.
 - Logs contain counters and stable error codes, never observation text.
@@ -120,6 +125,9 @@ behind an owned facade in a later phase. Apache-2.0.
 - [ ] Add build-tagged adapters for AXUIElement, UI Automation, and AT-SPI2 as
   explicit unavailable placeholders; native calls land only with fixtures.
 - [ ] Cross-compile command binaries for Darwin, Windows, and Linux.
+- [ ] Enforce `CGO_ENABLED=0` for release/cross-builds and audit the dependency
+  graph for Cgo files or `import "C"` while retaining race tests as a separate
+  toolchain-only check.
 
 ## Task 8: Foundation threat review and release checkpoint
 

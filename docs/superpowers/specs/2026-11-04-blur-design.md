@@ -154,9 +154,22 @@ not changed before injection.
 ### Chat and memory
 
 A slim “memory bar” lives at a chosen screen edge or corner. Hover/click/hotkey
-opens a resizable chat. Answers cite source observations. The dashboard exposes
-identity, wiki pages, timeline, time reports, reminders, provider controls,
-privacy controls, MCP setup, diagnostics, and token usage.
+opens a resizable chat. Hover is instant and model-free: it reads a locally
+materialized “Today” snapshot containing recent changes, active subjects,
+confirmed and inferred todos, open loops, and a time split. Click expands the
+snapshot into a cited daily recap with controls to confirm, correct, dismiss,
+or promote suggestions. Answers cite source observations. The dashboard
+exposes identity, a browsable knowledge library, wiki pages, timeline, time
+reports, reminders, provider controls, privacy controls, MCP setup,
+diagnostics, and token usage.
+
+The knowledge library groups People, Projects, Topics, Places, and Workflows.
+Each page has a current summary, evidence-backed facts, open loops, related
+entities, activity history, and exact sources. It is a reversible materialized
+view over the evidence/derivation store, not a second source of truth. Exact
+search and browsing require no AI; models may propose aliases, merges, or
+summaries but their output remains visibly untrusted until corrected or
+confirmed.
 
 ### Dictation
 
@@ -228,10 +241,13 @@ the grant.
 
 Storage is accessed only through `EncryptedStore`. A random data-encryption key
 is wrapped by Keychain, DPAPI CurrentUser, or Secret Service/passphrase
-fallback. SQLCipher is the authenticated production-default candidate;
-ncruces Adiantum remains experimental until both pass the same cross-platform
-benchmark, crash, tamper, and packaging gates. Only a typed `NotFound` secret
-state may create a new key.
+fallback. The in-process backend must be cgo-free and authenticated at the
+record or page boundary. SQLCipher remains a security/performance reference
+and may only run as an isolated helper unless the no-cgo rule changes;
+ncruces Adiantum remains experimental because it provides confidentiality but
+not authentication. Pure-Go candidates must pass identical benchmark, crash,
+tamper, key-loss, and packaging gates. Only a typed `NotFound` secret state may
+create a new key.
 
 AI ports are separated into `Generator`, `Embedder`, `Transcriber`, `Reranker`,
 and `TokenCounter`, each with independent admission policy. Local-to-remote
@@ -246,6 +262,14 @@ secret detection immediately quarantines descendants.
 This architecture defines parity as equivalent capture/search/chat/pause/
 evidence workflows plus honest runtime capability negotiation—not identical
 desktop mechanics on every OS.
+
+All shipped Go binaries and dependencies are cgo-free. Release and cross-build
+gates run with `CGO_ENABLED=0`, and CI rejects packages containing Cgo files or
+`import "C"`. Native access uses the standard library where practical, then a
+narrowly audited pure-Go binding or system protocol; an isolated signed native
+helper is a last-resort process boundary, never a cgo link into the core.
+Structured logging uses `log/slog` behind a content-free event vocabulary. No
+logging dependency is added without a measured need.
 
 ```text
 ┌──────────────────────── Blur.app / Wails 3 ────────────────────────┐
@@ -283,17 +307,25 @@ desktop mechanics on every OS.
 - `blurctl`: administrative CLI using the same authenticated API. Destructive
   commands require interactive confirmation unless `--yes` is explicit.
 
-The bundle contains Go binaries plus the minimal Objective-C/C ABI shims needed
-for AppKit, AXUIElement, Keychain, global event monitoring, text injection, and
-audio. There is no Swift or Rust application layer.
+The bundle contains cgo-free Go binaries. Native access is through pure-Go
+system calls/protocols where practical. If a platform API cannot be reached
+safely that way, a minimal signed helper may be isolated behind authenticated
+IPC, with no database/provider key and no raw-data persistence. There is no
+Swift or Rust application layer in the portable core.
 
 ### Technology choices
 
 - Go 1.27.3.
-- Wails 3.0 stable for the application, system tray, multiple windows, native
-  macOS panels, and generated Go/TypeScript bindings.
+- Wails 3.1 or newer is only a shell candidate behind `DesktopShell`, using its
+  pure-Go build mode with `CGO_ENABLED=0`. Its currently experimental macOS/
+  Linux pure-Go backends must pass signed fixture, renderer recovery, navigation
+  isolation, and packaging gates before adoption; framework types never enter
+  domain packages.
 - Svelte 5, TypeScript, and Vite for a small reactive UI bundle.
-- `github.com/ncruces/go-sqlite3` with FTS5 and the Adiantum encrypting VFS.
+- An `EncryptedStore` chosen only after cgo-free authenticated candidates pass
+  packaging, tamper, crash, key-loss, durability, and performance gates.
+  SQLCipher is a reference/out-of-process option, not an in-process dependency;
+  Adiantum is confidentiality-only and cannot be the secure default unchanged.
 - `github.com/klauspost/compress/zstd` for deduplicated content blobs.
 - `github.com/modelcontextprotocol/go-sdk` v1.8 or newer compatible minor.
 - Standard-library `log/slog`, `net/http`, `crypto`, and `testing` wherever
