@@ -57,3 +57,46 @@ separate Linux job checks cross-compilation for all five targets above.
   channel before public release.
 - No Go application entry point exists yet, so `go build ./...` validates the
   package set rather than producing an application binary.
+
+## Fix Round 1
+
+### Files changed
+
+- `go.mod`, `.github/workflows/ci.yml`, `README.md`, and `CONTRIBUTING.md` now
+  consistently require/use Go 1.27 (`go 1.27.0`, CI `1.27.x`).
+- `LICENSE` now contains the complete canonical Apache License 2.0 terms and
+  appendix, preceded by `Copyright 2026 Blur contributors`.
+- `SECURITY.md` links directly to
+  `https://github.com/nielsgroen/blur/security/advisories/new` and says private
+  vulnerability reporting must be enabled before public release.
+- This report includes this fix-round record.
+
+### Checks and exact results
+
+Toolchain: `go version go1.27.3 darwin/arm64`.
+
+- `diff -u <(tail -n +2 LICENSE) <(curl -fsSL https://www.apache.org/licenses/LICENSE-2.0.txt)` — passed with no differences after removing the project copyright line.
+- `go test ./internal/buildinfo` — passed: `ok github.com/nielsgroen/blur/internal/buildinfo 0.444s`.
+- `go test ./...` — passed: `ok github.com/nielsgroen/blur/internal/buildinfo 0.250s`.
+- `go test -race ./...` — passed: `ok github.com/nielsgroen/blur/internal/buildinfo 1.439s`.
+- `go vet ./...` — passed with no output.
+- `set -eu; for target in darwin/arm64 darwin/amd64 windows/amd64 linux/amd64 linux/arm64; do GOOS=${target%/*} GOARCH=${target#*/} go build ./...; done` — passed for all five targets with no output.
+- `git diff --check` — passed with no output.
+
+Final verification was rerun after correcting the license spacing. The focused
+test, full tests, and race tests each returned `ok
+github.com/nielsgroen/blur/internal/buildinfo (cached)`; vet, all five
+cross-builds, and `git diff --check` completed with exit status 0 and no output.
+
+An initial canonical-license comparison identified one spacing difference in
+the Appendix. It was corrected, and the comparison then passed exactly.
+
+### Self-review
+
+- All declared Go versions now match the binding 1.27 contract, and the local
+  Go 1.27.3 toolchain accepted the module syntax and all requested checks.
+- The canonical license text compares byte-for-byte after excluding only the
+  project copyright line; the license terms were not altered.
+- The security URL uses the temporary module/repository identity and does not
+  imply that private reporting is currently enabled.
+- Changes remain within Task 1 owned files and the implementer report.

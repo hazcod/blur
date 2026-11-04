@@ -13,7 +13,7 @@ the first public release.
 
 ## Development
 
-Requires Go 1.23 or newer. The current packages use only the Go standard
+Requires Go 1.27 or newer. The current packages use only the Go standard
 library.
 
 ```sh
