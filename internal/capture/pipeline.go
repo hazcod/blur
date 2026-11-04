@@ -35,16 +35,17 @@ type Exclusions struct {
 type ErrorCode string
 
 const (
-	InvalidLimits     ErrorCode = "invalid_limits"
-	InvalidExclusions ErrorCode = "invalid_exclusions"
-	Unavailable       ErrorCode = "unavailable"
-	ProbeFailed       ErrorCode = "probe_failed"
-	Excluded          ErrorCode = "excluded"
-	InvalidProbe      ErrorCode = "invalid_probe"
-	ReadFailed        ErrorCode = "read_failed"
-	LimitExceeded     ErrorCode = "limit_exceeded"
-	Cancelled         ErrorCode = "cancelled"
-	TimedOut          ErrorCode = "timed_out"
+	InvalidLimits      ErrorCode = "invalid_limits"
+	InvalidExclusions  ErrorCode = "invalid_exclusions"
+	Unavailable        ErrorCode = "unavailable"
+	ProbeFailed        ErrorCode = "probe_failed"
+	Excluded           ErrorCode = "excluded"
+	InvalidProbe       ErrorCode = "invalid_probe"
+	ReadFailed         ErrorCode = "read_failed"
+	LimitExceeded      ErrorCode = "limit_exceeded"
+	Cancelled          ErrorCode = "cancelled"
+	TimedOut           ErrorCode = "timed_out"
+	InvalidObservation ErrorCode = "invalid_observation"
 )
 
 type CaptureError struct {
@@ -74,6 +75,78 @@ type SanitizedObservation struct {
 	Truncated        bool            `json:"truncated"`
 	RedactionVersion int             `json:"redaction_version"`
 	RedactionCounts  []privacy.Count `json:"redaction_counts"`
+}
+
+const MaxObservationTextBytes = 1 << 20
+
+// CanonicalID computes the stable ID from all persisted observation fields.
+// It does not validate or sanitize its receiver; use Validate before ingest.
+func (o SanitizedObservation) CanonicalID() string { return contentID(o) }
+
+// Validate is the authoritative storage-boundary check for this forgeable type.
+// All failures are content-free. It does not claim to detect every kind of
+// sensitive text; it enforces the current deterministic redactor's fixed point.
+func (o SanitizedObservation) Validate() error {
+	invalid := func() error { return captureError(InvalidObservation, nil) }
+	if len(o.ContentID) != 64 || len(o.Text) > MaxObservationTextBytes || !utf8.ValidString(o.Text) || strings.ContainsRune(o.Text, 0) || o.RedactionVersion != privacy.Version || len(o.RedactionCounts) > 32 {
+		return invalid()
+	}
+	if o.ContentID != o.CanonicalID() {
+		return invalid()
+	}
+	app, appOK := normalizeAppID(o.AppID)
+	domain, domainOK := normalizeDomain(o.Domain)
+	if !appOK || !domainOK || app != o.AppID || domain != o.Domain {
+		return invalid()
+	}
+	for _, part := range []string{o.AppID, o.Domain, o.Text} {
+		redacted, _ := privacy.Redact(part)
+		if redacted != part {
+			return invalid()
+		}
+	}
+	last := ""
+	for _, count := range o.RedactionCounts {
+		if !validRedactionRule(count.Rule) || count.Rule <= last || count.Count <= 0 || count.Count > MaxObservationTextBytes {
+			return invalid()
+		}
+		last = count.Rule
+	}
+	for _, part := range []string{o.AppID, o.Domain, o.Text} {
+		if !validPlaceholders(part) {
+			return invalid()
+		}
+	}
+	return nil
+}
+
+func validPlaceholders(part string) bool {
+	for pos := 0; pos < len(part); {
+		i := strings.Index(part[pos:], "[REDACTED")
+		if i < 0 {
+			break
+		}
+		marker := pos + i
+		if !strings.HasPrefix(part[marker:], "[REDACTED:") {
+			return false
+		}
+		start := marker + len("[REDACTED:")
+		end := strings.IndexByte(part[start:], ']')
+		if end < 0 || !validRedactionRule(part[start:start+end]) {
+			return false
+		}
+		pos = start + end + 1
+	}
+	return true
+}
+
+func validRedactionRule(rule string) bool {
+	switch rule {
+	case "PRIVATE_KEY", "AUTHORIZATION", "URL_CREDENTIAL", "URL_QUERY", "MALFORMED_URL", "SECRET", "SECURITY_CODE", "TOKEN", "SSN", "CARD", "IBAN":
+		return true
+	default:
+		return false
+	}
 }
 
 // The frame and node deliberately have no exported representation or JSON tags.
@@ -182,9 +255,32 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	}
 	text, counts := privacy.Redact(b.String())
 	text, truncated := truncateUTF8(text, p.Limits.MaxBytes)
+	if truncated {
+		text = safeTruncatedText(text)
+	}
 	obs := SanitizedObservation{AppID: app, Domain: domain, Text: text, Truncated: truncated, RedactionVersion: privacy.Version, RedactionCounts: counts}
 	obs.ContentID = contentID(obs)
+	if err := obs.Validate(); err != nil {
+		return empty, err
+	}
 	return obs, nil
+}
+
+// A byte cap may bisect a redaction placeholder or leave a partial labelled
+// value. Back off a bounded number of runes, then drop the prefix if needed.
+func safeTruncatedText(text string) string {
+	for n := 0; n < 64; n++ {
+		redacted, _ := privacy.Redact(text)
+		if redacted == text && validPlaceholders(text) {
+			return text
+		}
+		if text == "" {
+			return text
+		}
+		_, width := utf8.DecodeLastRuneInString(text)
+		text = text[:len(text)-width]
+	}
+	return ""
 }
 
 func normalizeProbe(probe platform.CaptureProbe) (string, string, bool) {

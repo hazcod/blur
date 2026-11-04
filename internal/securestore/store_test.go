@@ -3,7 +3,9 @@ package securestore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ type secretBackend struct {
 	err        error
 	gets, puts int
 	putErr     error
+	onPut      func(*secretBackend, []byte)
 }
 
 func (*secretBackend) Capability(context.Context) (platform.CapabilityReport, error) {
@@ -38,6 +41,9 @@ func (b *secretBackend) Put(_ context.Context, _ string, value []byte) error {
 	}
 	b.value = append([]byte(nil), value...)
 	b.err = nil
+	if b.onPut != nil {
+		b.onPut(b, value)
+	}
 	return nil
 }
 func (*secretBackend) Delete(context.Context, string) error { return nil }
@@ -78,8 +84,8 @@ func TestOnlyExplicitNotFoundCreatesKey(t *testing.T) {
 	}
 	b := &secretBackend{err: &SecretError{State: NotFound}}
 	key, err := ResolveKey(context.Background(), b, "database", bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
-	if err != nil || key != [32]byte(bytes.Repeat([]byte{3}, 32)) || b.puts != 1 {
-		t.Fatalf("key match=%t err=%v puts=%d", key == [32]byte(bytes.Repeat([]byte{3}, 32)), err, b.puts)
+	if err != nil || key.Bytes() != [32]byte(bytes.Repeat([]byte{3}, 32)) || b.puts != 1 {
+		t.Fatalf("key match=%t err=%v puts=%d", key.Bytes() == [32]byte(bytes.Repeat([]byte{3}, 32)), err, b.puts)
 	}
 }
 
@@ -109,7 +115,7 @@ func TestConcurrentResolutionCreatesOneKeyAndCopiesFoundValue(t *testing.T) {
 	b := &secretBackend{err: &SecretError{State: NotFound}}
 	random := bytes.NewReader(bytes.Repeat([]byte{5}, 32))
 	var wg sync.WaitGroup
-	keys := make([][32]byte, 20)
+	keys := make([]Key, 20)
 	errs := make([]error, 20)
 	for i := range keys {
 		wg.Add(1)
@@ -120,7 +126,7 @@ func TestConcurrentResolutionCreatesOneKeyAndCopiesFoundValue(t *testing.T) {
 	}
 	wg.Wait()
 	for i := range keys {
-		if errs[i] != nil || keys[i] != keys[0] {
+		if errs[i] != nil || !keys[i].Equal(keys[0]) {
 			t.Fatalf("index %d: err=%v", i, errs[i])
 		}
 	}
@@ -128,7 +134,77 @@ func TestConcurrentResolutionCreatesOneKeyAndCopiesFoundValue(t *testing.T) {
 		t.Fatalf("puts=%d", b.puts)
 	}
 	b.value[0] = 8
-	if keys[0][0] != 5 {
+	if keys[0].Bytes()[0] != 5 {
 		t.Fatal("returned key aliases backend")
+	}
+}
+
+func TestKeyDoesNotFormatOrSerializeAndBytesAreCopies(t *testing.T) {
+	b := &secretBackend{value: bytes.Repeat([]byte{7}, 32)}
+	key, err := ResolveKey(context.Background(), b, "database", failReader{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	formatted := fmt.Sprintf("%v %+v %#v %s", key, key, key, key)
+	if strings.Contains(formatted, "7 7") || strings.Contains(formatted, "[7") {
+		t.Fatalf("key leaked through formatting")
+	}
+	if _, err := json.Marshal(key); err == nil {
+		t.Fatal("JSON serialized key")
+	}
+	if _, err := key.MarshalText(); err == nil {
+		t.Fatal("text serialized key")
+	}
+	copy := key.Bytes()
+	copy[0] = 9
+	if key.Bytes()[0] != 7 {
+		t.Fatal("byte accessor aliased key")
+	}
+}
+
+func TestPostPutVerificationRejectsMutationAndAmbiguousReread(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		onPut func(*secretBackend, []byte)
+	}{
+		{"mutated input only", func(_ *secretBackend, v []byte) { v[0] = 8 }},
+		{"mutated input", func(b *secretBackend, v []byte) { v[0] = 8; b.value = append([]byte(nil), v...) }},
+		{"wrong length", func(b *secretBackend, _ []byte) { b.value = []byte{1} }},
+		{"locked", func(b *secretBackend, _ []byte) { b.err = &SecretError{State: Locked} }},
+		{"missing", func(b *secretBackend, _ []byte) { b.err = &SecretError{State: NotFound}; b.value = nil }},
+		{"backend error", func(b *secretBackend, _ []byte) { b.err = errors.New("PRIVATE REREAD DETAIL") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &secretBackend{err: &SecretError{State: NotFound}, onPut: tc.onPut}
+			key, err := ResolveKey(context.Background(), b, "database", bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
+			if err == nil || key.Bytes() != [32]byte{} || strings.Contains(err.Error(), "PRIVATE") {
+				t.Fatalf("verification err=%v", err)
+			}
+		})
+	}
+}
+
+func TestTemporaryPutBufferIsCleared(t *testing.T) {
+	var putBuffer []byte
+	b := &secretBackend{err: &SecretError{State: NotFound}, onPut: func(_ *secretBackend, v []byte) { putBuffer = v }}
+	if _, err := ResolveKey(context.Background(), b, "database", bytes.NewReader(bytes.Repeat([]byte{3}, 32))); err != nil {
+		t.Fatal(err)
+	}
+	if len(putBuffer) != 32 {
+		t.Fatal("missing temporary buffer")
+	}
+	for _, v := range putBuffer {
+		if v != 0 {
+			t.Fatal("temporary buffer retained key")
+		}
+	}
+}
+
+func TestPostPutCancellationReturnsNoKey(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	b := &secretBackend{err: &SecretError{State: NotFound}, onPut: func(_ *secretBackend, _ []byte) { cancel() }}
+	key, err := ResolveKey(ctx, b, "database", bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
+	if !errors.Is(err, context.Canceled) || key.Bytes() != [32]byte{} {
+		t.Fatalf("cancel err=%v", err)
 	}
 }

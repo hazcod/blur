@@ -8,13 +8,12 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/nielsgroen/blur/internal/capture"
 	"github.com/nielsgroen/blur/internal/privacy"
 )
 
-const MaxObservationTextBytes = 1 << 20
+const MaxObservationTextBytes = capture.MaxObservationTextBytes
 const MaxListLimit = 1000
 
 type ErrorCode string
@@ -43,8 +42,9 @@ const (
 	Superseded  DerivationState = "superseded"
 )
 
-// Derivation is immutable provenance for one generated artifact. SourceIDs and
-// SourceHashes correspond by index. Its output is identified only by a hash;
+// Derivation is immutable provenance for one generated artifact. SourceIDs are
+// stored observation ContentIDs; SourceHashes correspond by index and describe
+// the input version used by the processor. Its output is identified by a hash;
 // retaining generated content belongs to a later authenticated backend.
 type Derivation struct {
 	ID, GenerationID                                                 string
@@ -87,12 +87,15 @@ type EncryptedStore interface {
 // EphemeralMemoryStore is TestOnly. It is never a production default and does
 // not encrypt or persist data. It exercises the EncryptedStore contract.
 type EphemeralMemoryStore struct {
-	mu           sync.RWMutex
-	closed       bool
-	observations map[string]capture.SanitizedObservation
-	derivations  map[string]Derivation
-	generations  map[string]Generation
-	active       string
+	mu             sync.RWMutex
+	closed         bool
+	observations   map[string]capture.SanitizedObservation
+	observationIDs []string
+	derivations    map[string]Derivation
+	derivationIDs  []string
+	generations    map[string]Generation
+	generationIDs  []string
+	active         string
 }
 
 var _ EncryptedStore = (*EphemeralMemoryStore)(nil)
@@ -120,6 +123,22 @@ func ready(ctx context.Context, closed bool) error {
 	}
 	return nil
 }
+
+func insertID(ids []string, id string) []string {
+	i := sort.SearchStrings(ids, id)
+	ids = append(ids, "")
+	copy(ids[i+1:], ids[i:len(ids)-1])
+	ids[i] = id
+	return ids
+}
+func pageIDs(ids []string, limit int, after string) []string {
+	start := sort.Search(len(ids), func(i int) bool { return ids[i] > after })
+	remaining := len(ids) - start
+	if limit > remaining {
+		limit = remaining
+	}
+	return ids[start : start+limit]
+}
 func validHash(s string) bool {
 	if len(s) != 64 {
 		return false
@@ -144,39 +163,6 @@ func validID(s string) bool {
 	}
 	return true
 }
-func validLabel(s string, max int) bool {
-	return len(s) <= max && utf8.ValidString(s) && !strings.ContainsRune(s, 0)
-}
-func validObservation(o capture.SanitizedObservation) bool {
-	if !validHash(o.ContentID) || !validLabel(o.AppID, 128) || !validLabel(o.Domain, 253) || !validLabel(o.Text, MaxObservationTextBytes) || o.RedactionVersion != privacy.Version || len(o.RedactionCounts) > 32 {
-		return false
-	}
-	for _, s := range []string{o.AppID, o.Domain} {
-		for i := 0; i < len(s); i++ {
-			c := s[i]
-			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '-' || c == '_') {
-				return false
-			}
-		}
-	}
-	if strings.Contains(o.Domain, "..") || strings.HasPrefix(o.Domain, ".") || strings.HasSuffix(o.Domain, ".") {
-		return false
-	}
-	last := ""
-	for _, c := range o.RedactionCounts {
-		if c.Count <= 0 || c.Count > MaxObservationTextBytes || c.Rule <= last || len(c.Rule) > 64 || c.Rule == "" {
-			return false
-		}
-		for i := 0; i < len(c.Rule); i++ {
-			x := c.Rule[i]
-			if !(x >= 'A' && x <= 'Z' || x == '_') {
-				return false
-			}
-		}
-		last = c.Rule
-	}
-	return true
-}
 func copyObservation(o capture.SanitizedObservation) capture.SanitizedObservation {
 	o.ContentID = strings.Clone(o.ContentID)
 	o.AppID = strings.Clone(o.AppID)
@@ -194,13 +180,15 @@ func (s *EphemeralMemoryStore) PutObservation(ctx context.Context, o capture.San
 	if err := ready(ctx, s.closed); err != nil {
 		return err
 	}
-	if !validObservation(o) {
+	if o.Validate() != nil {
 		return &StoreError{Code: Invalid}
 	}
 	if _, exists := s.observations[o.ContentID]; exists {
 		return &StoreError{Code: Duplicate}
 	}
-	s.observations[o.ContentID] = copyObservation(o)
+	stored := copyObservation(o)
+	s.observations[stored.ContentID] = stored
+	s.observationIDs = insertID(s.observationIDs, stored.ContentID)
 	return nil
 }
 func (s *EphemeralMemoryStore) GetObservation(ctx context.Context, id string) (capture.SanitizedObservation, bool, error) {
@@ -227,16 +215,7 @@ func (s *EphemeralMemoryStore) ListObservations(ctx context.Context, limit int, 
 	if !validPage(limit, after, true) {
 		return nil, &StoreError{Code: Invalid}
 	}
-	ids := make([]string, 0, len(s.observations))
-	for id := range s.observations {
-		if id > after {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	if len(ids) > limit {
-		ids = ids[:limit]
-	}
+	ids := pageIDs(s.observationIDs, limit, after)
 	out := make([]capture.SanitizedObservation, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, copyObservation(s.observations[id]))
@@ -289,7 +268,9 @@ func (s *EphemeralMemoryStore) PutDerivation(ctx context.Context, d Derivation) 
 	if _, ok := s.derivations[d.ID]; ok {
 		return &StoreError{Code: Duplicate}
 	}
-	s.derivations[d.ID] = copyDerivation(d)
+	stored := copyDerivation(d)
+	s.derivations[stored.ID] = stored
+	s.derivationIDs = insertID(s.derivationIDs, stored.ID)
 	return nil
 }
 func (s *EphemeralMemoryStore) GetDerivation(ctx context.Context, id string) (Derivation, bool, error) {
@@ -313,16 +294,7 @@ func (s *EphemeralMemoryStore) ListDerivations(ctx context.Context, limit int, a
 	if !validPage(limit, after, false) {
 		return nil, &StoreError{Code: Invalid}
 	}
-	ids := make([]string, 0, len(s.derivations))
-	for id := range s.derivations {
-		if id > after {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	if len(ids) > limit {
-		ids = ids[:limit]
-	}
+	ids := pageIDs(s.derivationIDs, limit, after)
 	out := make([]Derivation, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, copyDerivation(s.derivations[id]))
@@ -362,7 +334,9 @@ func (s *EphemeralMemoryStore) PutGeneration(ctx context.Context, g Generation) 
 	if _, ok := s.generations[g.ID]; ok {
 		return &StoreError{Code: Duplicate}
 	}
-	s.generations[g.ID] = copyGeneration(g)
+	stored := copyGeneration(g)
+	s.generations[stored.ID] = stored
+	s.generationIDs = insertID(s.generationIDs, stored.ID)
 	return nil
 }
 func (s *EphemeralMemoryStore) GetGeneration(ctx context.Context, id string) (Generation, bool, error) {
@@ -386,16 +360,7 @@ func (s *EphemeralMemoryStore) ListGenerations(ctx context.Context, limit int, a
 	if !validPage(limit, after, false) {
 		return nil, &StoreError{Code: Invalid}
 	}
-	ids := make([]string, 0, len(s.generations))
-	for id := range s.generations {
-		if id > after {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	if len(ids) > limit {
-		ids = ids[:limit]
-	}
+	ids := pageIDs(s.generationIDs, limit, after)
 	out := make([]Generation, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, copyGeneration(s.generations[id]))
@@ -419,6 +384,11 @@ func (s *EphemeralMemoryStore) ActivateGeneration(ctx context.Context, id string
 		d, ok := s.derivations[did]
 		if !ok || d.GenerationID != id || d.State != Active || d.CoveredSources+d.OmittedSources != len(d.SourceIDs) {
 			return &StoreError{Code: Incomplete}
+		}
+		for _, sourceID := range d.SourceIDs {
+			if _, present := s.observations[sourceID]; !present {
+				return &StoreError{Code: Incomplete}
+			}
 		}
 	}
 	s.active = id

@@ -10,6 +10,7 @@ import (
 
 	"github.com/nielsgroen/blur/internal/platform"
 	"github.com/nielsgroen/blur/internal/platform/fake"
+	"github.com/nielsgroen/blur/internal/privacy"
 )
 
 func available() platform.CapabilityReport {
@@ -216,6 +217,45 @@ func TestSanitizedObservationAndStableHash(t *testing.T) {
 		if strings.Contains(string(encoded), raw) {
 			t.Fatalf("JSON leaks %s: %s", raw, encoded)
 		}
+	}
+}
+
+func TestSanitizedObservationValidationRejectsForgery(t *testing.T) {
+	reads := 0
+	p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t", AppID: "org.example"}}, Read: reader("password: hunter2", &reads), Limits: limits()}
+	valid, err := p.Capture(context.Background())
+	if err != nil || valid.Validate() != nil {
+		t.Fatalf("genuine observation rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*SanitizedObservation)
+	}{
+		{"raw labelled secret", func(o *SanitizedObservation) { o.Text = "password: hunter2"; o.ContentID = o.CanonicalID() }},
+		{"mismatched id", func(o *SanitizedObservation) { o.ContentID = strings.Repeat("a", 64) }},
+		{"metadata mismatch", func(o *SanitizedObservation) { o.Domain = "other.test" }},
+		{"count mismatch", func(o *SanitizedObservation) { o.RedactionCounts[0].Count++ }},
+		{"secret shaped app", func(o *SanitizedObservation) {
+			o.AppID = "sk-abcdefghijklmnopqrstuvwxyz123456"
+			o.ContentID = o.CanonicalID()
+		}},
+		{"invalid placeholder", func(o *SanitizedObservation) { o.Text = "[REDACTED:FAKE]"; o.ContentID = o.CanonicalID() }},
+		{"partial placeholder", func(o *SanitizedObservation) { o.Text = "[REDACTED"; o.ContentID = o.CanonicalID() }},
+		{"invalid utf8", func(o *SanitizedObservation) { o.Text = "\xff"; o.ContentID = o.CanonicalID() }},
+		{"oversized text", func(o *SanitizedObservation) {
+			o.Text = strings.Repeat("x", MaxObservationTextBytes+1)
+			o.ContentID = o.CanonicalID()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := valid
+			o.RedactionCounts = append([]privacy.Count(nil), o.RedactionCounts...)
+			tc.mutate(&o)
+			err := o.Validate()
+			if err == nil || strings.Contains(err.Error(), "hunter2") {
+				t.Fatalf("validation error=%v", err)
+			}
+		})
 	}
 }
 
