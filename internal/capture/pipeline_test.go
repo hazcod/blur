@@ -110,13 +110,13 @@ func TestRemainingByteBudgetAndOversizeFailure(t *testing.T) {
 		return rawFrame{roots: []*rawNode{mk("ab"), mk("cde")}}, nil
 	}}
 	obs, err := p.Capture(context.Background())
-	if err != nil || obs.Text != "ab\ncde" || obs.Truncated || len(budgets) != 2 || budgets[0] != 6 || budgets[1] != 3 {
+	if err != nil || obs.text != "ab\ncde" || obs.truncated || len(budgets) != 2 || budgets[0] != 6 || budgets[1] != 3 {
 		t.Fatalf("obs=%+v budgets=%v err=%v", obs, budgets, err)
 	}
 	p.Limits.MaxBytes = 5
 	budgets = nil
 	obs, err = p.Capture(context.Background())
-	if err == nil || obs.Text != "" || len(budgets) != 2 || budgets[0] != 5 || budgets[1] != 2 {
+	if err == nil || obs.text != "" || len(budgets) != 2 || budgets[0] != 5 || budgets[1] != 2 {
 		t.Fatalf("separator budget: obs=%+v budgets=%v err=%v", obs, budgets, err)
 	}
 	p.Limits.MaxBytes = 2
@@ -125,7 +125,7 @@ func TestRemainingByteBudgetAndOversizeFailure(t *testing.T) {
 		return rawFrame{roots: []*rawNode{mk("ab"), {declaredBytes: 0, value: func(context.Context, int) (string, error) { budgets = append(budgets, -1); return "", nil }}}}, nil
 	}
 	obs, err = p.Capture(context.Background())
-	if err == nil || obs.Text != "" || len(budgets) != 1 {
+	if err == nil || obs.text != "" || len(budgets) != 1 {
 		t.Fatalf("separator with no room: obs=%+v budgets=%v err=%v", obs, budgets, err)
 	}
 	p.Limits.MaxBytes = 5
@@ -134,7 +134,7 @@ func TestRemainingByteBudgetAndOversizeFailure(t *testing.T) {
 		return rawFrame{roots: []*rawNode{{declaredBytes: 1, value: func(_ context.Context, n int) (string, error) { budgets = append(budgets, n); return "raw-secret", nil }}}}, nil
 	}
 	obs, err = p.Capture(context.Background())
-	if err == nil || obs.Text != "" || len(budgets) != 1 {
+	if err == nil || obs.text != "" || len(budgets) != 1 {
 		t.Fatalf("oversize obs=%+v budgets=%v err=%v", obs, budgets, err)
 	}
 }
@@ -194,22 +194,22 @@ func TestSanitizedObservationAndStableHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(a.Text, "hunter2") || a.AppID != "org.example.editor" || a.Domain != "example.test" || a.ContentID == "" || a.RedactionVersion == 0 {
+	if strings.Contains(a.text, "hunter2") || a.appID != "org.example.editor" || a.domain != "example.test" || a.contentID == "" || a.redactionVersion == 0 {
 		t.Fatalf("bad observation: %+v", a)
 	}
 	src.ProbeResult.TargetID = "target-b"
 	b, err := p.Capture(context.Background())
-	if err != nil || a.ContentID != b.ContentID {
+	if err != nil || a.contentID != b.contentID {
 		t.Fatalf("unstable ID: %v %+v %+v", err, a, b)
 	}
 	p.Read = reader("Note password: changed", &calls)
 	c, err := p.Capture(context.Background())
-	if err != nil || c.ContentID != a.ContentID {
+	if err != nil || c.contentID != a.contentID {
 		t.Fatalf("hash reveals redacted value: %v", err)
 	}
 	p.Read = reader("Different note password: changed", &calls)
 	d, err := p.Capture(context.Background())
-	if err != nil || d.ContentID == a.ContentID {
+	if err != nil || d.contentID == a.contentID {
 		t.Fatalf("hash ignores sanitized text: %v", err)
 	}
 	encoded, _ := json.Marshal(a)
@@ -231,31 +231,68 @@ func TestSanitizedObservationValidationRejectsForgery(t *testing.T) {
 		name   string
 		mutate func(*SanitizedObservation)
 	}{
-		{"raw labelled secret", func(o *SanitizedObservation) { o.Text = "password: hunter2"; o.ContentID = o.CanonicalID() }},
-		{"mismatched id", func(o *SanitizedObservation) { o.ContentID = strings.Repeat("a", 64) }},
-		{"metadata mismatch", func(o *SanitizedObservation) { o.Domain = "other.test" }},
-		{"count mismatch", func(o *SanitizedObservation) { o.RedactionCounts[0].Count++ }},
+		{"raw labelled secret", func(o *SanitizedObservation) { o.text = "password: hunter2"; o.contentID = contentID(*o) }},
+		{"mismatched id", func(o *SanitizedObservation) { o.contentID = strings.Repeat("a", 64) }},
+		{"metadata mismatch", func(o *SanitizedObservation) { o.domain = "other.test" }},
+		{"count mismatch", func(o *SanitizedObservation) { o.redactionCounts[0].Count = -1; o.contentID = contentID(*o) }},
 		{"secret shaped app", func(o *SanitizedObservation) {
-			o.AppID = "sk-abcdefghijklmnopqrstuvwxyz123456"
-			o.ContentID = o.CanonicalID()
+			o.appID = "sk-abcdefghijklmnopqrstuvwxyz123456"
+			o.contentID = contentID(*o)
 		}},
-		{"invalid placeholder", func(o *SanitizedObservation) { o.Text = "[REDACTED:FAKE]"; o.ContentID = o.CanonicalID() }},
-		{"partial placeholder", func(o *SanitizedObservation) { o.Text = "[REDACTED"; o.ContentID = o.CanonicalID() }},
-		{"invalid utf8", func(o *SanitizedObservation) { o.Text = "\xff"; o.ContentID = o.CanonicalID() }},
+		{"invalid utf8", func(o *SanitizedObservation) { o.text = "\xff"; o.contentID = contentID(*o) }},
 		{"oversized text", func(o *SanitizedObservation) {
-			o.Text = strings.Repeat("x", MaxObservationTextBytes+1)
-			o.ContentID = o.CanonicalID()
+			o.text = strings.Repeat("x", MaxObservationTextBytes+1)
+			o.contentID = contentID(*o)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o := valid
-			o.RedactionCounts = append([]privacy.Count(nil), o.RedactionCounts...)
+			o.redactionCounts = append([]privacy.Count(nil), o.redactionCounts...)
 			tc.mutate(&o)
 			err := o.Validate()
 			if err == nil || strings.Contains(err.Error(), "hunter2") {
 				t.Fatalf("validation error=%v", err)
 			}
 		})
+	}
+}
+
+func TestLiteralRedactedMarkersSurviveCapture(t *testing.T) {
+	for _, literal := range []string{"[REDACTED:FAKE]", "unfinished [REDACTED", "the exact [REDACTED:SECRET] string"} {
+		reads := 0
+		p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t"}}, Read: reader(literal, &reads), Limits: limits()}
+		o, err := p.Capture(context.Background())
+		if err != nil || o.text != literal || len(o.redactionCounts) != 0 {
+			t.Fatalf("literal changed: err=%v", err)
+		}
+	}
+}
+
+func TestSanitizerOwnsCountsAndID(t *testing.T) {
+	o, err := SanitizeObservation("example.app", "example.test", "password: hunter2", 256)
+	if err != nil || o.Validate() != nil || len(o.redactionCounts) != 1 || o.redactionCounts[0].Count != 1 || o.contentID == "" || strings.Contains(o.text, "hunter2") {
+		t.Fatalf("sanitizer result invalid: %v", err)
+	}
+}
+
+func TestOversizedMetadataRejectedBeforeHashOrRedaction(t *testing.T) {
+	for _, field := range []string{"app", "domain"} {
+		o := SanitizedObservation{contentID: strings.Repeat("a", 64), redactionVersion: privacy.Version}
+		if field == "app" {
+			o.appID = strings.Repeat("x", 8<<20)
+		} else {
+			o.domain = strings.Repeat("x", 8<<20)
+		}
+		result := testing.Benchmark(func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if o.Validate() == nil {
+					b.Fatal("oversized metadata accepted")
+				}
+			}
+		})
+		if result.NsPerOp() > 100000 {
+			t.Fatalf("%s validation performed unbounded work: %d ns/op", field, result.NsPerOp())
+		}
 	}
 }
 
@@ -267,7 +304,7 @@ func TestUTF8SafeOutputTruncation(t *testing.T) {
 	calls := 0
 	p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t"}}, Read: reader("🙂 password:x", &calls), Limits: Limits{MaxBytes: 15, MaxNodes: 1, MaxDepth: 1, MaxDuration: time.Second}}
 	obs, err := p.Capture(context.Background())
-	if err != nil || !obs.Truncated || !strings.HasPrefix(obs.Text, "🙂") || strings.Contains(obs.Text, "�") || strings.Contains(obs.Text, "password:x") {
+	if err != nil || !obs.truncated || !strings.HasPrefix(obs.text, "🙂") || strings.Contains(obs.text, "�") || strings.Contains(obs.text, "password:x") {
 		t.Fatalf("truncation: %+v %v", obs, err)
 	}
 }
@@ -317,7 +354,7 @@ func TestMalformedMetadataAndValueFailClosed(t *testing.T) {
 		return rawFrame{roots: []*rawNode{{declaredBytes: 1, value: func(context.Context, int) (string, error) { return string([]byte{0xff}), nil }}}}, nil
 	}}
 	obs, err := p.Capture(context.Background())
-	if err == nil || obs.Text != "" {
+	if err == nil || obs.text != "" {
 		t.Fatalf("malformed value: %+v %v", obs, err)
 	}
 }

@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -15,31 +17,65 @@ import (
 )
 
 func observation(id string) capture.SanitizedObservation {
-	o := capture.SanitizedObservation{AppID: "example.app", Domain: "example.com", Text: "password: [REDACTED:SECRET]\n" + id, RedactionVersion: privacy.Version, RedactionCounts: []privacy.Count{{Rule: "SECRET", Count: 1}}}
-	o.ContentID = o.CanonicalID()
+	o, err := capture.SanitizeObservation("example.app", "example.com", "password: hunter2\n"+id, 256)
+	if err != nil {
+		panic(err)
+	}
 	return o
 }
 func digest(c byte) string { return strings.Repeat(string(c), 64) }
-func idFor(c byte) string  { return observation(digest(c)).ContentID }
+func idFor(c byte) string  { return observation(digest(c)).ContentID() }
 
-func TestForgedObservationCannotEnterStorage(t *testing.T) {
+func TestObservationCannotBeForgedOutsideCapture(t *testing.T) {
+	shape := reflect.TypeOf(capture.SanitizedObservation{})
+	for i := 0; i < shape.NumField(); i++ {
+		if shape.Field(i).IsExported() {
+			t.Fatalf("exported observation field: %s", shape.Field(i).Name)
+		}
+	}
+	if _, exists := shape.MethodByName("CanonicalID"); exists {
+		t.Fatal("public canonical ID setter path")
+	}
+	constructor := reflect.TypeOf(capture.SanitizeObservation)
+	if constructor.NumIn() != 4 || constructor.In(0).Kind() != reflect.String || constructor.In(1).Kind() != reflect.String || constructor.In(2).Kind() != reflect.String || constructor.In(3).Kind() != reflect.Int {
+		t.Fatal("constructor accepts caller-supplied identity or counts")
+	}
+	var decoded capture.SanitizedObservation
+	if err := json.Unmarshal([]byte(`{"content_id":"untrusted"}`), &decoded); err == nil {
+		t.Fatal("untrusted wire JSON constructed observation")
+	}
+	encoded, err := json.Marshal(observation(digest('a')))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"content_id", "app_id", "domain", "text", "truncated", "redaction_version", "redaction_counts"} {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("missing sanitized JSON field %s", name)
+		}
+	}
+	if len(fields) != 7 || strings.Contains(string(encoded), "hunter2") {
+		t.Fatal("JSON exposed extra or raw fields")
+	}
+}
+
+func TestInvalidObservationReturnsBeforeExclusiveStoreLock(t *testing.T) {
 	s := NewEphemeralMemoryStore()
-	for _, tc := range []struct {
-		name   string
-		change func(*capture.SanitizedObservation)
-	}{
-		{"raw secret", func(o *capture.SanitizedObservation) { o.Text = "password: hunter2" }},
-		{"well shaped wrong hash", func(o *capture.SanitizedObservation) { o.ContentID = digest('f') }},
-		{"metadata mismatch", func(o *capture.SanitizedObservation) { o.Domain = "changed.test" }},
-		{"counts mismatch", func(o *capture.SanitizedObservation) { o.RedactionCounts[0].Count++ }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			o := observation(digest('a'))
-			tc.change(&o)
-			if err := s.PutObservation(context.Background(), o); !isStorageError(err, Invalid) {
-				t.Fatalf("forgery accepted: %v", err)
-			}
-		})
+	s.mu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- s.PutObservation(context.Background(), capture.SanitizedObservation{}) }()
+	select {
+	case err := <-done:
+		s.mu.Unlock()
+		if !isStorageError(err, Invalid) {
+			t.Fatalf("invalid value: %v", err)
+		}
+	case <-time.After(time.Second):
+		s.mu.Unlock()
+		t.Fatal("invalid observation waited for exclusive store lock")
 	}
 }
 
@@ -47,29 +83,12 @@ func TestObservationBoundaryRejectsMalformedAndDuplicates(t *testing.T) {
 	ctx := context.Background()
 	s := NewEphemeralMemoryStore()
 	base := observation(digest('a'))
-	bad := []capture.SanitizedObservation{
-		{}, func() capture.SanitizedObservation { x := base; x.ContentID = "not-a-digest"; return x }(), func() capture.SanitizedObservation { x := base; x.ContentID = strings.ToUpper(x.ContentID); return x }(),
-		func() capture.SanitizedObservation { x := base; x.Text = "\xff"; return x }(),
-		func() capture.SanitizedObservation {
-			x := base
-			x.Text = strings.Repeat("x", MaxObservationTextBytes+1)
-			return x
-		}(),
-		func() capture.SanitizedObservation { x := base; x.RedactionVersion = 0; return x }(),
-		func() capture.SanitizedObservation {
-			x := base
-			x.RedactionCounts = []privacy.Count{{Rule: "SECRET", Count: -1}}
-			return x
-		}(),
-		func() capture.SanitizedObservation {
-			x := base
-			x.RedactionCounts = []privacy.Count{{Rule: "SECRET", Count: 1}, {Rule: "SECRET", Count: 1}}
-			return x
-		}(),
+	if err := s.PutObservation(ctx, capture.SanitizedObservation{}); !isStorageError(err, Invalid) {
+		t.Fatalf("zero observation: %v", err)
 	}
-	for i, x := range bad {
-		if err := s.PutObservation(ctx, x); !isStorageError(err, Invalid) {
-			t.Fatalf("case %d: %v", i, err)
+	for _, raw := range []string{"\xff", strings.Repeat("x", MaxObservationTextBytes+1)} {
+		if _, err := capture.SanitizeObservation("example.app", "example.com", raw, MaxObservationTextBytes); err == nil {
+			t.Fatal("malformed raw text accepted")
 		}
 	}
 	if err := s.PutObservation(ctx, base); err != nil {
@@ -97,17 +116,17 @@ func TestObservationListIsBoundedOrderedAndCopied(t *testing.T) {
 	got, err := s.ListObservations(ctx, 2, "")
 	ids := []string{idFor('a'), idFor('b'), idFor('c')}
 	sort.Strings(ids)
-	if err != nil || len(got) != 2 || got[0].ContentID != ids[0] || got[1].ContentID != ids[1] {
+	if err != nil || len(got) != 2 || got[0].ContentID() != ids[0] || got[1].ContentID() != ids[1] {
 		t.Fatalf("first page: %v %v", len(got), err)
 	}
-	got[0].RedactionCounts[0].Rule = "BROKEN"
-	got[0].Text = "changed"
+	counts := got[0].RedactionCounts()
+	counts[0].Rule = "BROKEN"
 	x, ok, err := s.GetObservation(ctx, ids[0])
-	if err != nil || !ok || x.Text == "changed" || x.RedactionCounts[0].Rule != "SECRET" {
+	if err != nil || !ok || x.RedactionCounts()[0].Rule != "SECRET" {
 		t.Fatalf("get: %+v %t %v", x, ok, err)
 	}
 	page, err := s.ListObservations(ctx, 2, ids[1])
-	if err != nil || len(page) != 1 || page[0].ContentID != ids[2] {
+	if err != nil || len(page) != 1 || page[0].ContentID() != ids[2] {
 		t.Fatalf("second page: %v %v", len(page), err)
 	}
 	if _, ok, err := s.GetObservation(ctx, digest('f')); err != nil || ok {
@@ -121,18 +140,20 @@ func TestObservationWriteCopiesCallerData(t *testing.T) {
 	if err := s.PutObservation(context.Background(), o); err != nil {
 		t.Fatal(err)
 	}
-	o.RedactionCounts[0].Rule = "CHANGED"
+	counts := o.RedactionCounts()
+	counts[0].Rule = "CHANGED"
 	got, ok, err := s.GetObservation(context.Background(), idFor('a'))
-	if err != nil || !ok || got.RedactionCounts[0].Rule != "SECRET" {
+	if err != nil || !ok || got.RedactionCounts()[0].Rule != "SECRET" {
 		t.Fatalf("copy failed: found=%t err=%v", ok, err)
 	}
 }
 
 func TestObservationFromTargetWithoutAppIdentityIsAccepted(t *testing.T) {
 	s := NewEphemeralMemoryStore()
-	o := observation(digest('e'))
-	o.AppID = ""
-	o.ContentID = o.CanonicalID()
+	o, err := capture.SanitizeObservation("", "example.com", "safe text", 256)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.PutObservation(context.Background(), o); err != nil {
 		t.Fatal(err)
 	}
@@ -277,10 +298,10 @@ func TestSmallPagesStayBoundedOverLargeStore(t *testing.T) {
 	var after string
 	for i := 0; i < n; i++ {
 		page, err := s.ListObservations(ctx, 1, after)
-		if err != nil || len(page) != 1 || page[0].ContentID <= after {
+		if err != nil || len(page) != 1 || page[0].ContentID() <= after {
 			t.Fatalf("observation page %d: %v", i, err)
 		}
-		after = page[0].ContentID
+		after = page[0].ContentID()
 	}
 	if page, err := s.ListObservations(ctx, 1, after); err != nil || len(page) != 0 {
 		t.Fatalf("observation end: %v", err)

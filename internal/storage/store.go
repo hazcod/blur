@@ -164,31 +164,30 @@ func validID(s string) bool {
 	return true
 }
 func copyObservation(o capture.SanitizedObservation) capture.SanitizedObservation {
-	o.ContentID = strings.Clone(o.ContentID)
-	o.AppID = strings.Clone(o.AppID)
-	o.Domain = strings.Clone(o.Domain)
-	o.Text = strings.Clone(o.Text)
-	o.RedactionCounts = append([]privacy.Count(nil), o.RedactionCounts...)
-	for i := range o.RedactionCounts {
-		o.RedactionCounts[i].Rule = strings.Clone(o.RedactionCounts[i].Rule)
-	}
-	return o
+	return o.Clone()
 }
 func (s *EphemeralMemoryStore) PutObservation(ctx context.Context, o capture.SanitizedObservation) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := ready(ctx, s.closed); err != nil {
+	if ctx == nil {
+		return &StoreError{Code: Invalid}
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if o.Validate() != nil {
 		return &StoreError{Code: Invalid}
 	}
-	if _, exists := s.observations[o.ContentID]; exists {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ready(ctx, s.closed); err != nil {
+		return err
+	}
+	id := o.ContentID()
+	if _, exists := s.observations[id]; exists {
 		return &StoreError{Code: Duplicate}
 	}
 	stored := copyObservation(o)
-	s.observations[stored.ContentID] = stored
-	s.observationIDs = insertID(s.observationIDs, stored.ContentID)
+	s.observations[stored.ContentID()] = stored
+	s.observationIDs = insertID(s.observationIDs, stored.ContentID())
 	return nil
 }
 func (s *EphemeralMemoryStore) GetObservation(ctx context.Context, id string) (capture.SanitizedObservation, bool, error) {
