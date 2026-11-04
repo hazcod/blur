@@ -35,15 +35,16 @@ type Exclusions struct {
 type ErrorCode string
 
 const (
-	InvalidLimits ErrorCode = "invalid_limits"
-	Unavailable   ErrorCode = "unavailable"
-	ProbeFailed   ErrorCode = "probe_failed"
-	Excluded      ErrorCode = "excluded"
-	InvalidProbe  ErrorCode = "invalid_probe"
-	ReadFailed    ErrorCode = "read_failed"
-	LimitExceeded ErrorCode = "limit_exceeded"
-	Cancelled     ErrorCode = "cancelled"
-	TimedOut      ErrorCode = "timed_out"
+	InvalidLimits     ErrorCode = "invalid_limits"
+	InvalidExclusions ErrorCode = "invalid_exclusions"
+	Unavailable       ErrorCode = "unavailable"
+	ProbeFailed       ErrorCode = "probe_failed"
+	Excluded          ErrorCode = "excluded"
+	InvalidProbe      ErrorCode = "invalid_probe"
+	ReadFailed        ErrorCode = "read_failed"
+	LimitExceeded     ErrorCode = "limit_exceeded"
+	Cancelled         ErrorCode = "cancelled"
+	TimedOut          ErrorCode = "timed_out"
 )
 
 type CaptureError struct {
@@ -96,6 +97,10 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	if !p.Limits.valid() {
 		return empty, captureError(InvalidLimits, nil)
 	}
+	exclusions, ok := canonicalExclusions(p.Exclusions)
+	if !ok {
+		return empty, captureError(InvalidExclusions, nil)
+	}
 	if err := contextError(ctx.Err()); err != nil {
 		return empty, err
 	}
@@ -122,7 +127,7 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	if !ok {
 		return empty, captureError(InvalidProbe, nil)
 	}
-	if probe.Secure || probe.Elevated || probe.Private || excluded(app, domain, p.Exclusions) {
+	if probe.Secure || probe.Elevated || probe.Private || excluded(app, domain, exclusions) {
 		return empty, captureError(Excluded, nil)
 	}
 	frame, err := p.Read(ctx, probe, p.Limits)
@@ -145,6 +150,14 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		if node.value == nil {
 			continue
 		}
+		separator := 0
+		if b.Len() > 0 {
+			if remaining == 0 {
+				return empty, captureError(LimitExceeded, nil)
+			}
+			remaining--
+			separator = 1
+		}
 		value, readErr := node.value(ctx, remaining)
 		if ce := contextError(ctx.Err()); ce != nil {
 			return empty, ce
@@ -158,10 +171,13 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		if len(value) > remaining || len(value) > node.declaredBytes {
 			return empty, captureError(LimitExceeded, nil)
 		}
-		remaining -= len(value)
-		if b.Len() > 0 && value != "" {
+		if value == "" {
+			remaining += separator
+		}
+		if separator == 1 && value != "" {
 			b.WriteByte('\n')
 		}
+		remaining -= len(value)
 		b.WriteString(value)
 	}
 	text, counts := privacy.Redact(b.String())
@@ -172,15 +188,60 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 }
 
 func normalizeProbe(probe platform.CaptureProbe) (string, string, bool) {
-	if probe.TargetID == "" || len(probe.TargetID) > 256 || len(probe.AppID) > 128 || len(probe.Domain) > 253 {
+	if !validTargetID(probe.TargetID) {
 		return "", "", false
 	}
-	app := strings.ToLower(strings.TrimSpace(probe.AppID))
-	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(probe.Domain), "."))
-	if !identifier(app) || !identifier(domain) || strings.Contains(domain, "..") || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+	app, appOK := normalizeAppID(probe.AppID)
+	domain, domainOK := normalizeDomain(probe.Domain)
+	if !appOK || !domainOK {
 		return "", "", false
 	}
 	return app, domain, true
+}
+func validTargetID(id string) bool {
+	if id == "" || len(id) > 256 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+func normalizeAppID(raw string) (string, bool) {
+	if len(raw) > 128 {
+		return "", false
+	}
+	s := strings.ToLower(strings.TrimSpace(raw))
+	return s, identifier(s)
+}
+func normalizeDomain(raw string) (string, bool) {
+	if len(raw) > 253 {
+		return "", false
+	}
+	s := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+	return s, identifier(s) && !strings.Contains(s, "..") && !strings.HasPrefix(s, ".") && !strings.HasSuffix(s, ".")
+}
+func canonicalExclusions(e Exclusions) (Exclusions, bool) {
+	var out Exclusions
+	for _, raw := range e.Apps {
+		app, ok := normalizeAppID(raw)
+		if !ok || app == "" {
+			return Exclusions{}, false
+		}
+		out.Apps = append(out.Apps, app)
+	}
+	for _, raw := range e.Domains {
+		domain, ok := normalizeDomain(raw)
+		if !ok || domain == "" {
+			return Exclusions{}, false
+		}
+		out.Domains = append(out.Domains, domain)
+	}
+	return out, true
 }
 func identifier(s string) bool {
 	for _, r := range s {
@@ -192,12 +253,11 @@ func identifier(s string) bool {
 }
 func excluded(app, domain string, e Exclusions) bool {
 	for _, x := range e.Apps {
-		if app != "" && app == strings.ToLower(strings.TrimSpace(x)) {
+		if app != "" && app == x {
 			return true
 		}
 	}
 	for _, x := range e.Domains {
-		x = strings.ToLower(strings.TrimSpace(x))
 		if x != "" && domain != "" && (domain == x || strings.HasSuffix(domain, "."+x)) {
 			return true
 		}

@@ -9,6 +9,8 @@ type CapabilityReporter interface {
 
 // CaptureProbe is non-content metadata sufficient for policy preflight.
 // TargetID is an opaque adapter-issued identity, never a title, URL, or hostname.
+// It is 1–256 ASCII bytes: letters, digits, dot, underscore, colon, or hyphen.
+// Adapters must not encode content or environment values in it.
 type CaptureProbe struct {
 	TargetID string
 	AppID    string

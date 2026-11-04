@@ -16,71 +16,127 @@ type Count struct {
 }
 
 var (
-	pem    = regexp.MustCompile(`(?s)-----BEGIN (?:[A-Z0-9 ]* )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]* )?PRIVATE KEY-----`)
-	auth   = regexp.MustCompile(`(?im)\bAuthorization\s*:\s*[^\r\n]+`)
-	webURL = regexp.MustCompile(`https?://[^\s<>"']+`)
-	label  = regexp.MustCompile(`(?i)\b(password|secret|token|api[_ -]?key|cvv|cvc|security[_ -]?code)\b(\s*[:=]\s*)([^\s,;&]+)`)
-	token  = regexp.MustCompile(`\b(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{20,})\b`)
-	ssn    = regexp.MustCompile(`\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b`)
-	card   = regexp.MustCompile(`\b(?:[0-9][ -]?){12,18}[0-9]\b`)
-	iban   = regexp.MustCompile(`\b[A-Z]{2}[0-9]{2}(?:[ ]?[A-Z0-9]){11,30}\b`)
+	pem         = regexp.MustCompile(`(?s)-----BEGIN (?:[A-Z0-9 ]* )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]* )?PRIVATE KEY-----`)
+	auth        = regexp.MustCompile(`(?im)\bAuthorization\s*:\s*[^\r\n]+`)
+	webURL      = regexp.MustCompile(`https?://[^\s<>"']+`)
+	jsonLabel   = regexp.MustCompile(`(?i)"(password|secret|token|api[_ -]?key|cvv|cvc|security[_ -]?code)"([ \t]*:[ \t]*)"((?:\\.|[^"\\])*)"`)
+	quotedLabel = regexp.MustCompile(`(?i)\b(password|secret|token|api[_ -]?key|cvv|cvc|security[_ -]?code)\b([ \t]*[:=][ \t]*)"((?:\\.|[^"\\])*)"`)
+	label       = regexp.MustCompile(`(?i)\b(password|secret|token|api[_ -]?key|cvv|cvc|security[_ -]?code)\b([ \t]*[:=][ \t]*)([^\r\n,;&"']+)`)
+	token       = regexp.MustCompile(`\b(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{20,})\b`)
+	ssn         = regexp.MustCompile(`\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b`)
+	card        = regexp.MustCompile(`\b(?:[0-9][ -]?){12,18}[0-9]\b`)
+	iban        = regexp.MustCompile(`\b[A-Z]{2}[0-9]{2}(?:[ ]?[A-Z0-9]){11,30}\b`)
 )
+
+func placeholder(rule string) string           { return "[REDACTED:" + rule + "]" }
+func exactPlaceholder(value, rule string) bool { return value == placeholder(rule) }
+func labelRule(name string) string {
+	if strings.EqualFold(name, "cvv") || strings.EqualFold(name, "cvc") || strings.EqualFold(strings.ReplaceAll(strings.ReplaceAll(name, "_", " "), "-", " "), "security code") {
+		return "SECURITY_CODE"
+	}
+	return "SECRET"
+}
 
 func Redact(input string) (string, []Count) {
 	counts := map[string]int{}
 	replace := func(re *regexp.Regexp, rule string, valid func(string) bool) {
 		input = re.ReplaceAllStringFunc(input, func(match string) string {
-			if strings.Contains(match, "[REDACTED:") || valid != nil && !valid(match) {
+			if valid != nil && !valid(match) {
 				return match
 			}
 			counts[rule]++
-			return "[REDACTED:" + rule + "]"
+			return placeholder(rule)
 		})
 	}
 	replace(pem, "PRIVATE_KEY", nil)
-	replace(auth, "AUTHORIZATION", nil)
+	input = auth.ReplaceAllStringFunc(input, func(match string) string {
+		colon := strings.IndexByte(match, ':')
+		if colon >= 0 && exactPlaceholder(strings.TrimSpace(match[colon+1:]), "AUTHORIZATION") {
+			return match
+		}
+		counts["AUTHORIZATION"]++
+		return placeholder("AUTHORIZATION")
+	})
 	input = webURL.ReplaceAllStringFunc(input, func(raw string) string {
-		u, err := url.Parse(raw)
+		parseRaw := strings.Replace(raw, placeholder("URL_CREDENTIAL"), "%5BREDACTED%3AURL_CREDENTIAL%5D", 1)
+		u, err := url.Parse(parseRaw)
 		if err != nil || u.Host == "" {
 			return raw
 		}
 		changed := false
-		if u.User != nil && u.User.Username() != "[REDACTED:URL_CREDENTIAL]" {
-			u.User = url.User("[REDACTED:URL_CREDENTIAL]")
-			counts["URL_CREDENTIAL"]++
-			changed = true
+		if u.User != nil {
+			_, hasPassword := u.User.Password()
+			if !exactPlaceholder(u.User.Username(), "URL_CREDENTIAL") || hasPassword {
+				u.User = url.User(placeholder("URL_CREDENTIAL"))
+				counts["URL_CREDENTIAL"]++
+				changed = true
+			}
 		}
 		q := u.Query()
 		for key, vals := range q {
 			k := strings.ToLower(key)
 			if k == "token" || k == "access_token" || k == "refresh_token" || k == "auth_token" || k == "session_token" || k == "api_key" || k == "apikey" || k == "client_secret" || k == "password" || k == "secret" || k == "auth" || k == "key" {
-				if len(vals) > 0 && !strings.HasPrefix(vals[0], "[REDACTED:") {
-					for range vals {
-						counts["URL_QUERY"]++
+				if len(vals) != 1 || !exactPlaceholder(vals[0], "URL_QUERY") {
+					for _, v := range vals {
+						if !exactPlaceholder(v, "URL_QUERY") {
+							counts["URL_QUERY"]++
+						}
 					}
-					q.Set(key, "[REDACTED:URL_QUERY]")
+					q.Set(key, placeholder("URL_QUERY"))
 					changed = true
 				}
 			}
 		}
 		if changed {
 			u.RawQuery = q.Encode()
-			return strings.ReplaceAll(u.String(), "%5BREDACTED%3AURL_CREDENTIAL%5D", "[REDACTED:URL_CREDENTIAL]")
+			out := strings.ReplaceAll(u.String(), "%5BREDACTED%3AURL_CREDENTIAL%5D", placeholder("URL_CREDENTIAL"))
+			return strings.ReplaceAll(out, "%5BREDACTED%3AURL_QUERY%5D", placeholder("URL_QUERY"))
 		}
 		return raw
 	})
-	input = label.ReplaceAllStringFunc(input, func(match string) string {
-		parts := label.FindStringSubmatch(match)
-		if len(parts) != 4 || strings.Contains(parts[3], "REDACTED") {
-			return match
+	maskLabels := func(segment string) string {
+		maskQuoted := func(re *regexp.Regexp, json bool) {
+			segment = re.ReplaceAllStringFunc(segment, func(match string) string {
+				parts := re.FindStringSubmatch(match)
+				if len(parts) != 4 {
+					return match
+				}
+				rule := labelRule(parts[1])
+				if exactPlaceholder(parts[3], rule) {
+					return match
+				}
+				counts[rule]++
+				if json {
+					return "\"" + parts[1] + "\"" + parts[2] + "\"" + placeholder(rule) + "\""
+				}
+				return parts[1] + parts[2] + "\"" + placeholder(rule) + "\""
+			})
 		}
-		rule := "SECRET"
-		if strings.EqualFold(parts[1], "cvv") || strings.EqualFold(parts[1], "cvc") || strings.EqualFold(strings.ReplaceAll(parts[1], "_", " "), "security code") {
-			rule = "SECURITY_CODE"
-		}
-		counts[rule]++
-		return parts[1] + parts[2] + "[REDACTED:" + rule + "]"
-	})
+		maskQuoted(jsonLabel, true)
+		maskQuoted(quotedLabel, false)
+		segment = label.ReplaceAllStringFunc(segment, func(match string) string {
+			parts := label.FindStringSubmatch(match)
+			if len(parts) != 4 {
+				return match
+			}
+			rule := labelRule(parts[1])
+			if exactPlaceholder(strings.TrimSpace(parts[3]), rule) {
+				return match
+			}
+			counts[rule]++
+			return parts[1] + parts[2] + placeholder(rule)
+		})
+		return segment
+	}
+	var labelled strings.Builder
+	last := 0
+	for _, span := range webURL.FindAllStringIndex(input, -1) {
+		labelled.WriteString(maskLabels(input[last:span[0]]))
+		labelled.WriteString(input[span[0]:span[1]])
+		last = span[1]
+	}
+	labelled.WriteString(maskLabels(input[last:]))
+	input = labelled.String()
 	replace(token, "TOKEN", nil)
 	replace(ssn, "SSN", validSSN)
 	replace(card, "CARD", validCard)

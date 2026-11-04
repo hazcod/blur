@@ -105,13 +105,29 @@ func TestRemainingByteBudgetAndOversizeFailure(t *testing.T) {
 	mk := func(s string) *rawNode {
 		return &rawNode{declaredBytes: len(s), value: func(_ context.Context, n int) (string, error) { budgets = append(budgets, n); return s, nil }}
 	}
-	p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t"}}, Limits: Limits{MaxBytes: 5, MaxNodes: 2, MaxDepth: 1, MaxDuration: time.Second}, Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+	p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t"}}, Limits: Limits{MaxBytes: 6, MaxNodes: 2, MaxDepth: 1, MaxDuration: time.Second}, Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
 		return rawFrame{roots: []*rawNode{mk("ab"), mk("cde")}}, nil
 	}}
 	obs, err := p.Capture(context.Background())
-	if err != nil || obs.Text != "ab\ncd" || !obs.Truncated || len(budgets) != 2 || budgets[0] != 5 || budgets[1] != 3 {
+	if err != nil || obs.Text != "ab\ncde" || obs.Truncated || len(budgets) != 2 || budgets[0] != 6 || budgets[1] != 3 {
 		t.Fatalf("obs=%+v budgets=%v err=%v", obs, budgets, err)
 	}
+	p.Limits.MaxBytes = 5
+	budgets = nil
+	obs, err = p.Capture(context.Background())
+	if err == nil || obs.Text != "" || len(budgets) != 2 || budgets[0] != 5 || budgets[1] != 2 {
+		t.Fatalf("separator budget: obs=%+v budgets=%v err=%v", obs, budgets, err)
+	}
+	p.Limits.MaxBytes = 2
+	budgets = nil
+	p.Read = func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+		return rawFrame{roots: []*rawNode{mk("ab"), {declaredBytes: 0, value: func(context.Context, int) (string, error) { budgets = append(budgets, -1); return "", nil }}}}, nil
+	}
+	obs, err = p.Capture(context.Background())
+	if err == nil || obs.Text != "" || len(budgets) != 1 {
+		t.Fatalf("separator with no room: obs=%+v budgets=%v err=%v", obs, budgets, err)
+	}
+	p.Limits.MaxBytes = 5
 	budgets = nil
 	p.Read = func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
 		return rawFrame{roots: []*rawNode{{declaredBytes: 1, value: func(_ context.Context, n int) (string, error) { budgets = append(budgets, n); return "raw-secret", nil }}}}, nil
@@ -119,6 +135,53 @@ func TestRemainingByteBudgetAndOversizeFailure(t *testing.T) {
 	obs, err = p.Capture(context.Background())
 	if err == nil || obs.Text != "" || len(budgets) != 1 {
 		t.Fatalf("oversize obs=%+v budgets=%v err=%v", obs, budgets, err)
+	}
+}
+
+func TestExcludedCanonicalAppAndDomainNeverReachReader(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		probe      platform.CaptureProbe
+		exclusions Exclusions
+	}{
+		{"domain terminal dot", platform.CaptureProbe{TargetID: "target-1", Domain: "BANK.TEST."}, Exclusions{Domains: []string{" bank.test. "}}},
+		{"subdomain", platform.CaptureProbe{TargetID: "target-1", Domain: "login.bank.test."}, Exclusions{Domains: []string{"BANK.TEST."}}},
+		{"app case and space", platform.CaptureProbe{TargetID: "target-1", AppID: "Org.Secret"}, Exclusions{Apps: []string{" org.secret "}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: tc.probe}, Read: reader("secret", &reads), Limits: limits(), Exclusions: tc.exclusions}
+			_, err := p.Capture(context.Background())
+			var typed *CaptureError
+			if !errors.As(err, &typed) || typed.Code != Excluded || reads != 0 {
+				t.Fatalf("exclusion: %v reads=%d", err, reads)
+			}
+		})
+	}
+}
+
+func TestInvalidExclusionConfigurationFailsBeforeProbe(t *testing.T) {
+	for _, tc := range []Exclusions{{Apps: []string{""}}, {Apps: []string{"org.example/secret"}}, {Domains: []string{"https://bank.test"}}, {Domains: []string{strings.Repeat("a", 254)}}} {
+		src := &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "target-1"}}
+		reads := 0
+		p := Pipeline{Source: src, Read: reader("secret", &reads), Limits: limits(), Exclusions: tc}
+		_, err := p.Capture(context.Background())
+		var typed *CaptureError
+		if !errors.As(err, &typed) || typed.Code != InvalidExclusions || reads != 0 || src.Calls != 0 {
+			t.Fatalf("invalid exclusion: %v reads=%d probes=%d", err, reads, src.Calls)
+		}
+	}
+}
+
+func TestMalformedOpaqueTargetIDsNeverReachReader(t *testing.T) {
+	for _, id := range []string{"", "has space", "path/part", "target?token=secret", "https://example.test", "line\nbreak", string([]byte{0xff}), strings.Repeat("x", 257)} {
+		reads := 0
+		p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: id}}, Read: reader("secret", &reads), Limits: limits()}
+		_, err := p.Capture(context.Background())
+		var typed *CaptureError
+		if !errors.As(err, &typed) || typed.Code != InvalidProbe || reads != 0 {
+			t.Fatalf("target ID %q: %v reads=%d", id, err, reads)
+		}
 	}
 }
 

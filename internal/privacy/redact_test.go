@@ -65,3 +65,73 @@ func TestOpenAIProjectTokenAndClientSecretAreMasked(t *testing.T) {
 		t.Fatalf("sensitive values survived: %q", out)
 	}
 }
+
+func TestPlaceholderShapedTextDoesNotBypassWholeMatch(t *testing.T) {
+	in := "Authorization: [REDACTED:SECRET] Bearer actual-secret\n" +
+		"-----BEGIN PRIVATE KEY-----\n[REDACTED:SECRET] actual-key-material\n-----END PRIVATE KEY-----"
+	out, _ := Redact(in)
+	if strings.Contains(out, "actual-secret") || strings.Contains(out, "actual-key-material") || !strings.Contains(out, "[REDACTED:AUTHORIZATION]") || !strings.Contains(out, "[REDACTED:PRIVATE_KEY]") {
+		t.Fatalf("whole-match bypass: %q", out)
+	}
+	a, _ := Redact(out)
+	if a != out {
+		t.Fatalf("non-idempotent whole-match masking: %q", a)
+	}
+}
+
+func TestRepeatedSensitiveQueryValuesAllCollapse(t *testing.T) {
+	in := "https://example.test/?client_secret=%5BREDACTED%3AURL_QUERY%5D&client_secret=actual-secret&view=day"
+	out, counts := Redact(in)
+	if strings.Contains(out, "actual-secret") || strings.Count(out, "client_secret=") != 1 || !strings.Contains(out, "view=day") || len(counts) != 1 || counts[0].Count != 1 {
+		t.Fatalf("repeated query bypass: %q %+v", out, counts)
+	}
+	again, later := Redact(out)
+	if again != out || len(later) != 0 {
+		t.Fatalf("query idempotence: %q %q %+v", out, again, later)
+	}
+}
+
+func TestLabelledSecretContainingRedactedSubstringIsMasked(t *testing.T) {
+	in := "password: MY_REDACTED_PASSWORD_123\napi_key=prefix[REDACTED:SECRET]suffix"
+	out, counts := Redact(in)
+	if strings.Contains(out, "MY_REDACTED_PASSWORD_123") || strings.Contains(out, "prefix") || len(counts) != 1 || counts[0].Count != 2 {
+		t.Fatalf("label bypass: %q %+v", out, counts)
+	}
+	again, later := Redact(out)
+	if again != out || len(later) != 0 {
+		t.Fatalf("label idempotence: %q %q %+v", out, again, later)
+	}
+}
+
+func TestJSONQuotedSecretsAreMasked(t *testing.T) {
+	in := `{"password": "actual-secret", "api_key" :"key-value", "token":"[REDACTED:SECRET]"}`
+	out, counts := Redact(in)
+	if strings.Contains(out, "actual-secret") || strings.Contains(out, "key-value") || !strings.Contains(out, `"password": "[REDACTED:SECRET]"`) || !strings.Contains(out, `"api_key" :"[REDACTED:SECRET]"`) || len(counts) != 1 || counts[0].Count != 2 {
+		t.Fatalf("JSON secret redaction: %q %+v", out, counts)
+	}
+	again, later := Redact(out)
+	if again != out || len(later) != 0 {
+		t.Fatalf("JSON idempotence: %q %q %+v", out, again, later)
+	}
+}
+
+func TestURLCredentialPlaceholderWithPasswordIsMasked(t *testing.T) {
+	out, counts := Redact("https://[REDACTED:URL_CREDENTIAL]:actual-secret@example.test/")
+	if strings.Contains(out, "actual-secret") || !strings.Contains(out, "[REDACTED:URL_CREDENTIAL]") || len(counts) != 1 {
+		t.Fatalf("userinfo bypass: %q %+v", out, counts)
+	}
+}
+
+func TestPlainQuotedLabelMasksEntireValue(t *testing.T) {
+	out, _ := Redact(`password: "two word secret"`)
+	if strings.Contains(out, "word secret") || !strings.Contains(out, `"[REDACTED:SECRET]"`) {
+		t.Fatalf("quoted label: %q", out)
+	}
+}
+
+func TestLabelPlaceholderFollowedBySecretIsNotAccepted(t *testing.T) {
+	out, _ := Redact("password: [REDACTED:SECRET] actual-secret")
+	if strings.Contains(out, "actual-secret") || out != "password: [REDACTED:SECRET]" {
+		t.Fatalf("label suffix bypass: %q", out)
+	}
+}
