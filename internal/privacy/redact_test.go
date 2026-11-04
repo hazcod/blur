@@ -146,12 +146,18 @@ func TestMalformedURLSensitiveComponentsFailClosed(t *testing.T) {
 		{"invalid query escape", "https://example.test/path?token=actual-secret%ZZ", []string{"actual-secret"}},
 		{"repeated keys", "http:///path?client_secret=first-secret&client_secret=second-secret", []string{"first-secret", "second-secret"}},
 		{"userinfo", "http://alice:password@/path", []string{"alice:password"}},
+		{"raw userinfo with invalid escape", "http://alice%ZZ:pw@/path", []string{"alice%ZZ:pw"}},
+		{"encoded userinfo with invalid escape", "http://alice%ZZ%3Apw%40/path", []string{"alice%ZZ%3Apw%40"}},
+		{"double encoded userinfo with invalid escape", "http://alice%ZZ%2540/path", []string{"alice%ZZ%2540"}},
+		{"split encoded userinfo with invalid escape", "http://alice%ZZ%25%34%30/path", []string{"alice%ZZ%25%34%30"}},
 		{"encoded key and value", "http:///path?%74oken=actual%2Dsecret", []string{"actual%2Dsecret"}},
 		{"double encoded key", "http:///path?%2574oken=actual-secret", []string{"actual-secret"}},
 		{"encoded userinfo", "http://alice%3Apw%40/path", []string{"alice%3Apw%40"}},
 		{"encoded equals", "http:///path?token%3Dactual-secret", []string{"actual-secret"}},
 		{"placeholder suffix", "http:///path?token=[REDACTED:URL_QUERY]actual-secret", []string{"actual-secret"}},
 		{"userinfo placeholder suffix", "http://[REDACTED:URL_CREDENTIAL]:actual-secret@/path", []string{"actual-secret"}},
+		{"userinfo placeholder appended data", "http://[REDACTED:URL_CREDENTIAL]actual-secret@/path", []string{"actual-secret"}},
+		{"userinfo placeholder invalid escape", "http://[REDACTED:URL_CREDENTIAL]%ZZ:actual-secret@/path", []string{"actual-secret"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, counts := Redact(tc.in)
@@ -176,6 +182,8 @@ func TestMalformedURLBenignTextAndExactPlaceholderRemainStable(t *testing.T) {
 		"http:///path?view=day",
 		"http://exa%ZZmple.test/path?view=day",
 		"https://example.test:8080/path?view=%ZZ",
+		"http://example.test:abc/path?view=day",
+		"http://[REDACTED:URL_CREDENTIAL]@/path",
 		"http:///path?token=[REDACTED:URL_QUERY]",
 		"https://example.test/?token=%5BREDACTED%3AURL_QUERY%5D",
 	} {

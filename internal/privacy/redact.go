@@ -59,9 +59,69 @@ func decodeURLComponent(value string) (string, error) {
 	return value, nil
 }
 
-// A malformed URL cannot be trusted to have a parseable host or query. Preserve
-// harmless text, but replace the entire span when credential syntax is present.
-func sensitiveMalformedURL(raw string) bool {
+func hexNibble(c byte) int {
+	if c >= '0' && c <= '9' {
+		return int(c - '0')
+	}
+	if c >= 'a' && c <= 'f' {
+		return int(c-'a') + 10
+	}
+	if c >= 'A' && c <= 'F' {
+		return int(c-'A') + 10
+	}
+	return -1
+}
+
+// Decode valid escapes while retaining invalid ones. This is only used to
+// classify a userinfo delimiter after strict decoding fails.
+func hasDecodedUserinfo(authority string) bool {
+	value := authority
+	for pass := 0; pass < 2; pass++ {
+		if strings.Contains(value, "@") {
+			return true
+		}
+		var b strings.Builder
+		changed := false
+		for i := 0; i < len(value); i++ {
+			if value[i] == '%' && i+2 < len(value) {
+				hi, lo := hexNibble(value[i+1]), hexNibble(value[i+2])
+				if hi >= 0 && lo >= 0 {
+					b.WriteByte(byte(hi*16 + lo))
+					i += 2
+					changed = true
+					continue
+				}
+			}
+			b.WriteByte(value[i])
+		}
+		if !changed {
+			return false
+		}
+		value = b.String()
+	}
+	return strings.Contains(value, "@")
+}
+
+type malformedURLClass struct {
+	decodeFailed             bool
+	hasRawUserinfo           bool
+	hasDecodedUserinfo       bool
+	hasSensitiveQuery        bool
+	hasSensitiveLabel        bool
+	exactUserinfoPlaceholder bool
+}
+
+func (c malformedURLClass) mustMask() bool {
+	if c.hasSensitiveQuery || c.hasSensitiveLabel {
+		return true
+	}
+	return (c.hasRawUserinfo || c.hasDecodedUserinfo) && (c.decodeFailed || !c.exactUserinfoPlaceholder)
+}
+
+// Classify raw authority before decoding so an invalid escape cannot hide an
+// otherwise visible userinfo delimiter. An invalid port alone is benign.
+func classifyMalformedURL(raw string) malformedURLClass {
+	var class malformedURLClass
 	afterScheme := raw
 	if i := strings.Index(raw, "://"); i >= 0 {
 		afterScheme = raw[i+3:]
@@ -70,21 +130,18 @@ func sensitiveMalformedURL(raw string) bool {
 	if i := strings.IndexAny(authority, "/?#"); i >= 0 {
 		authority = authority[:i]
 	}
+	class.hasRawUserinfo = strings.Contains(authority, "@")
+	class.hasDecodedUserinfo = hasDecodedUserinfo(authority)
 	decodedAuthority, authorityErr := decodeURLComponent(authority)
-	if at := strings.LastIndexByte(decodedAuthority, '@'); at >= 0 {
-		if authorityErr != nil || !exactPlaceholder(decodedAuthority[:at], "URL_CREDENTIAL") {
-			return true
+	class.decodeFailed = authorityErr != nil
+	if authorityErr == nil {
+		if at := strings.LastIndexByte(decodedAuthority, '@'); at >= 0 {
+			class.exactUserinfoPlaceholder = exactPlaceholder(decodedAuthority[:at], "URL_CREDENTIAL")
 		}
 	}
-	if colon := strings.LastIndexByte(authority, ':'); colon >= 0 && !strings.Contains(authority, "@") && !strings.HasPrefix(authority, "[") {
-		port := authority[colon+1:]
-		if port == "" {
-			return true
-		}
-		for i := 0; i < len(port); i++ {
-			if port[i] < '0' || port[i] > '9' {
-				return true
-			}
+	if class.hasRawUserinfo || class.hasDecodedUserinfo {
+		if class.decodeFailed || !class.exactUserinfoPlaceholder {
+			return class
 		}
 	}
 	beforeQuery := raw
@@ -92,12 +149,10 @@ func sensitiveMalformedURL(raw string) bool {
 		beforeQuery = raw[:i]
 	}
 	decodedPath, pathErr := url.PathUnescape(beforeQuery)
-	if label.MatchString(beforeQuery) || pathErr == nil && label.MatchString(decodedPath) {
-		return true
-	}
+	class.hasSensitiveLabel = label.MatchString(beforeQuery) || pathErr == nil && label.MatchString(decodedPath)
 	qStart := strings.IndexByte(raw, '?')
 	if qStart < 0 {
-		return false
+		return class
 	}
 	query := raw[qStart+1:]
 	if i := strings.IndexByte(query, '#'); i >= 0 {
@@ -107,7 +162,9 @@ func sensitiveMalformedURL(raw string) bool {
 		key, value, hasValue := strings.Cut(field, "=")
 		decodedKey, err := decodeURLComponent(key)
 		if err != nil {
-			return true
+			class.decodeFailed = true
+			class.hasSensitiveQuery = true
+			return class
 		}
 		if embeddedKey, embeddedValue, embedded := strings.Cut(decodedKey, "="); embedded && !hasValue {
 			decodedKey, value, hasValue = embeddedKey, embeddedValue, true
@@ -117,11 +174,15 @@ func sensitiveMalformedURL(raw string) bool {
 		}
 		decodedValue, err := decodeURLComponent(value)
 		if err != nil || !hasValue || !exactPlaceholder(decodedValue, "URL_QUERY") {
-			return true
+			class.decodeFailed = class.decodeFailed || err != nil
+			class.hasSensitiveQuery = true
+			return class
 		}
 	}
-	return false
+	return class
 }
+
+func sensitiveMalformedURL(raw string) bool { return classifyMalformedURL(raw).mustMask() }
 
 func Redact(input string) (string, []Count) {
 	counts := map[string]int{}
