@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestEndpointDescriptors(t *testing.T) {
@@ -281,4 +282,118 @@ func TestMemoryTransportBlockedOperationsUnblock(t *testing.T) {
 		t.Fatalf("blocked dial: %v", err)
 	}
 	_ = queued.Close()
+}
+
+func TestMemoryTransportClosedPendingClientsReleaseQueueCapacity(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryTransport(1, 4)
+	e := EndpointDescriptor{Kind: EndpointUnix, Address: "/tmp/blur-user/socket"}
+	l, err := m.Listen(ctx, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	for i := 0; i < 4; i++ {
+		bounded, cancel := context.WithTimeout(ctx, time.Second)
+		client, err := m.Dial(bounded, e)
+		cancel()
+		if err != nil {
+			t.Fatalf("dial %d after closed pending client: %v", i, err)
+		}
+		_ = client.Close()
+	}
+	bounded, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	client, err := m.Dial(bounded, e)
+	if err != nil {
+		t.Fatalf("live dial: %v", err)
+	}
+	defer client.Close()
+	server, err := l.Accept(bounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if err := client.Send(bounded, []byte("live")); err != nil {
+		t.Fatal(err)
+	}
+	if frame, err := server.Receive(bounded); err != nil || string(frame) != "live" {
+		t.Fatalf("accepted dead client: %q, %v", frame, err)
+	}
+}
+
+func TestMemoryTransportAcceptSkipsClosedPendingClients(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryTransport(2, 4)
+	e := EndpointDescriptor{Kind: EndpointNamedPipe, Address: `\\.\pipe\blur-user-alice-main`}
+	l, err := m.Listen(ctx, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	dead, err := m.Dial(ctx, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = dead.Close()
+	live, err := m.Dial(ctx, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	server, err := l.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if err := live.Send(ctx, []byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	if frame, err := server.Receive(ctx); err != nil || string(frame) != "ping" {
+		t.Fatalf("accepted dead client: %q, %v", frame, err)
+	}
+}
+
+func TestMemoryTransportCancelAndCloseRaceLeavesNoStalePending(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryTransport(1, 4)
+	e := EndpointDescriptor{Kind: EndpointUnix, Address: "/tmp/blur-user/socket"}
+	l, err := m.Listen(ctx, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	for i := 0; i < 64; i++ {
+		first, err := m.Dial(ctx, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waiting, cancelWaiting := context.WithCancel(ctx)
+		result := make(chan error, 1)
+		go func() {
+			client, err := m.Dial(waiting, e)
+			if client != nil {
+				_ = client.Close()
+			}
+			result <- err
+		}()
+		start := make(chan struct{})
+		closed := make(chan struct{})
+		canceled := make(chan struct{})
+		go func() { <-start; _ = first.Close(); close(closed) }()
+		go func() { <-start; cancelWaiting(); close(canceled) }()
+		close(start)
+		<-closed
+		<-canceled
+		if err := <-result; err != nil && !errors.Is(err, ErrCanceled) {
+			t.Fatalf("race dial: %v", err)
+		}
+		bounded, cancel := context.WithTimeout(ctx, time.Second)
+		fresh, err := m.Dial(bounded, e)
+		cancel()
+		if err != nil {
+			t.Fatalf("stale pending after race %d: %v", i, err)
+		}
+		_ = fresh.Close()
+	}
 }

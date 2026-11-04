@@ -101,7 +101,8 @@ func NewMemoryTransport(queueSize, maxMessageBytes int) *MemoryTransport {
 type memoryListener struct {
 	owner    *MemoryTransport
 	endpoint EndpointDescriptor
-	incoming chan *memoryConn
+	pending  []*memoryConn
+	changed  chan struct{}
 	done     chan struct{}
 	mu       sync.Mutex
 	closed   bool
@@ -145,7 +146,7 @@ func (m *MemoryTransport) Listen(ctx context.Context, e EndpointDescriptor) (Loc
 	if _, exists := m.listeners[e]; exists {
 		return nil, ErrEndpointInUse
 	}
-	l := &memoryListener{owner: m, endpoint: e, incoming: make(chan *memoryConn, m.queueSize), done: make(chan struct{}), links: make(map[*memoryLink]struct{})}
+	l := &memoryListener{owner: m, endpoint: e, changed: make(chan struct{}), done: make(chan struct{}), links: make(map[*memoryLink]struct{})}
 	m.listeners[e] = l
 	return l, nil
 }
@@ -170,6 +171,15 @@ func (m *MemoryTransport) Dial(ctx context.Context, e EndpointDescriptor) (Local
 	link.onClose = func(closed *memoryLink) {
 		l.mu.Lock()
 		delete(l.links, closed)
+		for i, pending := range l.pending {
+			if pending.link == closed {
+				copy(l.pending[i:], l.pending[i+1:])
+				l.pending[len(l.pending)-1] = nil
+				l.pending = l.pending[:len(l.pending)-1]
+				l.signal()
+				break
+			}
+		}
 		l.mu.Unlock()
 	}
 	client := newMemoryConn(link, m.queueSize, m.maxBytes)
@@ -183,40 +193,85 @@ func (m *MemoryTransport) Dial(ctx context.Context, e EndpointDescriptor) (Local
 	}
 	l.links[link] = struct{}{}
 	l.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		link.close()
-		return nil, ErrCanceled
-	case <-l.done:
-		link.close()
-		return nil, ErrEndpointUnavailable
-	case l.incoming <- server:
+	for {
 		if err := contextErr(ctx); err != nil {
 			link.close()
 			return nil, err
 		}
-		return client, nil
+		l.mu.Lock()
+		if l.closed {
+			l.mu.Unlock()
+			link.close()
+			return nil, ErrEndpointUnavailable
+		}
+		if len(l.pending) < m.queueSize {
+			l.pending = append(l.pending, server)
+			l.signal()
+			l.mu.Unlock()
+			if err := contextErr(ctx); err != nil {
+				link.close()
+				return nil, err
+			}
+			select {
+			case <-l.done:
+				link.close()
+				return nil, ErrEndpointUnavailable
+			default:
+			}
+			return client, nil
+		}
+		changed := l.changed
+		l.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			link.close()
+			return nil, ErrCanceled
+		case <-l.done:
+			link.close()
+			return nil, ErrEndpointUnavailable
+		case <-changed:
+		}
 	}
 }
 
 func (l *memoryListener) Accept(ctx context.Context) (LocalConn, error) {
-	if err := contextErr(ctx); err != nil {
-		return nil, err
-	}
-	select {
-	case <-l.done:
-		return nil, ErrClosed
-	default:
-	}
-	select {
-	case <-ctx.Done():
-		return nil, ErrCanceled
-	case <-l.done:
-		return nil, ErrClosed
-	case c := <-l.incoming:
-		return c, nil
+	for {
+		if err := contextErr(ctx); err != nil {
+			return nil, err
+		}
+		l.mu.Lock()
+		if l.closed {
+			l.mu.Unlock()
+			return nil, ErrClosed
+		}
+		if len(l.pending) > 0 {
+			c := l.pending[0]
+			copy(l.pending, l.pending[1:])
+			l.pending[len(l.pending)-1] = nil
+			l.pending = l.pending[:len(l.pending)-1]
+			l.signal()
+			l.mu.Unlock()
+			select {
+			case <-c.link.done:
+				continue
+			default:
+				return c, nil
+			}
+		}
+		changed := l.changed
+		l.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ErrCanceled
+		case <-l.done:
+			return nil, ErrClosed
+		case <-changed:
+		}
 	}
 }
+
+// signal broadcasts a queue change. Call with l.mu held.
+func (l *memoryListener) signal() { close(l.changed); l.changed = make(chan struct{}) }
 
 func (l *memoryListener) Close() error {
 	l.owner.mu.Lock()
@@ -229,6 +284,10 @@ func (l *memoryListener) Close() error {
 	l.closed = true
 	close(l.done)
 	delete(l.owner.listeners, l.endpoint)
+	for i := range l.pending {
+		l.pending[i] = nil
+	}
+	l.pending = nil
 	links := make([]*memoryLink, 0, len(l.links))
 	for link := range l.links {
 		links = append(links, link)

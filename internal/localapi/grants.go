@@ -53,8 +53,12 @@ type IssuedGrant struct {
 	Credential []byte `json:"-"`
 }
 
-func (g IssuedGrant) String() string { return "issued grant (credential redacted)" }
+func (g IssuedGrant) String() string   { return "issued grant (credential redacted)" }
 func (g IssuedGrant) GoString() string { return g.String() }
+
+// MarshalJSON exposes no fields. A future wire protocol needs its own explicit,
+// bounded representation.
+func (g IssuedGrant) MarshalJSON() ([]byte, error) { return []byte("{}"), nil }
 
 type Proof struct {
 	GrantID   string
@@ -65,18 +69,26 @@ type Proof struct {
 	MAC       [32]byte `json:"-"`
 }
 
-func (p Proof) String() string { return "local proof (secret redacted)" }
+func (p Proof) String() string   { return "local proof (secret redacted)" }
 func (p Proof) GoString() string { return p.String() }
+
+// MarshalJSON exposes no fields, including identifiers.
+func (p Proof) MarshalJSON() ([]byte, error) { return []byte("{}"), nil }
 
 type storedGrant struct {
 	clientID  string
 	scopes    map[Scope]bool
 	issuedAt  time.Time
 	expiresAt time.Time
-	key       [32]byte
-	revoked   bool
-	nonces    map[[NonceBytes]byte]struct{}
+	// This SHA-256 digest is the HMAC authenticator key. Disclosure permits
+	// proof forgery, so it is credential-equivalent secret material.
+	authenticatorKey [32]byte
+	revoked          bool
+	nonces           map[[NonceBytes]byte]struct{}
 }
+
+func (g *storedGrant) String() string   { return "stored grant (authenticator key redacted)" }
+func (g *storedGrant) GoString() string { return g.String() }
 
 type GrantStore struct {
 	mu        sync.Mutex
@@ -85,6 +97,9 @@ type GrantStore struct {
 	maxNonces int
 	grants    map[string]*storedGrant
 }
+
+func (s *GrantStore) String() string   { return "local grant store (authenticator keys redacted)" }
+func (s *GrantStore) GoString() string { return s.String() }
 
 // NewGrantStore accepts injected time and randomness for deterministic tests.
 // nil values select the real clock and crypto/rand.Reader. Replay capacity is
@@ -148,8 +163,8 @@ func (s *GrantStore) Issue(clientID string, scopes []Scope, ttl time.Duration) (
 	if _, exists := s.grants[id]; exists {
 		return IssuedGrant{}, ErrInvalidGrant
 	}
-	key := sha256.Sum256(credential[:])
-	s.grants[id] = &storedGrant{clientID: clientID, scopes: selected, issuedAt: issued, expiresAt: expires, key: key, nonces: make(map[[NonceBytes]byte]struct{})}
+	authenticatorKey := sha256.Sum256(credential[:])
+	s.grants[id] = &storedGrant{clientID: clientID, scopes: selected, issuedAt: issued, expiresAt: expires, authenticatorKey: authenticatorKey, nonces: make(map[[NonceBytes]byte]struct{})}
 	result := IssuedGrant{ID: id, ClientID: clientID, Scopes: append([]Scope(nil), scopes...), IssuedAt: issued, ExpiresAt: expires, Credential: append([]byte(nil), credential[:]...)}
 	return result, nil
 }
@@ -186,8 +201,8 @@ func NewProof(g IssuedGrant, scope Scope, requestDigest [32]byte, at time.Time, 
 	if allZero(p.Nonce) {
 		return Proof{}, ErrUnauthorized
 	}
-	key := sha256.Sum256(g.Credential)
-	p.MAC = sign(key, p, requestDigest)
+	authenticatorKey := sha256.Sum256(g.Credential)
+	p.MAC = sign(authenticatorKey, p, requestDigest)
 	return p, nil
 }
 
@@ -207,14 +222,17 @@ func writeField(h io.Writer, b []byte) {
 	_, _ = h.Write(b)
 }
 
-func sign(key [32]byte, p Proof, digest [32]byte) [32]byte {
-	h := hmac.New(sha256.New, key[:])
+func sign(authenticatorKey [32]byte, p Proof, digest [32]byte) [32]byte {
+	h := hmac.New(sha256.New, authenticatorKey[:])
 	writeField(h, []byte("blur-local-proof-v1"))
 	writeField(h, []byte(p.GrantID))
 	writeField(h, []byte(p.ClientID))
 	writeField(h, []byte(p.Scope))
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], uint64(p.Timestamp.UnixNano()))
+	// Signed Unix seconds plus canonical nanoseconds cover the full time.Time
+	// range without the overflow and collisions of UnixNano.
+	var ts [12]byte
+	binary.BigEndian.PutUint64(ts[:8], uint64(p.Timestamp.Unix()))
+	binary.BigEndian.PutUint32(ts[8:], uint32(p.Timestamp.Nanosecond()))
 	writeField(h, ts[:])
 	writeField(h, p.Nonce)
 	writeField(h, digest[:])
@@ -242,7 +260,7 @@ func (s *GrantStore) Authorize(p Proof, requestDigest [32]byte) error {
 	if now.Before(g.issuedAt) || p.Timestamp.Before(g.issuedAt) || !p.Timestamp.Before(g.expiresAt) || p.Timestamp.Before(now.Add(-MaxClockSkew)) || p.Timestamp.After(now.Add(MaxClockSkew)) {
 		return ErrUnauthorized
 	}
-	expected := sign(g.key, p, requestDigest)
+	expected := sign(g.authenticatorKey, p, requestDigest)
 	if !hmac.Equal(expected[:], p.MAC[:]) {
 		return ErrUnauthorized
 	}

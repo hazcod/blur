@@ -170,6 +170,62 @@ func TestGrantRejectsZeroClockAndZeroCredential(t *testing.T) {
 	}
 }
 
+func TestGrantAndProofJSONAreFullyRedacted(t *testing.T) {
+	_, grant, now := grantFixture(t, 2)
+	proof := proofFixture(t, grant, ScopeUIRead, sha256.Sum256([]byte("request")), *now, 41)
+	for name, value := range map[string]any{"grant": grant, "proof": proof, "grant pointer": &grant, "proof pointer": &proof} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if string(encoded) != "{}" {
+			t.Fatalf("%s exposed fields: %s", name, encoded)
+		}
+	}
+}
+
+func TestGrantStoreFormattingRedactsAuthenticatorKey(t *testing.T) {
+	store, grant, _ := grantFixture(t, 2)
+	for name, value := range map[string]any{"store": store, "stored grant": store.grants[grant.ID]} {
+		for _, formatted := range []string{fmt.Sprintf("%v", value), fmt.Sprintf("%+v", value), fmt.Sprintf("%#v", value)} {
+			if strings.Contains(formatted, grant.ID) || strings.Contains(formatted, grant.ClientID) || strings.Contains(formatted, "authenticatorKey") || strings.Contains(formatted, "[32]uint8") {
+				t.Fatalf("%s exposed internal material: %s", name, formatted)
+			}
+		}
+	}
+}
+
+func TestProofTimestampEncodingDistinguishesExtremeInstants(t *testing.T) {
+	var key [32]byte
+	var digest [32]byte
+	key[0], digest[0] = 1, 2
+	p := Proof{GrantID: strings.Repeat("a", 32), ClientID: "client", Scope: ScopeUIRead, Nonce: bytes.Repeat([]byte{3}, NonceBytes)}
+	instants := []time.Time{
+		time.Unix(-1, 999999999),
+		time.Unix(0, 0),
+		time.Unix(0, 1),
+		time.Unix(18446744073, 709551616), // exactly 2^64 nanoseconds after Unix epoch
+		time.Unix(18446744073, 709551617),
+	}
+	seen := make(map[[32]byte]time.Time)
+	for _, instant := range instants {
+		p.Timestamp = instant
+		mac := sign(key, p, digest)
+		if prior, exists := seen[mac]; exists {
+			t.Fatalf("timestamp collision: %s and %s", prior, instant)
+		}
+		seen[mac] = instant
+	}
+	// Changing only a boundary timestamp must invalidate the original proof.
+	store, grant, now := grantFixture(t, 2)
+	request := sha256.Sum256([]byte("request"))
+	valid := proofFixture(t, grant, ScopeUIRead, request, *now, 42)
+	valid.Timestamp = valid.Timestamp.Add(time.Nanosecond)
+	if err := store.Authorize(valid, request); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("timestamp tamper: %v", err)
+	}
+}
+
 func TestGrantCredentialAndScopeCopies(t *testing.T) {
 	store, grant, now := grantFixture(t, 3)
 	original := append([]byte(nil), grant.Credential...)
