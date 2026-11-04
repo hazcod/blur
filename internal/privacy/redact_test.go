@@ -135,3 +135,71 @@ func TestLabelPlaceholderFollowedBySecretIsNotAccepted(t *testing.T) {
 		t.Fatalf("label suffix bypass: %q", out)
 	}
 }
+
+func TestMalformedURLSensitiveComponentsFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name, in string
+		secrets  []string
+	}{
+		{"empty host", "http:///path?token=actual-secret", []string{"actual-secret"}},
+		{"invalid host escape", "http://exa%ZZmple.test/path?client_secret=actual-secret", []string{"actual-secret"}},
+		{"invalid query escape", "https://example.test/path?token=actual-secret%ZZ", []string{"actual-secret"}},
+		{"repeated keys", "http:///path?client_secret=first-secret&client_secret=second-secret", []string{"first-secret", "second-secret"}},
+		{"userinfo", "http://alice:password@/path", []string{"alice:password"}},
+		{"encoded key and value", "http:///path?%74oken=actual%2Dsecret", []string{"actual%2Dsecret"}},
+		{"double encoded key", "http:///path?%2574oken=actual-secret", []string{"actual-secret"}},
+		{"encoded userinfo", "http://alice%3Apw%40/path", []string{"alice%3Apw%40"}},
+		{"encoded equals", "http:///path?token%3Dactual-secret", []string{"actual-secret"}},
+		{"placeholder suffix", "http:///path?token=[REDACTED:URL_QUERY]actual-secret", []string{"actual-secret"}},
+		{"userinfo placeholder suffix", "http://[REDACTED:URL_CREDENTIAL]:actual-secret@/path", []string{"actual-secret"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, counts := Redact(tc.in)
+			for _, secret := range tc.secrets {
+				if strings.Contains(out, secret) {
+					t.Fatalf("secret survived in %q: %q", tc.in, out)
+				}
+			}
+			if len(counts) == 0 {
+				t.Fatalf("missing aggregate count: %q", out)
+			}
+			again, later := Redact(out)
+			if again != out || len(later) != 0 {
+				t.Fatalf("non-idempotent masking: %q %q %+v", out, again, later)
+			}
+		})
+	}
+}
+
+func TestMalformedURLBenignTextAndExactPlaceholderRemainStable(t *testing.T) {
+	for _, in := range []string{
+		"http:///path?view=day",
+		"http://exa%ZZmple.test/path?view=day",
+		"https://example.test:8080/path?view=%ZZ",
+		"http:///path?token=[REDACTED:URL_QUERY]",
+		"https://example.test/?token=%5BREDACTED%3AURL_QUERY%5D",
+	} {
+		out, counts := Redact(in)
+		if out != in || len(counts) != 0 {
+			t.Fatalf("changed benign or exact value: %q -> %q %+v", in, out, counts)
+		}
+	}
+	appended := "https://example.test/?token=%5BREDACTED%3AURL_QUERY%5Dactual-secret"
+	out, _ := Redact(appended)
+	if strings.Contains(out, "actual-secret") {
+		t.Fatalf("appended value survived: %q", out)
+	}
+	doubleKey := "https://example.test/?%2574oken=actual-secret"
+	out, _ = Redact(doubleKey)
+	if strings.Contains(out, "actual-secret") {
+		t.Fatalf("double encoded valid key survived: %q", out)
+	}
+}
+
+func TestMalformedURLDoesNotHideAdjacentLabelledSecret(t *testing.T) {
+	in := "ordinary http:///path?token=first-secret password: second-secret"
+	out, counts := Redact(in)
+	if strings.Contains(out, "first-secret") || strings.Contains(out, "second-secret") || !strings.Contains(out, "ordinary") || len(counts) < 2 {
+		t.Fatalf("adjacent secret: %q %+v", out, counts)
+	}
+}

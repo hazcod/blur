@@ -18,7 +18,7 @@ type Count struct {
 var (
 	pem         = regexp.MustCompile(`(?s)-----BEGIN (?:[A-Z0-9 ]* )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]* )?PRIVATE KEY-----`)
 	auth        = regexp.MustCompile(`(?im)\bAuthorization\s*:\s*[^\r\n]+`)
-	webURL      = regexp.MustCompile(`https?://[^\s<>"']+`)
+	webURL      = regexp.MustCompile(`(?i)https?://[^\s<>"']+`)
 	jsonLabel   = regexp.MustCompile(`(?i)"(password|secret|token|api[_ -]?key|cvv|cvc|security[_ -]?code)"([ \t]*:[ \t]*)"((?:\\.|[^"\\])*)"`)
 	quotedLabel = regexp.MustCompile(`(?i)\b(password|secret|token|api[_ -]?key|cvv|cvc|security[_ -]?code)\b([ \t]*[:=][ \t]*)"((?:\\.|[^"\\])*)"`)
 	label       = regexp.MustCompile(`(?i)\b(password|secret|token|api[_ -]?key|cvv|cvc|security[_ -]?code)\b([ \t]*[:=][ \t]*)([^\r\n,;&"']+)`)
@@ -35,6 +35,92 @@ func labelRule(name string) string {
 		return "SECURITY_CODE"
 	}
 	return "SECRET"
+}
+
+func sensitiveQueryKey(key string) bool {
+	switch strings.ToLower(key) {
+	case "token", "access_token", "refresh_token", "auth_token", "session_token", "api_key", "apikey", "client_secret", "password", "secret", "auth", "key":
+		return true
+	}
+	return false
+}
+
+func decodeURLComponent(value string) (string, error) {
+	for i := 0; i < 2; i++ {
+		decoded, err := url.QueryUnescape(value)
+		if err != nil {
+			return "", err
+		}
+		if decoded == value {
+			return value, nil
+		}
+		value = decoded
+	}
+	return value, nil
+}
+
+// A malformed URL cannot be trusted to have a parseable host or query. Preserve
+// harmless text, but replace the entire span when credential syntax is present.
+func sensitiveMalformedURL(raw string) bool {
+	afterScheme := raw
+	if i := strings.Index(raw, "://"); i >= 0 {
+		afterScheme = raw[i+3:]
+	}
+	authority := afterScheme
+	if i := strings.IndexAny(authority, "/?#"); i >= 0 {
+		authority = authority[:i]
+	}
+	decodedAuthority, authorityErr := decodeURLComponent(authority)
+	if at := strings.LastIndexByte(decodedAuthority, '@'); at >= 0 {
+		if authorityErr != nil || !exactPlaceholder(decodedAuthority[:at], "URL_CREDENTIAL") {
+			return true
+		}
+	}
+	if colon := strings.LastIndexByte(authority, ':'); colon >= 0 && !strings.Contains(authority, "@") && !strings.HasPrefix(authority, "[") {
+		port := authority[colon+1:]
+		if port == "" {
+			return true
+		}
+		for i := 0; i < len(port); i++ {
+			if port[i] < '0' || port[i] > '9' {
+				return true
+			}
+		}
+	}
+	beforeQuery := raw
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		beforeQuery = raw[:i]
+	}
+	decodedPath, pathErr := url.PathUnescape(beforeQuery)
+	if label.MatchString(beforeQuery) || pathErr == nil && label.MatchString(decodedPath) {
+		return true
+	}
+	qStart := strings.IndexByte(raw, '?')
+	if qStart < 0 {
+		return false
+	}
+	query := raw[qStart+1:]
+	if i := strings.IndexByte(query, '#'); i >= 0 {
+		query = query[:i]
+	}
+	for _, field := range strings.FieldsFunc(query, func(r rune) bool { return r == '&' || r == ';' }) {
+		key, value, hasValue := strings.Cut(field, "=")
+		decodedKey, err := decodeURLComponent(key)
+		if err != nil {
+			return true
+		}
+		if embeddedKey, embeddedValue, embedded := strings.Cut(decodedKey, "="); embedded && !hasValue {
+			decodedKey, value, hasValue = embeddedKey, embeddedValue, true
+		}
+		if !sensitiveQueryKey(decodedKey) {
+			continue
+		}
+		decodedValue, err := decodeURLComponent(value)
+		if err != nil || !hasValue || !exactPlaceholder(decodedValue, "URL_QUERY") {
+			return true
+		}
+	}
+	return false
 }
 
 func Redact(input string) (string, []Count) {
@@ -61,6 +147,18 @@ func Redact(input string) (string, []Count) {
 		parseRaw := strings.Replace(raw, placeholder("URL_CREDENTIAL"), "%5BREDACTED%3AURL_CREDENTIAL%5D", 1)
 		u, err := url.Parse(parseRaw)
 		if err != nil || u.Host == "" {
+			if sensitiveMalformedURL(raw) {
+				counts["MALFORMED_URL"]++
+				return placeholder("MALFORMED_URL")
+			}
+			return raw
+		}
+		q, queryErr := url.ParseQuery(u.RawQuery)
+		if queryErr != nil {
+			if sensitiveMalformedURL(raw) {
+				counts["MALFORMED_URL"]++
+				return placeholder("MALFORMED_URL")
+			}
 			return raw
 		}
 		changed := false
@@ -72,10 +170,13 @@ func Redact(input string) (string, []Count) {
 				changed = true
 			}
 		}
-		q := u.Query()
 		for key, vals := range q {
-			k := strings.ToLower(key)
-			if k == "token" || k == "access_token" || k == "refresh_token" || k == "auth_token" || k == "session_token" || k == "api_key" || k == "apikey" || k == "client_secret" || k == "password" || k == "secret" || k == "auth" || k == "key" {
+			decodedKey, decodeErr := decodeURLComponent(key)
+			if decodeErr != nil {
+				counts["MALFORMED_URL"]++
+				return placeholder("MALFORMED_URL")
+			}
+			if sensitiveQueryKey(decodedKey) {
 				if len(vals) != 1 || !exactPlaceholder(vals[0], "URL_QUERY") {
 					for _, v := range vals {
 						if !exactPlaceholder(v, "URL_QUERY") {
