@@ -67,8 +67,13 @@ behind an owned facade in a later phase. Apache-2.0.
 ## Task 3: Enforce staged, privacy-preserving capture
 
 **Files:** `internal/capture/pipeline.go`, `internal/capture/pipeline_test.go`,
-`internal/privacy/redact.go`, `internal/privacy/redact_test.go`
+`internal/privacy/redact.go`, `internal/privacy/redact_test.go`,
+`internal/platform/contracts.go`, `internal/platform/fake/fake.go`,
+`internal/platform/fake/fake_test.go`
 
+- [ ] Extend the non-content capture probe only with bounded app identity,
+  registrable/domain text, and private-mode state needed for preflight. Do not
+  add window titles, URLs, raw values, or an exported content DTO.
 - [ ] Test that secure targets, excluded apps/domains, denied probes, timeout
   states, and byte/depth/node limits never invoke a value reader.
 - [ ] Keep raw-frame types unexported and construct only an exported
