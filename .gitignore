@@ -1,0 +1,6 @@
+.worktrees/
+.Codex/
+research_notes/
+.DS_Store
+dist/
+coverage.out
