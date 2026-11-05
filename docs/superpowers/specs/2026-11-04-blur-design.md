@@ -638,7 +638,27 @@ text scaling to 150% without clipping.
 - Abrupt termination at every transaction boundary recovers without corruption
   or plaintext residue.
 - Capture enters backpressure mode instead of growing unbounded queues.
-- Background AI pauses on battery/thermal pressure when configured.
+
+### Power and background work
+
+- Power policy is configurable: `Follow system`, `Balanced`, `Blur Saver`,
+  `Performance`, and user-defined budgets. Follow system maps verified OS
+  battery-saver state to Blur Saver and otherwise Balanced; an unknown signal
+  uses the user's configured fallback, defaulting to Blur Saver.
+- Saver mode reduces optional indexing, compaction, and AI concurrency. It does
+  not disable passive capture, deterministic indexing, retention-critical
+  summarization, or user-requested AI. Balanced allows at most one
+  low-priority, token- and time-bounded local background AI job.
+- A power state never permits fallback from a local model to a remote provider.
+  Each provider route still requires explicit user policy and visible egress.
+- Idle capture waits on OS events rather than polling. Activity accounting
+  advances only when observations or OS state events arrive. Reads traverse
+  changed accessibility subtrees, queues and retained plaintext have hard
+  bounds, and writes may be coalesced only while retaining durable sync
+  guarantees; `NoSync` is not a battery optimization.
+- UI surfaces, storage queries, and optional provider processes are lazy.
+  Measure idle wakeups, CPU, memory, write amplification, capture latency, and
+  Today read latency on each supported OS before release.
 
 ## Compatibility import
 
