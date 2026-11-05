@@ -1,5 +1,5 @@
-// Package nocgoaudit checks repository source and shipped dependency graphs for cgo use.
-package nocgoaudit
+// Package main checks repository source and shipped dependency graphs for cgo use.
+package main
 
 import (
 	"bytes"

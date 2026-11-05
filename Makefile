@@ -12,7 +12,7 @@ vet:
 build:
 	CGO_ENABLED=0 go build ./...
 
-# Keep shipped target tuples synchronized with internal/nocgoaudit.SupportedTargets.
+# Keep shipped target tuples synchronized with tools/no-cgo-audit.SupportedTargets.
 cross-build: physical-cross-build
 	@set -eu; \
 	for target in darwin/arm64 darwin/amd64 windows/amd64 linux/amd64 linux/arm64; do \
@@ -41,4 +41,4 @@ cross-test-compile:
 	done
 
 no-cgo-audit:
-	go run ./cmd/no-cgo-audit
+	go run ./tools/no-cgo-audit

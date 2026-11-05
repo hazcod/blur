@@ -1,4 +1,4 @@
-package nocgoaudit
+package main
 
 import (
 	"context"

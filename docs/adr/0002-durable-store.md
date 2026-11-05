@@ -26,7 +26,7 @@ The parent ruling clarifies the no-cgo boundary:
 4. Separately cross-build the physical package and shipped command binaries
    for every target with `CGO_ENABLED=0`.
 
-`internal/nocgoaudit` now implements that scope. Adversarial tests establish
+`tools/no-cgo-audit` now implements that scope. Adversarial tests establish
 that a selected supported-target `import "C"` fails, an ignored Hurd-only
 dependency file does not fail, and a build-tagged repository source is still
 scanned even when `go list` omits its directory for the target. New shipped

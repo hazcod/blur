@@ -4,12 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-
-	"github.com/nielsgroen/blur/internal/nocgoaudit"
 )
 
 func main() {
-	if err := nocgoaudit.AuditSupportedTargets(context.Background()); err != nil {
+	if err := AuditSupportedTargets(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
