@@ -142,8 +142,9 @@ func TestServiceStatusAndCapabilitiesAreAuthorizedAndStable(t *testing.T) {
 	if len(reports) != 10 {
 		t.Fatalf("report count: %d", len(reports))
 	}
+	wantIDs := []string{"audio_recorder", "autostart", "capture", "gesture_hotkeys", "local_transport", "private_path", "secret_store", "session_state", "surface_manager", "text_targets"}
 	for i, report := range reports {
-		if report.State != platform.UserDisabled || report.Validate() != nil || i > 0 && reports[i-1].ID >= report.ID {
+		if report.ID != wantIDs[i] || report.State != platform.UserDisabled || report.Validate() != nil || i > 0 && reports[i-1].ID >= report.ID {
 			t.Fatalf("invalid reports: %+v", reports)
 		}
 	}
@@ -245,5 +246,245 @@ func TestEphemeralConstructorRejectsTypedNilStore(t *testing.T) {
 	var store *storage.EphemeralMemoryStore
 	if _, err := NewEphemeralDevelopmentService(grants, store, nil); err == nil {
 		t.Fatal("nil store accepted")
+	}
+}
+
+func TestCapabilityReportsRequireExactlyTheTenPortsAndClosedDiagnostics(t *testing.T) {
+	grants, err := localapi.NewGrantStore(nil, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := storage.NewEphemeralMemoryStore()
+	ids := []string{"capture", "text_targets", "gesture_hotkeys", "surface_manager", "audio_recorder", "secret_store", "local_transport", "private_path", "autostart", "session_state"}
+	reports := make([]platform.CapabilityReport, len(ids))
+	for i, id := range ids {
+		reports[i] = platform.CapabilityReport{ID: id, State: platform.UserDisabled, Reason: "adapter_unimplemented", Evidence: "configuration"}
+	}
+	svc, err := NewEphemeralDevelopmentService(grants, store, reports)
+	if err != nil {
+		t.Fatalf("valid complete reports rejected: %v", err)
+	}
+	grant, err := grants.Issue("capability.client", []localapi.Scope{localapi.ScopeCLIAdmin}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.Capabilities(context.Background(), proof(t, grant, localapi.ScopeCLIAdmin, CapabilitiesDigest()))
+	if err != nil || len(got) != 10 {
+		t.Fatalf("capabilities: %v, %v", got, err)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1].ID >= got[i].ID {
+			t.Fatalf("unsorted: %v", got)
+		}
+	}
+	bad := [][]platform.CapabilityReport{
+		reports[:9],
+		append(append([]platform.CapabilityReport(nil), reports...), platform.CapabilityReport{ID: "extra_port", State: platform.UserDisabled, Reason: "foundation_only", Evidence: "configuration"}),
+		append(append([]platform.CapabilityReport(nil), reports[:9]...), reports[0]),
+	}
+	unknownReason := append([]platform.CapabilityReport(nil), reports...)
+	unknownReason[0].Reason = "project_alpha"
+	unknownEvidence := append([]platform.CapabilityReport(nil), reports...)
+	unknownEvidence[0].Evidence = "alice_secret"
+	invalidState := append([]platform.CapabilityReport(nil), reports...)
+	invalidState[0].State = "unknown"
+	bad = append(bad, unknownReason, unknownEvidence, invalidState)
+	for i, set := range bad {
+		if _, err := NewEphemeralDevelopmentService(grants, store, set); err == nil {
+			t.Fatalf("invalid set %d accepted", i)
+		}
+	}
+}
+
+type cancelAfterListStore struct {
+	storage.EncryptedStore
+	cancel context.CancelFunc
+}
+
+func (s cancelAfterListStore) ListObservations(ctx context.Context, limit int, after string) ([]capture.SanitizedObservation, error) {
+	page, err := s.EncryptedStore.ListObservations(ctx, limit, after)
+	s.cancel()
+	return page, err
+}
+
+type cancelAfterPutStore struct {
+	storage.EncryptedStore
+	cancel context.CancelFunc
+}
+
+func (s cancelAfterPutStore) PutObservation(ctx context.Context, o capture.SanitizedObservation) error {
+	err := s.EncryptedStore.PutObservation(ctx, o)
+	s.cancel()
+	return err
+}
+
+func TestCancellationDuringAuthorizationFailsClosed(t *testing.T) {
+	fixed := time.Now()
+	var cancelNow context.CancelFunc
+	armed := false
+	grants, err := localapi.NewGrantStore(func() time.Time {
+		if armed {
+			cancelNow()
+		}
+		return fixed
+	}, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := storage.NewEphemeralMemoryStore()
+	svc, err := NewEphemeralDevelopmentService(grants, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := grants.Issue("cancel.client", []localapi.Scope{localapi.ScopeCLIAdmin, localapi.ScopeCaptureIngest, localapi.ScopeUIRead}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := sample(t)
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10}
+	operations := []struct {
+		name   string
+		scope  localapi.Scope
+		digest [32]byte
+		call   func(context.Context, localapi.Proof) error
+	}{
+		{"status", localapi.ScopeCLIAdmin, StatusDigest(), func(ctx context.Context, p localapi.Proof) error {
+			status, err := svc.Status(ctx, p)
+			if status.Ready {
+				return errors.New("canceled status returned")
+			}
+			return err
+		}},
+		{"capabilities", localapi.ScopeCLIAdmin, CapabilitiesDigest(), func(ctx context.Context, p localapi.Proof) error {
+			reports, err := svc.Capabilities(ctx, p)
+			if len(reports) > 0 {
+				return errors.New("canceled reports returned")
+			}
+			return err
+		}},
+		{"ingest", localapi.ScopeCaptureIngest, IngestDigest(o), func(ctx context.Context, p localapi.Proof) error { return svc.Ingest(ctx, o, p) }},
+		{"search", localapi.ScopeUIRead, SearchDigest(r), func(ctx context.Context, p localapi.Proof) error {
+			result, err := svc.Search(ctx, r, p)
+			if len(result.Results) > 0 {
+				return errors.New("canceled results returned")
+			}
+			return err
+		}},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			p, err := localapi.NewProof(grant, operation.scope, operation.digest, fixed, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelNow, armed = cancel, true
+			err = operation.call(ctx, p)
+			armed = false
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled call returned %v", err)
+			}
+			if err := operation.call(context.Background(), p); !errors.Is(err, localapi.ErrReplay) {
+				t.Fatalf("proof consumed during authorization should replay-fail: %v", err)
+			}
+		})
+	}
+	page, err := store.ListObservations(context.Background(), 1, "")
+	if err != nil || len(page) != 0 {
+		t.Fatalf("canceled authorization wrote: %d, %v", len(page), err)
+	}
+}
+
+type deadlineProbeStore struct{ storage.EncryptedStore }
+
+func (deadlineProbeStore) ListObservations(context.Context, int, string) ([]capture.SanitizedObservation, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func TestStatusPropagatesStoreDeadline(t *testing.T) {
+	svc, memory, _, grant := fixture(t, localapi.ScopeCLIAdmin)
+	svc.store = deadlineProbeStore{memory}
+	status, err := svc.Status(context.Background(), proof(t, grant, localapi.ScopeCLIAdmin, StatusDigest()))
+	if !errors.Is(err, context.DeadlineExceeded) || status.Ready {
+		t.Fatalf("deadline converted to status: %+v, %v", status, err)
+	}
+}
+
+func TestCancellationAfterStoreOperationNeverReturnsSuccess(t *testing.T) {
+	for _, operation := range []string{"status", "search", "ingest"} {
+		t.Run(operation, func(t *testing.T) {
+			svc, memory, _, grant := fixture(t, localapi.ScopeCLIAdmin, localapi.ScopeUIRead, localapi.ScopeCaptureIngest)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			switch operation {
+			case "status", "search":
+				wrapped := cancelAfterListStore{EncryptedStore: memory, cancel: cancel}
+				svc.store, svc.search = wrapped, search.New(wrapped)
+			case "ingest":
+				svc.store = cancelAfterPutStore{EncryptedStore: memory, cancel: cancel}
+			}
+			var err error
+			switch operation {
+			case "status":
+				var status StatusReport
+				status, err = svc.Status(ctx, proof(t, grant, localapi.ScopeCLIAdmin, StatusDigest()))
+				if status.Ready {
+					t.Fatal("canceled status returned")
+				}
+			case "search":
+				r := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 2}
+				var result search.Response
+				result, err = svc.Search(ctx, r, proof(t, grant, localapi.ScopeUIRead, SearchDigest(r)))
+				if len(result.Results) > 0 {
+					t.Fatal("canceled result returned")
+				}
+			case "ingest":
+				o := sample(t)
+				err = svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o)))
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled operation returned %v", err)
+			}
+		})
+	}
+}
+
+func TestAlreadyCanceledRequestsDoNotConsumeProofsOrReturnData(t *testing.T) {
+	svc, memory, _, grant := fixture(t, localapi.ScopeCLIAdmin, localapi.ScopeCaptureIngest, localapi.ScopeUIRead)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	statusProof := proof(t, grant, localapi.ScopeCLIAdmin, StatusDigest())
+	if status, err := svc.Status(ctx, statusProof); !errors.Is(err, context.Canceled) || status.Ready {
+		t.Fatalf("canceled status: %+v, %v", status, err)
+	}
+	if _, err := svc.Status(context.Background(), statusProof); err != nil {
+		t.Fatalf("canceled request consumed status proof: %v", err)
+	}
+	capabilityProof := proof(t, grant, localapi.ScopeCLIAdmin, CapabilitiesDigest())
+	if reports, err := svc.Capabilities(ctx, capabilityProof); !errors.Is(err, context.Canceled) || len(reports) != 0 {
+		t.Fatalf("canceled capabilities: %d, %v", len(reports), err)
+	}
+	if _, err := svc.Capabilities(context.Background(), capabilityProof); err != nil {
+		t.Fatalf("canceled request consumed capability proof: %v", err)
+	}
+	o := sample(t)
+	ingestProof := proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))
+	if err := svc.Ingest(ctx, o, ingestProof); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled ingest: %v", err)
+	}
+	page, err := memory.ListObservations(context.Background(), 1, "")
+	if err != nil || len(page) != 0 {
+		t.Fatalf("canceled ingest wrote: %d, %v", len(page), err)
+	}
+	if err := svc.Ingest(context.Background(), o, ingestProof); err != nil {
+		t.Fatalf("canceled request consumed ingest proof: %v", err)
+	}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10}
+	searchProof := proof(t, grant, localapi.ScopeUIRead, SearchDigest(r))
+	if result, err := svc.Search(ctx, r, searchProof); !errors.Is(err, context.Canceled) || len(result.Results) != 0 {
+		t.Fatalf("canceled search: %+v, %v", result, err)
+	}
+	if result, err := svc.Search(context.Background(), r, searchProof); err != nil || len(result.Results) != 1 {
+		t.Fatalf("canceled request consumed search proof: %+v, %v", result, err)
 	}
 }

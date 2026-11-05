@@ -38,7 +38,7 @@ type StatusReport struct {
 	Ready            bool   `json:"ready"`
 }
 
-var defaultIDs = [...]string{"audio_recorder", "autostart", "capture_source", "gesture_hotkeys", "local_transport", "private_path", "secret_store", "session_state", "surface_manager", "text_targets"}
+var defaultIDs = [...]string{"audio_recorder", "autostart", "capture", "gesture_hotkeys", "local_transport", "private_path", "secret_store", "session_state", "surface_manager", "text_targets"}
 
 func defaultReports() []platform.CapabilityReport {
 	reports := make([]platform.CapabilityReport, 0, len(defaultIDs))
@@ -48,17 +48,33 @@ func defaultReports() []platform.CapabilityReport {
 	return reports
 }
 
-func safeCode(s string) bool {
-	if len(s) == 0 || len(s) > 64 || s[0] < 'a' || s[0] > 'z' {
-		return false
-	}
-	for i := 1; i < len(s); i++ {
-		b := s[i]
-		if !(b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_') {
-			return false
+func knownCapabilityID(id string) bool {
+	for _, known := range defaultIDs {
+		if id == known {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// These codes are deliberately closed at the service boundary. Adapters must
+// translate local diagnostics to this content-free vocabulary before reporting.
+func knownReason(reason string) bool {
+	switch reason {
+	case "foundation_only", "adapter_unimplemented", "permission_required", "user_disabled":
+		return true
+	default:
+		return false
+	}
+}
+
+func knownEvidence(evidence string) bool {
+	switch evidence {
+	case "adapter_not_connected", "axui_element", "ui_automation", "at_spi2", "xdg_portal", "configuration":
+		return true
+	default:
+		return false
+	}
 }
 
 func newService(grants *localapi.GrantStore, store storage.EncryptedStore, reports []platform.CapabilityReport, ephemeral bool) (*Service, error) {
@@ -69,12 +85,12 @@ func newService(grants *localapi.GrantStore, store storage.EncryptedStore, repor
 		reports = defaultReports()
 	}
 	copyReports := append([]platform.CapabilityReport(nil), reports...)
-	if len(copyReports) == 0 {
+	if len(copyReports) != len(defaultIDs) {
 		return nil, ErrInvalidService
 	}
 	seen := make(map[string]bool, len(copyReports))
 	for _, report := range copyReports {
-		if report.Validate() != nil || !safeCode(report.ID) || !safeCode(report.Reason) || !safeCode(report.Evidence) || seen[report.ID] {
+		if report.Validate() != nil || !knownCapabilityID(report.ID) || !knownReason(report.Reason) || !knownEvidence(report.Evidence) || seen[report.ID] {
 			return nil, ErrInvalidService
 		}
 		seen[report.ID] = true
@@ -142,11 +158,20 @@ func SearchDigest(r search.Request) [32]byte {
 func StatusDigest() [32]byte       { return operationDigest("cli:status") }
 func CapabilitiesDigest() [32]byte { return operationDigest("cli:capabilities") }
 
-func (s *Service) authorize(ctx context.Context, proof localapi.Proof, scope localapi.Scope, digest [32]byte) error {
+func checkContext(ctx context.Context) error {
 	if ctx == nil {
 		return ErrInvalidService
 	}
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// The grant may consume its one-use nonce if cancellation wins just after MAC
+// verification. Callers check context again before doing work or returning data.
+func (s *Service) authorize(ctx context.Context, proof localapi.Proof, scope localapi.Scope, digest [32]byte) error {
+	if err := checkContext(ctx); err != nil {
 		return err
 	}
 	if s == nil || proof.Scope != scope || digest == ([32]byte{}) {
@@ -156,10 +181,7 @@ func (s *Service) authorize(ctx context.Context, proof localapi.Proof, scope loc
 }
 
 func (s *Service) Ingest(ctx context.Context, o capture.SanitizedObservation, proof localapi.Proof) error {
-	if ctx == nil {
-		return ErrInvalidService
-	}
-	if err := ctx.Err(); err != nil {
+	if err := checkContext(ctx); err != nil {
 		return err
 	}
 	if err := o.Validate(); err != nil {
@@ -168,17 +190,21 @@ func (s *Service) Ingest(ctx context.Context, o capture.SanitizedObservation, pr
 	if err := s.authorize(ctx, proof, localapi.ScopeCaptureIngest, IngestDigest(o)); err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
+	// A proof can be consumed just before cancellation wins. No write starts
+	// after an observed cancellation; an already committed store call cannot be
+	// rolled back through EncryptedStore, so it never reports success if canceled.
+	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	return s.store.PutObservation(ctx, o)
+	err := s.store.PutObservation(ctx, o)
+	if cancelErr := checkContext(ctx); cancelErr != nil {
+		return cancelErr
+	}
+	return err
 }
 
 func (s *Service) Search(ctx context.Context, request search.Request, proof localapi.Proof) (search.Response, error) {
-	if ctx == nil {
-		return search.Response{}, ErrInvalidService
-	}
-	if err := ctx.Err(); err != nil {
+	if err := checkContext(ctx); err != nil {
 		return search.Response{}, err
 	}
 	if _, err := request.Validate(); err != nil {
@@ -190,22 +216,51 @@ func (s *Service) Search(ctx context.Context, request search.Request, proof loca
 	if err := s.authorize(ctx, proof, proof.Scope, SearchDigest(request)); err != nil {
 		return search.Response{}, err
 	}
-	return s.search.Search(ctx, request)
+	if err := checkContext(ctx); err != nil {
+		return search.Response{}, err
+	}
+	result, err := s.search.Search(ctx, request)
+	if cancelErr := checkContext(ctx); cancelErr != nil {
+		return search.Response{}, cancelErr
+	}
+	return result, err
 }
 
 func (s *Service) Status(ctx context.Context, proof localapi.Proof) (StatusReport, error) {
 	if err := s.authorize(ctx, proof, localapi.ScopeCLIAdmin, StatusDigest()); err != nil {
 		return StatusReport{}, err
 	}
+	if err := checkContext(ctx); err != nil {
+		return StatusReport{}, err
+	}
 	_, err := s.store.ListObservations(ctx, 1, "")
-	return StatusReport{Version: buildinfo.Version, Mode: s.mode, EncryptedAtRest: s.store.EncryptedAtRest(), AIEnabled: false, NetworkListening: false, Ready: err == nil}, nil
+	if cancelErr := checkContext(ctx); cancelErr != nil {
+		return StatusReport{}, cancelErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return StatusReport{}, err
+	}
+	// Non-context store errors mean the store is unavailable, not a canceled
+	// request; status reports Ready=false without exposing backend diagnostics.
+	encrypted := s.store.EncryptedAtRest()
+	if cancelErr := checkContext(ctx); cancelErr != nil {
+		return StatusReport{}, cancelErr
+	}
+	return StatusReport{Version: buildinfo.Version, Mode: s.mode, EncryptedAtRest: encrypted, AIEnabled: false, NetworkListening: false, Ready: err == nil}, nil
 }
 
 func (s *Service) Capabilities(ctx context.Context, proof localapi.Proof) ([]platform.CapabilityReport, error) {
 	if err := s.authorize(ctx, proof, localapi.ScopeCLIAdmin, CapabilitiesDigest()); err != nil {
 		return nil, err
 	}
-	return append([]platform.CapabilityReport(nil), s.reports...), nil
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	reports := append([]platform.CapabilityReport(nil), s.reports...)
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	return reports, nil
 }
 
 // CLIClient holds a single in-process grant. Every request receives a fresh proof.

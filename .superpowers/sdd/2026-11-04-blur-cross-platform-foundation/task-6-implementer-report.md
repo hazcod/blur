@@ -42,3 +42,25 @@ Coverage includes zero/invalid/tampered/replayed/expired/wrong-scope/cancelled i
 ```
 
 Self-review: operation digests bind the requested semantics and are recomputed inside service; proof scopes and nonces are enforced by the injected grant store. Search retains only the capped result set and rejects overlong store pages. The foundation commands deliberately report the unencrypted ephemeral mode and do not claim a daemon connection.
+
+## Fix Round 1
+
+- Capability construction now requires exactly the ten established IDs once each, with `capture` as the capture ID. Reason and evidence are closed content-free vocabularies; unknown values fail construction. A valid complete custom set is sorted by ID.
+- Every service request checks its context before and after authorization. Ingest, search, and status check again after their store/search call; capabilities checks after copying reports. Status propagates cancellation and deadline errors, while a non-context store failure reports `ready:false` without backend diagnostics.
+- The grant nonce may be consumed if cancellation occurs just after authorization. The service then returns a context error and starts no subsequent write or result delivery. A store write that already committed before cancellation cannot be rolled back through the current store contract; the service still never reports success for that canceled call.
+
+RED: the capability test accepted a nine-port set; the authorization-cancellation test returned success for status/capabilities; the post-store-cancellation test returned success for status/search/ingest. GREEN: focused core tests passed after each corresponding service change. Deterministic tests also cover already-canceled contexts (proof remains usable), nonce consumption during authorization, and a store deadline without a canceled caller context. A first vet run flagged a missing test cleanup; adding `defer cancel()` cleared it.
+
+Final verification: `go test -count=1 ./internal/core ./internal/search ./cmd/blurctl`, `go test -count=1 ./...`, `go test -race -count=1 ./...`, and `go vet ./...` all exited 0. All six `CGO_ENABLED=0` darwin/linux/windows amd64/arm64 builds exited 0. The cgo dependency listing exited 0 with no output; `rg -n 'import "C"|#cgo' --glob '*.go' .` exited 1 with no matches; `git diff --check` exited 0.
+
+Final smoke: `go run ./cmd/blur-core` and `go run ./cmd/blurctl status` each exited 0 and emitted exactly:
+
+```json
+{"version":"dev","mode":"ephemeral_memory","encrypted_at_rest":false,"ai_enabled":false,"network_listening":false,"ready":true}
+```
+
+`go run ./cmd/blurctl capabilities` exited 0 and emitted exactly:
+
+```json
+[{"id":"audio_recorder","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"autostart","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"capture","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"gesture_hotkeys","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"local_transport","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"private_path","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"secret_store","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"session_state","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"surface_manager","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"},{"id":"text_targets","state":"user_disabled","reason":"foundation_only","evidence":"adapter_not_connected"}]
+```
