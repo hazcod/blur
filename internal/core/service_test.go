@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -102,7 +103,7 @@ func TestSearchProofBindsLimitsAndReadScope(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
 		t.Fatal(err)
 	}
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes, AllowScanFallback: true}
 	p := proof(t, grant, localapi.ScopeUIRead, SearchDigest(r))
 	tampered := r
 	tampered.ResultLimit = 2
@@ -137,6 +138,47 @@ func TestSearchDigestBindsAggregateScanByteLimit(t *testing.T) {
 	defaulted.ScanBytes = search.MaxScanBytes
 	if SearchDigest(legacy) == ([32]byte{}) || SearchDigest(legacy) != SearchDigest(defaulted) {
 		t.Fatal("omitted aggregate scan-byte limit did not bind its bounded default semantics")
+	}
+}
+
+func TestSearchDigestBindsFiltersAndEffectiveIndexLimits(t *testing.T) {
+	const baseJSON = `{"query":"alpha","result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`
+	var base search.Request
+	if err := json.Unmarshal([]byte(baseJSON), &base); err != nil {
+		t.Fatal(err)
+	}
+	changes := []string{
+		`{"query":"alpha","app_id":"editor.app","result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`,
+		`{"query":"alpha","domain":"docs.example","result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`,
+		`{"query":"alpha","time_range":{"start":"2026-10-01T00:00:00Z"},"result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`,
+		`{"query":"alpha","index_limit":12,"result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`,
+		`{"query":"alpha","index_bytes":4096,"result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`,
+		`{"query":"alpha","result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":false}`,
+	}
+	for i, encoded := range changes {
+		var changed search.Request
+		if err := json.Unmarshal([]byte(encoded), &changed); err != nil {
+			t.Fatal(err)
+		}
+		if SearchDigest(base) == SearchDigest(changed) {
+			t.Fatalf("search proof digest ignored changed filter or effective index limit %d", i)
+		}
+	}
+	var defaults search.Request
+	if err := json.Unmarshal([]byte(`{"query":"alpha","index_limit":1000,"index_bytes":2097152,"result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`), &defaults); err != nil {
+		t.Fatal(err)
+	}
+	if SearchDigest(base) != SearchDigest(defaults) {
+		t.Fatal("explicit effective index defaults changed proof semantics")
+	}
+	var canonicalFilter search.Request
+	if err := json.Unmarshal([]byte(`{"query":"alpha","app_id":" EDITOR.APP ","result_limit":2,"snippet_bytes":32,"response_bytes":2048,"scan_limit":8,"scan_bytes":1024,"allow_scan_fallback":true}`), &canonicalFilter); err != nil {
+		t.Fatal(err)
+	}
+	filteredDigest := SearchDigest(canonicalFilter)
+	canonicalFilter.AppID = "editor.app"
+	if filteredDigest != SearchDigest(canonicalFilter) {
+		t.Fatal("canonical equivalent filter did not have a stable proof digest")
 	}
 }
 
@@ -186,7 +228,7 @@ func TestSearchSemaphoreBoundsConcurrencyAndReleasesCanceledWaiters(t *testing.T
 	svc, memory, _, grant := fixture(t, localapi.ScopeUIRead)
 	blocked := &blockingPageStore{EncryptedStore: memory, entered: make(chan struct{}, 4), release: make(chan struct{})}
 	svc.store, svc.search = blocked, search.New(blocked)
-	request := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 1, ScanBytes: search.MaxScanBytes}
+	request := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 1, ScanBytes: search.MaxScanBytes, AllowScanFallback: true}
 	start := func(ctx context.Context) <-chan error {
 		result := make(chan error, 1)
 		p := proof(t, grant, localapi.ScopeUIRead, SearchDigest(request))
@@ -356,7 +398,7 @@ func TestMCPReadProofIsAcceptedButMutateIsDenied(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
 		t.Fatal(err)
 	}
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes, AllowScanFallback: true}
 	if _, err := svc.Search(context.Background(), r, proof(t, grant, localapi.ScopeUIMutate, SearchDigest(r))); err == nil {
 		t.Fatal("mutate scope accepted")
 	}
@@ -479,7 +521,7 @@ func TestCancellationDuringAuthorizationFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	o := sample(t)
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes, AllowScanFallback: true}
 	operations := []struct {
 		name   string
 		scope  localapi.Scope
@@ -568,7 +610,7 @@ func TestCancellationAfterStoreOperationNeverReturnsSuccess(t *testing.T) {
 					t.Fatal("canceled status returned")
 				}
 			case "search":
-				r := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 2, ScanBytes: search.MaxScanBytes}
+				r := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 2, ScanBytes: search.MaxScanBytes, AllowScanFallback: true}
 				var result search.Response
 				result, err = svc.Search(ctx, r, proof(t, grant, localapi.ScopeUIRead, SearchDigest(r)))
 				if len(result.Results) > 0 {
@@ -612,7 +654,7 @@ func TestAlreadyCanceledRequestsDoNotConsumeProofsOrReturnData(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, ingestProof); err != nil {
 		t.Fatalf("canceled request consumed ingest proof: %v", err)
 	}
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes, AllowScanFallback: true}
 	searchProof := proof(t, grant, localapi.ScopeUIRead, SearchDigest(r))
 	if result, err := svc.Search(ctx, r, searchProof); !errors.Is(err, context.Canceled) || len(result.Results) != 0 {
 		t.Fatalf("canceled search: %+v, %v", result, err)

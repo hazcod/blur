@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -28,7 +29,7 @@ func TestExactTermsAreCaseFoldedBoundedAndDeterministic(t *testing.T) {
 		observation(t, "alpha.app", "example.test", "café planning"),
 		observation(t, "beta.app", "example.test", "CAFÉ plan"),
 	}
-	request := Request{Query: "CAFÉ plan", ResultLimit: 2, SnippetBytes: 32, ResponseBytes: 4096, ScanLimit: 10, ScanBytes: MaxScanBytes}
+	request := Request{Query: "CAFÉ plan", ResultLimit: 2, SnippetBytes: 32, ResponseBytes: 4096, ScanLimit: 10, ScanBytes: MaxScanBytes, AllowScanFallback: true}
 	var first []string
 	for run := 0; run < 2; run++ {
 		store := storage.NewEphemeralMemoryStore()
@@ -69,7 +70,7 @@ func TestSearchReportsScanAndResponseOmissions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 100, ResponseBytes: 4096, ScanLimit: 2, ScanBytes: MaxScanBytes})
+	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 100, ResponseBytes: 4096, ScanLimit: 2, ScanBytes: MaxScanBytes, AllowScanFallback: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +86,81 @@ func TestSearchReportsScanAndResponseOmissions(t *testing.T) {
 	}
 }
 
+func TestSearchAppliesCanonicalAppAndDomainFilters(t *testing.T) {
+	store := storage.NewEphemeralMemoryStore()
+	items := []capture.SanitizedObservation{
+		observation(t, "editor.app", "docs.example", "alpha shared"),
+		observation(t, "browser.app", "docs.example", "alpha shared"),
+		observation(t, "editor.app", "mail.example", "alpha shared"),
+	}
+	for _, item := range items {
+		if err := store.PutObservation(context.Background(), item); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var appRequest Request
+	if err := json.Unmarshal([]byte(`{"query":"alpha","app_id":" EDITOR.APP ","result_limit":10,"snippet_bytes":32,"response_bytes":4096,"scan_limit":10,"allow_scan_fallback":true}`), &appRequest); err != nil {
+		t.Fatal(err)
+	}
+	appResults, err := New(store).Search(context.Background(), appRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(appResults.Results) != 2 {
+		t.Fatalf("app filter returned %d results, want 2", len(appResults.Results))
+	}
+	for _, result := range appResults.Results {
+		if result.AppID != "editor.app" {
+			t.Fatalf("app filter returned %q", result.AppID)
+		}
+	}
+
+	var domainRequest Request
+	if err := json.Unmarshal([]byte(`{"query":"alpha","domain":" DOCS.EXAMPLE. ","result_limit":10,"snippet_bytes":32,"response_bytes":4096,"scan_limit":10,"allow_scan_fallback":true}`), &domainRequest); err != nil {
+		t.Fatal(err)
+	}
+	domainResults, err := New(store).Search(context.Background(), domainRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(domainResults.Results) != 2 {
+		t.Fatalf("domain filter returned %d results, want 2", len(domainResults.Results))
+	}
+	for _, result := range domainResults.Results {
+		if result.Domain != "docs.example" {
+			t.Fatalf("domain filter returned %q", result.Domain)
+		}
+	}
+}
+
+func TestNonEmptyTimeRangeIsRejectedUntilActivityIndexExists(t *testing.T) {
+	store := storage.NewEphemeralMemoryStore()
+	if err := store.PutObservation(context.Background(), observation(t, "editor.app", "docs.example", "alpha")); err != nil {
+		t.Fatal(err)
+	}
+	var request Request
+	if err := json.Unmarshal([]byte(`{"query":"alpha","time_range":{"start":"2026-10-01T00:00:00Z","end":"2026-10-02T00:00:00Z"},"result_limit":10,"snippet_bytes":32,"response_bytes":4096,"scan_limit":10,"allow_scan_fallback":true}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(store).Search(context.Background(), request)
+	var unsupported *UnsupportedFilterError
+	if !errors.As(err, &unsupported) || !errors.Is(err, ErrUnsupportedFilter) {
+		t.Fatal("non-empty time range was accepted without authoritative observation timestamps")
+	}
+}
+
+func TestScanFallbackRequiresExplicitOptIn(t *testing.T) {
+	store := storage.NewEphemeralMemoryStore()
+	if err := store.PutObservation(context.Background(), observation(t, "editor.app", "docs.example", "alpha")); err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 32, ResponseBytes: 4096, ScanLimit: 4}
+	if _, err := New(store).Search(context.Background(), request); !errors.Is(err, ErrScanFallbackDisabled) {
+		t.Fatalf("scan fallback error = %v, want explicit opt-in error", err)
+	}
+}
+
 func TestSearchStopsAtRequestedByteBudgetAndReportsExactAccounting(t *testing.T) {
 	store := storage.NewEphemeralMemoryStore()
 	for _, body := range []string{"alpha one", "alpha two"} {
@@ -92,7 +168,7 @@ func TestSearchStopsAtRequestedByteBudgetAndReportsExactAccounting(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 2, SnippetBytes: 32, ResponseBytes: 512, ScanLimit: 10, ScanBytes: 29})
+	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 2, SnippetBytes: 32, ResponseBytes: 512, ScanLimit: 10, ScanBytes: 29, AllowScanFallback: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +188,7 @@ func TestSearchByteCutoffCountsOnlyObservedResultOmissions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 32, ResponseBytes: 512, ScanLimit: 3, ScanBytes: 58})
+	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 32, ResponseBytes: 512, ScanLimit: 3, ScanBytes: 58, AllowScanFallback: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +223,7 @@ func TestSearchUsesByteAndRowBoundedPagesAndPropagatesHasMore(t *testing.T) {
 		}
 	}
 	store := &recordingPageStore{EncryptedStore: memory}
-	request := Request{Query: "alpha", ResultLimit: 20, SnippetBytes: 32, ResponseBytes: 4096, ScanLimit: 12, ScanBytes: 330}
+	request := Request{Query: "alpha", ResultLimit: 20, SnippetBytes: 32, ResponseBytes: 4096, ScanLimit: 12, ScanBytes: 330, AllowScanFallback: true}
 	got, err := New(store).Search(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +247,7 @@ func TestSearchMarksResultOmissionAsTruncated(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 100, ResponseBytes: 4096, ScanLimit: 3, ScanBytes: MaxScanBytes})
+	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 100, ResponseBytes: 4096, ScanLimit: 3, ScanBytes: MaxScanBytes, AllowScanFallback: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +263,7 @@ func TestSearchBoundsSerializedBytesAndUnicodeSnippet(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 2, SnippetBytes: 7, ResponseBytes: 128, ScanLimit: 3, ScanBytes: MaxScanBytes})
+	got, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 2, SnippetBytes: 7, ResponseBytes: 128, ScanLimit: 3, ScanBytes: MaxScanBytes, AllowScanFallback: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +279,7 @@ func TestSearchBoundsSerializedBytesAndUnicodeSnippet(t *testing.T) {
 			t.Fatalf("bad snippet %q", result.Snippet)
 		}
 	}
-	got, err = New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 2, SnippetBytes: 7, ResponseBytes: 4096, ScanLimit: 3, ScanBytes: MaxScanBytes})
+	got, err = New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 2, SnippetBytes: 7, ResponseBytes: 4096, ScanLimit: 3, ScanBytes: MaxScanBytes, AllowScanFallback: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +291,7 @@ func TestSearchBoundsSerializedBytesAndUnicodeSnippet(t *testing.T) {
 }
 
 func TestSearchRejectsInvalidQueriesAndLimits(t *testing.T) {
-	base := Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 1, ResponseBytes: 1024, ScanLimit: 1, ScanBytes: MaxScanBytes}
+	base := Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 1, ResponseBytes: 1024, ScanLimit: 1, ScanBytes: MaxScanBytes, AllowScanFallback: true}
 	cases := []Request{base, base, base, base, base, base, base, base, base, base}
 	cases[0].Query = "\xff"
 	cases[1].Query = "a\x00b"
@@ -239,7 +315,7 @@ func TestSearchDefaultsOmittedAggregateByteLimitToHardMaximum(t *testing.T) {
 	if err := store.PutObservation(context.Background(), observation(t, "demo.app", "example.test", "alpha one")); err != nil {
 		t.Fatal(err)
 	}
-	request := Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 32, ResponseBytes: 512, ScanLimit: 1}
+	request := Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 32, ResponseBytes: 512, ScanLimit: 1, AllowScanFallback: true}
 	got, err := New(store).Search(context.Background(), request)
 	if err != nil {
 		t.Fatalf("request without the new optional limit was rejected: %v", err)
@@ -257,7 +333,7 @@ func (overlongPageStore) ListObservationPage(context.Context, storage.Observatio
 
 func TestSearchRejectsStorePageBeyondHardCap(t *testing.T) {
 	store := overlongPageStore{storage.NewEphemeralMemoryStore()}
-	_, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: StorePage, ScanBytes: MaxScanBytes})
+	_, err := New(store).Search(context.Background(), Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: StorePage, ScanBytes: MaxScanBytes, AllowScanFallback: true})
 	if err == nil {
 		t.Fatal("overlong store page accepted")
 	}
@@ -276,7 +352,7 @@ func TestSearchStopsAtAggregateBudgetForMaximumSizeObservations(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := New(store).Search(context.Background(), Request{Query: "marker", ResultLimit: 2, SnippetBytes: 64, ResponseBytes: 4096, ScanLimit: 5, ScanBytes: MaxScanBytes})
+	got, err := New(store).Search(context.Background(), Request{Query: "marker", ResultLimit: 2, SnippetBytes: 64, ResponseBytes: 4096, ScanLimit: 5, ScanBytes: MaxScanBytes, AllowScanFallback: true})
 	if err != nil {
 		t.Fatal(err)
 	}

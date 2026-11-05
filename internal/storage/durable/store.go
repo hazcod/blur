@@ -155,6 +155,10 @@ func openDurableWithHook(path string, key securestore.Key, mode OpenMode, migrat
 		_ = store.Close()
 		return nil, err
 	}
+	if err := store.ensureSearchIndex(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	return store, nil
 }
 
@@ -1093,6 +1097,11 @@ func (tx *Tx) PutObservation(observation capture.SanitizedObservation) error {
 		return tx.failLocked(err)
 	}
 	clear(sizeValue)
+	if err := tx.indexObservationLocked(observation); err != nil {
+		clear(recordKey)
+		clear(orderKey)
+		return tx.failLocked(err)
+	}
 	clear(recordKey)
 	clear(orderKey)
 	return nil

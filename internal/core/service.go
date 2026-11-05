@@ -216,13 +216,32 @@ func IngestDigest(o capture.SanitizedObservation) [32]byte {
 	return operationDigest("capture:ingest", []byte(o.ContentID()))
 }
 
-// SearchDigest binds the normalized terms and every result, scan and byte limit.
+// SearchDigest binds normalized terms, effective filters and all retrieval limits.
 func SearchDigest(r search.Request) [32]byte {
 	canonical, err := r.Validate()
 	if err != nil {
 		return [32]byte{}
 	}
-	return operationDigest("search", []byte(canonical), integer(r.ResultLimit), integer(r.SnippetBytes), integer(r.ResponseBytes), integer(r.ScanLimit), integer(r.EffectiveScanBytes()))
+	appID, _ := search.CanonicalAppID(r.AppID)
+	domain, _ := search.CanonicalDomain(r.Domain)
+	start, end := "", ""
+	if r.TimeRange != nil {
+		if !r.TimeRange.Start.IsZero() {
+			start = r.TimeRange.Start.UTC().Format(time.RFC3339Nano)
+		}
+		if !r.TimeRange.End.IsZero() {
+			end = r.TimeRange.End.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	fallback := byte(0)
+	if r.AllowScanFallback {
+		fallback = 1
+	}
+	return operationDigest(
+		"search", []byte(canonical), []byte(appID), []byte(domain), []byte(start), []byte(end), []byte{fallback},
+		integer(r.ResultLimit), integer(r.SnippetBytes), integer(r.ResponseBytes),
+		integer(r.EffectiveIndexLimit()), integer(r.EffectiveIndexBytes()), integer(r.ScanLimit), integer(r.EffectiveScanBytes()),
+	)
 }
 
 func StatusDigest() [32]byte       { return operationDigest("cli:status") }
