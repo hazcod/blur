@@ -101,11 +101,16 @@ reports `EncryptedAtRest() == false`, and loses all data when the process ends.
 An internal `durable.Store` now provides the same contract over the Task 1
 opaque bbolt adapter: logical IDs are domain-separated keyed HMACs, values are
 versioned and AEAD-encrypted, and an encrypted keyed record-set manifest is
-updated in the same transaction. Open requires explicit create-new or
+updated in the same transaction. A random persistent store identity and each
+record's schema context are authenticated as AEAD associated data. Schema
+upgrades atomically advance identity/schema/manifest metadata; old values
+remain readable only under their authenticated older schema context, while
+new writes use the current schema. Open requires explicit create-new or
 open-existing mode; reads verify the manifest before serving the store, and
-observation pages use authenticated size metadata to enforce byte ceilings
-before copying/decrypting a record that will not fit. A single internal
-transaction extension boundary is available to later index materializers.
+observation pages authenticate a small sealed size record to enforce byte
+ceilings before fetching/decrypting a record that will not fit. A single
+internal transaction extension boundary is available to later index
+materializers.
 This backend is not yet wired into `NewService` or the demo commands; those
 still use the ephemeral store and remain unsuitable for real personal data.
 The store does not protect against whole-file rollback, compromised process

@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ const (
 	MaxEnvelopeBytes  = 1 + NonceSize + AuthenticationTag + MaxPlaintextBytes
 	MaxNamespaceBytes = 64
 	MaxRecordKeyBytes = 1024
+	MaxStoreIDBytes   = 32
 
 	envelopeVersion = 1
 	nonceOffset     = 1
@@ -43,12 +45,15 @@ var (
 	ErrSerialization      = errors.New("recordcodec: serialization disabled")
 )
 
-// RecordMetadata binds a ciphertext to its logical location and schema
-// revision. These strings are metadata only; record contents remain opaque.
+// RecordMetadata binds a ciphertext to its store identity, schema version,
+// logical location, and record revision. These strings are metadata only;
+// record contents remain opaque.
 type RecordMetadata struct {
-	Namespace string
-	Key       string
-	Revision  uint64
+	StoreID       string
+	SchemaVersion uint32
+	Namespace     string
+	Key           string
+	Revision      uint64
 }
 
 // Codec owns a derived record key. Close clears its best-effort key buffer.
@@ -88,11 +93,17 @@ func deriveKey(secret, salt []byte, info string, length int) ([]byte, error) {
 }
 
 // Seal encrypts plaintext into a versioned envelope with a fresh random GCM
-// nonce. The namespace, key, and revision are authenticated as associated data.
+// nonce. Store identity, schema, namespace, key, and revision are authenticated
+// as associated data.
 func (c *Codec) Seal(metadata RecordMetadata, plaintext []byte) ([]byte, error) {
 	if err := validateMetadata(metadata); err != nil {
 		return nil, err
 	}
+	return c.seal(associatedData(metadata), plaintext)
+}
+
+func (c *Codec) seal(aad, plaintext []byte) ([]byte, error) {
+	defer clear(aad)
 	if len(plaintext) > MaxPlaintextBytes {
 		return nil, ErrOversize
 	}
@@ -113,17 +124,22 @@ func (c *Codec) Seal(metadata RecordMetadata, plaintext []byte) ([]byte, error) 
 	envelope := make([]byte, headerSize, headerSize+len(plaintext)+aead.Overhead())
 	envelope[0] = envelopeVersion
 	copy(envelope[nonceOffset:], nonce[:])
-	envelope = aead.Seal(envelope, nonce[:], plaintext, associatedData(metadata))
+	envelope = aead.Seal(envelope, nonce[:], plaintext, aad)
 	return envelope, nil
 }
 
 // Open authenticates the envelope and its metadata before returning plaintext.
 func (c *Codec) Open(metadata RecordMetadata, envelope []byte) ([]byte, error) {
-	if len(envelope) > MaxEnvelopeBytes {
-		return nil, ErrOversize
-	}
 	if err := validateMetadata(metadata); err != nil {
 		return nil, err
+	}
+	return c.open(associatedData(metadata), envelope)
+}
+
+func (c *Codec) open(aad, envelope []byte) ([]byte, error) {
+	defer clear(aad)
+	if len(envelope) > MaxEnvelopeBytes {
+		return nil, ErrOversize
 	}
 	if len(envelope) < headerSize+AuthenticationTag {
 		return nil, ErrInvalidEnvelope
@@ -141,7 +157,7 @@ func (c *Codec) Open(metadata RecordMetadata, envelope []byte) ([]byte, error) {
 		return nil, ErrInvalidKey
 	}
 	nonce := envelope[nonceOffset:headerSize]
-	plaintext, err := aead.Open(nil, nonce, envelope[headerSize:], associatedData(metadata))
+	plaintext, err := aead.Open(nil, nonce, envelope[headerSize:], aad)
 	if err != nil {
 		return nil, ErrAuthentication
 	}
@@ -174,7 +190,11 @@ func (c *Codec) keyCopy() ([]byte, error) {
 }
 
 func validateMetadata(metadata RecordMetadata) error {
-	if metadata.Namespace == "" || metadata.Key == "" || metadata.Revision == 0 ||
+	storeID, storeIDErr := hex.DecodeString(metadata.StoreID)
+	validStoreID := storeIDErr == nil && len(storeID) == 16 && hex.EncodeToString(storeID) == metadata.StoreID
+	clear(storeID)
+	if !validStoreID || metadata.SchemaVersion == 0 || metadata.Namespace == "" || metadata.Key == "" || metadata.Revision == 0 ||
+		len(metadata.StoreID) > MaxStoreIDBytes ||
 		len(metadata.Namespace) > MaxNamespaceBytes || len(metadata.Key) > MaxRecordKeyBytes ||
 		!utf8.ValidString(metadata.Namespace) || !utf8.ValidString(metadata.Key) ||
 		strings.ContainsRune(metadata.Namespace, 0) || strings.ContainsRune(metadata.Key, 0) {
@@ -184,10 +204,16 @@ func validateMetadata(metadata RecordMetadata) error {
 }
 
 func associatedData(metadata RecordMetadata) []byte {
-	out := make([]byte, 1+2+len(metadata.Namespace)+2+len(metadata.Key)+8)
+	out := make([]byte, 1+2+len(metadata.StoreID)+4+2+len(metadata.Namespace)+2+len(metadata.Key)+8)
 	index := 0
 	out[index] = envelopeVersion
 	index++
+	binary.BigEndian.PutUint16(out[index:index+2], uint16(len(metadata.StoreID)))
+	index += 2
+	copy(out[index:], metadata.StoreID)
+	index += len(metadata.StoreID)
+	binary.BigEndian.PutUint32(out[index:index+4], metadata.SchemaVersion)
+	index += 4
 	binary.BigEndian.PutUint16(out[index:index+2], uint16(len(metadata.Namespace)))
 	index += 2
 	copy(out[index:], metadata.Namespace)

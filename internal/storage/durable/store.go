@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/hkdf"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
@@ -29,9 +30,12 @@ import (
 )
 
 const (
-	OpenSchemaVersion = 1
+	OpenSchemaVersion = 2
 	valueVersion      = 1
 	recordRevision    = 1
+	storedValueHeader = 1 + 4
+	identityHeader    = 1 + 16 + 4
+	identityPlainSize = 1 + 16 + 4
 
 	groupRecord byte = 0x10
 	groupOrder  byte = 0x20
@@ -43,7 +47,7 @@ const (
 	kindIndex       byte = 0x04
 
 	physicalKeyBytes = 34
-	sizeValueBytes   = 4 + physicalKeyBytes + sha256.Size
+	sizeRecordBytes  = 1 + 4 + physicalKeyBytes
 
 	maxLogicalIDBytes = 4096
 )
@@ -66,6 +70,7 @@ var (
 var (
 	schemaKey   = []byte{0x00, 's', 'c', 'h', 1}
 	manifestKey = []byte{0x00, 'm', 'a', 'n', 1}
+	identityKey = []byte{0x00, 'i', 'd', 'e', 1}
 	activeKey   = []byte{groupActive, 0x01}
 
 	observationRecordPrefix = []byte{groupRecord, kindObservation}
@@ -93,7 +98,8 @@ type storeState struct {
 	codec       *recordcodec.Codec
 	idKey       []byte
 	manifestKey []byte
-	sizeKey     []byte
+	storeID     [16]byte
+	schemaVer   uint32
 	closed      bool
 }
 
@@ -124,7 +130,7 @@ func openDurableWithHook(path string, key securestore.Key, mode OpenMode, migrat
 	if path == "" {
 		return nil, ErrInvalidPath
 	}
-	state, err := newStoreState(key)
+	state, err := newStoreState(key, mode == CreateNew)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +158,7 @@ func openDurableWithHook(path string, key securestore.Key, mode OpenMode, migrat
 	return store, nil
 }
 
-func newStoreState(key securestore.Key) (*storeState, error) {
+func newStoreState(key securestore.Key, createNew bool) (*storeState, error) {
 	dataKey := key.Bytes()
 	defer clear(dataKey[:])
 	if dataKey == ([32]byte{}) {
@@ -180,14 +186,16 @@ func newStoreState(key securestore.Key) (*storeState, error) {
 		_ = codec.Close()
 		return nil, err
 	}
-	sizeKey, err := derive("observation page-size metadata key v1")
-	if err != nil {
-		clear(idKey)
-		clear(manifestKey)
-		_ = codec.Close()
-		return nil, err
+	state := &storeState{codec: codec, idKey: idKey, manifestKey: manifestKey}
+	if createNew {
+		if _, err := io.ReadFull(rand.Reader, state.storeID[:]); err != nil {
+			clear(idKey)
+			clear(manifestKey)
+			_ = codec.Close()
+			return nil, ErrUnavailable
+		}
 	}
-	return &storeState{codec: codec, idKey: idKey, manifestKey: manifestKey, sizeKey: sizeKey}, nil
+	return state, nil
 }
 
 func mapOpenError(err error) error {
@@ -210,9 +218,23 @@ func (s *Store) initialize() error {
 	if state == nil || state.db == nil {
 		return ErrUnavailable
 	}
+	state.schemaVer = OpenSchemaVersion
 	var callbackErr error
 	err := state.db.Update(context.Background(), func(writer bolt.Writer) error {
 		tx := &Tx{store: s, writer: writer, active: true}
+		identityEnvelope, identityErr := s.sealIdentity(state.storeID, OpenSchemaVersion)
+		if identityErr != nil {
+			callbackErr = identityErr
+			tx.active = false
+			return errAbortTransaction
+		}
+		if err := tx.writeEntryLocked(identityKey, identityEnvelope, false); err != nil {
+			clear(identityEnvelope)
+			callbackErr = err
+			tx.active = false
+			return errAbortTransaction
+		}
+		clear(identityEnvelope)
 		plain := encodeSchema(OpenSchemaVersion)
 		envelope, sealErr := s.seal(schemaKey, "schema", plain)
 		clear(plain)
@@ -246,6 +268,9 @@ func (s *Store) initialize() error {
 }
 
 func (s *Store) validateAndMigrate(ctx context.Context, migrationHook func() error) error {
+	if err := s.readIdentity(ctx); err != nil {
+		return err
+	}
 	version, manifest, err := s.readOpenMetadata(ctx)
 	if err != nil {
 		return err
@@ -253,16 +278,19 @@ func (s *Store) validateAndMigrate(ctx context.Context, migrationHook func() err
 	if version > OpenSchemaVersion {
 		return ErrUnsupportedSchema
 	}
+	if version != s.state.schemaVer {
+		return ErrCorrupt
+	}
 	if err := s.verifyManifest(ctx, manifest); err != nil {
 		return err
 	}
 	for version < OpenSchemaVersion {
 		switch version {
-		case 0:
-			if err := s.migrateZeroToOne(ctx, migrationHook); err != nil {
+		case 1:
+			if err := s.migrateOneToTwo(ctx, migrationHook); err != nil {
 				return err
 			}
-			version = 1
+			version = 2
 		default:
 			return ErrUnsupportedSchema
 		}
@@ -275,6 +303,51 @@ func (s *Store) validateAndMigrate(ctx context.Context, migrationHook func() err
 		return err
 	}
 	return s.verifyManifest(ctx, manifest)
+}
+
+func (s *Store) readIdentity(ctx context.Context) error {
+	var encoded []byte
+	err := s.view(ctx, func(reader bolt.Reader) error {
+		var found bool
+		var err error
+		encoded, found, err = reader.Get(identityKey)
+		if err != nil {
+			return mapStorePhysicalError(err)
+		}
+		if !found {
+			return ErrCorrupt
+		}
+		return nil
+	})
+	if err != nil {
+		clear(encoded)
+		return err
+	}
+	defer clear(encoded)
+	if len(encoded) < identityHeader+1+12+16 || encoded[0] != valueVersion {
+		return ErrCorrupt
+	}
+	var storeID [16]byte
+	copy(storeID[:], encoded[1:17])
+	schemaVersion := binary.BigEndian.Uint32(encoded[17:identityHeader])
+	plain, err := s.openEnvelopeAtContext(identityKey, "store-identity", storeID, schemaVersion, encoded[identityHeader:])
+	if errors.Is(err, recordcodec.ErrAuthentication) {
+		return ErrWrongKey
+	}
+	if err != nil {
+		return ErrCorrupt
+	}
+	defer clear(plain)
+	if len(plain) != identityPlainSize || plain[0] != valueVersion ||
+		!bytes.Equal(plain[1:17], storeID[:]) || binary.BigEndian.Uint32(plain[17:]) != schemaVersion {
+		return ErrCorrupt
+	}
+	if schemaVersion == 0 || schemaVersion > OpenSchemaVersion {
+		return ErrUnsupportedSchema
+	}
+	s.state.storeID = storeID
+	s.state.schemaVer = schemaVersion
+	return nil
 }
 
 func (s *Store) readOpenMetadata(ctx context.Context) (uint32, manifestState, error) {
@@ -373,7 +446,12 @@ func (s *Store) verifyManifest(ctx context.Context, want manifestState) error {
 	return nil
 }
 
-func (s *Store) migrateZeroToOne(ctx context.Context, migrationHook func() error) error {
+func (s *Store) migrateOneToTwo(ctx context.Context, migrationHook func() error) error {
+	const oldVersion = uint32(1)
+	const newVersion = uint32(2)
+	if s.state.schemaVer != oldVersion {
+		return ErrUnsupportedSchema
+	}
 	var callbackErr error
 	err := s.state.db.Update(ctx, func(writer bolt.Writer) error {
 		tx := &Tx{store: s, writer: writer, active: true}
@@ -397,26 +475,42 @@ func (s *Store) migrateZeroToOne(ctx context.Context, migrationHook func() error
 		}
 		version, err := decodeSchema(schemaPlain)
 		clear(schemaPlain)
-		if err != nil || version != 0 {
+		if err != nil || version != oldVersion {
 			callbackErr = ErrUnsupportedSchema
 			tx.active = false
 			return errAbortTransaction
 		}
-		plain := encodeSchema(1)
-		envelope, err := s.seal(schemaKey, "schema", plain)
+		identityEnvelope, err := s.sealIdentity(s.state.storeID, newVersion)
+		if err != nil {
+			callbackErr = ErrMigration
+			tx.active = false
+			return errAbortTransaction
+		}
+		if err := tx.writeEntryLocked(identityKey, identityEnvelope, true); err != nil {
+			clear(identityEnvelope)
+			callbackErr = ErrMigration
+			tx.active = false
+			return errAbortTransaction
+		}
+		clear(identityEnvelope)
+		plain := encodeSchema(newVersion)
+		envelope, err := s.sealAtSchema(schemaKey, "schema", plain, newVersion)
 		clear(plain)
 		if err != nil {
-			callbackErr = err
+			callbackErr = ErrMigration
 			tx.active = false
 			return errAbortTransaction
 		}
 		if err := tx.writeEntryLocked(schemaKey, envelope, true); err != nil {
 			clear(envelope)
-			callbackErr = err
+			callbackErr = ErrMigration
 			tx.active = false
 			return errAbortTransaction
 		}
 		clear(envelope)
+		// Existing value envelopes carry their authenticated schema context and
+		// remain readable; new and rewritten records use the new context.
+		s.state.schemaVer = newVersion
 		if migrationHook != nil {
 			if err := migrationHook(); err != nil {
 				callbackErr = ErrMigration
@@ -432,13 +526,11 @@ func (s *Store) migrateZeroToOne(ctx context.Context, migrationHook func() error
 		tx.active = false
 		return nil
 	})
-	if callbackErr != nil {
+	if callbackErr != nil || err != nil {
+		s.state.schemaVer = oldVersion
 		if errors.Is(callbackErr, ErrCorrupt) || errors.Is(callbackErr, ErrUnsupportedSchema) {
 			return callbackErr
 		}
-		return ErrMigration
-	}
-	if err != nil {
 		return ErrMigration
 	}
 	return nil
@@ -606,8 +698,9 @@ func (s *Store) Close() error {
 	}
 	clear(state.idKey)
 	clear(state.manifestKey)
-	clear(state.sizeKey)
-	state.idKey, state.manifestKey, state.sizeKey = nil, nil, nil
+	state.idKey, state.manifestKey = nil, nil
+	clear(state.storeID[:])
+	state.schemaVer = 0
 	if closeErr != nil {
 		return ErrUnavailable
 	}
@@ -625,8 +718,9 @@ func (s *Store) clearState() {
 	}
 	clear(state.idKey)
 	clear(state.manifestKey)
-	clear(state.sizeKey)
-	state.idKey, state.manifestKey, state.sizeKey = nil, nil, nil
+	state.idKey, state.manifestKey = nil, nil
+	clear(state.storeID[:])
+	state.schemaVer = 0
 }
 
 const redactedStore = "durable.Store([redacted])"
@@ -801,10 +895,22 @@ func (s *Store) seal(key []byte, namespace string, plaintext []byte) ([]byte, er
 	if s == nil || s.state == nil || s.state.codec == nil {
 		return nil, &storage.StoreError{Code: storage.Closed}
 	}
+	return s.sealAtSchema(key, namespace, plaintext, s.state.schemaVer)
+}
+
+func (s *Store) sealAtSchema(key []byte, namespace string, plaintext []byte, schemaVersion uint32) ([]byte, error) {
+	if s == nil || s.state == nil || s.state.codec == nil {
+		return nil, &storage.StoreError{Code: storage.Closed}
+	}
+	if schemaVersion == 0 || s.state.storeID == ([16]byte{}) {
+		return nil, ErrUnsupportedSchema
+	}
 	envelope, err := s.state.codec.Seal(recordcodec.RecordMetadata{
-		Namespace: namespace,
-		Key:       hex.EncodeToString(key),
-		Revision:  recordRevision,
+		StoreID:       hex.EncodeToString(s.state.storeID[:]),
+		SchemaVersion: schemaVersion,
+		Namespace:     namespace,
+		Key:           hex.EncodeToString(key),
+		Revision:      recordRevision,
 	}, plaintext)
 	if errors.Is(err, recordcodec.ErrOversize) {
 		return nil, &storage.StoreError{Code: storage.Invalid}
@@ -812,22 +918,71 @@ func (s *Store) seal(key []byte, namespace string, plaintext []byte) ([]byte, er
 	if err != nil {
 		return nil, ErrUnavailable
 	}
-	return envelope, nil
+	encoded := make([]byte, storedValueHeader+len(envelope))
+	encoded[0] = valueVersion
+	binary.BigEndian.PutUint32(encoded[1:storedValueHeader], schemaVersion)
+	copy(encoded[storedValueHeader:], envelope)
+	clear(envelope)
+	return encoded, nil
 }
 
 func (s *Store) open(key []byte, namespace string, envelope []byte) ([]byte, error) {
 	if s == nil || s.state == nil || s.state.codec == nil {
 		return nil, &storage.StoreError{Code: storage.Closed}
 	}
+	if len(envelope) < storedValueHeader+1+12+16 || envelope[0] != valueVersion {
+		return nil, recordcodec.ErrInvalidEnvelope
+	}
+	schemaVersion := binary.BigEndian.Uint32(envelope[1:storedValueHeader])
+	if schemaVersion == 0 || schemaVersion > s.state.schemaVer {
+		return nil, ErrUnsupportedSchema
+	}
+	return s.openEnvelopeAtContext(key, namespace, s.state.storeID, schemaVersion, envelope[storedValueHeader:])
+}
+
+func (s *Store) openEnvelopeAtContext(key []byte, namespace string, storeID [16]byte, schemaVersion uint32, envelope []byte) ([]byte, error) {
+	if s == nil || s.state == nil || s.state.codec == nil {
+		return nil, &storage.StoreError{Code: storage.Closed}
+	}
 	plaintext, err := s.state.codec.Open(recordcodec.RecordMetadata{
-		Namespace: namespace,
-		Key:       hex.EncodeToString(key),
-		Revision:  recordRevision,
+		StoreID:       hex.EncodeToString(storeID[:]),
+		SchemaVersion: schemaVersion,
+		Namespace:     namespace,
+		Key:           hex.EncodeToString(key),
+		Revision:      recordRevision,
 	}, envelope)
 	if err != nil {
 		return nil, err
 	}
 	return plaintext, nil
+}
+
+func (s *Store) sealIdentity(storeID [16]byte, schemaVersion uint32) ([]byte, error) {
+	if s == nil || s.state == nil || s.state.codec == nil || storeID == ([16]byte{}) || schemaVersion == 0 {
+		return nil, ErrUnsupportedSchema
+	}
+	plain := make([]byte, identityPlainSize)
+	plain[0] = valueVersion
+	copy(plain[1:17], storeID[:])
+	binary.BigEndian.PutUint32(plain[17:], schemaVersion)
+	defer clear(plain)
+	envelope, err := s.state.codec.Seal(recordcodec.RecordMetadata{
+		StoreID:       hex.EncodeToString(storeID[:]),
+		SchemaVersion: schemaVersion,
+		Namespace:     "store-identity",
+		Key:           hex.EncodeToString(identityKey),
+		Revision:      recordRevision,
+	}, plain)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	encoded := make([]byte, identityHeader+len(envelope))
+	encoded[0] = valueVersion
+	copy(encoded[1:17], storeID[:])
+	binary.BigEndian.PutUint32(encoded[17:identityHeader], schemaVersion)
+	copy(encoded[identityHeader:], envelope)
+	clear(envelope)
+	return encoded, nil
 }
 
 func (s *Store) logicalKey(group, kind byte, namespace, logicalID string) []byte {
@@ -842,6 +997,19 @@ func (s *Store) logicalKey(group, kind byte, namespace, logicalID string) []byte
 	copy(key[2:], sum)
 	clear(sum)
 	return key
+}
+
+func (s *Store) cursorKey(group, kind byte, namespace, logicalID string) ([]byte, error) {
+	if s == nil || s.state == nil {
+		return nil, &storage.StoreError{Code: storage.Closed}
+	}
+	state := s.state
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	if state.closed || state.db == nil || len(state.idKey) == 0 {
+		return nil, &storage.StoreError{Code: storage.Closed}
+	}
+	return s.logicalKey(group, kind, namespace, logicalID), nil
 }
 
 func writeMACString(mac hash.Hash, value string) {
@@ -912,7 +1080,12 @@ func (tx *Tx) PutObservation(observation capture.SanitizedObservation) error {
 		return tx.failLocked(err)
 	}
 	clear(envelope)
-	sizeValue := tx.store.encodeSizeEntry(orderKey, recordKey, searchBytes)
+	sizeValue, err := tx.store.encodeSizeEntry(orderKey, recordKey, searchBytes)
+	if err != nil {
+		clear(recordKey)
+		clear(orderKey)
+		return tx.failLocked(err)
+	}
 	if err := tx.writeEntryLocked(orderKey, sizeValue, false); err != nil {
 		clear(sizeValue)
 		clear(recordKey)
@@ -1024,41 +1197,37 @@ func validOpaqueID(id string) bool {
 	return id != "" && len(id) <= maxLogicalIDBytes && utf8.ValidString(id) && !strings.ContainsRune(id, 0)
 }
 
-func (s *Store) encodeSizeEntry(orderKey, recordKey []byte, size int) []byte {
-	encoded := make([]byte, sizeValueBytes)
-	binary.BigEndian.PutUint32(encoded[:4], uint32(size))
-	copy(encoded[4:4+physicalKeyBytes], recordKey)
-	mac := hmac.New(sha256.New, s.state.sizeKey)
-	_, _ = io.WriteString(mac, "blur.durable.observation-size.v1\x00")
-	_, _ = mac.Write(orderKey)
-	_, _ = mac.Write(encoded[:4+physicalKeyBytes])
-	sum := mac.Sum(nil)
-	copy(encoded[4+physicalKeyBytes:], sum)
-	clear(sum)
-	return encoded
+func (s *Store) encodeSizeEntry(orderKey, recordKey []byte, size int) ([]byte, error) {
+	if len(recordKey) != physicalKeyBytes || size < 0 || size > storage.MaxObservationPageBytes {
+		return nil, ErrCorrupt
+	}
+	plain := make([]byte, sizeRecordBytes)
+	plain[0] = 1
+	binary.BigEndian.PutUint32(plain[1:5], uint32(size))
+	copy(plain[5:], recordKey)
+	envelope, err := s.seal(orderKey, "observation-size", plain)
+	clear(plain)
+	if err != nil {
+		return nil, err
+	}
+	return envelope, nil
 }
 
 func (s *Store) decodeSizeEntry(orderKey, encoded []byte) (int, []byte, error) {
-	if len(encoded) != sizeValueBytes {
+	plain, err := s.open(orderKey, "observation-size", encoded)
+	if err != nil {
 		return 0, nil, ErrCorrupt
 	}
-	recordKey := bytes.Clone(encoded[4 : 4+physicalKeyBytes])
+	defer clear(plain)
+	if len(plain) != sizeRecordBytes || plain[0] != 1 {
+		return 0, nil, ErrCorrupt
+	}
+	recordKey := bytes.Clone(plain[5:])
 	if !bytes.HasPrefix(recordKey, observationRecordPrefix) {
 		clear(recordKey)
 		return 0, nil, ErrCorrupt
 	}
-	mac := hmac.New(sha256.New, s.state.sizeKey)
-	_, _ = io.WriteString(mac, "blur.durable.observation-size.v1\x00")
-	_, _ = mac.Write(orderKey)
-	_, _ = mac.Write(encoded[:4+physicalKeyBytes])
-	want := mac.Sum(nil)
-	ok := subtle.ConstantTimeCompare(want, encoded[4+physicalKeyBytes:]) == 1
-	clear(want)
-	if !ok {
-		clear(recordKey)
-		return 0, nil, ErrCorrupt
-	}
-	size := binary.BigEndian.Uint32(encoded[:4])
+	size := binary.BigEndian.Uint32(plain[1:5])
 	maxSize := uint32(storage.MaxObservationTextBytes + 128 + 253)
 	if size > maxSize {
 		clear(recordKey)
@@ -1144,7 +1313,11 @@ func (s *Store) ListObservationPage(ctx context.Context, request storage.Observa
 	}
 	var after []byte
 	if request.After != "" {
-		after = s.logicalKey(groupOrder, kindObservation, "", request.After)
+		var err error
+		after, err = s.cursorKey(groupOrder, kindObservation, "", request.After)
+		if err != nil {
+			return storage.ObservationPage{}, err
+		}
 		defer clear(after)
 	}
 	page := storage.ObservationPage{Observations: make([]capture.SanitizedObservation, 0, request.Limit)}
@@ -1257,7 +1430,11 @@ func (s *Store) ListDerivations(ctx context.Context, limit int, after string) ([
 	}
 	var cursor []byte
 	if after != "" {
-		cursor = s.logicalKey(groupRecord, kindDerivation, "derivations", after)
+		var err error
+		cursor, err = s.cursorKey(groupRecord, kindDerivation, "derivations", after)
+		if err != nil {
+			return nil, err
+		}
 		defer clear(cursor)
 	}
 	out := make([]storage.Derivation, 0, limit)
@@ -1343,7 +1520,11 @@ func (s *Store) ListGenerations(ctx context.Context, limit int, after string) ([
 	}
 	var cursor []byte
 	if after != "" {
-		cursor = s.logicalKey(groupRecord, kindGeneration, "generations", after)
+		var err error
+		cursor, err = s.cursorKey(groupRecord, kindGeneration, "generations", after)
+		if err != nil {
+			return nil, err
+		}
 		defer clear(cursor)
 	}
 	out := make([]storage.Generation, 0, limit)

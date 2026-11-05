@@ -732,7 +732,7 @@ func TestEncryptedRecordsLeaveNoPlaintextInFilesOrErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer codec.Close()
-	metadata := recordcodec.RecordMetadata{Namespace: "observations", Key: "synthetic-9107", Revision: 1}
+	metadata := recordcodec.RecordMetadata{StoreID: "0123456789abcdef0123456789abcdef", SchemaVersion: 1, Namespace: "observations", Key: "synthetic-9107", Revision: 1}
 	envelope, err := codec.Seal(metadata, []byte(sentinel))
 	if err != nil {
 		t.Fatal(err)

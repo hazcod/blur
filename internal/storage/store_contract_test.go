@@ -197,6 +197,88 @@ func TestEncryptedStoreContractDerivationsGenerationsAndActivation(t *testing.T)
 	}
 }
 
+func TestEncryptedStoreContractDerivationAndGenerationPagesAreStable(t *testing.T) {
+	for _, opener := range storeOpeners() {
+		t.Run(opener.name, func(t *testing.T) {
+			store := opener.open(t)
+			t.Cleanup(func() { _ = store.Close() })
+			ctx := context.Background()
+			source := contractObservation(t, "ordered source")
+			if err := store.PutObservation(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+			for _, suffix := range []string{"a", "b", "c", "d"} {
+				generationID := "page-generation-" + suffix
+				derivationID := "page-derivation-" + suffix
+				derivation := contractDerivation(source.ContentID(), derivationID, generationID, storage.Active)
+				if err := store.PutDerivation(ctx, derivation); err != nil {
+					t.Fatalf("PutDerivation(%s): %v", suffix, err)
+				}
+				generation := storage.Generation{ID: generationID, DerivationIDs: []string{derivationID}, SchemaVersion: 1, RedactionVersion: privacy.Version}
+				if err := store.PutGeneration(ctx, generation); err != nil {
+					t.Fatalf("PutGeneration(%s): %v", suffix, err)
+				}
+			}
+
+			derivationFirst, err := store.ListDerivations(ctx, 1, "")
+			if err != nil || len(derivationFirst) != 1 {
+				t.Fatalf("first derivation page = (%d, %v), want one row", len(derivationFirst), err)
+			}
+			derivationRepeated, err := store.ListDerivations(ctx, 1, "")
+			if err != nil || len(derivationRepeated) != 1 || derivationRepeated[0].ID != derivationFirst[0].ID {
+				t.Fatalf("repeated first derivation page changed order: %v", err)
+			}
+			derivationSeen := make(map[string]bool)
+			after := ""
+			for {
+				page, err := store.ListDerivations(ctx, 1, after)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(page) == 0 {
+					break
+				}
+				if derivationSeen[page[0].ID] {
+					t.Fatalf("derivation pagination repeated %q", page[0].ID)
+				}
+				derivationSeen[page[0].ID] = true
+				after = page[0].ID
+			}
+			if len(derivationSeen) != 4 {
+				t.Fatalf("paged derivation count = %d, want 4", len(derivationSeen))
+			}
+
+			generationFirst, err := store.ListGenerations(ctx, 1, "")
+			if err != nil || len(generationFirst) != 1 {
+				t.Fatalf("first generation page = (%d, %v), want one row", len(generationFirst), err)
+			}
+			generationRepeated, err := store.ListGenerations(ctx, 1, "")
+			if err != nil || len(generationRepeated) != 1 || generationRepeated[0].ID != generationFirst[0].ID {
+				t.Fatalf("repeated first generation page changed order: %v", err)
+			}
+			generationSeen := make(map[string]bool)
+			after = ""
+			for {
+				page, err := store.ListGenerations(ctx, 1, after)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(page) == 0 {
+					break
+				}
+				if generationSeen[page[0].ID] {
+					t.Fatalf("generation pagination repeated %q", page[0].ID)
+				}
+				generationSeen[page[0].ID] = true
+				after = page[0].ID
+			}
+			if len(generationSeen) != 4 {
+				t.Fatalf("paged generation count = %d, want 4", len(generationSeen))
+			}
+		})
+	}
+}
+
 func TestEncryptedStoreContractCancellationAndClose(t *testing.T) {
 	for _, opener := range storeOpeners() {
 		t.Run(opener.name, func(t *testing.T) {

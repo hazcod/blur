@@ -15,7 +15,13 @@ func testKey(seed byte) []byte {
 }
 
 func testMetadata() RecordMetadata {
-	return RecordMetadata{Namespace: "observations", Key: "content-001", Revision: 3}
+	return RecordMetadata{
+		StoreID:       "0123456789abcdef0123456789abcdef",
+		SchemaVersion: 7,
+		Namespace:     "observations",
+		Key:           "content-001",
+		Revision:      3,
+	}
 }
 
 func TestDeriveKeyMatchesRFC5869SHA256Vector(t *testing.T) {
@@ -122,9 +128,11 @@ func TestOpenAuthenticatesNamespaceKeyAndRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	tests := map[string]RecordMetadata{
-		"namespace": {Namespace: "derivations", Key: metadata.Key, Revision: metadata.Revision},
-		"key":       {Namespace: metadata.Namespace, Key: "content-002", Revision: metadata.Revision},
-		"revision":  {Namespace: metadata.Namespace, Key: metadata.Key, Revision: metadata.Revision + 1},
+		"store identity": {StoreID: "fedcba9876543210fedcba9876543210", SchemaVersion: metadata.SchemaVersion, Namespace: metadata.Namespace, Key: metadata.Key, Revision: metadata.Revision},
+		"schema version": {StoreID: metadata.StoreID, SchemaVersion: metadata.SchemaVersion + 1, Namespace: metadata.Namespace, Key: metadata.Key, Revision: metadata.Revision},
+		"namespace":      {StoreID: metadata.StoreID, SchemaVersion: metadata.SchemaVersion, Namespace: "derivations", Key: metadata.Key, Revision: metadata.Revision},
+		"key":            {StoreID: metadata.StoreID, SchemaVersion: metadata.SchemaVersion, Namespace: metadata.Namespace, Key: "content-002", Revision: metadata.Revision},
+		"revision":       {StoreID: metadata.StoreID, SchemaVersion: metadata.SchemaVersion, Namespace: metadata.Namespace, Key: metadata.Key, Revision: metadata.Revision + 1},
 	}
 	for name, swapped := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -235,11 +243,13 @@ func TestCodecRejectsInvalidKeysAndMetadataBounds(t *testing.T) {
 	defer codec.Close()
 
 	for name, metadata := range map[string]RecordMetadata{
-		"empty namespace": {Namespace: "", Key: "k", Revision: 1},
-		"empty key":       {Namespace: "records", Key: "", Revision: 1},
-		"zero revision":   {Namespace: "records", Key: "k", Revision: 0},
-		"long namespace":  {Namespace: string(bytes.Repeat([]byte("n"), MaxNamespaceBytes+1)), Key: "k", Revision: 1},
-		"long key":        {Namespace: "records", Key: string(bytes.Repeat([]byte("k"), MaxRecordKeyBytes+1)), Revision: 1},
+		"empty store id":  {SchemaVersion: 1, Namespace: "records", Key: "k", Revision: 1},
+		"zero schema":     {StoreID: testMetadata().StoreID, Namespace: "records", Key: "k", Revision: 1},
+		"empty namespace": {StoreID: testMetadata().StoreID, SchemaVersion: 1, Namespace: "", Key: "k", Revision: 1},
+		"empty key":       {StoreID: testMetadata().StoreID, SchemaVersion: 1, Namespace: "records", Key: "", Revision: 1},
+		"zero revision":   {StoreID: testMetadata().StoreID, SchemaVersion: 1, Namespace: "records", Key: "k", Revision: 0},
+		"long namespace":  {StoreID: testMetadata().StoreID, SchemaVersion: 1, Namespace: string(bytes.Repeat([]byte("n"), MaxNamespaceBytes+1)), Key: "k", Revision: 1},
+		"long key":        {StoreID: testMetadata().StoreID, SchemaVersion: 1, Namespace: "records", Key: string(bytes.Repeat([]byte("k"), MaxRecordKeyBytes+1)), Revision: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := codec.Seal(metadata, []byte("synthetic")); !errors.Is(err, ErrInvalidMetadata) {

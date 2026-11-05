@@ -3,6 +3,7 @@ package durable
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -10,11 +11,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/nielsgroen/blur/internal/capture"
 	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/nielsgroen/blur/internal/privacy"
 	"github.com/nielsgroen/blur/internal/securestore"
 	"github.com/nielsgroen/blur/internal/storage"
 	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
@@ -69,6 +72,28 @@ func TestOpenDurableRejectsMissingZeroKeyWithoutCreating(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("zero-key open created a store: %v", err)
+	}
+}
+
+func TestOpenDurableKeyLossDoesNotChangeExistingStore(t *testing.T) {
+	path := durableTestPath(t)
+	store, err := OpenDurable(path, durableTestKey(t, 0x33), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDurable(path, securestore.Key{}, OpenExisting); !errors.Is(err, ErrWrongKey) {
+		t.Fatalf("OpenDurable(lost key) error = %v, want ErrWrongKey", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, original) {
+		t.Fatalf("lost-key open changed store bytes: %v", err)
 	}
 }
 
@@ -273,6 +298,201 @@ func TestDurableDetectsRecordSwapAfterManifestConsistentRewrite(t *testing.T) {
 	}
 }
 
+func TestDurableRejectsRecordCopiedBetweenStoresWithSameDataKey(t *testing.T) {
+	key := durableTestKey(t, 0x5a)
+	firstPath, secondPath := durableTestPath(t), durableTestPath(t)
+	first, err := OpenDurable(firstPath, key, CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenDurable(secondPath, key, CreateNew)
+	if err != nil {
+		_ = first.Close()
+		t.Fatal(err)
+	}
+	defer first.Close()
+	defer second.Close()
+
+	observation, err := capture.SanitizeObservation("store.app", "store.example", "password: cross-store fixture", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.PutObservation(context.Background(), observation); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.PutObservation(context.Background(), observation); err != nil {
+		t.Fatal(err)
+	}
+	recordKey := first.logicalKey(groupRecord, kindObservation, "", observation.ContentID())
+	defer clear(recordKey)
+	var firstEnvelope []byte
+	if err := first.view(context.Background(), func(reader bolt.Reader) error {
+		var found bool
+		firstEnvelope, found, err = reader.Get(recordKey)
+		if err != nil || !found {
+			return ErrCorrupt
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read first store record: %v", err)
+	}
+	defer clear(firstEnvelope)
+	if err := second.state.db.Update(context.Background(), func(writer bolt.Writer) error {
+		tx := &Tx{store: second, writer: writer, active: true}
+		if err := tx.loadManifestLocked(); err != nil {
+			return err
+		}
+		if err := tx.writeEntryLocked(recordKey, firstEnvelope, true); err != nil {
+			return err
+		}
+		return tx.flushManifestLocked()
+	}); err != nil {
+		t.Fatalf("write manifest-consistent cross-store record: %v", err)
+	}
+	if _, _, err := second.GetObservation(context.Background(), observation.ContentID()); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("GetObservation(cross-store copy) error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestDurableRejectsAuthenticatedRecordWithSwappedSchemaContext(t *testing.T) {
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x5c), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	observation, err := capture.SanitizeObservation("schema.app", "schema.example", "password: schema context swap", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservation(context.Background(), observation); err != nil {
+		t.Fatal(err)
+	}
+	key := store.logicalKey(groupRecord, kindObservation, "", observation.ContentID())
+	defer clear(key)
+	if err := store.state.db.Update(context.Background(), func(writer bolt.Writer) error {
+		tx := &Tx{store: store, writer: writer, active: true}
+		if err := tx.loadManifestLocked(); err != nil {
+			return err
+		}
+		value, found, err := writer.Get(key)
+		if err != nil || !found || len(value) <= storedValueHeader {
+			clear(value)
+			return ErrCorrupt
+		}
+		binary.BigEndian.PutUint32(value[1:storedValueHeader], OpenSchemaVersion-1)
+		err = tx.writeEntryLocked(key, value, true)
+		clear(value)
+		if err != nil {
+			return err
+		}
+		return tx.flushManifestLocked()
+	}); err != nil {
+		t.Fatalf("write manifest-consistent schema-context swap: %v", err)
+	}
+	if _, _, err := store.GetObservation(context.Background(), observation.ContentID()); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("GetObservation(schema-context swap) error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestDurableListCursorsRejectZeroValueStore(t *testing.T) {
+	var store Store
+	ctx := context.Background()
+	if _, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 1, MaxBytes: 1, After: strings.Repeat("a", 64)}); !contractClosed(err) {
+		t.Fatalf("ListObservationPage(zero store, cursor) error = %v, want Closed", err)
+	}
+	if _, err := store.ListDerivations(ctx, 1, "after-id"); !contractClosed(err) {
+		t.Fatalf("ListDerivations(zero store, cursor) error = %v, want Closed", err)
+	}
+	if _, err := store.ListGenerations(ctx, 1, "after-id"); !contractClosed(err) {
+		t.Fatalf("ListGenerations(zero store, cursor) error = %v, want Closed", err)
+	}
+}
+
+func TestDurableListCursorsRaceSafelyWithClose(t *testing.T) {
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x5b), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	observation, err := capture.SanitizeObservation("cursor.app", "cursor.example", "password: cursor race", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservation(ctx, observation); err != nil {
+		t.Fatal(err)
+	}
+	derivation := storage.Derivation{
+		ID: "cursor-derivation", GenerationID: "cursor-generation", State: storage.Active,
+		SourceIDs: []string{observation.ContentID()}, SourceHashes: []string{fmt.Sprintf("%064x", 1)},
+		ProcessorVersion: 1, SchemaVersion: 1, PromptVersion: 1, RedactionVersion: privacy.Version,
+		ProviderModelDigest: fmt.Sprintf("%064x", 2), OutputHash: fmt.Sprintf("%064x", 3),
+		CoveredSources: 1,
+	}
+	if err := store.PutDerivation(ctx, derivation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutGeneration(ctx, storage.Generation{ID: "cursor-generation", DerivationIDs: []string{"cursor-derivation"}, SchemaVersion: 1, RedactionVersion: privacy.Version}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	errs := make(chan error, 4)
+	group.Add(4)
+	go func() {
+		defer group.Done()
+		<-start
+		for range 64 {
+			_, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 1, MaxBytes: storage.MaxObservationPageBytes, After: observation.ContentID()})
+			if err != nil && !contractClosed(err) {
+				errs <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer group.Done()
+		<-start
+		for range 64 {
+			_, err := store.ListDerivations(ctx, 1, derivation.ID)
+			if err != nil && !contractClosed(err) {
+				errs <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer group.Done()
+		<-start
+		for range 64 {
+			_, err := store.ListGenerations(ctx, 1, "cursor-generation")
+			if err != nil && !contractClosed(err) {
+				errs <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer group.Done()
+		<-start
+		if err := store.Close(); err != nil {
+			errs <- err
+		}
+	}()
+	close(start)
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("list/close race returned unexpected error: %v", err)
+	}
+}
+
+func contractClosed(err error) bool {
+	var storeErr *storage.StoreError
+	return errors.As(err, &storeErr) && storeErr.Code == storage.Closed
+}
+
 func TestDurableManifestDetectsUnauthorizedInsertionDeletionAndTamper(t *testing.T) {
 	for _, scenario := range []string{"insert", "delete", "manifest-tamper", "schema-tamper"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -427,10 +647,94 @@ func TestDurablePageSkipsDecryptingOverBudgetRecord(t *testing.T) {
 	}
 }
 
+func TestDurableObservationSizeMetadataIsSealedAndBoundToOrderKey(t *testing.T) {
+	path := durableTestPath(t)
+	store, err := OpenDurable(path, durableTestKey(t, 0x59), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := capture.SanitizeObservation("size.app", "size.example", "password: first size fixture\nfirst row", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := capture.SanitizeObservation("size.app", "size.example", "password: second size fixture\nsecond row", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservation(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservation(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+
+	firstOrderKey := store.logicalKey(groupOrder, kindObservation, "", first.ContentID())
+	defer clear(firstOrderKey)
+	firstRecordKey := store.logicalKey(groupRecord, kindObservation, "", first.ContentID())
+	defer clear(firstRecordKey)
+	secondOrderKey := store.logicalKey(groupOrder, kindObservation, "", second.ContentID())
+	defer clear(secondOrderKey)
+	var firstEnvelope, secondEnvelope []byte
+	if err := store.view(context.Background(), func(reader bolt.Reader) error {
+		var found bool
+		firstEnvelope, found, err = reader.Get(firstOrderKey)
+		if err != nil || !found {
+			return ErrCorrupt
+		}
+		secondEnvelope, found, err = reader.Get(secondOrderKey)
+		if err != nil || !found {
+			return ErrCorrupt
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read opaque order metadata: %v", err)
+	}
+	defer clear(firstEnvelope)
+	defer clear(secondEnvelope)
+
+	plainSizeAndKey := make([]byte, 1+4+len(firstRecordKey))
+	plainSizeAndKey[0] = 1
+	pageSize := uint32(len(first.Text()) + len(first.AppID()) + len(first.Domain()))
+	binary.BigEndian.PutUint32(plainSizeAndKey[1:5], pageSize)
+	copy(plainSizeAndKey[5:], firstRecordKey)
+	plainSizeBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(plainSizeBytes, pageSize)
+	if bytes.Contains(firstEnvelope, firstRecordKey) || bytes.Contains(firstEnvelope, plainSizeAndKey) || bytes.Contains(firstEnvelope, plainSizeBytes) {
+		t.Fatal("observation size metadata exposed its byte count or physical record key")
+	}
+	plain, err := store.open(firstOrderKey, "observation-size", firstEnvelope)
+	if err != nil {
+		t.Fatalf("open authenticated size metadata: %v", err)
+	}
+	if !bytes.Equal(plain, plainSizeAndKey) {
+		clear(plain)
+		t.Fatal("authenticated size metadata did not contain the versioned expected record")
+	}
+	clear(plain)
+
+	if err := store.state.db.Update(context.Background(), func(writer bolt.Writer) error {
+		tx := &Tx{store: store, writer: writer, active: true}
+		if err := tx.loadManifestLocked(); err != nil {
+			return err
+		}
+		if err := tx.writeEntryLocked(firstOrderKey, secondEnvelope, true); err != nil {
+			return err
+		}
+		return tx.flushManifestLocked()
+	}); err != nil {
+		t.Fatalf("write manifest-consistent size-envelope swap: %v", err)
+	}
+	if _, _, err := store.GetObservation(context.Background(), first.ContentID()); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("GetObservation after size-envelope swap = %v, want ErrCorrupt", err)
+	}
+}
+
 func TestDurableSchemaMigrationIsAtomicAndIdempotent(t *testing.T) {
 	path := durableTestPath(t)
 	key := durableTestKey(t, 0x54)
-	writeSchemaVersionFixture(t, path, key, 0)
+	writeSchemaVersionFixture(t, path, key, 1)
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -445,6 +749,11 @@ func TestDurableSchemaMigrationIsAtomicAndIdempotent(t *testing.T) {
 	store, err := OpenDurable(path, key, OpenExisting)
 	if err != nil {
 		t.Fatalf("OpenDurable(after interrupted migration) error = %v", err)
+	}
+	wantObservation := schemaMigrationFixtureObservation(t)
+	got, found, getErr := store.GetObservation(context.Background(), wantObservation.ContentID())
+	if getErr != nil || !found || got.ContentID() != wantObservation.ContentID() {
+		t.Fatalf("GetObservation(after schema migration) found=%t err=%v", found, getErr)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -601,21 +910,60 @@ func writeSchemaVersionFixture(t *testing.T, path string, key securestore.Key, v
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.PutObservation(context.Background(), schemaMigrationFixtureObservation(t)); err != nil {
+		_ = store.Close()
+		t.Fatalf("write schema fixture observation: %v", err)
+	}
 	err = store.state.db.Update(context.Background(), func(writer bolt.Writer) error {
 		tx := &Tx{store: store, writer: writer, active: true}
 		if err := tx.loadManifestLocked(); err != nil {
 			return err
 		}
-		plain := encodeSchema(version)
-		envelope, err := store.seal(schemaKey, "schema", plain)
-		clear(plain)
+		entries, _, err := writer.Scan(nil, nil, 64, bolt.MaxTransactionBytes-bolt.MaxKeyBytes)
 		if err != nil {
 			return err
 		}
-		defer clear(envelope)
-		if err := tx.writeEntryLocked(schemaKey, envelope, true); err != nil {
-			return err
+		defer clearBoltEntries(entries)
+		for _, entry := range entries {
+			if bytes.Equal(entry.Key, manifestKey) {
+				continue
+			}
+			var replacement []byte
+			switch {
+			case bytes.Equal(entry.Key, identityKey):
+				replacement, err = store.sealIdentity(store.state.storeID, version)
+			case bytes.Equal(entry.Key, schemaKey):
+				plain := encodeSchema(version)
+				replacement, err = store.sealAtSchema(schemaKey, "schema", plain, version)
+				clear(plain)
+			case bytes.HasPrefix(entry.Key, observationRecordPrefix):
+				var plain []byte
+				plain, err = store.open(entry.Key, "observations", entry.Value)
+				if err == nil {
+					replacement, err = store.sealAtSchema(entry.Key, "observations", plain, version)
+				}
+				clear(plain)
+			case bytes.HasPrefix(entry.Key, observationOrderPrefix):
+				var plain []byte
+				plain, err = store.open(entry.Key, "observation-size", entry.Value)
+				if err == nil {
+					replacement, err = store.sealAtSchema(entry.Key, "observation-size", plain, version)
+				}
+				clear(plain)
+			default:
+				continue
+			}
+			if err != nil {
+				clear(replacement)
+				return err
+			}
+			if err := tx.writeEntryLocked(entry.Key, replacement, true); err != nil {
+				clear(replacement)
+				return err
+			}
+			clear(replacement)
 		}
+		store.state.schemaVer = version
 		return tx.flushManifestLocked()
 	})
 	if err != nil {
@@ -625,6 +973,15 @@ func writeSchemaVersionFixture(t *testing.T, path string, key securestore.Key, v
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func schemaMigrationFixtureObservation(t *testing.T) capture.SanitizedObservation {
+	t.Helper()
+	observation, err := capture.SanitizeObservation("migration.app", "migration.example", "password: authenticated schema fixture", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return observation
 }
 
 func durableTestKey(t *testing.T, seed byte) securestore.Key {

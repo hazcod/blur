@@ -93,11 +93,22 @@ Candidate release/module evidence is linked from the official
 The record codec uses Go 1.27's standard-library `crypto/hkdf`, HMAC-SHA-256,
 AES-256-GCM, and `crypto/rand`; no extra crypto module is introduced. Version
 1 envelopes contain a version byte, fresh 96-bit nonce, and authenticated
-ciphertext/tag. Associated data binds the envelope version, namespace, opaque
-record key, and nonzero revision. Plaintext is limited to 4 MiB; metadata is
+ciphertext/tag. Associated data binds the envelope version, persistent store
+identity, per-record schema context, namespace, opaque record key, and nonzero
+revision. Plaintext is limited to 4 MiB; metadata is
 length-limited UTF-8. Errors and formatting are content/key-free. The codec
 copies the 32-byte input key, clears that copy after derivation, and best-effort
 clears the retained derived key on `Close`.
+
+The durable layer stores a random 128-bit store identity in a small bootstrap
+record. Its identity and schema header are authenticated by that same AEAD
+record before the store accepts them. Other encrypted values carry a schema
+context header that is authenticated as AAD; after an atomic schema upgrade,
+existing values remain readable under their authenticated older context while
+new or rewritten values use the current schema. The keyed manifest covers each
+physical record except its own envelope, including identity and schema
+metadata, but does not prevent rollback of the whole file to a prior consistent
+state.
 
 The physical adapter provides one fixed record bucket and only bounded opaque
 byte operations: 4 KiB maximum keys, 5 MiB values, 16 MiB/1024-operation
