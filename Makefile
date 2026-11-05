@@ -1,4 +1,4 @@
-.PHONY: test race vet build cross-build no-cgo-audit
+.PHONY: test race vet build cross-build cross-test-compile no-cgo-audit
 
 test:
 	go test ./...
@@ -22,18 +22,13 @@ cross-build:
 		done; \
 	done
 
-no-cgo-audit:
+cross-test-compile:
 	@set -eu; \
-	imports=$$(rg -n '^[[:space:]]*import[[:space:]]+"C"' --glob '*.go' internal cmd || true); \
-	if [ -n "$$imports" ]; then \
-		echo "Found import C in application source:"; \
-		echo "$$imports"; \
-		exit 1; \
-	fi; \
-	cgo_files=$$(CGO_ENABLED=0 go list -deps -f '{{if .CgoFiles}}{{.ImportPath}}:{{join .CgoFiles ","}}{{end}}' ./... | sed '/^$$/d'); \
-	if [ -n "$$cgo_files" ]; then \
-		echo "Found cgo files in the disabled-cgo dependency graph:"; \
-		echo "$$cgo_files"; \
-		exit 1; \
-	fi; \
-	echo "No import C or CgoFiles found in the CGO_ENABLED=0 dependency graph"
+	for target in darwin/arm64 windows/amd64 linux/amd64; do \
+		GOOS=$${target%/*}; GOARCH=$${target#*/}; \
+		echo "Compiling platform conformance tests for $$GOOS/$$GOARCH with cgo disabled"; \
+		CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go test -c -o /dev/null ./internal/platform/conformance; \
+	done
+
+no-cgo-audit:
+	go run ./cmd/no-cgo-audit

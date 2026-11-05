@@ -31,7 +31,33 @@
   intended native mechanisms; they do not claim those mechanisms have been
   probed or initialized.
 - Go selects `_darwin.go`, `_windows.go`, and `_linux.go` files only on their
-  matching targets. The conformance test therefore runs against the Darwin
-  adapter on the current Darwin host; Windows and Linux behavior is covered by
-  compile-time interface assertions and their cross-builds, not runtime tests
-  in this host environment.
+  matching targets. Runtime conformance ran for Darwin on this host; the
+  Windows and Linux conformance binaries were cross-compiled here and their
+  tests run in the matching native CI jobs.
+
+## Fix Round 1
+
+Addressed both review findings:
+
+- Replaced the shell regex and `CGO_ENABLED=0` CgoFiles query with a small
+  standard-library Go audit command. It queries the repository dependency
+  graph with `go list -deps -json` and cgo enabled for every supported target,
+  rejects CgoFiles in each non-standard package, and parses selected and
+  ignored Go files with the Go parser to find any import path `C`, including
+  grouped and aliased imports. Standard-library packages are exempt from the
+  third-party prohibition.
+- Split conformance into a shared behavioral assertion and Darwin, Windows,
+  and Linux native-build test files. Each checks its exact evidence-backed
+  report and verifies both `Probe` and `Next` return the matching typed
+  unavailable error. Native CI tests each target; `cross-test-compile` also
+  compiles all three conformance test binaries with cgo disabled.
+
+Fix Round 1 verification:
+
+- Adversarial audit fixtures passed for CgoFiles, grouped/aliased `import C`,
+  ignored source files, the standard-library exemption, and a pure-Go
+  dependency.
+- `go test ./...` and `go vet ./...` passed.
+- `make cross-build cross-test-compile no-cgo-audit` passed for all supported
+  command build targets. The audit reports no CgoFiles or `import C` in
+  non-standard repository dependencies.
