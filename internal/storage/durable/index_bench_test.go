@@ -17,6 +17,7 @@ import (
 )
 
 const durableScaleBenchOptIn = "BLUR_RUN_SCALE_BENCH"
+const durableRankedBenchOptIn = "BLUR_RUN_RANKED_BENCH"
 
 const durableScaleQuerySamples = 20
 const durableScaleReopenSamples = 5
@@ -58,7 +59,7 @@ func BenchmarkDurableExactIndexScale(b *testing.B) {
 			runtime.ReadMemStats(&memory)
 			heapInuse := memory.HeapInuse
 
-			query := search.ExactQuery{Terms: []string{"benchmark"}, MaxRows: 1000, MaxBytes: search.MaxIndexBytes}
+			query := search.ExactQuery{Terms: []string{"benchmark"}, TopK: 100, MaxRows: 1000, MaxBytes: search.MaxIndexBytes}
 			request := search.Request{
 				Query: "benchmark", ResultLimit: 100, SnippetBytes: 128,
 				ResponseBytes: search.MaxResponseBytes, ScanLimit: 1,
@@ -74,7 +75,7 @@ func BenchmarkDurableExactIndexScale(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if page.Rows != query.MaxRows || len(page.Hits) != query.MaxRows || !page.HasMore {
+				if page.Rows > query.MaxRows || len(page.Hits) != query.TopK || !page.HasMore {
 					b.Fatalf("bounded common-term page rows=%d hits=%d has_more=%t", page.Rows, len(page.Hits), page.HasMore)
 				}
 			}
@@ -130,6 +131,93 @@ func BenchmarkDurableExactIndexScale(b *testing.B) {
 			b.ReportMetric(float64(len(reopenDurations)), "reopens")
 		})
 	}
+}
+
+func BenchmarkDurableExactIndexRankedOverCap(b *testing.B) {
+	if os.Getenv(durableRankedBenchOptIn) != "1" {
+		b.Skip("set BLUR_RUN_RANKED_BENCH=1 to build an over-cap ranked synthetic corpus")
+	}
+	const ordinaryCount = 1_024
+	const rankedCount = 12
+	path := filepath.Join(b.TempDir(), "ranked.db")
+	key, err := securestore.ResolveKey(context.Background(), &testKeyBackend{}, "durable-ranked-benchmark", bytes.NewReader(bytes.Repeat([]byte{0x9c}, 32)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	store, err := OpenDurable(path, key, CreateNew)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+
+	ids := make([]string, 0, rankedCount)
+	observations := make([]capture.SanitizedObservation, 0, 4)
+	writeBatches := 0
+	writeBatch := func() {
+		b.Helper()
+		if len(observations) == 0 {
+			return
+		}
+		writeBatches++
+		batch := append([]capture.SanitizedObservation(nil), observations...)
+		if err := store.Update(context.Background(), func(tx *Tx) error {
+			for _, observation := range batch {
+				if err := tx.PutObservation(observation); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			b.Fatalf("ranked corpus setup batch %d: %v", writeBatches, err)
+		}
+		observations = observations[:0]
+	}
+	for i := 0; i < ordinaryCount; i++ {
+		observation, err := capture.SanitizeObservation("editor.app", "docs.example", fmt.Sprintf("alpha ordinary-%04d", i), 64)
+		if err != nil {
+			b.Fatal(err)
+		}
+		observations = append(observations, observation)
+		if len(observations) == cap(observations) {
+			writeBatch()
+		}
+	}
+	writeBatch()
+	for i := 0; i < rankedCount; i++ {
+		observation, err := capture.SanitizeObservation("alpha.app", "docs.example", fmt.Sprintf("ranked item-%02d", i), 64)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ids = append(ids, observation.ContentID())
+		observations = append(observations, observation)
+		if len(observations) == cap(observations) {
+			writeBatch()
+		}
+	}
+	writeBatch()
+	sort.Strings(ids)
+	query := search.ExactQuery{Terms: []string{"alpha"}, TopK: 10, MaxRows: search.MaxIndexRows, MaxBytes: search.MaxIndexBytes}
+	durations := make([]time.Duration, 0, durableScaleQuerySamples)
+	b.ResetTimer()
+	for i := 0; i < durableScaleQuerySamples; i++ {
+		started := time.Now()
+		page, err := store.SearchExact(context.Background(), query)
+		durations = append(durations, time.Since(started))
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(page.Hits) != query.TopK || !page.HasMore || page.Rows > query.MaxRows {
+			b.Fatalf("bounded ranked page rows=%d hits=%d has_more=%t", page.Rows, len(page.Hits), page.HasMore)
+		}
+		for j, hit := range page.Hits {
+			if hit.SourceID != ids[j] || hit.Score != 3 {
+				b.Fatalf("ranked hit %d = %+v, want source %s score 3", j, hit, ids[j])
+			}
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(ordinaryCount+rankedCount), "records")
+	reportScaleLatency(b, "ranked-index", durations)
 }
 
 func seedDurableScaleCorpus(b *testing.B, store *Store, count int) ([]time.Duration, error) {

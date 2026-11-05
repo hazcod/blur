@@ -18,16 +18,20 @@ const (
 var (
 	ErrIndexUnavailable = errors.New("search: exact index unavailable")
 	ErrIndexCorrupt     = errors.New("search: exact index inconsistent")
+	ErrIndexBudget      = errors.New("search: exact index budget exhausted before ranking was proven")
 )
 
 // ExactQuery contains canonical exact terms and optional canonical app/domain
-// filters. MaxRows and MaxBytes bound posting rows and encrypted index bytes
-// read; each hit's authenticated Bytes estimate lets callers budget source
-// hydration before reading it.
+// filters. TopK asks the index for a globally proven ranked prefix (zero uses
+// MaxResults). MaxRows, MaxBytes, and the fixed node budget bound work; if the
+// index cannot prove the prefix within those budgets it returns ErrIndexBudget
+// instead of exposing a potentially misranked partial page. Each hit's
+// authenticated Bytes estimate lets callers budget source hydration.
 type ExactQuery struct {
 	Terms    []string
 	AppID    string
 	Domain   string
+	TopK     int
 	MaxRows  int
 	MaxBytes int
 }
@@ -46,6 +50,7 @@ type IndexHit struct {
 type ExactPage struct {
 	Hits    []IndexHit
 	Rows    int
+	Nodes   int
 	Bytes   int
 	HasMore bool
 }

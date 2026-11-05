@@ -12,7 +12,7 @@ observation, its index entries, and the authenticated manifest.
 
 ## Decision
 
-Use an exact inverted index. Normalize tokens by Go Unicode lowercase mapping,
+Use a private exact index. Normalize tokens by Go Unicode lowercase mapping,
 split on Unicode runes other than letters and digits, deduplicate, then sort by
 UTF-8 byte order. There is no locale-specific folding, stemming,
 transliteration, or Unicode normalization. At most 128 unique terms are
@@ -22,11 +22,14 @@ terms.
 
 Term, app-filter, domain-filter, and reverse-link lookup keys are HMAC-SHA-256
 values with separate domain labels and the store's keyed identifier secret.
-Posting pages hold at most 64 source IDs and are encrypted/authenticated; each
-bucket's counts and each observation's reverse links are encrypted too. The
-reverse link maps an observation back to the pages that must be changed when
-the internal deletion fixture removes it. Observation writes/deletes and all
-affected pages, metadata, and the manifest share one `Store.Update` transaction.
+Each private posting list is an encrypted B+ tree. Leaves contain at most 64
+source IDs; packed branch nodes contain at most 1,024 child references and
+encrypted source-ID-order fences. Node contents and source IDs are
+encrypted/authenticated. Child node IDs are random and only their keyed
+physical addresses are stored. Reverse links map an observation to every
+lookup key it references, so its postings can be removed transactionally.
+Observation writes/deletes, tree changes, reverse links, and the manifest share
+one `Store.Update` transaction.
 
 When opening an existing store without a completed-index marker, opening first
 removes any incomplete index, rebuilds it in bounded transactions, and commits
@@ -35,16 +38,18 @@ After a crash, the missing marker causes the next open to discard partial
 pages and repeat the rebuild; a partial index is never exposed as ready.
 
 Queries use exact AND semantics, with canonical bounded app/domain equality
-filters. The index starts from the smallest encrypted posting count and
-intersects the other terms and filters using encrypted reverse links. Ranking
-is deterministic: app term match = 3, domain = 2, text = 1 per distinct query
-term; ties use ascending source ID. Results retain
-`raw_sanitized_observation` provenance. Search uses a default maximum of 1,000
-candidate posting rows and 2 MiB of index/source-field budget; request limits
-can reduce but not exceed those ceilings. The byte count includes index keys
-and encrypted values plus the authenticated source-field byte estimate used
-before hydration; it is a logical retrieval budget, not a measure of bbolt
-page I/O or filesystem bytes.
+filters. Each posting tree is traversed in rank-descending/source-ID-ascending
+order; intersection checks encrypted reverse links and proves the global top-K
+prefix before returning it. App-field match scores 3, domain 2, and text 1 per
+distinct query term; ties use ascending source ID. If row, node, or byte bounds
+are reached before the prefix is proven, the index returns typed
+`ErrIndexBudget` rather than a potentially misranked partial page. Results
+retain `raw_sanitized_observation` provenance. Search uses a default maximum of
+1,000 candidate posting rows, 1,024 index nodes, and 2 MiB of index/source-field
+budget; request limits can reduce but not exceed those ceilings. The byte count
+includes index keys and encrypted values plus the authenticated source-field
+byte estimate used before hydration; it is a logical retrieval budget, not a
+measure of bbolt page I/O or filesystem bytes.
 
 Only stores without the exact-index capability may use the old observation
 scan, and only when `allow_scan_fallback` is explicitly true. That fallback
@@ -58,17 +63,21 @@ result, index, and scan limit.
 
 No plaintext term, app/domain value, logical observation ID, or term-frequency
 value appears in index artifacts. HMACs hide lookup values and AEAD protects
-posting contents, exact counts, source IDs, and reverse links. The physical
-page key still exposes index kind, page sequence, and number of pages; page
-counts therefore leak a coarse posting-frequency bound (up to 64 rows per
-page). Ciphertext lengths and change timing also leak approximate page
-occupancy, record-size class, and update/delete activity. This is accepted for
-the local exact index and must remain explicit in threat-model reviews.
+posting contents, source IDs, branch fences, and reverse links. The physical
+key reveals index kind, stable keyed lookup digest (allowing same-store
+equality/linkage for a repeated term or app/domain value), and a keyed node
+address. The number of nodes in a tree and its depth are observable from record
+counts; encrypted node payload lengths reveal leaf/branch size classes and
+approximate occupancy (up to 64 posting rows per leaf and 1,024 child references
+per branch). Write timing and key insertion/deletion reveal update activity.
+This residual structural and equality leakage is accepted for this local exact
+index and must remain explicit in threat-model reviews.
 
-The index favors bounded updates and exact retrieval over compactness. Content
-IDs in each page are prefix-delta encoded within that fixed 64-row page. Page
-splits are append-only; deletions leave holes rather than shifting later page
-references, and a later insertion can reuse an empty trailing page.
+Leaf and packed-branch splits move a median split along the root-to-leaf path;
+they do not rebucket all siblings. The maximum tree depth is four and all node
+reads, rows, bytes, and mutations remain bounded. A transaction that reaches
+the physical operation/byte ceiling aborts atomically; it is never split into
+multiple commits for one observation.
 
 ## Scale benchmark
 
@@ -99,8 +108,8 @@ median (averaging the two middle values when even) and nearest-rank p95.
 
 | Scale | Total setup/ingest | 32-row write p50 / p95 | Index read p50 / p95 | Search p50 / p95 | Reopen p50 / p95 | DB bytes | Heap-in-use |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100k | 47.181 s | 14.593 / 17.618 ms | 1.346 / 1.536 ms | 3.066 / 3.169 ms | 261.360 / 275.334 ms | 100,925,440 | 3.383 MiB |
-| 1M | 803.951 s (13m23.951s) | 22.684 / 41.581 ms | 1.434 / 1.806 ms | 3.419 / 6.071 ms | 3.042 / 5.054 s | 992,755,712 | 6.836 MiB |
+| 100k | 71.468 s | 22.700 / 27.384 ms | 0.238 / 0.530 ms | 1.837 / 2.355 ms | 270.500 / 288.780 ms | 101,302,272 | 5.039 MiB |
+| 1M | 802.446 s (13m22.446s) | 24.775 / 30.691 ms | 0.225 / 0.400 ms | 1.612 / 1.749 ms | 2.335 / 2.351 s | 913,227,776 | 7.906 MiB |
 
 For this hardware/toolchain and this dense synthetic corpus, reference p95
 regression budgets are: 50 ms per 32-row write, 2.5 ms for a bounded index
@@ -108,5 +117,12 @@ read, 8 ms for an end-to-end search returning up to 100 hydrated results, and
 6 s for a durable reopen at 1M records. These are local regression budgets,
 not portable SLOs. The memory figure is Go heap-in-use after forced GC while
 the DB is open; it excludes bbolt-mapped pages and process RSS. The benchmark
-stores one nearly-1GB DB for 1M records, so disk footprint remains a material
-trade-off even though exact read latency stays bounded.
+stores about 913 MB (870.9 MiB) for 1M records, so disk footprint remains a
+material trade-off even though exact read latency stays bounded.
+
+A separate `BenchmarkDurableExactIndexRankedOverCap` run exercises a 1,036-
+record corpus where field-score winners occur beyond the prior 1,000-row
+candidate prefix. It prebuilds once, then takes 20 bounded ranked-query samples
+with `-benchtime=1x`. The recorded p50/p95 were 134,583/348,541 ns. With only 20
+samples, these percentile labels describe the bounded local sample, not a
+population-level statistical estimate.

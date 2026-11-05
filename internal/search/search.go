@@ -21,9 +21,12 @@ const (
 	MaxResponseBytes = 64 << 10
 	MaxIndexRows     = 1000
 	MaxIndexBytes    = 2 << 20
-	MaxScan          = 64
-	MaxScanBytes     = 2 << 20
-	StorePage        = 4
+	// MaxIndexNodes stays within the durable reader's physical transaction
+	// operation cap; an exhausted query returns ErrIndexBudget first.
+	MaxIndexNodes = 1024
+	MaxScan       = 64
+	MaxScanBytes  = 2 << 20
+	StorePage     = 4
 )
 
 var (
@@ -239,12 +242,12 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 	if index, ok := e.store.(ExactIndex); ok {
 		page, err := index.SearchExact(ctx, ExactQuery{
 			Terms: wanted, AppID: appFilter, Domain: domainFilter,
-			MaxRows: request.EffectiveIndexLimit(), MaxBytes: request.EffectiveIndexBytes(),
+			TopK: request.ResultLimit, MaxRows: request.EffectiveIndexLimit(), MaxBytes: request.EffectiveIndexBytes(),
 		})
 		if err != nil {
 			return Response{}, err
 		}
-		if page.Rows < 0 || page.Rows > request.EffectiveIndexLimit() || page.Bytes < 0 || page.Bytes > request.EffectiveIndexBytes() || len(page.Hits) > page.Rows {
+		if page.Rows < 0 || page.Rows > request.EffectiveIndexLimit() || page.Nodes < 0 || page.Nodes > MaxIndexNodes || page.Bytes < 0 || page.Bytes > request.EffectiveIndexBytes() || len(page.Hits) > page.Rows {
 			return Response{}, ErrIndexCorrupt
 		}
 		for _, hit := range page.Hits {

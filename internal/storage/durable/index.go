@@ -24,26 +24,18 @@ const (
 	searchIndexDomain  byte = 0x12
 	searchIndexReverse byte = 0x7f
 
-	searchIndexFormatVersion   byte   = 1
-	searchIndexPageRows               = 64
-	searchIndexMetaPage        uint32 = ^uint32(0)
-	searchIndexMetaBytes              = 1 + 4 + 8
-	searchIndexPageHeader             = 2
-	searchIndexRefBytes               = 1 + sha256.Size + 4 + 1
-	searchIndexMaxRefs                = search.MaxIndexedObservationTerms + 2
-	searchIndexPageKeyBytes           = 2 + sha256.Size + 4
-	searchIndexReverseKeyBytes        = 2 + sha256.Size
+	searchIndexFormatVersion   byte = 3
+	searchIndexPageRows             = 64
+	searchIndexPageHeader           = 2
+	searchIndexRefBytes             = 1 + sha256.Size + 4 + 1
+	searchIndexMaxRefs              = search.MaxIndexedObservationTerms + 2
+	searchIndexReverseKeyBytes      = 2 + sha256.Size
 )
 
 var (
 	searchIndexPrefix   = []byte{searchIndexGroup}
 	searchIndexStateKey = []byte{searchIndexGroup, searchIndexState}
 )
-
-type searchIndexMeta struct {
-	pageCount    uint32
-	postingCount uint64
-}
 
 type searchIndexPosting struct {
 	sourceID string
@@ -60,7 +52,6 @@ type searchIndexRef struct {
 type searchIndexConstraint struct {
 	kind   byte
 	digest [sha256.Size]byte
-	meta   searchIndexMeta
 }
 
 var _ search.ExactIndex = (*Store)(nil)
@@ -88,14 +79,6 @@ func (s *Store) searchReverseDigest(sourceID string) [sha256.Size]byte {
 	return digest
 }
 
-func searchIndexKey(kind byte, digest [sha256.Size]byte, page uint32) []byte {
-	key := make([]byte, searchIndexPageKeyBytes)
-	key[0], key[1] = searchIndexGroup, kind
-	copy(key[2:2+sha256.Size], digest[:])
-	binary.BigEndian.PutUint32(key[2+sha256.Size:], page)
-	return key
-}
-
 func (s *Store) searchReverseKey(sourceID string) []byte {
 	digest := s.searchReverseDigest(sourceID)
 	key := make([]byte, searchIndexReverseKeyBytes)
@@ -105,37 +88,16 @@ func (s *Store) searchReverseKey(sourceID string) []byte {
 	return key
 }
 
-func encodeSearchIndexMeta(meta searchIndexMeta) []byte {
-	encoded := make([]byte, searchIndexMetaBytes)
-	encoded[0] = searchIndexFormatVersion
-	binary.BigEndian.PutUint32(encoded[1:5], meta.pageCount)
-	binary.BigEndian.PutUint64(encoded[5:13], meta.postingCount)
-	return encoded
-}
-
-func decodeSearchIndexMeta(encoded []byte) (searchIndexMeta, error) {
-	var meta searchIndexMeta
-	if len(encoded) != searchIndexMetaBytes || encoded[0] != searchIndexFormatVersion {
-		return meta, ErrCorrupt
-	}
-	meta.pageCount = binary.BigEndian.Uint32(encoded[1:5])
-	meta.postingCount = binary.BigEndian.Uint64(encoded[5:13])
-	if meta.pageCount > 1<<24 || meta.postingCount > 0 && meta.pageCount == 0 {
-		return searchIndexMeta{}, ErrCorrupt
-	}
-	return meta, nil
-}
-
 func encodeSearchIndexPage(postings []searchIndexPosting) ([]byte, error) {
 	if len(postings) > searchIndexPageRows {
 		return nil, ErrCorrupt
 	}
 	ordered := append([]searchIndexPosting(nil), postings...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].sourceID < ordered[j].sourceID })
+	sort.Slice(ordered, func(i, j int) bool { return searchIndexPostingLess(ordered[i], ordered[j]) })
 	encoded := []byte{searchIndexFormatVersion, byte(len(ordered))}
 	var previous []byte
 	for i, posting := range ordered {
-		if !validHash(posting.sourceID) || posting.fields&^byte(0x07) != 0 || i > 0 && ordered[i-1].sourceID == posting.sourceID {
+		if !validHash(posting.sourceID) || posting.fields&^byte(0x07) != 0 || i > 0 && !searchIndexPostingLess(ordered[i-1], posting) {
 			return nil, ErrCorrupt
 		}
 		id, err := hex.DecodeString(posting.sourceID)
@@ -190,12 +152,13 @@ func decodeSearchIndexPage(encoded []byte) ([]searchIndexPosting, error) {
 			return nil, ErrCorrupt
 		}
 		sourceID := hex.EncodeToString(id)
-		if len(postings) > 0 && sourceID <= postings[len(postings)-1].sourceID {
+		posting := searchIndexPosting{sourceID: sourceID, fields: fields}
+		if len(postings) > 0 && !searchIndexPostingLess(postings[len(postings)-1], posting) {
 			clear(id)
 			clear(previous)
 			return nil, ErrCorrupt
 		}
-		postings = append(postings, searchIndexPosting{sourceID: sourceID, fields: fields})
+		postings = append(postings, posting)
 		clear(previous)
 		previous = id
 	}
@@ -301,103 +264,18 @@ func (tx *Tx) putSearchIndexValueLocked(key []byte, namespace string, plaintext 
 
 func (tx *Tx) addSearchIndexPostingLocked(kind byte, value, sourceID string, fields byte) (uint32, [sha256.Size]byte, error) {
 	digest := tx.store.searchLookupDigest(kind, value)
-	metaKey := searchIndexKey(kind, digest, searchIndexMetaPage)
-	metaPlain, hasMeta, err := tx.searchIndexPlainLocked(metaKey, "search-index-meta-v1")
+	ordered, err := searchIndexOrderKey(kind, fields, sourceID)
 	if err != nil {
-		clear(metaKey)
 		clear(digest[:])
 		return 0, [sha256.Size]byte{}, err
 	}
-	meta := searchIndexMeta{}
-	if hasMeta {
-		meta, err = decodeSearchIndexMeta(metaPlain)
-		clear(metaPlain)
-		if err != nil {
-			clear(metaKey)
-			clear(digest[:])
-			return 0, [sha256.Size]byte{}, err
-		}
-	} else {
-		clear(metaPlain)
-	}
-	if meta.postingCount == ^uint64(0) || meta.pageCount >= 1<<24 {
-		clear(metaKey)
-		clear(digest[:])
-		return 0, [sha256.Size]byte{}, ErrCorrupt
-	}
-
-	pageNo := uint32(0)
-	var postings []searchIndexPosting
-	replacePage := false
-	if meta.pageCount > 0 {
-		pageNo = meta.pageCount - 1
-		pageKey := searchIndexKey(kind, digest, pageNo)
-		pagePlain, found, readErr := tx.searchIndexPlainLocked(pageKey, "search-index-page-v1")
-		clear(pageKey)
-		if readErr != nil || !found {
-			clear(pagePlain)
-			clear(metaKey)
-			clear(digest[:])
-			if readErr != nil {
-				return 0, [sha256.Size]byte{}, readErr
-			}
-			return 0, [sha256.Size]byte{}, ErrCorrupt
-		}
-		postings, err = decodeSearchIndexPage(pagePlain)
-		clear(pagePlain)
-		if err != nil {
-			clear(metaKey)
-			clear(digest[:])
-			return 0, [sha256.Size]byte{}, err
-		}
-		if len(postings) < searchIndexPageRows {
-			replacePage = true
-			for _, posting := range postings {
-				if posting.sourceID == sourceID {
-					clear(metaKey)
-					clear(digest[:])
-					return 0, [sha256.Size]byte{}, ErrCorrupt
-				}
-			}
-		} else {
-			postings = nil
-			pageNo = meta.pageCount
-			meta.pageCount++
-		}
-	} else {
-		meta.pageCount = 1
-	}
-	if len(postings) == 0 {
-		postings = make([]searchIndexPosting, 0, searchIndexPageRows)
-	}
-	postings = append(postings, searchIndexPosting{sourceID: sourceID, fields: fields})
-	pagePlain, err := encodeSearchIndexPage(postings)
+	err = tx.insertSearchIndexTreeLocked(kind, digest, ordered, searchIndexPosting{sourceID: sourceID, fields: fields})
+	clear(ordered)
 	if err != nil {
-		clear(metaKey)
 		clear(digest[:])
 		return 0, [sha256.Size]byte{}, err
 	}
-	pageKey := searchIndexKey(kind, digest, pageNo)
-	if err := tx.putSearchIndexValueLocked(pageKey, "search-index-page-v1", pagePlain, replacePage); err != nil {
-		clear(pagePlain)
-		clear(pageKey)
-		clear(metaKey)
-		clear(digest[:])
-		return 0, [sha256.Size]byte{}, err
-	}
-	clear(pagePlain)
-	clear(pageKey)
-	meta.postingCount++
-	metaPlain = encodeSearchIndexMeta(meta)
-	if err := tx.putSearchIndexValueLocked(metaKey, "search-index-meta-v1", metaPlain, hasMeta); err != nil {
-		clear(metaPlain)
-		clear(metaKey)
-		clear(digest[:])
-		return 0, [sha256.Size]byte{}, err
-	}
-	clear(metaPlain)
-	clear(metaKey)
-	return pageNo, digest, nil
+	return 0, digest, nil
 }
 
 func observationSearchTerms(observation capture.SanitizedObservation) (map[string]byte, error) {
@@ -464,7 +342,7 @@ func (tx *Tx) indexObservationLocked(observation capture.SanitizedObservation) e
 		return err
 	}
 	reverseKey := tx.store.searchReverseKey(observation.ContentID())
-	err = tx.putSearchIndexValueLocked(reverseKey, "search-index-reverse-v1", reversePlain, false)
+	err = tx.putSearchIndexValueLocked(reverseKey, "search-index-reverse-v3", reversePlain, false)
 	clear(reversePlain)
 	clear(reverseKey)
 	return err
@@ -484,10 +362,12 @@ func estimatedSearchIndexOperations(observation capture.SanitizedObservation) (i
 	if err != nil {
 		return 0, err
 	}
-	// Every term, exact-app filter and exact-domain filter costs at most six
-	// bounded reader/writer operations; the observation, size row, and reverse
-	// link cost six, with two more reserved for manifest load/flush.
-	return len(terms)*6 + 20, nil
+	// A term, exact-app filter, or exact-domain filter uses at most seven
+	// bounded operations on the normal path, including a fixed leaf split.
+	// Reserve another twenty for the observation, size row, reverse link, and
+	// manifest work. Branch-root splits remain transaction-atomic and subject
+	// to the physical writer's hard operation/byte ceilings.
+	return len(terms)*7 + 20, nil
 }
 
 func (tx *Tx) deleteEntryLocked(key []byte) error {
@@ -523,7 +403,7 @@ func (tx *Tx) deleteKnownEntryLocked(key, value []byte) error {
 
 func (tx *Tx) removeSearchIndexSourceLocked(sourceID string) error {
 	reverseKey := tx.store.searchReverseKey(sourceID)
-	reversePlain, found, err := tx.searchIndexPlainLocked(reverseKey, "search-index-reverse-v1")
+	reversePlain, found, err := tx.searchIndexPlainLocked(reverseKey, "search-index-reverse-v3")
 	if err != nil || !found {
 		clear(reverseKey)
 		clear(reversePlain)
@@ -539,84 +419,12 @@ func (tx *Tx) removeSearchIndexSourceLocked(sourceID string) error {
 		return err
 	}
 	for _, ref := range refs {
-		pageKey := searchIndexKey(ref.kind, ref.digest, ref.page)
-		pagePlain, pageFound, err := tx.searchIndexPlainLocked(pageKey, "search-index-page-v1")
-		if err != nil || !pageFound {
-			clear(pageKey)
-			clear(pagePlain)
-			if err != nil {
-				return err
-			}
+		if ref.page != 0 {
 			return ErrCorrupt
 		}
-		postings, err := decodeSearchIndexPage(pagePlain)
-		clear(pagePlain)
-		if err != nil {
-			clear(pageKey)
+		if err := tx.removeSearchIndexTreePostingLocked(ref.kind, ref.digest, sourceID, ref.fields); err != nil {
 			return err
 		}
-		foundPosting := false
-		kept := postings[:0]
-		for _, posting := range postings {
-			if posting.sourceID == sourceID {
-				if foundPosting || posting.fields != ref.fields {
-					clear(pageKey)
-					return ErrCorrupt
-				}
-				foundPosting = true
-				continue
-			}
-			kept = append(kept, posting)
-		}
-		if !foundPosting {
-			clear(pageKey)
-			return ErrCorrupt
-		}
-		metaKey := searchIndexKey(ref.kind, ref.digest, searchIndexMetaPage)
-		metaPlain, metaFound, err := tx.searchIndexPlainLocked(metaKey, "search-index-meta-v1")
-		if err != nil || !metaFound {
-			clear(metaKey)
-			clear(pageKey)
-			clear(metaPlain)
-			if err != nil {
-				return err
-			}
-			return ErrCorrupt
-		}
-		meta, err := decodeSearchIndexMeta(metaPlain)
-		clear(metaPlain)
-		if err != nil || meta.postingCount == 0 || meta.pageCount <= ref.page {
-			clear(metaKey)
-			clear(pageKey)
-			if err != nil {
-				return err
-			}
-			return ErrCorrupt
-		}
-		meta.postingCount--
-		pagePlain, err = encodeSearchIndexPage(kept)
-		if err != nil {
-			clear(metaKey)
-			clear(pageKey)
-			return err
-		}
-		if err := tx.putSearchIndexValueLocked(pageKey, "search-index-page-v1", pagePlain, true); err != nil {
-			clear(pagePlain)
-			clear(metaKey)
-			clear(pageKey)
-			return err
-		}
-		clear(pagePlain)
-		metaPlain = encodeSearchIndexMeta(meta)
-		if err := tx.putSearchIndexValueLocked(metaKey, "search-index-meta-v1", metaPlain, true); err != nil {
-			clear(metaPlain)
-			clear(metaKey)
-			clear(pageKey)
-			return err
-		}
-		clear(metaPlain)
-		clear(metaKey)
-		clear(pageKey)
 	}
 
 	reverseKey = tx.store.searchReverseKey(sourceID)
@@ -684,12 +492,12 @@ func (s *Store) ensureSearchIndex(ctx context.Context) error {
 		}
 		plain, err := s.open(searchIndexStateKey, "search-index-state-v1", envelope)
 		clear(envelope)
-		if err != nil || len(plain) != 2 || plain[0] != searchIndexFormatVersion || plain[1] != 1 {
+		if err != nil || len(plain) != 2 || plain[0] == 0 || plain[0] > searchIndexFormatVersion || plain[1] != 1 {
 			clear(plain)
 			return ErrCorrupt
 		}
+		ready = plain[0] == searchIndexFormatVersion
 		clear(plain)
-		ready = true
 		return nil
 	})
 	if err != nil || ready {
@@ -841,50 +649,6 @@ func decodeSearchIndexState(reader bolt.Reader, store *Store, maxBytes int) (int
 	return used, true, false, nil
 }
 
-func readSearchIndexMeta(reader bolt.Reader, store *Store, kind byte, digest [sha256.Size]byte, maxBytes int) (searchIndexMeta, int, bool, error) {
-	key := searchIndexKey(kind, digest, searchIndexMetaPage)
-	encoded, found, used, blocked, err := readBoundedIndexValue(reader, key, maxBytes)
-	clear(key)
-	if err != nil || blocked {
-		return searchIndexMeta{}, used, blocked, err
-	}
-	if !found {
-		return searchIndexMeta{}, used, false, nil
-	}
-	pageKey := searchIndexKey(kind, digest, searchIndexMetaPage)
-	plain, err := store.open(pageKey, "search-index-meta-v1", encoded)
-	clear(pageKey)
-	clear(encoded)
-	if err != nil {
-		return searchIndexMeta{}, used, false, ErrCorrupt
-	}
-	meta, err := decodeSearchIndexMeta(plain)
-	clear(plain)
-	return meta, used, false, err
-}
-
-func readSearchIndexPage(reader bolt.Reader, store *Store, kind byte, digest [sha256.Size]byte, page uint32, maxBytes int) ([]searchIndexPosting, int, bool, error) {
-	key := searchIndexKey(kind, digest, page)
-	encoded, found, used, blocked, err := readBoundedIndexValue(reader, key, maxBytes)
-	if err != nil || blocked {
-		clear(key)
-		return nil, used, blocked, err
-	}
-	if !found {
-		clear(key)
-		return nil, used, false, ErrCorrupt
-	}
-	plain, err := store.open(key, "search-index-page-v1", encoded)
-	clear(key)
-	clear(encoded)
-	if err != nil {
-		return nil, used, false, ErrCorrupt
-	}
-	postings, err := decodeSearchIndexPage(plain)
-	clear(plain)
-	return postings, used, false, err
-}
-
 func readSearchIndexReverse(reader bolt.Reader, store *Store, sourceID string, maxBytes int) (int, []searchIndexRef, int, bool, error) {
 	key := store.searchReverseKey(sourceID)
 	encoded, found, used, blocked, err := readBoundedIndexValue(reader, key, maxBytes)
@@ -896,7 +660,7 @@ func readSearchIndexReverse(reader bolt.Reader, store *Store, sourceID string, m
 		clear(key)
 		return 0, nil, used, false, ErrCorrupt
 	}
-	plain, err := store.open(key, "search-index-reverse-v1", encoded)
+	plain, err := store.open(key, "search-index-reverse-v3", encoded)
 	clear(key)
 	clear(encoded)
 	if err != nil {
@@ -921,8 +685,11 @@ func findSearchIndexRef(refs []searchIndexRef, kind byte, digest [sha256.Size]by
 }
 
 func (s *Store) SearchExact(ctx context.Context, query search.ExactQuery) (search.ExactPage, error) {
-	if ctx == nil || len(query.Terms) == 0 || len(query.Terms) > search.MaxTerms || query.MaxRows < 1 || query.MaxRows > search.MaxIndexRows || query.MaxBytes < 1 || query.MaxBytes > search.MaxIndexBytes {
+	if ctx == nil || len(query.Terms) == 0 || len(query.Terms) > search.MaxTerms || query.TopK < 0 || query.TopK > search.MaxResults || query.MaxRows < 1 || query.MaxRows > search.MaxIndexRows || query.MaxBytes < 1 || query.MaxBytes > search.MaxIndexBytes {
 		return search.ExactPage{}, search.ErrInvalidRequest
+	}
+	if query.TopK == 0 {
+		query.TopK = search.MaxResults
 	}
 	for i, term := range query.Terms {
 		normalized, err := search.NormalizeTokens(term, 1)
@@ -940,7 +707,7 @@ func (s *Store) SearchExact(ctx context.Context, query search.ExactQuery) (searc
 	}
 	var result search.ExactPage
 	err = s.view(ctx, func(reader bolt.Reader) error { // one snapshot for every posting and source reference
-		return s.searchExactReader(ctx, reader, query, &result)
+		return s.searchExactTreeReader(ctx, reader, query, &result)
 	})
 	if err != nil {
 		return search.ExactPage{}, err
@@ -948,20 +715,36 @@ func (s *Store) SearchExact(ctx context.Context, query search.ExactQuery) (searc
 	return result, nil
 }
 
-func (s *Store) searchExactReader(ctx context.Context, reader bolt.Reader, query search.ExactQuery, result *search.ExactPage) error {
+type searchIndexSearchStream struct {
+	constraintIndex int
+	iterator        *searchIndexTreeIterator
+	current         searchIndexPosting
+	currentScore    int
+	exhausted       bool
+	seen            map[string]struct{}
+}
+
+type searchIndexEvaluatedCandidate struct {
+	fields  []byte
+	matches bool
+	score   int
+}
+
+func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, query search.ExactQuery, result *search.ExactPage) error {
 	used, ready, blocked, err := decodeSearchIndexState(reader, s, query.MaxBytes)
 	result.Bytes += used
+	result.Nodes++
 	if err != nil {
 		return err
 	}
 	if blocked {
-		result.HasMore = true
-		return nil
+		return search.ErrIndexBudget
 	}
 	if !ready {
 		return search.ErrIndexUnavailable
 	}
 	constraints := make([]searchIndexConstraint, 0, len(query.Terms)+2)
+	defer func() { clearSearchIndexConstraints(constraints) }()
 	for _, term := range query.Terms {
 		constraints = append(constraints, searchIndexConstraint{kind: searchIndexTerm, digest: s.searchLookupDigest(searchIndexTerm, term)})
 	}
@@ -971,116 +754,170 @@ func (s *Store) searchExactReader(ctx context.Context, reader bolt.Reader, query
 	if query.Domain != "" {
 		constraints = append(constraints, searchIndexConstraint{kind: searchIndexDomain, digest: s.searchLookupDigest(searchIndexDomain, query.Domain)})
 	}
+	streams := make([]searchIndexSearchStream, len(constraints))
 	for i := range constraints {
-		remaining := query.MaxBytes - result.Bytes
-		meta, readBytes, stopped, err := readSearchIndexMeta(reader, s, constraints[i].kind, constraints[i].digest, remaining)
-		result.Bytes += readBytes
+		streams[i] = searchIndexSearchStream{
+			constraintIndex: i,
+			iterator:        newSearchIndexTreeIterator(ctx, reader, s, constraints[i].kind, constraints[i].digest),
+			seen:            make(map[string]struct{}),
+		}
+	}
+	evaluated := make(map[string]searchIndexEvaluatedCandidate, min(query.MaxRows, 128))
+	matchedCount := 0
+	advance := func(streamIndex int) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stream := &streams[streamIndex]
+		if stream.exhausted {
+			return nil
+		}
+		if result.Rows >= query.MaxRows {
+			return search.ErrIndexBudget
+		}
+		posting, ok, stopped, err := stream.iterator.next(result, query.MaxBytes)
 		if err != nil {
-			clearSearchIndexConstraints(constraints)
 			return err
 		}
 		if stopped {
-			result.HasMore = true
-			clearSearchIndexConstraints(constraints)
+			return search.ErrIndexBudget
+		}
+		if !ok {
+			stream.exhausted = true
+			stream.currentScore = 0
 			return nil
 		}
-		constraints[i].meta = meta
-		if meta.postingCount == 0 {
-			clearSearchIndexConstraints(constraints)
+		result.Rows++
+		if _, duplicate := stream.seen[posting.sourceID]; duplicate {
+			return ErrCorrupt
+		}
+		stream.seen[posting.sourceID] = struct{}{}
+		stream.current = posting
+		constraint := constraints[stream.constraintIndex]
+		if constraint.kind == searchIndexTerm {
+			stream.currentScore = searchIndexWeight(posting.fields)
+			if stream.currentScore == 0 {
+				return ErrCorrupt
+			}
+		} else if posting.fields != 0 {
+			return ErrCorrupt
+		}
+		if previous, seen := evaluated[posting.sourceID]; seen {
+			if previous.fields[stream.constraintIndex] != posting.fields {
+				return ErrCorrupt
+			}
 			return nil
 		}
-	}
-	seed := 0
-	for i := 1; i < len(constraints); i++ {
-		if constraints[i].meta.postingCount < constraints[seed].meta.postingCount {
-			seed = i
+		if result.Nodes >= search.MaxIndexNodes {
+			return search.ErrIndexBudget
 		}
-	}
-	seedConstraint := constraints[seed]
-	var seen uint64
-	for pageNo := uint32(0); pageNo < seedConstraint.meta.pageCount; pageNo++ {
-		remaining := query.MaxBytes - result.Bytes
-		postings, readBytes, stopped, err := readSearchIndexPage(reader, s, seedConstraint.kind, seedConstraint.digest, pageNo, remaining)
+		result.Nodes++
+		sourceBytes, refs, readBytes, stopped, err := readSearchIndexReverse(reader, s, posting.sourceID, query.MaxBytes-result.Bytes)
 		result.Bytes += readBytes
 		if err != nil {
-			clearSearchIndexConstraints(constraints)
 			return err
 		}
 		if stopped {
-			result.HasMore = true
-			clearSearchIndexConstraints(constraints)
-			return nil
+			return search.ErrIndexBudget
 		}
-		for _, posting := range postings {
-			if err := ctx.Err(); err != nil {
-				clearSearchIndexConstraints(constraints)
-				return err
+		candidate := searchIndexEvaluatedCandidate{fields: make([]byte, len(constraints)), matches: true}
+		for i, constraint := range constraints {
+			ref, found := findSearchIndexRef(refs, constraint.kind, constraint.digest)
+			if !found {
+				candidate.matches = false
+				continue
 			}
-			if result.Rows >= query.MaxRows {
-				result.HasMore = true
-				clearSearchIndexConstraints(constraints)
-				return nil
-			}
-			result.Rows++
-			seen++
-			remaining = query.MaxBytes - result.Bytes
-			sourceBytes, refs, readBytes, stopped, err := readSearchIndexReverse(reader, s, posting.sourceID, remaining)
-			result.Bytes += readBytes
-			if err != nil {
-				clearSearchIndexConstraints(constraints)
-				return err
-			}
-			if stopped {
-				result.HasMore = true
-				clearSearchIndexConstraints(constraints)
-				return nil
-			}
-			matches := true
-			score := 0
-			for _, constraint := range constraints {
-				ref, found := findSearchIndexRef(refs, constraint.kind, constraint.digest)
-				if !found {
-					if constraint.kind == seedConstraint.kind && constraint.digest == seedConstraint.digest {
-						clearSearchIndexRefs(refs)
-						clearSearchIndexConstraints(constraints)
-						return ErrCorrupt
-					}
-					matches = false
-					break
-				}
-				if constraint.kind == seedConstraint.kind && constraint.digest == seedConstraint.digest && (ref.page != pageNo || ref.fields != posting.fields) {
+			candidate.fields[i] = ref.fields
+			if constraint.kind == searchIndexTerm {
+				weight := searchIndexWeight(ref.fields)
+				if weight == 0 {
 					clearSearchIndexRefs(refs)
-					clearSearchIndexConstraints(constraints)
 					return ErrCorrupt
 				}
-				if constraint.kind == searchIndexTerm {
-					weight := 0
-					if ref.fields&0x02 != 0 {
-						weight = 3
-					} else if ref.fields&0x04 != 0 {
-						weight = 2
-					} else if ref.fields&0x01 != 0 {
-						weight = 1
-					}
-					if weight == 0 {
-						matches = false
-						break
-					}
-					score += weight
-				}
-			}
-			clearSearchIndexRefs(refs)
-			if matches {
-				result.Hits = append(result.Hits, search.IndexHit{SourceID: posting.sourceID, Score: score, Bytes: sourceBytes})
+				candidate.score += weight
+			} else if ref.fields != 0 {
+				clearSearchIndexRefs(refs)
+				return ErrCorrupt
 			}
 		}
+		clearSearchIndexRefs(refs)
+		if candidate.fields[stream.constraintIndex] != posting.fields {
+			clear(candidate.fields)
+			return ErrCorrupt
+		}
+		evaluated[posting.sourceID] = candidate
+		if candidate.matches {
+			matchedCount++
+			result.Hits = append(result.Hits, search.IndexHit{SourceID: posting.sourceID, Score: candidate.score, Bytes: sourceBytes})
+			sort.Slice(result.Hits, func(i, j int) bool {
+				if result.Hits[i].Score != result.Hits[j].Score {
+					return result.Hits[i].Score > result.Hits[j].Score
+				}
+				return result.Hits[i].SourceID < result.Hits[j].SourceID
+			})
+			if len(result.Hits) > query.TopK {
+				result.Hits = result.Hits[:query.TopK]
+			}
+		}
+		return nil
 	}
-	if seen != seedConstraint.meta.postingCount {
-		clearSearchIndexConstraints(constraints)
-		return ErrCorrupt
+	for i := range streams {
+		if err := advance(i); err != nil {
+			return err
+		}
+		if streams[i].exhausted {
+			return nil
+		}
 	}
-	clearSearchIndexConstraints(constraints)
-	return nil
+	for {
+		if searchIndexTopKProven(result.Hits, query.TopK, streams) {
+			result.HasMore = matchedCount > len(result.Hits)
+			for _, stream := range streams {
+				result.HasMore = result.HasMore || !stream.exhausted
+			}
+			return nil
+		}
+		progressed := false
+		for i := range streams {
+			if streams[i].exhausted {
+				continue
+			}
+			if err := advance(i); err != nil {
+				return err
+			}
+			progressed = true
+			if streams[i].exhausted {
+				result.HasMore = matchedCount > len(result.Hits)
+				return nil
+			}
+		}
+		if !progressed {
+			result.HasMore = matchedCount > len(result.Hits)
+			return nil
+		}
+	}
+}
+
+func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream) bool {
+	if len(hits) < topK {
+		return false
+	}
+	threshold := 0
+	maxCursorID := ""
+	for _, stream := range streams {
+		if stream.exhausted {
+			return true
+		}
+		threshold += stream.currentScore
+		if stream.current.sourceID > maxCursorID {
+			maxCursorID = stream.current.sourceID
+		}
+	}
+	kth := hits[topK-1]
+	if kth.Score > threshold {
+		return true
+	}
+	return kth.Score == threshold && kth.SourceID <= maxCursorID
 }
 
 func clearSearchIndexConstraints(constraints []searchIndexConstraint) {
