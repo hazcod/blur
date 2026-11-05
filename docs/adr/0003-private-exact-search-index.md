@@ -24,12 +24,23 @@ Term, app-filter, domain-filter, and reverse-link lookup keys are HMAC-SHA-256
 values with separate domain labels and the store's keyed identifier secret.
 Each private posting list is an encrypted B+ tree. Leaves contain at most 64
 source IDs; packed branch nodes contain at most 1,024 child references and
-encrypted source-ID-order fences. Node contents and source IDs are
-encrypted/authenticated. Child node IDs are random and only their keyed
-physical addresses are stored. Reverse links map an observation to every
-lookup key it references, so its postings can be removed transactionally.
-Observation writes/deletes, tree changes, reverse links, and the manifest share
-one `Store.Update` transaction.
+encrypted source-ID-order fences. Node contents, source IDs, child IDs, branch
+fences, and deferred sibling links are encrypted/authenticated. Node IDs are
+128-bit opaque values inside encrypted nodes; physical node records are
+addressed by keyed HMACs. Reverse links map an observation to every lookup key
+it references, so its postings can be removed transactionally. Observation
+writes/deletes, tree changes, reverse links, and the manifest share one
+`Store.Update` transaction.
+
+Index format version 4 uses encrypted deferred right-sibling links for a
+non-root branch split. This avoids materializing/rebucketing a second full
+1,024-entry packed branch in the observation transaction. Readers follow the
+encrypted link within the same root-to-leaf depth and still prove the ordered
+top-K prefix. A following non-splitting mutation repairs the parent pointer in
+that same transaction; a second split at a branch with an outstanding link
+fails closed and rolls back instead of creating an unbounded sibling chain.
+The format-version mismatch causes versions 1 through 3 to be cleared and
+rebuilt before the store is exposed; there is no mixed-version query state.
 
 When opening an existing store without a completed-index marker, opening first
 removes any incomplete index, rebuilds it in bounded transactions, and commits
@@ -69,15 +80,45 @@ equality/linkage for a repeated term or app/domain value), and a keyed node
 address. The number of nodes in a tree and its depth are observable from record
 counts; encrypted node payload lengths reveal leaf/branch size classes and
 approximate occupancy (up to 64 posting rows per leaf and 1,024 child references
-per branch). Write timing and key insertion/deletion reveal update activity.
+per branch). A deferred split adds a node record just like a regular split;
+the encrypted sibling link and ordering fence are not visible in plaintext.
+Write timing and key insertion/deletion reveal update activity.
 This residual structural and equality leakage is accepted for this local exact
 index and must remain explicit in threat-model reviews.
 
 Leaf and packed-branch splits move a median split along the root-to-leaf path;
 they do not rebucket all siblings. The maximum tree depth is four and all node
-reads, rows, bytes, and mutations remain bounded. A transaction that reaches
-the physical operation/byte ceiling aborts atomically; it is never split into
-multiple commits for one observation.
+reads, rows, bytes, and mutations remain bounded. The declared write estimate
+is seven operations per affected posting tree plus 20 fixed observation,
+reverse-link, size-row, and manifest operations. With the maximum 128 unique
+text terms plus app and domain trees (130 trees), the estimate is 930
+operations, leaving headroom under the physical writer's 1,024-operation cap.
+A transaction that reaches the physical operation/byte ceiling aborts
+atomically; it is never split into multiple commits for one observation. The
+16 MiB limit is per physical transaction, not a global posting-store cap. No
+global posting-count or total-index-size cap is currently enforced; bounded
+page/value sizes and query/transaction budgets are not a global storage quota.
+
+The synchronized max-130 branch-split fixture measured 918 writer operations
+and 13,754,884 charged bytes; ordinary sibling repair measured 788 operations
+and 3,405,197 bytes; repair concurrent with a full-leaf split measured 918
+operations and 7,243,219 bytes. These figures include manifest load/flush
+work, and each stayed below the 1,024-operation and 16 MiB transaction caps
+with at least 64 operations and 1 MiB of byte headroom.
+
+The packed non-root branch cascade has an opt-in focused benchmark. It builds a
+synthetic 1,024-child encrypted branch with a full 64-row leaf, then records 20
+independent split samples while resetting the fixture outside each timed
+sample. Reproduce with:
+
+```sh
+BLUR_RUN_BRANCH_CASCADE_BENCH=1 go test ./internal/storage/durable -run '^$' \
+	-bench '^BenchmarkDurableIndexPackedBranchSplitCascade$' -benchtime=1x -count=1 -v
+```
+
+On the environment above, the 20-sample split p50/p95 were 8.876/11.846 ms;
+the operation used 9 charged writer operations and 102,020 transaction bytes.
+These are local synthetic fixture measurements, not portable latency targets.
 
 ## Scale benchmark
 
@@ -119,6 +160,14 @@ not portable SLOs. The memory figure is Go heap-in-use after forced GC while
 the DB is open; it excludes bbolt-mapped pages and process RSS. The benchmark
 stores about 913 MB (870.9 MiB) for 1M records, so disk footprint remains a
 material trade-off even though exact read latency stays bounded.
+
+The table above is the format-v3 scale baseline. In the format-v4 sibling-link
+follow-up, the same opt-in command completed the 100k case: setup/ingest
+69.875 s; 32-row write p50/p95 21.606/27.554 ms; index read 0.220/0.462 ms;
+100-result search 1.606/1.799 ms; reopen 0.239/0.240 s; database 101,040,128
+bytes; heap-in-use 4.859 MiB. Per owner direction, the v4 1M rerun was
+interrupted after 359.689 s before it completed, so there is no v4 1M result;
+the v3 1M metrics above remain the last completed 1M evidence.
 
 A separate `BenchmarkDurableExactIndexRankedOverCap` run exercises a 1,036-
 record corpus where field-score winners occur beyond the prior 1,000-row

@@ -24,7 +24,7 @@ const (
 	searchIndexDomain  byte = 0x12
 	searchIndexReverse byte = 0x7f
 
-	searchIndexFormatVersion   byte = 3
+	searchIndexFormatVersion   byte = 4
 	searchIndexPageRows             = 64
 	searchIndexPageHeader           = 2
 	searchIndexRefBytes             = 1 + sha256.Size + 4 + 1
@@ -342,7 +342,7 @@ func (tx *Tx) indexObservationLocked(observation capture.SanitizedObservation) e
 		return err
 	}
 	reverseKey := tx.store.searchReverseKey(observation.ContentID())
-	err = tx.putSearchIndexValueLocked(reverseKey, "search-index-reverse-v3", reversePlain, false)
+	err = tx.putSearchIndexValueLocked(reverseKey, "search-index-reverse-v4", reversePlain, false)
 	clear(reversePlain)
 	clear(reverseKey)
 	return err
@@ -362,12 +362,19 @@ func estimatedSearchIndexOperations(observation capture.SanitizedObservation) (i
 	if err != nil {
 		return 0, err
 	}
-	// A term, exact-app filter, or exact-domain filter uses at most seven
-	// bounded operations on the normal path, including a fixed leaf split.
+	// A term or exact filter tree uses at most seven bounded operations,
+	// including one leaf split and (when needed) publication/repair of one
+	// deferred branch sibling. App and domain are separate posting trees.
 	// Reserve another twenty for the observation, size row, reverse link, and
-	// manifest work. Branch-root splits remain transaction-atomic and subject
-	// to the physical writer's hard operation/byte ceilings.
-	return len(terms)*7 + 20, nil
+	// manifest work. The physical writer remains the authoritative hard cap.
+	treeCount := len(terms)
+	if observation.AppID() != "" {
+		treeCount++
+	}
+	if observation.Domain() != "" {
+		treeCount++
+	}
+	return treeCount*7 + 20, nil
 }
 
 func (tx *Tx) deleteEntryLocked(key []byte) error {
@@ -403,7 +410,7 @@ func (tx *Tx) deleteKnownEntryLocked(key, value []byte) error {
 
 func (tx *Tx) removeSearchIndexSourceLocked(sourceID string) error {
 	reverseKey := tx.store.searchReverseKey(sourceID)
-	reversePlain, found, err := tx.searchIndexPlainLocked(reverseKey, "search-index-reverse-v3")
+	reversePlain, found, err := tx.searchIndexPlainLocked(reverseKey, "search-index-reverse-v4")
 	if err != nil || !found {
 		clear(reverseKey)
 		clear(reversePlain)
@@ -660,7 +667,7 @@ func readSearchIndexReverse(reader bolt.Reader, store *Store, sourceID string, m
 		clear(key)
 		return 0, nil, used, false, ErrCorrupt
 	}
-	plain, err := store.open(key, "search-index-reverse-v3", encoded)
+	plain, err := store.open(key, "search-index-reverse-v4", encoded)
 	clear(key)
 	clear(encoded)
 	if err != nil {

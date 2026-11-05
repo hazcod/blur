@@ -16,10 +16,12 @@ import (
 const (
 	searchIndexTreeNodeKeyBytes = 2 + sha256.Size + sha256.Size
 	searchIndexTreeHeaderBytes  = 4
+	searchIndexTreeSiblingBytes = searchIndexTreeOrderBytes + searchIndexTreeChildIDBytes
 	searchIndexTreeLeaf         = 1
 	searchIndexTreeBranch       = 2
 	searchIndexTreeOrderBytes   = 1 + sha256.Size
-	searchIndexTreeChildBytes   = searchIndexTreeOrderBytes + sha256.Size
+	searchIndexTreeChildIDBytes = 16
+	searchIndexTreeChildBytes   = searchIndexTreeOrderBytes + searchIndexTreeChildIDBytes
 	searchIndexTreeMaxChildren  = 1024
 	searchIndexTreeMaxDepth     = 4
 )
@@ -30,14 +32,16 @@ type searchIndexTreeChild struct {
 }
 
 type searchIndexTreeNode struct {
-	leaf     bool
-	postings []searchIndexPosting
-	children []searchIndexTreeChild
+	leaf         bool
+	postings     []searchIndexPosting
+	children     []searchIndexTreeChild
+	rightSibling [sha256.Size]byte
+	siblingPivot [searchIndexTreeOrderBytes]byte
 }
 
 func (s *Store) searchIndexTreeKey(kind byte, digest [sha256.Size]byte, nodeID [sha256.Size]byte) []byte {
 	mac := hmac.New(sha256.New, s.state.idKey)
-	_, _ = io.WriteString(mac, "blur.durable.search.tree-node.v3\x00")
+	_, _ = io.WriteString(mac, "blur.durable.search.tree-node.v4\x00")
 	_, _ = mac.Write([]byte{kind})
 	_, _ = mac.Write(digest[:])
 	_, _ = mac.Write(nodeID[:])
@@ -52,14 +56,14 @@ func (s *Store) searchIndexTreeKey(kind byte, digest [sha256.Size]byte, nodeID [
 
 func (s *Store) searchIndexTreeChildID(kind byte, digest [sha256.Size]byte, parent [sha256.Size]byte, pivot [searchIndexTreeOrderBytes]byte, nodeType, side byte) [sha256.Size]byte {
 	mac := hmac.New(sha256.New, s.state.idKey)
-	_, _ = io.WriteString(mac, "blur.durable.search.tree-child.v3\x00")
+	_, _ = io.WriteString(mac, "blur.durable.search.tree-child.v4\x00")
 	_, _ = mac.Write([]byte{kind, nodeType, side})
 	_, _ = mac.Write(digest[:])
 	_, _ = mac.Write(parent[:])
 	_, _ = mac.Write(pivot[:])
 	sum := mac.Sum(nil)
 	var id [sha256.Size]byte
-	copy(id[:], sum)
+	copy(id[:searchIndexTreeChildIDBytes], sum[:searchIndexTreeChildIDBytes])
 	clear(sum)
 	return id
 }
@@ -67,7 +71,7 @@ func (s *Store) searchIndexTreeChildID(kind byte, digest [sha256.Size]byte, pare
 func newSearchIndexTreeNodeID() ([sha256.Size]byte, error) {
 	var id [sha256.Size]byte
 	for id == ([sha256.Size]byte{}) {
-		if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
+		if _, err := io.ReadFull(rand.Reader, id[:searchIndexTreeChildIDBytes]); err != nil {
 			clear(id[:])
 			return [sha256.Size]byte{}, err
 		}
@@ -122,8 +126,11 @@ func searchIndexPostingLess(a, b searchIndexPosting) bool {
 
 func encodeSearchIndexTreeNode(node searchIndexTreeNode) ([]byte, error) {
 	if node.leaf {
-		if len(node.postings) == 0 || len(node.postings) > searchIndexPageRows || len(node.children) != 0 {
+		if len(node.postings) > searchIndexPageRows || len(node.children) != 0 || node.rightSibling != ([sha256.Size]byte{}) || node.siblingPivot != ([searchIndexTreeOrderBytes]byte{}) {
 			return nil, ErrCorrupt
+		}
+		if len(node.postings) == 0 {
+			return []byte{searchIndexFormatVersion, searchIndexTreeLeaf, 0, 0}, nil
 		}
 		page, err := encodeSearchIndexPage(node.postings)
 		if err != nil {
@@ -140,11 +147,25 @@ func encodeSearchIndexTreeNode(node searchIndexTreeNode) ([]byte, error) {
 	if len(node.postings) != 0 || len(node.children) == 0 || len(node.children) > searchIndexTreeMaxChildren {
 		return nil, ErrCorrupt
 	}
-	encoded := make([]byte, searchIndexTreeHeaderBytes+len(node.children)*searchIndexTreeChildBytes)
+	if (node.rightSibling == ([sha256.Size]byte{})) != (node.siblingPivot == ([searchIndexTreeOrderBytes]byte{})) {
+		return nil, ErrCorrupt
+	}
+	if node.rightSibling != ([sha256.Size]byte{}) {
+		for _, unused := range node.rightSibling[searchIndexTreeChildIDBytes:] {
+			if unused != 0 {
+				return nil, ErrCorrupt
+			}
+		}
+	}
+	encoded := make([]byte, searchIndexTreeHeaderBytes+searchIndexTreeSiblingBytes+len(node.children)*searchIndexTreeChildBytes)
 	encoded[0], encoded[1] = searchIndexFormatVersion, searchIndexTreeBranch
 	encoded[2] = byte(len(node.children) >> 8)
 	encoded[3] = byte(len(node.children))
 	position := searchIndexTreeHeaderBytes
+	copy(encoded[position:position+searchIndexTreeChildIDBytes], node.rightSibling[:searchIndexTreeChildIDBytes])
+	position += searchIndexTreeChildIDBytes
+	copy(encoded[position:position+searchIndexTreeOrderBytes], node.siblingPivot[:])
+	position += searchIndexTreeOrderBytes
 	var previous [searchIndexTreeOrderBytes]byte
 	seen := make(map[[sha256.Size]byte]struct{}, len(node.children))
 	for i, child := range node.children {
@@ -162,7 +183,13 @@ func encodeSearchIndexTreeNode(node searchIndexTreeNode) ([]byte, error) {
 			return nil, ErrCorrupt
 		}
 		copy(encoded[position:position+searchIndexTreeOrderBytes], child.upper[:])
-		copy(encoded[position+searchIndexTreeOrderBytes:position+searchIndexTreeChildBytes], child.id[:])
+		for _, unused := range child.id[searchIndexTreeChildIDBytes:] {
+			if unused != 0 {
+				clear(encoded)
+				return nil, ErrCorrupt
+			}
+		}
+		copy(encoded[position+searchIndexTreeOrderBytes:position+searchIndexTreeChildBytes], child.id[:searchIndexTreeChildIDBytes])
 		previous = child.upper
 		position += searchIndexTreeChildBytes
 	}
@@ -185,8 +212,14 @@ func decodeSearchIndexTreeNode(encoded []byte, kind byte) (searchIndexTreeNode, 
 	node := searchIndexTreeNode{}
 	switch encoded[1] {
 	case searchIndexTreeLeaf:
+		if count == 0 {
+			if len(encoded) != searchIndexTreeHeaderBytes {
+				return searchIndexTreeNode{}, ErrCorrupt
+			}
+			return searchIndexTreeNode{leaf: true}, nil
+		}
 		postings, err := decodeSearchIndexPage(encoded[searchIndexTreeHeaderBytes:])
-		if err != nil || len(postings) == 0 || len(postings) != count {
+		if err != nil || len(postings) != count {
 			return searchIndexTreeNode{}, ErrCorrupt
 		}
 		for _, posting := range postings {
@@ -199,17 +232,35 @@ func decodeSearchIndexTreeNode(encoded []byte, kind byte) (searchIndexTreeNode, 
 		}
 		return searchIndexTreeNode{leaf: true, postings: postings}, nil
 	case searchIndexTreeBranch:
-		if count == 0 || count > searchIndexTreeMaxChildren || len(encoded) != searchIndexTreeHeaderBytes+count*searchIndexTreeChildBytes {
+		if count == 0 || count > searchIndexTreeMaxChildren || len(encoded) != searchIndexTreeHeaderBytes+searchIndexTreeSiblingBytes+count*searchIndexTreeChildBytes {
 			return searchIndexTreeNode{}, ErrCorrupt
 		}
 		node.children = make([]searchIndexTreeChild, count)
 		position := searchIndexTreeHeaderBytes
+		copy(node.rightSibling[:searchIndexTreeChildIDBytes], encoded[position:position+searchIndexTreeChildIDBytes])
+		position += searchIndexTreeChildIDBytes
+		copy(node.siblingPivot[:], encoded[position:position+searchIndexTreeOrderBytes])
+		position += searchIndexTreeOrderBytes
+		if node.rightSibling == ([sha256.Size]byte{}) {
+			if node.siblingPivot != ([searchIndexTreeOrderBytes]byte{}) {
+				return searchIndexTreeNode{}, ErrCorrupt
+			}
+		} else {
+			if node.siblingPivot == ([searchIndexTreeOrderBytes]byte{}) || node.siblingPivot == searchIndexTreeInfinity {
+				return searchIndexTreeNode{}, ErrCorrupt
+			}
+			for _, unused := range node.rightSibling[searchIndexTreeChildIDBytes:] {
+				if unused != 0 {
+					return searchIndexTreeNode{}, ErrCorrupt
+				}
+			}
+		}
 		var previous [searchIndexTreeOrderBytes]byte
 		seen := make(map[[sha256.Size]byte]struct{}, count)
 		for i := range node.children {
 			child := &node.children[i]
 			copy(child.upper[:], encoded[position:position+searchIndexTreeOrderBytes])
-			copy(child.id[:], encoded[position+searchIndexTreeOrderBytes:position+searchIndexTreeChildBytes])
+			copy(child.id[:searchIndexTreeChildIDBytes], encoded[position+searchIndexTreeOrderBytes:position+searchIndexTreeChildBytes])
 			if child.id == ([sha256.Size]byte{}) || i > 0 && bytes.Compare(previous[:], child.upper[:]) >= 0 || child.upper == searchIndexTreeInfinity && i != count-1 {
 				return searchIndexTreeNode{}, ErrCorrupt
 			}
@@ -242,10 +293,17 @@ func validateSearchIndexTreeNodeRange(node searchIndexTreeNode, upper *[searchIn
 		}
 		return nil
 	}
-	if upper == nil && node.children[len(node.children)-1].upper != searchIndexTreeInfinity {
+	lastUpper := node.children[len(node.children)-1].upper
+	if node.rightSibling != ([sha256.Size]byte{}) {
+		if lastUpper != node.siblingPivot || upper != nil && bytes.Compare(lastUpper[:], upper[:]) > 0 || upper == nil && lastUpper == searchIndexTreeInfinity {
+			return ErrCorrupt
+		}
+		return nil
+	}
+	if upper == nil && lastUpper != searchIndexTreeInfinity {
 		return ErrCorrupt
 	}
-	if upper != nil && node.children[len(node.children)-1].upper != *upper {
+	if upper != nil && lastUpper != *upper {
 		return ErrCorrupt
 	}
 	return nil
@@ -262,7 +320,7 @@ func (tx *Tx) readSearchIndexTreeNodeLocked(kind byte, digest [sha256.Size]byte,
 		clear(key)
 		return searchIndexTreeNode{}, nil, false, nil
 	}
-	plain, err := tx.store.open(key, "search-index-tree-v3", envelope)
+	plain, err := tx.store.open(key, "search-index-tree-v4", envelope)
 	clear(key)
 	if err != nil {
 		clear(envelope)
@@ -284,7 +342,7 @@ func (tx *Tx) putSearchIndexTreeNodeLocked(kind byte, digest [sha256.Size]byte, 
 		clear(key)
 		return err
 	}
-	envelope, err := tx.store.seal(key, "search-index-tree-v3", plain)
+	envelope, err := tx.store.seal(key, "search-index-tree-v4", plain)
 	clear(plain)
 	if err != nil {
 		clear(key)
@@ -310,8 +368,10 @@ func (tx *Tx) putSearchIndexTreeNodeLocked(kind byte, digest [sha256.Size]byte, 
 }
 
 type searchIndexTreeSplit struct {
-	pivot [searchIndexTreeOrderBytes]byte
-	right [sha256.Size]byte
+	pivot    [searchIndexTreeOrderBytes]byte
+	right    [sha256.Size]byte
+	deferred bool
+	repair   bool
 }
 
 func (tx *Tx) insertSearchIndexTreeLocked(kind byte, digest [sha256.Size]byte, ordered []byte, posting searchIndexPosting) error {
@@ -394,20 +454,56 @@ func (tx *Tx) insertSearchIndexTreeLocked(kind byte, digest [sha256.Size]byte, o
 		if depth == searchIndexTreeMaxDepth-1 {
 			return nil, ErrCorrupt
 		}
+		pendingSibling := node.rightSibling != ([sha256.Size]byte{}) && (upper == nil || bytes.Compare(node.siblingPivot[:], upper[:]) < 0)
+		if pendingSibling && bytes.Compare(wanted[:], node.siblingPivot[:]) > 0 {
+			siblingSplit, err := insert(node.rightSibling, depth, upper)
+			if err != nil {
+				return nil, err
+			}
+			if siblingSplit != nil {
+				return nil, search.ErrIndexBudget
+			}
+			return &searchIndexTreeSplit{pivot: node.siblingPivot, right: node.rightSibling, repair: true}, nil
+		}
 		position := treeChildPosition(node.children, wanted)
 		child := node.children[position]
 		childUpper := child.upper
 		childSplit, err := insert(child.id, depth+1, &childUpper)
-		if err != nil || childSplit == nil {
+		if err != nil {
 			return nil, err
 		}
+		if childSplit == nil {
+			if pendingSibling {
+				return &searchIndexTreeSplit{pivot: node.siblingPivot, right: node.rightSibling, repair: true}, nil
+			}
+			return nil, nil
+		}
+		if childSplit.deferred {
+			if pendingSibling {
+				return nil, search.ErrIndexBudget
+			}
+			return childSplit, nil
+		}
 		children := append([]searchIndexTreeChild(nil), node.children...)
-		children[position].upper = childSplit.pivot
-		children = append(children, searchIndexTreeChild{})
-		copy(children[position+2:], children[position+1:])
-		children[position+1] = searchIndexTreeChild{upper: childUpper, id: childSplit.right}
+		if childSplit.repair && position+1 < len(children) && children[position+1].id == childSplit.right {
+			// The parent link was already published by an earlier transaction.
+		} else {
+			children[position].upper = childSplit.pivot
+			children = append(children, searchIndexTreeChild{})
+			copy(children[position+2:], children[position+1:])
+			children[position+1] = searchIndexTreeChild{upper: childUpper, id: childSplit.right}
+		}
 		if len(children) <= searchIndexTreeMaxChildren {
-			return nil, tx.putSearchIndexTreeNodeLocked(kind, digest, nodeID, searchIndexTreeNode{children: children}, oldEnvelope)
+			if err := tx.putSearchIndexTreeNodeLocked(kind, digest, nodeID, searchIndexTreeNode{children: children}, oldEnvelope); err != nil {
+				return nil, err
+			}
+			if pendingSibling {
+				return &searchIndexTreeSplit{pivot: node.siblingPivot, right: node.rightSibling, repair: true}, nil
+			}
+			return nil, nil
+		}
+		if pendingSibling {
+			return nil, search.ErrIndexBudget
 		}
 		middle := len(children) / 2
 		leftNode := searchIndexTreeNode{children: append([]searchIndexTreeChild(nil), children[:middle]...)}
@@ -435,13 +531,15 @@ func (tx *Tx) insertSearchIndexTreeLocked(kind byte, digest [sha256.Size]byte, o
 		if err != nil {
 			return nil, err
 		}
+		leftNode.rightSibling = rightID
+		leftNode.siblingPivot = pivot
 		if err := tx.putSearchIndexTreeNodeLocked(kind, digest, nodeID, leftNode, oldEnvelope); err != nil {
 			return nil, err
 		}
 		if err := tx.putSearchIndexTreeNodeLocked(kind, digest, rightID, rightNode, nil); err != nil {
 			return nil, err
 		}
-		return &searchIndexTreeSplit{pivot: pivot, right: rightID}, nil
+		return &searchIndexTreeSplit{pivot: pivot, right: rightID, deferred: true}, nil
 	}
 	_, err := insert(root, 0, nil)
 	return err
@@ -473,22 +571,22 @@ func (tx *Tx) removeSearchIndexTreePostingLocked(kind byte, digest [sha256.Size]
 	var wanted [searchIndexTreeOrderBytes]byte
 	copy(wanted[:], ordered)
 	var root [sha256.Size]byte
-	var remove func([sha256.Size]byte, int, *[searchIndexTreeOrderBytes]byte) (bool, error)
-	remove = func(nodeID [sha256.Size]byte, depth int, upper *[searchIndexTreeOrderBytes]byte) (bool, error) {
+	var remove func([sha256.Size]byte, int, *[searchIndexTreeOrderBytes]byte) (*searchIndexTreeSplit, error)
+	remove = func(nodeID [sha256.Size]byte, depth int, upper *[searchIndexTreeOrderBytes]byte) (*searchIndexTreeSplit, error) {
 		if depth >= searchIndexTreeMaxDepth {
-			return false, ErrCorrupt
+			return nil, ErrCorrupt
 		}
 		node, oldEnvelope, found, err := tx.readSearchIndexTreeNodeLocked(kind, digest, nodeID)
 		if err != nil || !found {
 			clear(oldEnvelope)
 			if err != nil {
-				return false, err
+				return nil, err
 			}
-			return false, ErrCorrupt
+			return nil, ErrCorrupt
 		}
 		defer clear(oldEnvelope)
 		if err := validateSearchIndexTreeNodeRange(node, upper, kind); err != nil {
-			return false, err
+			return nil, err
 		}
 		if node.leaf {
 			kept := make([]searchIndexPosting, 0, len(node.postings)-1)
@@ -496,7 +594,7 @@ func (tx *Tx) removeSearchIndexTreePostingLocked(kind byte, digest [sha256.Size]
 			for _, posting := range node.postings {
 				if posting.sourceID == sourceID {
 					if removed || posting.fields != fields {
-						return false, ErrCorrupt
+						return nil, ErrCorrupt
 					}
 					removed = true
 					continue
@@ -504,42 +602,56 @@ func (tx *Tx) removeSearchIndexTreePostingLocked(kind byte, digest [sha256.Size]
 				kept = append(kept, posting)
 			}
 			if !removed {
-				return false, ErrCorrupt
+				return nil, ErrCorrupt
 			}
-			if len(kept) == 0 {
-				key := tx.store.searchIndexTreeKey(kind, digest, nodeID)
-				err := tx.deleteKnownEntryLocked(key, oldEnvelope)
-				clear(key)
-				return true, err
-			}
-			return false, tx.putSearchIndexTreeNodeLocked(kind, digest, nodeID, searchIndexTreeNode{leaf: true, postings: kept}, oldEnvelope)
+			return nil, tx.putSearchIndexTreeNodeLocked(kind, digest, nodeID, searchIndexTreeNode{leaf: true, postings: kept}, oldEnvelope)
 		}
 		if depth == searchIndexTreeMaxDepth-1 {
-			return false, ErrCorrupt
+			return nil, ErrCorrupt
+		}
+		pendingSibling := node.rightSibling != ([sha256.Size]byte{}) && (upper == nil || bytes.Compare(node.siblingPivot[:], upper[:]) < 0)
+		if pendingSibling && bytes.Compare(wanted[:], node.siblingPivot[:]) > 0 {
+			siblingRepair, err := remove(node.rightSibling, depth, upper)
+			if err != nil {
+				return nil, err
+			}
+			if siblingRepair != nil {
+				return nil, search.ErrIndexBudget
+			}
+			return &searchIndexTreeSplit{pivot: node.siblingPivot, right: node.rightSibling, repair: true}, nil
 		}
 		position := treeChildPosition(node.children, wanted)
 		child := node.children[position]
 		childUpper := child.upper
-		childEmpty, err := remove(child.id, depth+1, &childUpper)
-		if err != nil || !childEmpty {
-			return false, err
+		childRepair, err := remove(child.id, depth+1, &childUpper)
+		if err != nil {
+			return nil, err
+		}
+		if childRepair == nil && !pendingSibling {
+			return nil, nil
+		}
+		if pendingSibling && childRepair != nil {
+			return nil, search.ErrIndexBudget
 		}
 		children := append([]searchIndexTreeChild(nil), node.children...)
-		children = append(children[:position], children[position+1:]...)
-		if len(children) == 0 {
-			key := tx.store.searchIndexTreeKey(kind, digest, nodeID)
-			err := tx.deleteKnownEntryLocked(key, oldEnvelope)
-			clear(key)
-			return true, err
-		}
-		if position == len(children) {
-			if upper == nil {
-				children[len(children)-1].upper = searchIndexTreeInfinity
-			} else {
-				children[len(children)-1].upper = *upper
+		if childRepair != nil {
+			if position+1 >= len(children) || children[position+1].id != childRepair.right {
+				children[position].upper = childRepair.pivot
+				children = append(children, searchIndexTreeChild{})
+				copy(children[position+2:], children[position+1:])
+				children[position+1] = searchIndexTreeChild{upper: childUpper, id: childRepair.right}
 			}
 		}
-		return false, tx.putSearchIndexTreeNodeLocked(kind, digest, nodeID, searchIndexTreeNode{children: children}, oldEnvelope)
+		if len(children) > searchIndexTreeMaxChildren {
+			return nil, search.ErrIndexBudget
+		}
+		if err := tx.putSearchIndexTreeNodeLocked(kind, digest, nodeID, searchIndexTreeNode{children: children}, oldEnvelope); err != nil {
+			return nil, err
+		}
+		if pendingSibling {
+			return &searchIndexTreeSplit{pivot: node.siblingPivot, right: node.rightSibling, repair: true}, nil
+		}
+		return nil, nil
 	}
 	_, err = remove(root, 0, nil)
 	return err
@@ -598,7 +710,7 @@ func (it *searchIndexTreeIterator) next(result *search.ExactPage, maxBytes int) 
 			return searchIndexTreeFrame{}, false, false, ErrCorrupt
 		}
 		result.Bytes += used
-		plain, err := it.store.open(key, "search-index-tree-v3", envelope)
+		plain, err := it.store.open(key, "search-index-tree-v4", envelope)
 		clear(key)
 		clear(envelope)
 		if err != nil {
@@ -661,6 +773,19 @@ func (it *searchIndexTreeIterator) next(result *search.ExactPage, maxBytes int) 
 			continue
 		}
 		if frame.nextChild >= len(frame.node.children) {
+			if frame.node.rightSibling != ([sha256.Size]byte{}) && frame.hasUpper && bytes.Compare(frame.node.siblingPivot[:], frame.upper[:]) < 0 {
+				upper := frame.upper
+				sibling, found, blocked, err := load(frame.node.rightSibling, frame.depth, &upper, false)
+				if err != nil || blocked {
+					return searchIndexPosting{}, false, blocked, err
+				}
+				if !found {
+					return searchIndexPosting{}, false, false, ErrCorrupt
+				}
+				it.stack = it.stack[:last]
+				it.stack = append(it.stack, sibling)
+				continue
+			}
 			it.stack = it.stack[:last]
 			continue
 		}
