@@ -14,6 +14,11 @@ and local-AI paths work without an account or cloud dependency.
   `CGO_ENABLED=0`; the repository audit must remain green.
 - Raw accessibility values exist only inside the platform-host capture stage.
   Storage, IPC, UI, MCP, and AI accept validated sanitized observations only.
+- Capture is passive: app profiles may select and normalize the current
+  user-opened context, including accessibility nodes the app already loaded
+  off-screen, but no capture path can click, scroll, paginate, search, open a
+  context, or crawl an app. Profile output is semantic-chunk deduplicated so
+  unchanged message/document history is not stored again with every event.
 - Capture, exact retrieval, Today, knowledge browsing, time accounting,
   lifecycle, and export work without AI. Capture never invokes a model.
 - Model output is untrusted, source-linked, reversible, and cannot change
@@ -40,8 +45,10 @@ and local-AI paths work without an account or cloud dependency.
 3. **Secure host and local transport.** Implement OS-protected data-key
    wrapping, private paths, single-instance coordination, AF_UNIX/named-pipe
    transport with peer identity and bounded admission queues, then fixture-
-   driven AXUIElement, UI Automation, and AT-SPI2 capture adapters. Capability
-   parity is required; unsupported desktop mechanics degrade honestly.
+   driven AXUIElement, UI Automation, and AT-SPI2 capture adapters, with
+   conservative built-in and user-overridable app profiles for semantic
+   context selection and chrome suppression. Capability parity is required;
+   unsupported desktop mechanics degrade honestly.
 4. **Retrieval and provider-neutral AI.** Add deterministic timeline/session/
    entity retrieval, rank fusion and evidence packing before optional local
    embeddings. Implement separate Generator/Embedder/Transcriber/Reranker/

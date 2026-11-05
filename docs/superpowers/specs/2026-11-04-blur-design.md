@@ -30,6 +30,10 @@ safe to run over sensitive work.
    scheduling, and time accounting work without a cloud account.
 2. **No screenshots.** Capture accessible text, metadata, and focused-control
    breadcrumbs only. Never request Screen Recording permission.
+   Capture is passive and user-directed: adapters may inspect the current
+   user-opened context, including already-loaded off-screen accessibility
+   nodes, but never click, scroll, paginate, search, open another context, or
+   otherwise control an app to acquire more history.
 3. **AI is optional and replaceable.** Deterministic capture and keyword search
    remain useful without a model. Ollama and OpenAI-compatible local endpoints
    are first-class; remote providers are explicit choices.
@@ -95,6 +99,8 @@ The build is a failure even if it appears functional when it:
 - requires an online account to search or export local data;
 - uses a broad Accessibility tree crawl when event-driven or bounded reads are
   sufficient;
+- gives an app profile, model, or capture worker any ability to navigate or
+  control an app in order to acquire additional context;
 - exposes a localhost service without peer checks and an install secret;
 - silently edits third-party AI-client configuration;
 - makes deletion claims that SSD and SQLite behavior cannot support.
