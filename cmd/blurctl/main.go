@@ -67,5 +67,8 @@ func launch(args []string, out, errOut io.Writer, factory func() (client, error)
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "fixture" {
+		os.Exit(fixtureMain(os.Args[1:]))
+	}
 	os.Exit(launch(os.Args[1:], os.Stdout, os.Stderr, func() (client, error) { return core.NewEphemeralDemoCLIClient() }))
 }

@@ -27,6 +27,10 @@ make no-cgo-audit
 go run ./cmd/blurctl status
 go run ./cmd/blurctl capabilities
 go run ./cmd/blur-core
+# Read-only, synthetic fixture commands only:
+go run ./cmd/blurctl fixture doctor --fixture --store "$TMPDIR/blur-fixture-demo.db"
+go run ./cmd/blurctl fixture today --fixture --store "$TMPDIR/blur-fixture-demo.db"
+go run ./cmd/blurctl fixture knowledge --fixture --store "$TMPDIR/blur-fixture-demo.db"
 ```
 
 `blurctl` accepts only `status` and `capabilities`. Both commands start an
@@ -35,6 +39,16 @@ open a local endpoint. `blur-core` prints the same one-shot development status.
 Expect `mode: ephemeral_memory`, `encrypted_at_rest: false`,
 `ai_enabled: false`, and `network_listening: false`. Memory exists only for the
 process lifetime and is not suitable for real personal data.
+
+The separate `blurctl fixture` commands open an existing store read-only with a
+fixed, publicly known fixture key. They are only for synthetic offline test
+fixtures, require the explicit `--fixture` marker and a
+`blur-fixture-*.db` file under the operating system temporary directory, and
+cannot open a store protected by an OS secret adapter.
+They never accept keys through arguments, environment variables, or config.
+`doctor` reports counters and fixed capability states; `today` and `knowledge`
+print bounded fixture content. Do not place personal data in a fixture store.
+Production key wiring remains blocked on the OS secret adapters.
 
 `make cross-build` builds `blur-core` and `blurctl` with cgo disabled for
 Darwin arm64/amd64, Windows amd64, and Linux amd64/arm64. The

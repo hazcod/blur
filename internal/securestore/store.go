@@ -32,6 +32,13 @@ func (e *SecretError) Error() string { return "securestore: " + string(e.State) 
 // operations; ordinary formatting and encoding cannot disclose its contents.
 type Key struct{ bytes [32]byte }
 
+// OfflineFixtureKey returns a fixed, publicly known key for the explicitly
+// fixture-only CLI. It must never be used for personal or production stores.
+// Production callers must obtain a key through ResolveKey and an OS secret port.
+func OfflineFixtureKey() Key {
+	return Key{bytes: [32]byte{0x62, 0x6c, 0x75, 0x72, 0x2d, 0x6f, 0x66, 0x66, 0x6c, 0x69, 0x6e, 0x65, 0x2d, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x6f, 0x6e, 0x6c, 0x79, 0x2d, 0x6e, 0x6f, 0x2d, 0x70, 0x72, 0x64}}
+}
+
 var ErrKeySerialization = errors.New("securestore: key serialization disabled")
 
 func (Key) String() string               { return "securestore.Key([redacted])" }
