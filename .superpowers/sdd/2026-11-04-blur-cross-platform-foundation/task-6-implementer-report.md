@@ -82,3 +82,11 @@ Capability validation now binds evidence to the capability ID as well as the sta
 RED: the updated complete custom set using `platform_stub` was rejected, and `TestCapabilityEvidenceMatchesPort` rejected the valid capture stub. GREEN: focused capability tests passed after adding the port evidence map and integrating it into tuple validation. The regression test enumerates every port's stub and native mechanisms, then rejects all API evidence from other ports unless that mechanism is explicitly shared; this includes `axui_element` on autostart and audio recorder.
 
 Final verification: `go test -count=1 ./internal/core ./internal/search ./cmd/blurctl`, `go test -count=1 ./...`, `go test -race -count=1 ./...`, and `go vet ./...` all exited 0. Six `CGO_ENABLED=0` darwin/linux/windows amd64/arm64 builds exited 0. The cgo dependency listing exited 0 with no output; the `import "C"|#cgo` audit found no matches; `git diff --check` exited 0. `go run ./cmd/blur-core`, `go run ./cmd/blurctl status`, and `go run ./cmd/blurctl capabilities` each exited 0 and emitted the exact same safe JSON documents recorded in Fix Round 1 above.
+
+## Fix Round 4
+
+Capability validation now applies an explicit per-port semantic matrix: only `capture` and `text_targets` may report target-specific states; only `gesture_hotkeys` and `surface_manager` may report a missing XDG portal; and `permission_required` is limited to capture, text targets, gesture hotkeys, audio recorder, secret store, autostart, and session state. Temporary unresponsiveness requires a runtime-backed native port mechanism. Foundation, configuration, and `platform_stub` evidence remain excluded from runtime states, while the existing available, user-disabled, stub, and foundation tuples remain intact.
+
+RED: `TestCapabilityEvidenceMatchesPort` accepted `gesture_hotkeys/unsupported_target/unsupported_target/event_tap`. GREEN: the test now checks the special-state matrix across each port and native evidence, including forbidden portal and runtime-state combinations; the focused capability tests pass.
+
+Verification: `go test ./...`, `go vet ./...`, all six `CGO_ENABLED=0` darwin/linux/windows amd64/arm64 builds, and the no-cgo dependency listing exited 0. The `import "C"|#cgo` audit found no matches (rg exit 1).

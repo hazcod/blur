@@ -84,11 +84,38 @@ func portAPIEvidence(id, evidence string) bool {
 	}
 }
 
+type capabilitySemantics struct {
+	targetStates            bool
+	portalMissing           bool
+	permissionRequired      bool
+	temporarilyUnresponsive bool
+}
+
+// Capability states are scoped to the operations each port performs. These
+// permissions describe which ports may make each state claim; the report's
+// evidence is validated separately against the port's native mechanism.
+func semanticsForPort(id string) capabilitySemantics {
+	switch id {
+	case "capture", "text_targets":
+		return capabilitySemantics{targetStates: true, permissionRequired: true, temporarilyUnresponsive: true}
+	case "gesture_hotkeys":
+		return capabilitySemantics{portalMissing: true, permissionRequired: true, temporarilyUnresponsive: true}
+	case "surface_manager":
+		return capabilitySemantics{portalMissing: true, temporarilyUnresponsive: true}
+	case "audio_recorder", "secret_store", "autostart", "session_state":
+		return capabilitySemantics{permissionRequired: true, temporarilyUnresponsive: true}
+	case "local_transport", "private_path":
+		return capabilitySemantics{temporarilyUnresponsive: true}
+	default:
+		return capabilitySemantics{}
+	}
+}
+
 // Adapters must map diagnostics to one coherent, content-free tuple. Evidence
 // names a fixed API or configuration state; captured text is never accepted.
 func coherentReport(report platform.CapabilityReport) bool {
 	portAPI := portAPIEvidence(report.ID, report.Evidence)
-	targetAPI := portAPI && report.Evidence != "xdg_portal" && report.Evidence != "desktop_shell"
+	semantics := semanticsForPort(report.ID)
 	switch report.State {
 	case platform.UserDisabled:
 		switch report.Reason {
@@ -102,17 +129,17 @@ func coherentReport(report platform.CapabilityReport) bool {
 	case platform.Available:
 		return report.Reason == "available" && portAPI
 	case platform.PermissionRequired:
-		return report.Reason == "permission_required" && portAPI
+		return report.Reason == "permission_required" && semantics.permissionRequired && portAPI
 	case platform.UnsupportedTarget:
-		return report.Reason == "unsupported_target" && targetAPI
+		return report.Reason == "unsupported_target" && semantics.targetStates && portAPI
 	case platform.SecureTarget:
-		return report.Reason == "secure_target" && targetAPI
+		return report.Reason == "secure_target" && semantics.targetStates && portAPI
 	case platform.TargetElevated:
-		return report.Reason == "target_elevated" && targetAPI
+		return report.Reason == "target_elevated" && semantics.targetStates && portAPI
 	case platform.PortalMissing:
-		return report.Reason == "portal_missing" && portAPI && report.Evidence == "xdg_portal"
+		return report.Reason == "portal_missing" && semantics.portalMissing && portAPI && report.Evidence == "xdg_portal"
 	case platform.TemporarilyUnresponsive:
-		return report.Reason == "temporarily_unresponsive" && portAPI
+		return report.Reason == "temporarily_unresponsive" && semantics.temporarilyUnresponsive && portAPI
 	}
 	return false
 }

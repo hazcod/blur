@@ -627,7 +627,8 @@ func TestCapabilityEvidenceMatchesPort(t *testing.T) {
 		check(port.id, platform.PermissionRequired, "permission_required", "platform_stub", false)
 		for _, evidence := range port.evidence {
 			check(port.id, platform.UserDisabled, "adapter_unimplemented", evidence, true)
-			check(port.id, platform.PermissionRequired, "permission_required", evidence, true)
+			permissionPort := port.id == "capture" || port.id == "text_targets" || port.id == "gesture_hotkeys" || port.id == "audio_recorder" || port.id == "secret_store" || port.id == "autostart" || port.id == "session_state"
+			check(port.id, platform.PermissionRequired, "permission_required", evidence, permissionPort)
 			check(port.id, platform.Available, "available", evidence, true)
 		}
 		allowed := make(map[string]bool, len(port.evidence))
@@ -643,5 +644,29 @@ func TestCapabilityEvidenceMatchesPort(t *testing.T) {
 				check(port.id, platform.Available, "available", evidence, false)
 			}
 		}
+		for _, evidence := range port.evidence {
+			targetState := port.id == "capture" || port.id == "text_targets"
+			for _, row := range []struct {
+				state  platform.CapabilityState
+				reason string
+			}{
+				{platform.UnsupportedTarget, "unsupported_target"},
+				{platform.SecureTarget, "secure_target"},
+				{platform.TargetElevated, "target_elevated"},
+			} {
+				check(port.id, row.state, row.reason, evidence, targetState)
+			}
+
+			permissionPort := port.id == "capture" || port.id == "text_targets" || port.id == "gesture_hotkeys" || port.id == "audio_recorder" || port.id == "secret_store" || port.id == "autostart" || port.id == "session_state"
+			check(port.id, platform.PermissionRequired, "permission_required", evidence, permissionPort)
+			check(port.id, platform.TemporarilyUnresponsive, "temporarily_unresponsive", evidence, true)
+		}
+		check(port.id, platform.TemporarilyUnresponsive, "temporarily_unresponsive", "platform_stub", false)
+		check(port.id, platform.TemporarilyUnresponsive, "temporarily_unresponsive", "configuration", false)
+		check(port.id, platform.TemporarilyUnresponsive, "temporarily_unresponsive", "adapter_not_connected", false)
 	}
+	check("gesture_hotkeys", platform.PortalMissing, "portal_missing", "xdg_portal", true)
+	check("surface_manager", platform.PortalMissing, "portal_missing", "xdg_portal", true)
+	check("capture", platform.PortalMissing, "portal_missing", "xdg_portal", false)
+	check("autostart", platform.PortalMissing, "portal_missing", "xdg_portal", false)
 }
