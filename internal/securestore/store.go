@@ -10,23 +10,19 @@ import (
 	"github.com/nielsgroen/blur/internal/platform"
 )
 
-// SecretState is a closed set. A successful Get with a 32-byte value means Found;
-// a typed NotFound error is the sole authorization to create a key.
-type SecretState string
+// SecretState and SecretError alias the shared platform types so OS adapters
+// can report typed outcomes without importing this higher-level package.
+type SecretState = platform.SecretState
+type SecretError = platform.SecretStoreError
 
 const (
-	Found       SecretState = "found"
-	NotFound    SecretState = "not_found"
-	Locked      SecretState = "locked"
-	Corrupt     SecretState = "corrupt"
-	Denied      SecretState = "denied"
-	Unavailable SecretState = "unavailable"
+	Found       SecretState = platform.SecretFound
+	NotFound    SecretState = platform.SecretNotFound
+	Locked      SecretState = platform.SecretLocked
+	Corrupt     SecretState = platform.SecretCorrupt
+	Denied      SecretState = platform.SecretDenied
+	Unavailable SecretState = platform.SecretUnavailable
 )
-
-// SecretError intentionally contains no backend cause or key material.
-type SecretError struct{ State SecretState }
-
-func (e *SecretError) Error() string { return "securestore: " + string(e.State) }
 
 // Key is an opaque DEK. Explicit Bytes access returns a copy for cryptographic
 // operations; ordinary formatting and encoding cannot disclose its contents.

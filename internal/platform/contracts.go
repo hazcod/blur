@@ -2,6 +2,25 @@ package platform
 
 import "context"
 
+// SecretState is shared by secret-store adapters so platform packages can
+// report typed outcomes without importing the higher-level securestore.
+type SecretState string
+
+const (
+	SecretFound       SecretState = "found"
+	SecretNotFound    SecretState = "not_found"
+	SecretLocked      SecretState = "locked"
+	SecretCorrupt     SecretState = "corrupt"
+	SecretDenied      SecretState = "denied"
+	SecretUnavailable SecretState = "unavailable"
+)
+
+// SecretStoreError carries only a closed status; backend details and secret
+// values must never appear in its formatting.
+type SecretStoreError struct{ State SecretState }
+
+func (e *SecretStoreError) Error() string { return "platform.secret_store: " + string(e.State) }
+
 // Every port reports its availability without exposing private content.
 type CapabilityReporter interface {
 	Capability(context.Context) (CapabilityReport, error)
