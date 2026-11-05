@@ -2,8 +2,8 @@
 
 > **Execution status:** Long-range product backlog. The original macOS-first
 > ordering and fixed storage choice are superseded by
-> `2026-11-04-blur-cross-platform-foundation.md`. Resume this backlog only
-> through the gates and interfaces established by that foundation.
+> `2026-11-05-blur-delivery-roadmap.md`. Resume individual product tasks only
+> through the cross-platform phases and gates in that roadmap.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
