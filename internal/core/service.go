@@ -57,24 +57,48 @@ func knownCapabilityID(id string) bool {
 	return false
 }
 
-// These codes are deliberately closed at the service boundary. Adapters must
-// translate local diagnostics to this content-free vocabulary before reporting.
-func knownReason(reason string) bool {
-	switch reason {
-	case "foundation_only", "adapter_unimplemented", "permission_required", "user_disabled":
+func nativeAPIEvidence(evidence string) bool {
+	switch evidence {
+	case "axui_element", "ui_automation", "at_spi2":
 		return true
 	default:
 		return false
 	}
 }
 
-func knownEvidence(evidence string) bool {
-	switch evidence {
-	case "adapter_not_connected", "axui_element", "ui_automation", "at_spi2", "xdg_portal", "configuration":
-		return true
-	default:
-		return false
+func apiEvidence(evidence string) bool {
+	return nativeAPIEvidence(evidence) || evidence == "xdg_portal"
+}
+
+// Adapters must map diagnostics to one coherent, content-free tuple. Evidence
+// names a fixed API or configuration state; captured text is never accepted.
+func coherentReport(report platform.CapabilityReport) bool {
+	switch report.State {
+	case platform.UserDisabled:
+		switch report.Reason {
+		case "foundation_only":
+			return report.Evidence == "adapter_not_connected"
+		case "adapter_unimplemented":
+			return apiEvidence(report.Evidence)
+		case "user_disabled":
+			return report.Evidence == "configuration"
+		}
+	case platform.Available:
+		return report.Reason == "available" && (apiEvidence(report.Evidence) || report.Evidence == "configuration")
+	case platform.PermissionRequired:
+		return report.Reason == "permission_required" && apiEvidence(report.Evidence)
+	case platform.UnsupportedTarget:
+		return report.Reason == "unsupported_target" && nativeAPIEvidence(report.Evidence)
+	case platform.SecureTarget:
+		return report.Reason == "secure_target" && nativeAPIEvidence(report.Evidence)
+	case platform.TargetElevated:
+		return report.Reason == "target_elevated" && nativeAPIEvidence(report.Evidence)
+	case platform.PortalMissing:
+		return report.Reason == "portal_missing" && report.Evidence == "xdg_portal"
+	case platform.TemporarilyUnresponsive:
+		return report.Reason == "temporarily_unresponsive" && apiEvidence(report.Evidence)
 	}
+	return false
 }
 
 func newService(grants *localapi.GrantStore, store storage.EncryptedStore, reports []platform.CapabilityReport, ephemeral bool) (*Service, error) {
@@ -90,7 +114,7 @@ func newService(grants *localapi.GrantStore, store storage.EncryptedStore, repor
 	}
 	seen := make(map[string]bool, len(copyReports))
 	for _, report := range copyReports {
-		if report.Validate() != nil || !knownCapabilityID(report.ID) || !knownReason(report.Reason) || !knownEvidence(report.Evidence) || seen[report.ID] {
+		if report.Validate() != nil || !knownCapabilityID(report.ID) || !coherentReport(report) || seen[report.ID] {
 			return nil, ErrInvalidService
 		}
 		seen[report.ID] = true
@@ -191,16 +215,13 @@ func (s *Service) Ingest(ctx context.Context, o capture.SanitizedObservation, pr
 		return err
 	}
 	// A proof can be consumed just before cancellation wins. No write starts
-	// after an observed cancellation; an already committed store call cannot be
-	// rolled back through EncryptedStore, so it never reports success if canceled.
+	// after an observed cancellation. During Put, the store owns cancellation
+	// and commit atomicity: a nil return means the commit succeeded, even if
+	// cancellation arrives immediately afterward.
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	err := s.store.PutObservation(ctx, o)
-	if cancelErr := checkContext(ctx); cancelErr != nil {
-		return cancelErr
-	}
-	return err
+	return s.store.PutObservation(ctx, o)
 }
 
 func (s *Service) Search(ctx context.Context, request search.Request, proof localapi.Proof) (search.Response, error) {

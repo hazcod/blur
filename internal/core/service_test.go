@@ -258,7 +258,7 @@ func TestCapabilityReportsRequireExactlyTheTenPortsAndClosedDiagnostics(t *testi
 	ids := []string{"capture", "text_targets", "gesture_hotkeys", "surface_manager", "audio_recorder", "secret_store", "local_transport", "private_path", "autostart", "session_state"}
 	reports := make([]platform.CapabilityReport, len(ids))
 	for i, id := range ids {
-		reports[i] = platform.CapabilityReport{ID: id, State: platform.UserDisabled, Reason: "adapter_unimplemented", Evidence: "configuration"}
+		reports[i] = platform.CapabilityReport{ID: id, State: platform.UserDisabled, Reason: "adapter_unimplemented", Evidence: "axui_element"}
 	}
 	svc, err := NewEphemeralDevelopmentService(grants, store, reports)
 	if err != nil {
@@ -316,6 +316,16 @@ func (s cancelAfterPutStore) PutObservation(ctx context.Context, o capture.Sanit
 	err := s.EncryptedStore.PutObservation(ctx, o)
 	s.cancel()
 	return err
+}
+
+type cancelBeforePutStore struct {
+	storage.EncryptedStore
+	cancel context.CancelFunc
+}
+
+func (s cancelBeforePutStore) PutObservation(ctx context.Context, o capture.SanitizedObservation) error {
+	s.cancel()
+	return s.EncryptedStore.PutObservation(ctx, o)
 }
 
 func TestCancellationDuringAuthorizationFailsClosed(t *testing.T) {
@@ -411,17 +421,15 @@ func TestStatusPropagatesStoreDeadline(t *testing.T) {
 }
 
 func TestCancellationAfterStoreOperationNeverReturnsSuccess(t *testing.T) {
-	for _, operation := range []string{"status", "search", "ingest"} {
+	for _, operation := range []string{"status", "search"} {
 		t.Run(operation, func(t *testing.T) {
-			svc, memory, _, grant := fixture(t, localapi.ScopeCLIAdmin, localapi.ScopeUIRead, localapi.ScopeCaptureIngest)
+			svc, memory, _, grant := fixture(t, localapi.ScopeCLIAdmin, localapi.ScopeUIRead)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			switch operation {
 			case "status", "search":
 				wrapped := cancelAfterListStore{EncryptedStore: memory, cancel: cancel}
 				svc.store, svc.search = wrapped, search.New(wrapped)
-			case "ingest":
-				svc.store = cancelAfterPutStore{EncryptedStore: memory, cancel: cancel}
 			}
 			var err error
 			switch operation {
@@ -438,9 +446,6 @@ func TestCancellationAfterStoreOperationNeverReturnsSuccess(t *testing.T) {
 				if len(result.Results) > 0 {
 					t.Fatal("canceled result returned")
 				}
-			case "ingest":
-				o := sample(t)
-				err = svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o)))
 			}
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled operation returned %v", err)
@@ -486,5 +491,88 @@ func TestAlreadyCanceledRequestsDoNotConsumeProofsOrReturnData(t *testing.T) {
 	}
 	if result, err := svc.Search(context.Background(), r, searchProof); err != nil || len(result.Results) != 1 {
 		t.Fatalf("canceled request consumed search proof: %+v, %v", result, err)
+	}
+}
+
+func TestSuccessfulIngestCommitWinsCancellationRace(t *testing.T) {
+	svc, memory, _, grant := fixture(t, localapi.ScopeCaptureIngest)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.store = cancelAfterPutStore{EncryptedStore: memory, cancel: cancel}
+	o := sample(t)
+	if err := svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
+		t.Fatalf("committed write reported failure: %v", err)
+	}
+	page, err := memory.ListObservations(context.Background(), 2, "")
+	if err != nil || len(page) != 1 || page[0].ContentID() != o.ContentID() {
+		t.Fatalf("successful commit missing or duplicated: %d, %v", len(page), err)
+	}
+}
+
+func TestStoreCancellationErrorLeavesNoIngestWrite(t *testing.T) {
+	svc, memory, _, grant := fixture(t, localapi.ScopeCaptureIngest)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.store = cancelBeforePutStore{EncryptedStore: memory, cancel: cancel}
+	o := sample(t)
+	if err := svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); !errors.Is(err, context.Canceled) {
+		t.Fatalf("store cancellation error lost: %v", err)
+	}
+	page, err := memory.ListObservations(context.Background(), 1, "")
+	if err != nil || len(page) != 0 {
+		t.Fatalf("canceled store write committed: %d, %v", len(page), err)
+	}
+}
+
+func TestCapabilityTuplesAreCoherent(t *testing.T) {
+	grants, err := localapi.NewGrantStore(nil, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := storage.NewEphemeralMemoryStore()
+	accepted := []struct {
+		state    platform.CapabilityState
+		reason   string
+		evidence []string
+	}{
+		{platform.UserDisabled, "foundation_only", []string{"adapter_not_connected"}},
+		{platform.UserDisabled, "adapter_unimplemented", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal"}},
+		{platform.Available, "available", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal", "configuration"}},
+		{platform.PermissionRequired, "permission_required", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal"}},
+		{platform.UnsupportedTarget, "unsupported_target", []string{"axui_element", "ui_automation", "at_spi2"}},
+		{platform.SecureTarget, "secure_target", []string{"axui_element", "ui_automation", "at_spi2"}},
+		{platform.TargetElevated, "target_elevated", []string{"axui_element", "ui_automation", "at_spi2"}},
+		{platform.PortalMissing, "portal_missing", []string{"xdg_portal"}},
+		{platform.TemporarilyUnresponsive, "temporarily_unresponsive", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal"}},
+		{platform.UserDisabled, "user_disabled", []string{"configuration"}},
+	}
+	for _, row := range accepted {
+		for _, evidence := range row.evidence {
+			reports := defaultReports()
+			reports[0].State, reports[0].Reason, reports[0].Evidence = row.state, row.reason, evidence
+			if _, err := NewEphemeralDevelopmentService(grants, store, reports); err != nil {
+				t.Fatalf("valid tuple %s/%s/%s rejected: %v", row.state, row.reason, evidence, err)
+			}
+		}
+	}
+	contradictions := []struct {
+		state            platform.CapabilityState
+		reason, evidence string
+	}{
+		{platform.Available, "permission_required", "adapter_not_connected"},
+		{platform.PermissionRequired, "foundation_only", "adapter_not_connected"},
+		{platform.Available, "available", "adapter_not_connected"},
+		{platform.UserDisabled, "user_disabled", "axui_element"},
+		{platform.UserDisabled, "adapter_unimplemented", "configuration"},
+		{platform.PortalMissing, "portal_missing", "axui_element"},
+		{platform.TargetElevated, "target_elevated", "xdg_portal"},
+		{platform.SecureTarget, "secure_target", "configuration"},
+	}
+	for _, row := range contradictions {
+		reports := defaultReports()
+		reports[0].State, reports[0].Reason, reports[0].Evidence = row.state, row.reason, row.evidence
+		if _, err := NewEphemeralDevelopmentService(grants, store, reports); err == nil {
+			t.Fatalf("contradictory tuple %s/%s/%s accepted", row.state, row.reason, row.evidence)
+		}
 	}
 }
