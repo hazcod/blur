@@ -1,11 +1,12 @@
-# Foundation threat model
+# Blur foundation and durable-core threat model
 
-Status: implementation checkpoint, 2026-11-05. This model covers code in the
-current Go foundation, not every capability described by the product design.
-The demo is not suitable for storing real personal data: its service and
-commands still use ephemeral, unencrypted memory and have no native capture
-or production durable local service. An internal encrypted durable backend
-exists and is tested, but is not yet wired into those entry points.
+Status: durable-core implementation checkpoint, 2026-11-05. This model covers
+code in the current Go foundation and durable core, not every capability in
+the product design. The regular demo commands still use ephemeral,
+unencrypted memory. `blurctl fixture` can read only explicitly marked synthetic
+stores in the OS temporary directory using a public fixture key. There is no
+production key adapter, native capture, or production durable service, so Blur
+is not yet suitable for storing personal memory.
 
 ## Assets
 
@@ -26,10 +27,10 @@ capture package: private raw staging → redactor → validated observation
                 │ in-process value boundary only
                 ▼
 core: scoped proof check → search/store interface
-                              ├── ephemeral memory store (wired demo backend)
-                              └── internal AEAD durable store (not wired)
+                              ├── ephemeral memory store (regular demo)
+                              └── AEAD durable store (synthetic fixture CLI only)
 
-CLI ── in-process demo client; no endpoint
+CLI ── in-process demo client or explicit fixture-only durable reader; no endpoint
 future IPC, OS identity integration, production key management, and providers
 are not present
 ```
@@ -51,7 +52,7 @@ are not present
 4. **Client to core:** in-memory grants bind a client, scope, expiry and
    request semantics through a one-use HMAC proof. Current CLI access is an
    in-process demonstration and no grant crosses IPC.
-5. **Core to persistence:** the demo's only wired backend is explicitly
+5. **Core to persistence:** the regular demo's backend is explicitly
    unencrypted and ephemeral. The production constructor refuses it. The
    internal durable backend encrypts each versioned record with AEAD, uses
    domain-separated keyed HMACs for physical logical-ID keys, and verifies an
@@ -62,10 +63,13 @@ are not present
    malformed, wrong-key, or unsupported stores without creating or overwriting
    them. It is not yet selected by a production service entry point and depends
    on a caller-provided 32-byte key; OS wrapping, cross-process key
-   coordination, backup and key rotation are not implemented.
-6. **Core to diagnostics/network:** current commands print bounded structured
-   status/capabilities to stdout. No network, AI, logging sink, crash upload,
-   or telemetry path is present.
+   coordination, backup and key rotation are not implemented. The explicit
+   fixture CLI reads Today, knowledge, and bounded doctor samples from a
+   caller-selected synthetic store path below the OS temp directory.
+6. **Core to diagnostics/network:** lifecycle jobs use bounded queues,
+   coalescing and cancellation; doctor output uses capped metadata samples and
+   closed content-free vocabularies. No network, AI, crash upload, or telemetry
+   path is present. There is no general logging sink.
 
 ## Attacker goals, controls, and residual risks
 
@@ -77,9 +81,9 @@ are not present
 | Recover a known secret using patterned capture | Redaction handles a selected deterministic set of recognizable patterns before observation construction and counts rules, not matched values. | Heuristics can miss novel formats, unlabeled prose, split values, encodings, images, application-specific secrets, or data added after redaction. Redaction does not establish confidentiality or make the demo appropriate for real secrets. |
 | Forge, broaden, or replay a local operation | Proofs bind grant/client/scope/timestamp/nonce/request digest; authorizer checks expiration, skew, revocation, constant-time MAC equality, replay and bounded nonce capacity. Scope vocabulary is closed. | All state and credentials are in process memory; there is no peer identity, endpoint ACL, secure provisioning, persistence or revocation across restarts. Compromise of the process or credential can authorize its permitted scopes. |
 | Exhaust memory or CPU through grants or search | GrantStore holds at most 1,024 grants and prunes expired grants on issuance/authorization; removal clears nonce/scope maps and overwrites the authenticator key first. Search limits each request to 64 observations and 2 MiB of scanned text/app/domain bytes, fetches at most four rows per byte-bounded page, and the core admits at most two concurrent searches with context-aware waiting. | The caps still permit bounded transient work and memory use. Key overwrite is best-effort in Go process memory and cannot erase prior copies, runtime artifacts, swap, or credentials held by callers. A request waiting for a search slot has already consumed its one-use proof. |
-| Expose persistent memory from a lost device | Current demo retains memory only in process and reports `encrypted_at_rest=false`; production constructor refuses the in-memory store. The unintegrated durable backend encrypts records at rest when given a data key. | There is no production-wired persistent store or OS wrapping key, backup, or device-loss key recovery. Users should not treat the demo as safe storage. |
-| Read or alter a durable database file | The internal durable backend uses AES-GCM authenticated records, binds ciphertext to the persistent store identity, per-record schema context, physical key/namespace and revision, HMACs logical IDs, and verifies an authenticated keyed record-set manifest on open. Observation size metadata is AEAD-sealed too. Wrong keys, tampering, cross-store record swaps, unauthorized insertions/deletions, and interrupted schema migration are covered by tests. The physical adapter enforces private file/directory boundaries and durable bbolt transactions. | The backend is not wired into the demo or production service. Whole-store rollback to an earlier consistent file is not detected. Anyone who obtains the data key can decrypt or forge records; process memory, key storage/wrapping, cross-process creation coordination, backup/restore, rotation, and deletion are outside this phase. Filesystem snapshots and storage media may retain prior ciphertext. |
-| Leak data through errors, status or logs | Capture, secret-store, and durable-store errors suppress payloads and backend details; report vocabularies and CLI output are bounded and content-free; secret-bearing grant/proof/store types redact formatting or refuse serialization. | No general logger/crash/diagnostics implementation exists. Future logs, traces, crash dumps, test output and support bundles need separate review. In-process memory remains readable to a process-level attacker. |
+| Expose persistent memory from a lost device | Regular demo retains memory only in process and reports `encrypted_at_rest=false`; production constructor refuses the in-memory store. Durable records use authenticated encryption when opened with a key. | The durable backend is reachable only through an explicitly marked synthetic fixture CLI using a public test key. There is no production store wiring or OS key wrapping, backup, or device-loss recovery. Never use the fixture path for personal data. |
+| Read or alter a durable database file | The durable backend uses AES-GCM authenticated records, binds ciphertext to store identity, schema context, physical key/namespace and revision, HMACs logical IDs, and verifies an authenticated keyed record-set manifest on open. Wrong keys, tampering, cross-store swaps, unauthorized insertions/deletions, and interrupted migration have tests. The physical adapter enforces private file/directory boundaries and durable bbolt transactions. The exact index encrypts posting contents and HMACs lookup values. | Whole-store rollback to an earlier consistent file is not detected. Index artifacts reveal record counts, tree shape, approximate posting occupancy, same-store equality/linkage for repeated terms, and write timing. Anyone who obtains the data key can decrypt or forge records; process memory, key wrapping, cross-process creation coordination, backup/restore, rotation, and deletion integration remain open. Filesystem snapshots and storage media may retain prior ciphertext. |
+| Leak data through errors, status or logs | Capture, secret-store, durable-store errors suppress payloads; CLI failures are generic; doctor uses bounded metadata samples; lifecycle logging uses closed operation/result fields and duration only; secret-bearing grant/proof/store types redact formatting or refuse serialization. | There is no general logging sink, crash reporting, or support bundle. Future logs, traces, crash dumps, test output and support bundles need separate review. In-process memory remains readable to a process-level attacker. |
 | Trigger hidden screenshot, OCR or network fallback | No screenshot, OCR, clipboard, keystroke, network client, AI/provider code, or native capture path is wired. Unavailable adapters return disabled/error states. | Future changes could add paths; review and CI need to preserve the explicit no-fallback contract. |
 | Use dependency/native code to cross the cgo boundary | The runtime store graph uses bbolt and x/sys; cgo-disabled cross-builds and the repository audit reject selected Cgo files or `import "C"` in non-standard dependencies for shipped targets. | This does not establish supply-chain provenance, signed artifacts, license policy, JavaScript dependency posture, or future package safety. `govulncheck` was unavailable at this checkpoint. |
 
@@ -171,10 +175,11 @@ an unavailable accessibility or desktop capability.
   snapshots, backups, swap, hibernation, crash dumps, or later persistent
   stores. A future delete/key-destroy design must document those limits and
   test authenticated recovery.
-- No native capture, UI, AI, MCP, writing, dictation, production-wired durable
-  store, provider egress, or user-facing privacy controls are implemented. The
-  design and ADR describe requirements and deferred gates, not shipped
-  controls.
+- Activity, Today, knowledge, lifecycle, and diagnostics components are
+  implemented as local libraries, but production bootstrap does not connect
+  them to native capture or OS key management. No native UI, AI, MCP, writing,
+  dictation, or provider egress is implemented. The design and ADR describe
+  requirements and deferred gates, not shipped desktop controls.
 - Capability status and content-free errors reduce accidental exposure; they
   are not a substitute for OS-level process isolation or independent security
   review.

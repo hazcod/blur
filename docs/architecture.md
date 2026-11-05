@@ -1,8 +1,8 @@
 # Implemented architecture
 
-This document describes code present in the cross-platform foundation as of
-the 2026-11-05 release checkpoint. The broader product design is a roadmap,
-not a description of shipped behavior.
+This document describes the cross-platform foundation and durable memory core
+as of the 2026-11-05 implementation checkpoint. The broader product design is
+a roadmap, not a claim that the desktop product is complete.
 
 ## Runtime shape
 
@@ -111,22 +111,42 @@ observation pages authenticate a small sealed size record to enforce byte
 ceilings before fetching/decrypting a record that will not fit. A single
 internal transaction extension boundary is available to later index
 materializers.
-This backend is not yet wired into `NewService` or the demo commands; those
-still use the ephemeral store and remain unsuitable for real personal data.
-The store does not protect against whole-file rollback, compromised process
-memory, or loss/theft of the data key. See [ADR 0002](adr/0002-durable-store.md).
+The durable backend now includes encrypted exact search, activity segments,
+materialized Today snapshots, and the evidence-backed knowledge library. The
+explicit `blurctl fixture` commands can read synthetic stores under the OS
+temporary directory using a public test key; regular commands still use the
+ephemeral demo service. There is no production key adapter or bootstrap, so
+neither command path should be treated as a personal-memory product. The store
+does not protect against whole-file rollback, compromised process memory, or
+loss/theft of the data key. See [ADR 0002](adr/0002-durable-store.md) and
+[ADR 0003](adr/0003-private-exact-search-index.md).
 
-Search is deterministic exact-term matching, capped at 64 observations and
+Activity accounting is event-driven and uses monotonic elapsed time. Durable
+segments are encrypted and source-linked; reports currently operate over
+caller-selected bounded segment IDs rather than a store-wide time index. Today
+is a deterministic, bounded model-free projection persisted as one encrypted
+per-date value and read with one fixed-key lookup. The job layer does not yet
+wire capture inputs or automatic rebuild after every source lifecycle change.
+Knowledge entities, facts, open loops, aliases, merge history, and source
+links are encrypted; exact name lookup uses keyed normalized terms, and source
+quarantine removes claims that lose all evidence. Lifecycle callbacks exist,
+but no production bootstrap connects capture, store, Today, and knowledge.
+
+The durable backend now has a private encrypted exact search index with
+bounded global top-k retrieval, keyed term/app/domain postings and deletion
+repair. It is exposed by the durable store API but is not yet routed through
+the regular demo service. That service's deterministic exact-term search is
+capped at 64 observations and
 2 MiB of aggregate text/app/domain bytes per request; an omitted request byte
 limit uses that same hard maximum. It fetches at most four observations per
 page through a byte-bounded store contract; the store reports
 page bytes and whether more records remain before returning copies. The core
 service permits at most two searches at once and waits for a slot with context
 cancellation. Results, snippets, serialized response bytes, and provenance
-content IDs are bounded too. Search does not provide persistent indexing,
-fuzzy or semantic search, timeline, summaries, or AI answers. Derivation and
-generation types record provenance metadata, but the demo does not generate
-or persist derived content.
+content IDs are bounded too. Fuzzy or semantic search, timeline, summaries,
+and AI answers remain unimplemented. Derivation and generation types record
+provenance metadata, but the regular demo does not generate or persist derived
+content.
 
 ### Secrets and diagnostics
 
@@ -142,7 +162,14 @@ Capability reports, capture errors, grant/proof formatting, store errors, and
 CLI failures use stable codes or generic messages rather than payloads. Status
 reports expose mode, encryption, AI/network booleans, readiness, and version;
 capability output contains fixed IDs, states, reasons, and evidence codes.
-There is no diagnostics service or logging pipeline to claim as implemented.
+The lifecycle layer provides a bounded writer queue, coalescing for keyed
+materialization jobs, explicit backpressure, cancellation, and orderly store
+close hooks. Diagnostics builds a content-free doctor report from bounded
+durable samples. The fixture CLI supports doctor, Today, and knowledge reads
+only with an explicit fixture marker and a `blur-fixture-*.db` path below the
+OS temporary directory. It uses a deliberately public synthetic key and is
+not a production key flow. Logs use closed operation/result values and
+durations; there is no general application logging sink yet.
 
 ## Enforced foundation controls
 
@@ -163,11 +190,20 @@ There is no diagnostics service or logging pipeline to claim as implemented.
 - The internal durable store authenticates encrypted records, HMACs physical
   logical-ID keys, detects record-set insertion/deletion/tampering with a
   transactionally updated manifest, and refuses implicit create-on-open.
+- Today is read as one bounded materialized value; its projection and fixture
+  read path do not call a model or provider.
+- Activity sessions advance only on capture or OS-state events; recovery after
+  missing events is bounded and excess time is explicitly reported as omitted.
+- Knowledge claims require source IDs or explicit user-authored provenance;
+  source quarantine removes claims whose evidence has been deleted.
+- Lifecycle jobs use a bounded queue with explicit rejection, coalescing and
+  cancellation. Doctor samples are capped and report metadata only.
 - Command binaries and transitive non-standard dependencies pass the current
   cgo-disabled build and Cgo/import-C audit matrix.
 
 These controls constrain this foundation. They do not establish a complete
-desktop security boundary, persistent privacy guarantee, or product workflow.
+desktop security boundary, persistent privacy guarantee, or production
+personal-memory workflow.
 
 ## Deferred product phases
 
@@ -175,7 +211,7 @@ Native accessibility reads and target leases; OS secret stores and data-key
 wrapping; production wiring of authenticated persistence; single-instance and
 key-creation coordination;
 native IPC, ACLs and peer identity; GUI and onboarding; pause UI and durable
-exclusions; real diagnostics and log sinks; AI/provider routing; MCP; writing,
+exclusions; a general diagnostics/logging sink; AI/provider routing; MCP; writing,
 dictation, audio; histories, chronicles, wiki, scheduling; export/import;
 retention and deletion; authenticated backups and key rotation; packaging,
 signing, release SBOMs; and platform fixture applications remain unimplemented.
