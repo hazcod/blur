@@ -13,5 +13,5 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Println("No CgoFiles or import C found in non-standard repository dependencies across supported targets")
+	fmt.Println("No CgoFiles or target-selected import C found in Blur source or non-standard dependencies across supported targets")
 }

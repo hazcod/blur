@@ -1,4 +1,4 @@
-// Package nocgoaudit checks shipped command dependency graphs for cgo use.
+// Package nocgoaudit checks repository source and shipped dependency graphs for cgo use.
 package nocgoaudit
 
 import (
@@ -10,10 +10,12 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Package is the subset of go list output needed by the audit.
@@ -41,8 +43,9 @@ var SupportedTargets = []Target{
 	{GOOS: "linux", GOARCH: "arm64"},
 }
 
-// AuditPackages rejects cgo files and any import of "C" in non-standard
-// packages. It scans ignored files too, so build tags do not hide a cgo import.
+// AuditPackages rejects cgo files and any import of "C" in selected
+// non-standard package sources. IgnoredGoFiles are intentionally excluded:
+// external dependency files ignored on every shipped target are not shipped.
 func AuditPackages(packages []Package, readFile func(string) ([]byte, error)) error {
 	for _, pkg := range packages {
 		if pkg.Standard {
@@ -53,7 +56,7 @@ func AuditPackages(packages []Package, readFile func(string) ([]byte, error)) er
 		}
 
 		seen := make(map[string]struct{})
-		files := append(append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...), pkg.IgnoredGoFiles...)
+		files := append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...)
 		for _, name := range files {
 			path := filepath.Join(pkg.Dir, name)
 			if _, exists := seen[path]; exists {
@@ -65,27 +68,89 @@ func AuditPackages(packages []Package, readFile func(string) ([]byte, error)) er
 			if err != nil {
 				return fmt.Errorf("read %s in %s: %w", name, pkg.ImportPath, err)
 			}
-			file, err := parser.ParseFile(token.NewFileSet(), path, source, parser.ImportsOnly)
-			if err != nil {
-				return fmt.Errorf("parse %s in %s: %w", name, pkg.ImportPath, err)
-			}
-			for _, imported := range file.Imports {
-				importPath, err := strconv.Unquote(imported.Path.Value)
-				if err != nil {
-					return fmt.Errorf("parse import in %s/%s: %w", pkg.ImportPath, name, err)
-				}
-				if importPath == "C" {
-					return fmt.Errorf("%s/%s contains import C", pkg.ImportPath, name)
-				}
+			if err := rejectImportC(path, source); err != nil {
+				return fmt.Errorf("%s/%s: %w", pkg.ImportPath, name, err)
 			}
 		}
 	}
 	return nil
 }
 
+// AuditRepository checks every Go source file owned by the current repository,
+// regardless of build tags. Vendor trees are dependency sources and are
+// checked through the selected per-target package graph instead.
+func AuditRepository(root string, readFile func(string) ([]byte, error)) error {
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve repository root: %w", err)
+	}
+	return filepath.WalkDir(absolute, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != absolute && (entry.Name() == ".git" || entry.Name() == "vendor") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(entry.Name()) != ".go" {
+			return nil
+		}
+		source, err := readFile(path)
+		if err != nil {
+			return fmt.Errorf("read repository source %s: %w", path, err)
+		}
+		if err := rejectImportC(path, source); err != nil {
+			return fmt.Errorf("repository source %s: %w", path, err)
+		}
+		return nil
+	})
+}
+
+func rejectImportC(path string, source []byte) error {
+	file, err := parser.ParseFile(token.NewFileSet(), path, source, parser.ImportsOnly)
+	if err != nil {
+		return fmt.Errorf("parse source: %w", err)
+	}
+	for _, imported := range file.Imports {
+		importPath, err := strconv.Unquote(imported.Path.Value)
+		if err != nil {
+			return fmt.Errorf("parse import: %w", err)
+		}
+		if importPath == "C" {
+			return errors.New("contains import C")
+		}
+	}
+	return nil
+}
+
+func currentModuleRoot(ctx context.Context, target Target) (string, error) {
+	cmd := exec.CommandContext(ctx, "go", "env", "GOMOD")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS="+target.GOOS, "GOARCH="+target.GOARCH)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("go env GOMOD for %s/%s: %w", target.GOOS, target.GOARCH, err)
+	}
+	modFile := strings.TrimSpace(string(output))
+	if modFile == "" || modFile == os.DevNull {
+		return "", errors.New("go env GOMOD returned no repository module")
+	}
+	return filepath.Dir(modFile), nil
+}
+
 // AuditTarget obtains the dependency list with cgo enabled so go list does not
-// suppress CgoFiles, then checks all selected and ignored Go source files.
+// suppress CgoFiles. It scans all repository Go source, then only target-
+// selected GoFiles/CgoFiles in non-standard dependency packages.
 func AuditTarget(ctx context.Context, target Target) error {
+	root, err := currentModuleRoot(ctx, target)
+	if err != nil {
+		return err
+	}
+	if err := AuditRepository(root, os.ReadFile); err != nil {
+		return fmt.Errorf("%s/%s repository: %w", target.GOOS, target.GOARCH, err)
+	}
+
 	cmd := exec.CommandContext(ctx, "go", "list", "-deps", "-json", "./...")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS="+target.GOOS, "GOARCH="+target.GOARCH)
 	var output bytes.Buffer
@@ -115,7 +180,8 @@ func AuditTarget(ctx context.Context, target Target) error {
 }
 
 // AuditSupportedTargets checks every GOOS/GOARCH pair used by the command
-// cross-build gate.
+// cross-build gate. Any new shipped target must be added both here and to the
+// CGO_ENABLED=0 physical/command build matrices in the Makefile.
 func AuditSupportedTargets(ctx context.Context) error {
 	for _, target := range SupportedTargets {
 		if err := AuditTarget(ctx, target); err != nil {
