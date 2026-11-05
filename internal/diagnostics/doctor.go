@@ -25,6 +25,8 @@ type Report struct {
 	Queue                  memory.Stats               `json:"queue"`
 	StaleDerivations       int                        `json:"stale_derivations"`
 	QuarantinedDerivations int                        `json:"quarantined_derivations"`
+	DerivationsSampled     int                        `json:"derivations_sampled"`
+	DerivationCountsCapped bool                       `json:"derivation_counts_capped"`
 	Today                  Freshness                  `json:"today_freshness"`
 	Capabilities           map[string]CapabilityState `json:"capabilities"`
 }
@@ -34,6 +36,8 @@ type Inputs struct {
 	Integrity                                IntegrityState
 	Queue                                    memory.Stats
 	StaleDerivations, QuarantinedDerivations int
+	DerivationsSampled                       int
+	DerivationCountsCapped                   bool
 	Today                                    Freshness
 	Capabilities                             map[string]CapabilityState
 }
@@ -64,7 +68,11 @@ func Build(in Inputs) Report {
 		}
 		caps[name] = value
 	}
-	return Report{StoreVersion: in.StoreVersion, Integrity: state, Queue: in.Queue, StaleDerivations: stale, QuarantinedDerivations: quarantined, Today: fresh, Capabilities: caps}
+	sampled := in.DerivationsSampled
+	if sampled < 0 {
+		sampled = 0
+	}
+	return Report{StoreVersion: in.StoreVersion, Integrity: state, Queue: in.Queue, StaleDerivations: stale, QuarantinedDerivations: quarantined, DerivationsSampled: sampled, DerivationCountsCapped: in.DerivationCountsCapped, Today: fresh, Capabilities: caps}
 }
 
 func safeName(name string) bool {

@@ -12,6 +12,7 @@ import (
 	"github.com/nielsgroen/blur/internal/knowledge"
 	"github.com/nielsgroen/blur/internal/memory"
 	"github.com/nielsgroen/blur/internal/securestore"
+	"github.com/nielsgroen/blur/internal/storage"
 	"github.com/nielsgroen/blur/internal/storage/durable"
 )
 
@@ -27,12 +28,23 @@ func parseFixture(args []string) (command, path string, ok bool) {
 	if err != nil {
 		return "", "", false
 	}
-	rel, err := filepath.Rel(temp, path)
-	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)) {
-		return "", "", false
-	}
 	base := filepath.Base(path)
 	if len(base) < 17 || base[:13] != "blur-fixture-" || filepath.Ext(base) != ".db" {
+		return "", "", false
+	}
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return "", "", false
+	}
+	if resolvedTemp, resolveErr := filepath.EvalSymlinks(temp); resolveErr == nil {
+		temp = resolvedTemp
+	}
+	rel, err := filepath.Rel(temp, resolvedParent)
+	if err != nil || rel == ".." || filepath.IsAbs(rel) || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)) {
+		return "", "", false
+	}
+	resolvedRel, err := filepath.Rel(temp, resolvedParent)
+	if err != nil || resolvedRel == ".." || filepath.IsAbs(resolvedRel) || (len(resolvedRel) >= 3 && resolvedRel[:3] == ".."+string(filepath.Separator)) {
 		return "", "", false
 	}
 	return args[1], path, true
@@ -58,7 +70,31 @@ func runFixture(args []string, out, errOut io.Writer) int {
 	var value any
 	switch command {
 	case "doctor":
-		value = diagnostics.Build(diagnostics.Inputs{StoreVersion: durable.OpenSchemaVersion, Integrity: diagnostics.Healthy, Queue: memory.Stats{}, Today: diagnostics.Missing, Capabilities: map[string]diagnostics.CapabilityState{"capture": diagnostics.Unavailable, "ai": diagnostics.Disabled}})
+		rows, readErr := store.ListDerivations(ctx, 256, "")
+		if readErr != nil {
+			_, _ = io.WriteString(errOut, "doctor unavailable\n")
+			return 1
+		}
+		stale, quarantined := 0, 0
+		for _, row := range rows {
+			if row.State == storage.Stale {
+				stale++
+			}
+			if row.State == storage.Quarantined {
+				quarantined++
+			}
+		}
+		date := time.Now().In(time.Local).Format("2006-01-02")
+		_, found, readErr := store.GetTodaySnapshot(ctx, date)
+		if readErr != nil {
+			_, _ = io.WriteString(errOut, "doctor unavailable\n")
+			return 1
+		}
+		freshness := diagnostics.Missing
+		if found {
+			freshness = diagnostics.Fresh
+		}
+		value = diagnostics.Build(diagnostics.Inputs{StoreVersion: durable.OpenSchemaVersion, Integrity: diagnostics.Healthy, Queue: memory.Stats{}, StaleDerivations: stale, QuarantinedDerivations: quarantined, DerivationsSampled: len(rows), DerivationCountsCapped: len(rows) == 256, Today: freshness, Capabilities: map[string]diagnostics.CapabilityState{"capture": diagnostics.Unavailable, "ai": diagnostics.Disabled}})
 	case "today":
 		date := time.Now().In(time.Local).Format("2006-01-02")
 		snapshot, found, readErr := store.GetTodaySnapshot(ctx, date)
