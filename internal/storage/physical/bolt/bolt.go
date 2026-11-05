@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
@@ -53,10 +52,16 @@ type DB struct {
 	closed bool
 }
 
-// Open opens or creates path only when its containing directory and existing
-// file are private regular filesystem objects. The caller supplies an existing
-// private directory; the database file is created with mode 0600.
+// Open opens or creates path only through a pinned private parent-directory
+// handle. The platform boundary rejects links/reparse points and verifies the
+// opened database object, rather than trusting pre-open pathname metadata.
 func Open(path string) (*DB, error) {
+	return openWithDirectoryHook(path, nil)
+}
+
+// openWithDirectoryHook places the test hook after the parent has been opened
+// and verified but before the database is opened relative to that handle.
+func openWithDirectoryHook(path string, afterDirectoryOpen func() error) (*DB, error) {
 	if path == "" {
 		return nil, ErrInvalid
 	}
@@ -66,30 +71,32 @@ func Open(path string) (*DB, error) {
 	}
 	absolute = filepath.Clean(absolute)
 	directory := filepath.Dir(absolute)
-	if err := validateDirectory(directory); err != nil {
-		return nil, err
+	name := filepath.Base(absolute)
+	if name == "." || name == string(filepath.Separator) || name == "" || name == ".." {
+		return nil, ErrInvalid
 	}
-	existed, err := validateDatabaseEntry(absolute)
+	parent, err := openSecureDirectory(directory)
 	if err != nil {
 		return nil, err
+	}
+	defer parent.Close()
+	if afterDirectoryOpen != nil {
+		if err := afterDirectoryOpen(); err != nil {
+			return nil, ErrUnavailable
+		}
 	}
 
-	database, err := openBbolt(absolute)
+	database, err := openBbolt(absolute, func(_ string, flags int, mode os.FileMode) (*os.File, error) {
+		return parent.OpenFile(name, flags, mode)
+	})
 	if err != nil {
+		if errors.Is(err, ErrInvalid) {
+			return nil, ErrInvalid
+		}
 		if errors.Is(err, ErrCorrupt) || errors.Is(err, bbolt.ErrInvalid) || errors.Is(err, bbolt.ErrChecksum) || errors.Is(err, bbolt.ErrVersionMismatch) {
 			return nil, ErrCorrupt
 		}
 		return nil, ErrUnavailable
-	}
-	if !existed && runtime.GOOS != "windows" {
-		if err := os.Chmod(absolute, 0o600); err != nil {
-			_ = database.Close()
-			return nil, ErrUnavailable
-		}
-	}
-	if _, err := validateDatabaseEntry(absolute); err != nil {
-		_ = database.Close()
-		return nil, err
 	}
 	if err := database.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(recordBucket)
@@ -101,7 +108,7 @@ func Open(path string) (*DB, error) {
 	return &DB{db: database}, nil
 }
 
-func openBbolt(path string) (database *bbolt.DB, err error) {
+func openBbolt(path string, openFile func(string, int, os.FileMode) (*os.File, error)) (database *bbolt.DB, err error) {
 	defer func() {
 		if recover() != nil {
 			database = nil
@@ -113,39 +120,9 @@ func openBbolt(path string) (database *bbolt.DB, err error) {
 		NoSync:         false,
 		NoFreelistSync: false,
 		NoGrowSync:     false,
+		OpenFile:       openFile,
 	})
 	return database, err
-}
-
-func validateDirectory(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return ErrUnavailable
-	}
-	if !info.IsDir() {
-		return ErrInvalid
-	}
-	if runtime.GOOS != "windows" && (info.Mode().Perm()&0o077 != 0 || info.Mode().Perm()&0o700 != 0o700) {
-		return ErrInvalid
-	}
-	return nil
-}
-
-func validateDatabaseEntry(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, ErrUnavailable
-	}
-	if !info.Mode().IsRegular() {
-		return false, ErrInvalid
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
-		return false, ErrInvalid
-	}
-	return true, nil
 }
 
 // View runs a bounded read-only transaction. Callback errors are reduced to a

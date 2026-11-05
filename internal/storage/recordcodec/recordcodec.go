@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -52,6 +53,10 @@ type RecordMetadata struct {
 
 // Codec owns a derived record key. Close clears its best-effort key buffer.
 type Codec struct {
+	state *codecState
+}
+
+type codecState struct {
 	mu     sync.RWMutex
 	key    []byte
 	closed bool
@@ -69,7 +74,7 @@ func NewCodec(dataKey []byte) (*Codec, error) {
 	if err != nil {
 		return nil, ErrInvalidKey
 	}
-	return &Codec{key: key}, nil
+	return &Codec{state: &codecState{key: key}}, nil
 }
 
 // deriveKey implements HKDF-SHA-256 and is kept small so its RFC 5869
@@ -156,15 +161,16 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 }
 
 func (c *Codec) keyCopy() ([]byte, error) {
-	if c == nil {
+	if c == nil || c.state == nil {
 		return nil, ErrClosed
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed {
+	state := c.state
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	if state.closed {
 		return nil, ErrClosed
 	}
-	return append([]byte(nil), c.key...), nil
+	return append([]byte(nil), state.key...), nil
 }
 
 func validateMetadata(metadata RecordMetadata) error {
@@ -196,23 +202,31 @@ func associatedData(metadata RecordMetadata) []byte {
 
 // Close clears the retained key buffer and prevents further operations.
 func (c *Codec) Close() error {
-	if c == nil {
+	if c == nil || c.state == nil {
 		return ErrClosed
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.closed {
-		clear(c.key)
-		c.key = nil
-		c.closed = true
+	state := c.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.closed {
+		clear(state.key)
+		state.key = nil
+		state.closed = true
 	}
 	return nil
 }
 
-func (*Codec) String() string   { return "recordcodec.Codec([redacted])" }
-func (*Codec) GoString() string { return "recordcodec.Codec([redacted])" }
+const redactedCodec = "recordcodec.Codec([redacted])"
+
+// Format redacts the codec regardless of formatting verb, including %#v on a
+// dereferenced value or shallow copy. Secret state is kept behind a private
+// pointer so formatting a value cannot traverse key bytes.
+func (Codec) Format(state fmt.State, _ rune) { _, _ = io.WriteString(state, redactedCodec) }
+
+func (Codec) String() string   { return redactedCodec }
+func (Codec) GoString() string { return redactedCodec }
 
 // MarshalText and MarshalJSON refuse serialization instead of disclosing the
 // key or implying that the codec is a serializable value.
-func (*Codec) MarshalText() ([]byte, error) { return nil, ErrSerialization }
-func (*Codec) MarshalJSON() ([]byte, error) { return nil, ErrSerialization }
+func (Codec) MarshalText() ([]byte, error) { return nil, ErrSerialization }
+func (Codec) MarshalJSON() ([]byte, error) { return nil, ErrSerialization }

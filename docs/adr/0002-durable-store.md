@@ -102,11 +102,23 @@ clears the retained derived key on `Close`.
 The physical adapter provides one fixed record bucket and only bounded opaque
 byte operations: 4 KiB maximum keys, 5 MiB values, 16 MiB/1024-operation
 transaction limits, copied values, concurrent readers, and serialized
-single-writer transactions. Unix directory and file modes are enforced as
-0700/0600; symlinks and non-regular entries are refused. bbolt's durability
-options stay synchronized (all no-sync options false), and its default logger
-discards output. No domain observations or higher-level repository API are
-exposed.
+single-writer transactions. On Darwin/Linux it verifies owner and 0700/0600
+modes from opened handles, pins the parent directory, and opens each component
+with no-follow semantics. On Windows it creates directories/files with a
+protected DACL for only the current user, verifies owner and the single
+non-inheriting allow ACE from opened handles, rejects reparse points, and opens
+relative to a pinned parent handle. `CreatePrivateDirectory` provides the
+platform-specific safe directory-creation path. The deterministic path-swap
+regression confirms that replacement of the checked pathname cannot redirect
+the database open. bbolt's durability options stay synchronized (all no-sync
+options false), and its default logger discards output. No domain observations
+or higher-level repository API are exposed.
+
+The Windows implementation follows the documented `NtCreateFile` contract for
+names relative to `OBJECT_ATTRIBUTES.RootDirectory`, opens each component with
+`FILE_OPEN_REPARSE_POINT`, and supplies the protected DACL at object creation;
+see Microsoft's [`NtCreateFile` documentation](https://learn.microsoft.com/windows/win32/api/winternl/nf-winternl-ntcreatefile)
+and [security descriptors for new objects](https://learn.microsoft.com/windows/win32/secauthz/security-descriptors-for-new-objects).
 
 ## Verification evidence
 
@@ -127,6 +139,10 @@ On the local Darwin/arm64 host, the following passed on v1.5.0:
   darwin/arm64, darwin/amd64, windows/amd64, linux/amd64, and linux/arm64.
   The audit additionally found no selected `CgoFiles` for any shipped target
   when listing with cgo enabled.
+- The parent-directory swap regression ran natively on Darwin/arm64. Windows
+  ACL tests cover current-user-only creation/open and explicit broad-ACL
+  rejection; they are compiled locally for windows/amd64 and execute in hosted
+  Windows CI.
 - Dependency listing, upstream license inspection, `go mod verify`, and
   `git diff --check`.
 
@@ -156,11 +172,13 @@ same clarified audit and runtime gates, so the older lines were not selected.
   probabilistic and still needs an explicit key-volume/rotation policy.
 - Subprocess termination tests are not power-loss or filesystem-fault
   injection across every OS.
-- Unix mode checks are exercised locally; Windows file mode is not an ACL and
-  Task 1 does not establish a user-only Windows ACL policy.
-- `Lstat` followed by open leaves a race if a caller places the store under a
-  directory writable by another principal. Callers must provide a private
-  directory; descriptor-based no-follow handling deserves follow-up review.
+- Windows ACL tests are cross-compiled locally but require hosted Windows CI
+  for native execution; Windows ACL semantics therefore remain a platform
+  verification risk until that job passes.
+- The Darwin/Linux path boundary resolves platform path aliases (including
+  macOS `/var`) before a component-by-component no-follow walk. Windows rejects
+  UNC/device paths and fails closed if handle-relative open or ACL inspection
+  is unavailable. Callers should still use a stable application data root.
 - This task does not implement DEK wrapping, typed secret-state handling,
   atomic key creation, key rotation, backup/restore, indexing, migration, or
   the higher-level production `EncryptedStore` repository.

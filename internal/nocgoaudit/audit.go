@@ -152,6 +152,7 @@ func AuditTarget(ctx context.Context, target Target) error {
 	}
 
 	cmd := exec.CommandContext(ctx, "go", "list", "-deps", "-json", "./...")
+	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS="+target.GOOS, "GOARCH="+target.GOARCH)
 	var output bytes.Buffer
 	var stderr bytes.Buffer

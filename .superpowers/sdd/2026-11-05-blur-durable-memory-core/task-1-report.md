@@ -322,3 +322,95 @@ user-only ACL; and `Lstat` then open is weaker than descriptor-based
 no-follow handling if callers use a shared writable parent. These remain
 follow-up production-hardening items, not failures of the Task 1 selected
 candidate gates. The commit hash is recorded by the final task handoff.
+
+## Fix Round 1 — review findings
+
+This continuation supersedes the two path/Windows limitations in the preceding
+historical self-review. The no-cgo ruling and five-target matrices remain
+unchanged.
+
+### Findings fixed
+
+1. `Codec` now stores its derived key and lock behind a private shared-state
+   pointer. Its value-receiver `fmt.Formatter`, `String`, and `GoString`
+   implementations redact pointers, dereferenced values, and shallow copies
+   for formatting verbs; serialization remains refused. The copied value no
+   longer contains a key slice or mutex that `%#v` can traverse.
+2. Windows now has cgo-free ACL and path helpers. Directory and database
+   creation supplies a protected DACL containing exactly one non-inheriting
+   `GENERIC_ALL` allow ACE for the current user; opened handles are checked for
+   that owner/DACL, object type, and reparse status. Explicit broad, inherited,
+   null, defaulted, or otherwise ambiguous ACLs fail closed. `CreatePrivateDirectory`
+   is the safe creation entry point.
+3. The bbolt adapter supplies `Options.OpenFile` and opens the database
+   relative to a pinned directory handle. Darwin/Linux walk canonical
+   components with `openat`/`O_NOFOLLOW` and validate ownership, mode, and file
+   type with `fstat`; Windows walks with `NtCreateFile` relative to handles,
+   uses `FILE_OPEN_REPARSE_POINT`, and verifies ACL/type from the returned
+   handle. Unsupported operating systems return `ErrUnavailable`. The test
+   hook swaps the checked parent pathname for a replacement before bbolt opens
+   the file and proves the DB remains under the already-opened directory.
+4. `AuditTarget` sets `go list`'s working directory to the module root found
+   by `go env GOMOD`. A real temporary-module regression invokes it from a
+   nested package while a root package imports a target-selected Cgo
+   dependency, ensuring that dependency remains in the audited graph.
+
+Windows path handling follows Microsoft's documented handle-relative
+`OBJECT_ATTRIBUTES.RootDirectory` behavior and the `FILE_OPEN_REPARSE_POINT`
+option in [`NtCreateFile`](https://learn.microsoft.com/windows/win32/api/winternl/nf-winternl-ntcreatefile).
+The protected DACL is supplied at creation as described in Microsoft's
+[security-descriptor guidance](https://learn.microsoft.com/windows/win32/secauthz/security-descriptors-for-new-objects).
+
+### Fix Round 1 TDD record
+
+The four focused regressions were added before their implementation changes.
+
+| Finding / test | Red command and observed result | Green command and observed result |
+| --- | --- | --- |
+| Codec value/copy formatting: `TestCodecFormattingRedactsValuesCopiesAndCommonVerbs` | `go test ./internal/storage/recordcodec -run '^TestCodecFormattingRedactsValuesCopiesAndCommonVerbs$' -count=1` exited 1. `%+v`/`%#v` on dereferenced values and copies printed the key byte slice; alternate numeric verbs also exposed its bytes. | `go test -run '^TestCodecFormattingRedactsValuesCopiesAndCommonVerbs$' -count=1 ./internal/storage/recordcodec` passed. It covers `%v`, `%+v`, `%#v`, `%s`, `%q`, `%x`, `%X`, `%p`, `%b`, `%d`, `%o`, `%U`, and `%T` across pointers, values, and copies; all outputs are checked for key disclosure. |
+| Nested-cwd audit: `TestAuditTargetUsesModuleRootWhenCalledFromNestedDirectory` | `go test ./internal/nocgoaudit -run '^TestAuditTargetUsesModuleRootWhenCalledFromNestedDirectory$' -count=1` exited 1 with `AuditTarget() from nested cwd error = <nil>`; the root dependency was missing from `go list ./...`. | `go test -run '^TestAuditTargetUsesModuleRootWhenCalledFromNestedDirectory$' -count=1 ./internal/nocgoaudit` passed and rejected `example.test/dep`'s selected `CgoFiles`. |
+| Pinned-parent swap: `TestOpenWithDirectoryHookPinsDirectoryAgainstPathSwap` | `go test ./internal/storage/physical/bolt -run '^TestOpenWithDirectoryHookPinsDirectoryAgainstPathSwap$' -count=1` first exited 1 at compile because the seam was absent. After adding the seam, I temporarily restored pathname-based `os.OpenFile` behavior to exercise the actual race; the same command then failed with `database was redirected into replacement directory: Lstat error = <nil>`. | Restored the `Options.OpenFile` callback to use the pinned directory handle; `go test -run '^TestOpenWithDirectoryHookPinsDirectoryAgainstPathSwap$' -count=1 ./internal/storage/physical/bolt` passed on native Darwin/arm64. The DB landed in the renamed directory represented by the pinned handle, not the replacement path. |
+| Windows ACL/path tests: `TestWindowsCreatePrivateDirectoryAndDatabase`, `TestWindowsOpenRejectsBroadDirectoryACL`, `TestWindowsOpenRejectsBroadDatabaseACL`, `TestWindowsOpenRejectsInheritedBroadDirectoryACL`, and `TestWindowsOpenRejectsDirectoryJunction` | `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /dev/null ./internal/storage/physical/bolt` initially exited 1 because the new tests referenced missing `CreatePrivateDirectory`, `openSecureDirectory`, and `openWithDirectoryHook`. | The same command passed after the Windows helpers were added. Windows-native test execution is provided by the existing `windows-latest` CI matrix; this Darwin host only cross-compiled those tests. |
+
+The broader focused green run also passed:
+
+```text
+go test -count=1 ./internal/storage/recordcodec ./internal/storage/physical/bolt
+go test -count=1 ./internal/nocgoaudit -run 'TestAuditTargetUsesModuleRootWhenCalledFromNestedDirectory|TestAuditTargetRejectsCImportSelectedForSupportedTarget|TestAuditTargetAllowsIgnoredCImportInExternalDependency|TestAuditTargetStillRejectsIgnoredCImportInBlurSource'
+```
+
+### Fix Round 1 final verification
+
+All commands below were rerun after the final code edits on Go 1.27.3,
+Darwin/arm64:
+
+| Command | Result |
+| --- | --- |
+| `go test ./...` | Passed all packages. |
+| `go test -race ./...` | Passed all packages. |
+| `go vet ./...` | Passed. |
+| `make build cross-build cross-test-compile no-cgo-audit` | Passed. `build` used `CGO_ENABLED=0`; physical and command packages built on darwin/arm64, darwin/amd64, windows/amd64, linux/amd64, and linux/arm64; conformance tests compiled for the Makefile's test matrix; the target-aware audit found no selected `CgoFiles` or `import C`. |
+| `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /dev/null ./internal/storage/physical/bolt` | Passed; Windows ACL, inheritance, junction, and path-swap tests compile. Native Windows execution remains a hosted-CI check. |
+| `go test -run='TestEncryptedRecordsLeaveNoPlaintextInFilesOrErrors|TestCorruptDatabaseIsRejectedWithoutContentfulErrors' -v -count=1 ./internal/storage/physical/bolt` | Both passed. The synthetic plaintext sentinel was absent from database/temp artifacts, logs, and returned errors; corrupt bytes were rejected without contentful errors. |
+| `go test -run=^$ -fuzz=FuzzOpenRejectsUnauthenticatedEnvelope -fuzztime=2s -parallel=2 ./internal/storage/recordcodec` | Passed; 253,559 executions, 0 new interesting inputs, 6 corpus inputs. |
+| `go test -run=^$ -bench=BenchmarkUpdateOpaqueRecord -benchmem -count=1 ./internal/storage/physical/bolt` | Passed on Apple M5 Max / Darwin arm64: 6,774,587 ns/op, 23,872 B/op, 58 allocs/op. |
+| `go list -deps -f '{{if and (not .Standard) (not .Module.Main)}}{{.ImportPath}}{{end}}' ./internal/storage/physical/bolt` | Runtime dependencies: bbolt errors/common/freelist/core and `golang.org/x/sys/unix`. Windows target additionally selects `golang.org/x/sys/windows`; no new module was added. |
+| `go list -m all` / `go mod verify` | Listed the pinned bbolt v1.5.0 and x/sys v0.45.0 graph; `all modules verified`. x/sys is now direct because the physical boundary calls its handle-relative platform APIs. |
+| `git diff --check` | Passed after the final report and source edits. |
+
+### Fix Round 1 files and remaining concerns
+
+Changed files in this round: `docs/adr/0002-durable-store.md`, `go.mod`,
+`internal/nocgoaudit/audit.go`, `internal/nocgoaudit/audit_test.go`,
+`internal/storage/recordcodec/recordcodec.go`,
+`internal/storage/recordcodec/recordcodec_test.go`,
+`internal/storage/physical/bolt/bolt.go`, `bolt_test.go`,
+`bolt_windows_test.go`, `path.go`, `path_unix.go`, `path_windows.go`, and
+`path_unsupported.go`.
+
+The previous statements that Windows user-only ACL enforcement was absent and
+that a pathname `Lstat`/open race remained are superseded by this round. The
+primary remaining concern is that Windows ACL and junction behavior was only
+cross-compiled locally and awaits execution in the existing Windows CI job.
+The Task 1 boundary continues not to implement DEK wrapping/rotation, the
+higher-level `EncryptedStore`, or all-OS power-loss testing.

@@ -86,6 +86,18 @@ func TestAuditTargetRejectsCImportSelectedForSupportedTarget(t *testing.T) {
 	}
 }
 
+func TestAuditTargetUsesModuleRootWhenCalledFromNestedDirectory(t *testing.T) {
+	project, dependency := makeAuditProject(t)
+	writeAuditFile(t, filepath.Join(dependency, "selected_darwin.go"), "//go:build darwin && cgo\n\npackage dep\nimport \"C\"\n")
+	nested := filepath.Join(project, "internal", "nested")
+	writeAuditFile(t, filepath.Join(nested, "nested.go"), "package nested\nfunc Value() int { return 1 }\n")
+	t.Chdir(nested)
+	err := AuditTarget(context.Background(), Target{GOOS: "darwin", GOARCH: "arm64"})
+	if err == nil || !strings.Contains(err.Error(), "example.test/dep") || !strings.Contains(err.Error(), "CgoFiles") {
+		t.Fatalf("AuditTarget() from nested cwd error = %v, want root dependency selected by go list to be rejected", err)
+	}
+}
+
 func TestAuditTargetStillRejectsIgnoredCImportInBlurSource(t *testing.T) {
 	project, _ := makeAuditProject(t)
 	writeAuditFile(t, filepath.Join(project, "unsupported", "unsupported_hurd.go"), "//go:build hurd && cgo\n\npackage unsupported\nimport \"C\"\n")

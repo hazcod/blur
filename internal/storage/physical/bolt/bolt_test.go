@@ -22,11 +22,9 @@ import (
 
 func databasePath(t *testing.T) string {
 	t.Helper()
-	directory := t.TempDir()
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
+	directory := filepath.Join(t.TempDir(), "private")
+	if err := CreatePrivateDirectory(directory); err != nil {
+		t.Fatalf("CreatePrivateDirectory() error = %v", err)
 	}
 	return filepath.Join(directory, "store.db")
 }
@@ -123,6 +121,35 @@ func TestOpenRefusesSymlinksAndNonRegularFiles(t *testing.T) {
 			t.Fatalf("Open(directory) error = %v, want ErrInvalid", err)
 		}
 	})
+}
+
+func TestOpenWithDirectoryHookPinsDirectoryAgainstPathSwap(t *testing.T) {
+	root := t.TempDir()
+	checkedDirectory := filepath.Join(root, "checked")
+	if err := CreatePrivateDirectory(checkedDirectory); err != nil {
+		t.Fatal(err)
+	}
+	pinnedDirectory := filepath.Join(root, "pinned")
+	replacementDirectory := checkedDirectory
+	databasePath := filepath.Join(checkedDirectory, "store.db")
+	db, err := openWithDirectoryHook(databasePath, func() error {
+		if err := os.Rename(checkedDirectory, pinnedDirectory); err != nil {
+			return err
+		}
+		return CreatePrivateDirectory(replacementDirectory)
+	})
+	if err != nil {
+		t.Fatalf("openWithDirectoryHook() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(replacementDirectory, "store.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database was redirected into replacement directory: Lstat error = %v", err)
+	}
+	if info, err := os.Lstat(filepath.Join(pinnedDirectory, "store.db")); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("pinned database = (%v, %v), want regular DB under opened directory", info, err)
+	}
 }
 
 func TestOpaqueTransactionRoundTripAndCopyBoundaries(t *testing.T) {
@@ -542,11 +569,9 @@ func TestEncryptedRecordsLeaveNoPlaintextInFilesOrErrors(t *testing.T) {
 }
 
 func BenchmarkUpdateOpaqueRecord(b *testing.B) {
-	directory := b.TempDir()
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(directory, 0o700); err != nil {
-			b.Fatal(err)
-		}
+	directory := filepath.Join(b.TempDir(), "private")
+	if err := CreatePrivateDirectory(directory); err != nil {
+		b.Fatal(err)
 	}
 	db, err := Open(filepath.Join(directory, "bench.db"))
 	if err != nil {

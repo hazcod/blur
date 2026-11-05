@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -271,7 +272,7 @@ func TestCodecCopiesKeyInputAndClearsOnClose(t *testing.T) {
 	if err := codec.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if len(codec.key) != 0 {
+	if len(codec.state.key) != 0 {
 		t.Fatal("Close() retained the derived key buffer")
 	}
 	if got, err := codec.Open(testMetadata(), envelope); !errors.Is(err, ErrClosed) || got != nil {
@@ -299,6 +300,28 @@ func TestCodecFormattingAndJSONDoNotExposeKey(t *testing.T) {
 	encoded, err := json.Marshal(codec)
 	if !errors.Is(err, ErrSerialization) || len(encoded) != 0 {
 		t.Fatalf("json.Marshal(codec) = (%s, %v), want serialization refusal without bytes", encoded, err)
+	}
+}
+
+func TestCodecFormattingRedactsValuesCopiesAndCommonVerbs(t *testing.T) {
+	codec, err := NewCodec(testKey(0x5a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer codec.Close()
+
+	value := *codec
+	copyValue := value
+	values := []any{codec, *codec, value, &value, copyValue, &copyValue}
+	verbs := []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%p", "%b", "%d", "%o", "%U", "%T"}
+	derivedKey := hex.EncodeToString(codec.state.key)
+	for _, candidate := range values {
+		for _, verb := range verbs {
+			formatted := fmt.Sprintf(verb, candidate)
+			if (verb != "%p" && verb != "%T" && formatted != "recordcodec.Codec([redacted])") || strings.Contains(formatted, derivedKey) {
+				t.Errorf("fmt.Sprintf(%q, %T) = %q, want redacted marker without key material", verb, candidate, formatted)
+			}
+		}
 	}
 }
 
