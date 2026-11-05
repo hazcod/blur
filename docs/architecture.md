@@ -57,7 +57,11 @@ version, redactor fixed-point status, bounded text and counters, and a
 recomputed content identity. JSON marshal is available for the validated
 sanitized form; JSON unmarshal is rejected. The storage and core APIs accept
 this type, not raw frames. This is an in-process Go type boundary; it is not
-yet a wire protocol or process isolation boundary.
+yet a wire protocol or process isolation boundary. Capture also owns a
+versioned deterministic bounded binary persistence codec. The durable store
+calls its restore path only after AEAD authentication; restore reconstructs
+private fields, checks canonical encoding, current redaction policy and the
+recomputed content identity. JSON remains unable to construct a trusted value.
 
 Redaction is deterministic and heuristic. Current patterns cover labeled
 secrets, selected provider tokens, authorization headers, private-key blocks,
@@ -91,13 +95,21 @@ revocation remain deferred.
 ### Core, store, and search
 
 The `EncryptedStore` interface requires bounded ordered listing, validated
-sanitized observations, and immutable derivation/generation metadata. Its only
-implementation here, `EphemeralMemoryStore`, stores copies in process memory,
+sanitized observations, and immutable derivation/generation metadata. The
+explicitly named `EphemeralMemoryStore` stores copies in process memory,
 reports `EncryptedAtRest() == false`, and loses all data when the process ends.
-The production `NewService` constructor rejects a store that does not report
-encryption; only the explicitly named ephemeral development constructor can
-accept this backend. No encrypted persistence implementation has been
-selected (see [ADR 0001](adr/0001-encrypted-store-selection.md)).
+An internal `durable.Store` now provides the same contract over the Task 1
+opaque bbolt adapter: logical IDs are domain-separated keyed HMACs, values are
+versioned and AEAD-encrypted, and an encrypted keyed record-set manifest is
+updated in the same transaction. Open requires explicit create-new or
+open-existing mode; reads verify the manifest before serving the store, and
+observation pages use authenticated size metadata to enforce byte ceilings
+before copying/decrypting a record that will not fit. A single internal
+transaction extension boundary is available to later index materializers.
+This backend is not yet wired into `NewService` or the demo commands; those
+still use the ephemeral store and remain unsuitable for real personal data.
+The store does not protect against whole-file rollback, compromised process
+memory, or loss/theft of the data key. See [ADR 0002](adr/0002-durable-store.md).
 
 Search is deterministic exact-term matching, capped at 64 observations and
 2 MiB of aggregate text/app/domain bytes per request; an omitted request byte
@@ -143,6 +155,9 @@ There is no diagnostics service or logging pipeline to claim as implemented.
 - Search work is bounded per request and concurrent call, including byte-aware
   pages whose metadata prevents the store from cloning observations that do
   not fit.
+- The internal durable store authenticates encrypted records, HMACs physical
+  logical-ID keys, detects record-set insertion/deletion/tampering with a
+  transactionally updated manifest, and refuses implicit create-on-open.
 - Command binaries and transitive non-standard dependencies pass the current
   cgo-disabled build and Cgo/import-C audit matrix.
 
@@ -151,8 +166,9 @@ desktop security boundary, persistent privacy guarantee, or product workflow.
 
 ## Deferred product phases
 
-Native accessibility reads and target leases; OS secret stores; authenticated
-encrypted persistent storage; single-instance/key-creation coordination;
+Native accessibility reads and target leases; OS secret stores and data-key
+wrapping; production wiring of authenticated persistence; single-instance and
+key-creation coordination;
 native IPC, ACLs and peer identity; GUI and onboarding; pause UI and durable
 exclusions; real diagnostics and log sinks; AI/provider routing; MCP; writing,
 dictation, audio; histories, chronicles, wiki, scheduling; export/import;

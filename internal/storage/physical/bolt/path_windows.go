@@ -82,7 +82,11 @@ func (directory *windowsSecureDirectory) OpenFile(name string, flag int, mode os
 	disposition := uint32(windows.FILE_OPEN)
 	var descriptor *windows.SECURITY_DESCRIPTOR
 	if flag&os.O_CREATE != 0 {
-		disposition = windows.FILE_OPEN_IF
+		if flag&os.O_EXCL != 0 {
+			disposition = windows.FILE_CREATE
+		} else {
+			disposition = windows.FILE_OPEN_IF
+		}
 		var err error
 		descriptor, err = currentUserSecurityDescriptor()
 		if err != nil {
@@ -92,6 +96,12 @@ func (directory *windowsSecureDirectory) OpenFile(name string, flag int, mode os
 	options := uint32(windows.FILE_NON_DIRECTORY_FILE | windows.FILE_OPEN_REPARSE_POINT | windows.FILE_SYNCHRONOUS_IO_NONALERT)
 	handle, err := openRelativeWindows(directory.handle, name, access|windows.SYNCHRONIZE, disposition, options, descriptor)
 	if err != nil {
+		switch err {
+		case windows.STATUS_OBJECT_NAME_COLLISION:
+			return nil, os.ErrExist
+		case windows.STATUS_OBJECT_NAME_NOT_FOUND, windows.STATUS_OBJECT_PATH_NOT_FOUND:
+			return nil, os.ErrNotExist
+		}
 		if isWindowsUnsafePathError(err) {
 			return nil, ErrInvalid
 		}

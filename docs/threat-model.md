@@ -2,17 +2,19 @@
 
 Status: implementation checkpoint, 2026-11-05. This model covers code in the
 current Go foundation, not every capability described by the product design.
-The demo is not suitable for storing real personal data: it uses ephemeral,
-unencrypted memory and has no native capture or durable local service.
+The demo is not suitable for storing real personal data: its service and
+commands still use ephemeral, unencrypted memory and have no native capture
+or production durable local service. An internal encrypted durable backend
+exists and is tested, but is not yet wired into those entry points.
 
 ## Assets
 
 The design protects foreground text and metadata, observation identity and
 provenance, grant credentials and HMAC keys, future data-encryption keys,
 capability configuration, derived personal facts, and any future provider
-credentials. In this implementation only synthetic/test or caller-supplied
-values exist in process memory; there is no on-disk user store or provider
-secret.
+credentials. Synthetic/test or caller-supplied values exist in process
+memory; durable-store tests also create encrypted temporary database files.
+There is no on-disk user store wired into the application or provider secret.
 
 ## Trust boundaries
 
@@ -24,10 +26,12 @@ capture package: private raw staging → redactor → validated observation
                 │ in-process value boundary only
                 ▼
 core: scoped proof check → search/store interface
-                              └── ephemeral memory store today
+                              ├── ephemeral memory store (wired demo backend)
+                              └── internal AEAD durable store (not wired)
 
 CLI ── in-process demo client; no endpoint
-future IPC, OS identity, encrypted persistence, and providers are not present
+future IPC, OS identity integration, production key management, and providers
+are not present
 ```
 
 1. **Desktop target to adapter:** a future native adapter will observe
@@ -41,13 +45,22 @@ future IPC, OS identity, encrypted persistence, and providers are not present
    to `capture`; reads have byte/node/depth/time bounds; deterministic
    redaction precedes construction; validation is repeated at the store/core
    boundary. This is a type/package boundary in one process, not hostile-code
-   isolation.
+   isolation. Capture owns a deterministic bounded binary persistence codec;
+   the durable backend authenticates its bytes with AEAD before calling
+   restore, which revalidates canonical identity and the current redactor.
 4. **Client to core:** in-memory grants bind a client, scope, expiry and
    request semantics through a one-use HMAC proof. Current CLI access is an
    in-process demonstration and no grant crosses IPC.
-5. **Core to persistence:** the interface is named `EncryptedStore`, but the
-   only current backend is explicitly unencrypted and ephemeral. The
-   production constructor refuses it. No persistent backend is wired.
+5. **Core to persistence:** the demo's only wired backend is explicitly
+   unencrypted and ephemeral. The production constructor refuses it. The
+   internal durable backend encrypts each versioned record with AEAD, uses
+   domain-separated keyed HMACs for physical logical-ID keys, and verifies an
+   encrypted keyed record-set manifest. It requires explicit create/open mode,
+   has byte-aware non-decrypting page admission, and refuses malformed,
+   wrong-key, or unsupported stores without creating or overwriting them. It
+   is not yet selected by a production service entry point and depends on a
+   caller-provided 32-byte key; OS wrapping, cross-process key coordination,
+   backup and key rotation are not implemented.
 6. **Core to diagnostics/network:** current commands print bounded structured
    status/capabilities to stdout. No network, AI, logging sink, crash upload,
    or telemetry path is present.
@@ -62,10 +75,11 @@ future IPC, OS identity, encrypted persistence, and providers are not present
 | Recover a known secret using patterned capture | Redaction handles a selected deterministic set of recognizable patterns before observation construction and counts rules, not matched values. | Heuristics can miss novel formats, unlabeled prose, split values, encodings, images, application-specific secrets, or data added after redaction. Redaction does not establish confidentiality or make the demo appropriate for real secrets. |
 | Forge, broaden, or replay a local operation | Proofs bind grant/client/scope/timestamp/nonce/request digest; authorizer checks expiration, skew, revocation, constant-time MAC equality, replay and bounded nonce capacity. Scope vocabulary is closed. | All state and credentials are in process memory; there is no peer identity, endpoint ACL, secure provisioning, persistence or revocation across restarts. Compromise of the process or credential can authorize its permitted scopes. |
 | Exhaust memory or CPU through grants or search | GrantStore holds at most 1,024 grants and prunes expired grants on issuance/authorization; removal clears nonce/scope maps and overwrites the authenticator key first. Search limits each request to 64 observations and 2 MiB of scanned text/app/domain bytes, fetches at most four rows per byte-bounded page, and the core admits at most two concurrent searches with context-aware waiting. | The caps still permit bounded transient work and memory use. Key overwrite is best-effort in Go process memory and cannot erase prior copies, runtime artifacts, swap, or credentials held by callers. A request waiting for a search slot has already consumed its one-use proof. |
-| Expose persistent memory from a lost device | Current demo retains memory only in process and reports `encrypted_at_rest=false`; production constructor refuses the in-memory store. | There is no encrypted persistent store, OS wrapping key, backup or device-loss protection to evaluate or claim. Users should not treat the demo as safe storage. |
-| Leak data through errors, status or logs | Capture and secret-store errors suppress backend details; report vocabularies and CLI output are bounded and content-free; secret-bearing grant/proof types redact formatting and JSON. | No general logger/crash/diagnostics implementation exists. Future logs, traces, crash dumps, test output and support bundles need separate review. In-process memory remains readable to a process-level attacker. |
+| Expose persistent memory from a lost device | Current demo retains memory only in process and reports `encrypted_at_rest=false`; production constructor refuses the in-memory store. The unintegrated durable backend encrypts records at rest when given a data key. | There is no production-wired persistent store or OS wrapping key, backup, or device-loss key recovery. Users should not treat the demo as safe storage. |
+| Read or alter a durable database file | The internal durable backend uses AES-GCM authenticated records, binds ciphertext to the physical key/namespace/revision, HMACs logical IDs, and verifies an authenticated keyed record-set manifest on open. Wrong keys, tampering, record swaps, unauthorized insertions/deletions, and interrupted migration are covered by tests. The physical adapter enforces private file/directory boundaries and durable bbolt transactions. | The backend is not wired into the demo or production service. Whole-store rollback to an earlier consistent file is not detected. Anyone who obtains the data key can decrypt or forge records; process memory, key storage/wrapping, cross-process creation coordination, backup/restore, rotation, and deletion are outside this phase. Filesystem snapshots and storage media may retain prior ciphertext. |
+| Leak data through errors, status or logs | Capture, secret-store, and durable-store errors suppress payloads and backend details; report vocabularies and CLI output are bounded and content-free; secret-bearing grant/proof/store types redact formatting or refuse serialization. | No general logger/crash/diagnostics implementation exists. Future logs, traces, crash dumps, test output and support bundles need separate review. In-process memory remains readable to a process-level attacker. |
 | Trigger hidden screenshot, OCR or network fallback | No screenshot, OCR, clipboard, keystroke, network client, AI/provider code, or native capture path is wired. Unavailable adapters return disabled/error states. | Future changes could add paths; review and CI need to preserve the explicit no-fallback contract. |
-| Use dependency/native code to cross the cgo boundary | Current Go module has no third-party Go modules; cgo-disabled cross-builds and the repository audit reject Cgo files or `import "C"` in non-standard dependencies. | This does not establish supply-chain provenance, signed artifacts, license policy, JavaScript dependency posture, or future package safety. `govulncheck` was unavailable at this checkpoint. |
+| Use dependency/native code to cross the cgo boundary | The runtime store graph uses bbolt and x/sys; cgo-disabled cross-builds and the repository audit reject selected Cgo files or `import "C"` in non-standard dependencies for shipped targets. | This does not establish supply-chain provenance, signed artifacts, license policy, JavaScript dependency posture, or future package safety. `govulncheck` was unavailable at this checkpoint. |
 
 ## Local grant proof lifecycle
 
@@ -147,16 +161,18 @@ an unavailable accessibility or desktop capability.
   are trusted for this foundation. An administrator/root user, kernel
   compromise, debugger with process access, or hostile code injection can read
   process memory and is out of scope.
-- Current data is ephemeral. Process exit loses observations and grants; this
-  does not count as secure deletion because copies may exist in runtime memory,
-  swap, hibernation, crash dumps, or host diagnostics.
-- There are no backups, exports, rotation or deletion operations. No guarantee
-  is made about erasure from SSDs, filesystem snapshots, backups, swap, WAL,
-  crash artifacts, or future persistent stores. A future delete/key-destroy
-  design must document those limits and test authenticated recovery.
-- No native capture, UI, AI, MCP, writing, dictation, persistent store,
-  provider egress, or user-facing privacy controls are implemented. The design
-  and ADR describe requirements and deferred gates, not shipped controls.
+- Application demo data is ephemeral. Process exit loses its observations and
+  grants; this does not count as secure deletion because copies may exist in
+  runtime memory, swap, hibernation, crash dumps, or host diagnostics.
+- The internal durable store has no backup, export, rotation, or deletion
+  operations. No guarantee is made about erasure from SSDs, filesystem
+  snapshots, backups, swap, hibernation, crash dumps, or later persistent
+  stores. A future delete/key-destroy design must document those limits and
+  test authenticated recovery.
+- No native capture, UI, AI, MCP, writing, dictation, production-wired durable
+  store, provider egress, or user-facing privacy controls are implemented. The
+  design and ADR describe requirements and deferred gates, not shipped
+  controls.
 - Capability status and content-free errors reduce accidental exposure; they
   are not a substitute for OS-level process isolation or independent security
   review.
@@ -167,8 +183,10 @@ Before native capture: adversarial accessibility fixtures must verify secure
 target and exclusion behavior, budgets, cancellation, redaction, and sentinel
 absence from outputs/errors. Before native IPC: review ACL/peer evidence,
 grant issuance/revocation, bounded decoding, restart semantics and race/fuzz
-tests. Before persistent user data: select and pass the authenticated
-no-cgo store gate in [ADR 0001](adr/0001-encrypted-store-selection.md),
-including tamper, crash, backup, key-loss and plaintext-residue checks. Before
-provider code: define feature-specific disclosure and validate network
-admission, redirect, certificate, credential and prompt-injection behavior.
+tests. Before wiring persistent user data: integrate the internal backend
+with production key management and cross-process creation coordination, then
+re-validate tamper, crash, key-loss, migration, rollback, backup and
+plaintext-residue behavior. Whole-store rollback remains a documented
+residual risk. Before provider code: define feature-specific disclosure and
+validate network admission, redirect, certificate, credential and
+prompt-injection behavior.

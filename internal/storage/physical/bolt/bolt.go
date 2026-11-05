@@ -3,6 +3,7 @@
 package bolt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -26,6 +27,8 @@ var (
 	ErrInvalid     = errors.New("physical bolt: invalid input or path")
 	ErrUnavailable = errors.New("physical bolt: unavailable")
 	ErrCorrupt     = errors.New("physical bolt: corrupt database")
+	ErrNotFound    = errors.New("physical bolt: database not found")
+	ErrExists      = errors.New("physical bolt: database already exists")
 	ErrTransaction = errors.New("physical bolt: transaction failed")
 	ErrClosed      = errors.New("physical bolt: closed")
 	ErrInvalidTx   = errors.New("physical bolt: transaction limit or operation rejected")
@@ -36,6 +39,14 @@ var recordBucket = []byte("blur_records_v1")
 // Reader exposes only bounded opaque byte lookups.
 type Reader interface {
 	Get(key []byte) (value []byte, found bool, err error)
+	Has(key []byte) (found bool, err error)
+	Scan(prefix, after []byte, limit, maxBytes int) (entries []Entry, hasMore bool, err error)
+}
+
+// Entry is an independent copy returned from a bounded ordered scan.
+type Entry struct {
+	Key   []byte
+	Value []byte
 }
 
 // Writer exposes only bounded opaque byte mutations and lookups.
@@ -56,12 +67,35 @@ type DB struct {
 // handle. The platform boundary rejects links/reparse points and verifies the
 // opened database object, rather than trusting pre-open pathname metadata.
 func Open(path string) (*DB, error) {
-	return openWithDirectoryHook(path, nil)
+	return openWithMode(path, openOrCreate, nil)
 }
+
+// CreateNew creates a private database only when path does not already exist.
+func CreateNew(path string) (*DB, error) {
+	return openWithMode(path, createNew, nil)
+}
+
+// OpenExisting opens an existing database without a create flag. Missing paths
+// are never created and a missing record bucket is treated as corruption.
+func OpenExisting(path string) (*DB, error) {
+	return openWithMode(path, openExisting, nil)
+}
+
+type openMode uint8
+
+const (
+	openOrCreate openMode = iota
+	createNew
+	openExisting
+)
 
 // openWithDirectoryHook places the test hook after the parent has been opened
 // and verified but before the database is opened relative to that handle.
 func openWithDirectoryHook(path string, afterDirectoryOpen func() error) (*DB, error) {
+	return openWithMode(path, openOrCreate, afterDirectoryOpen)
+}
+
+func openWithMode(path string, mode openMode, afterDirectoryOpen func() error) (*DB, error) {
 	if path == "" {
 		return nil, ErrInvalid
 	}
@@ -86,23 +120,48 @@ func openWithDirectoryHook(path string, afterDirectoryOpen func() error) (*DB, e
 		}
 	}
 
-	database, err := openBbolt(absolute, func(_ string, flags int, mode os.FileMode) (*os.File, error) {
-		return parent.OpenFile(name, flags, mode)
+	database, err := openBbolt(absolute, func(_ string, flags int, fileMode os.FileMode) (*os.File, error) {
+		switch mode {
+		case createNew:
+			flags |= os.O_EXCL
+		case openExisting:
+			flags &^= os.O_CREATE
+		}
+		return parent.OpenFile(name, flags, fileMode)
 	})
 	if err != nil {
 		if errors.Is(err, ErrInvalid) {
 			return nil, ErrInvalid
+		}
+		if errors.Is(err, os.ErrNotExist) && mode == openExisting {
+			return nil, ErrNotFound
+		}
+		if errors.Is(err, os.ErrExist) && mode == createNew {
+			return nil, ErrExists
 		}
 		if errors.Is(err, ErrCorrupt) || errors.Is(err, bbolt.ErrInvalid) || errors.Is(err, bbolt.ErrChecksum) || errors.Is(err, bbolt.ErrVersionMismatch) {
 			return nil, ErrCorrupt
 		}
 		return nil, ErrUnavailable
 	}
-	if err := database.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(recordBucket)
-		return err
-	}); err != nil {
+	if mode == openExisting {
+		err = database.View(func(tx *bbolt.Tx) error {
+			if tx.Bucket(recordBucket) == nil {
+				return ErrCorrupt
+			}
+			return nil
+		})
+	} else {
+		err = database.Update(func(tx *bbolt.Tx) error {
+			_, err := tx.CreateBucketIfNotExists(recordBucket)
+			return err
+		})
+	}
+	if err != nil {
 		_ = database.Close()
+		if errors.Is(err, ErrCorrupt) {
+			return nil, ErrCorrupt
+		}
 		return nil, ErrCorrupt
 	}
 	return &DB{db: database}, nil
@@ -347,6 +406,78 @@ func (tx *readTx) Get(key []byte) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	return append([]byte(nil), value...), true, nil
+}
+
+func (tx *readTx) Has(key []byte) (bool, error) {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+	if err := tx.state.begin(key, 0); err != nil {
+		return false, err
+	}
+	return tx.bucket.Get(key) != nil, nil
+}
+
+func (tx *readTx) Scan(prefix, after []byte, limit, maxBytes int) ([]Entry, bool, error) {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+	if !tx.state.active {
+		return nil, false, tx.state.fail(ErrClosed)
+	}
+	if err := tx.state.ctx.Err(); err != nil {
+		return nil, false, tx.state.fail(err)
+	}
+	if len(prefix) > MaxKeyBytes || len(after) > MaxKeyBytes ||
+		(len(after) > 0 && !bytes.HasPrefix(after, prefix)) ||
+		limit <= 0 || limit > MaxTransactionOps || maxBytes <= 0 || maxBytes > MaxTransactionBytes {
+		return nil, false, tx.state.fail(ErrInvalidTx)
+	}
+
+	cursor := tx.bucket.Cursor()
+	var key, value []byte
+	if len(after) > 0 {
+		key, value = cursor.Seek(after)
+		if bytes.Equal(key, after) {
+			key, value = cursor.Next()
+		}
+	} else if len(prefix) > 0 {
+		key, value = cursor.Seek(prefix)
+	} else {
+		key, value = cursor.First()
+	}
+
+	entries := make([]Entry, 0, min(limit, 16))
+	clearEntries := func() {
+		for index := range entries {
+			clear(entries[index].Key)
+			clear(entries[index].Value)
+		}
+	}
+	usedBytes := 0
+	for key != nil && bytes.HasPrefix(key, prefix) {
+		if err := tx.state.ctx.Err(); err != nil {
+			clearEntries()
+			return nil, false, tx.state.fail(err)
+		}
+		if len(entries) == limit {
+			return entries, true, nil
+		}
+		if err := tx.state.begin(key, 0); err != nil {
+			clearEntries()
+			return nil, false, err
+		}
+		entryBytes := len(key) + len(value)
+		if entryBytes > maxBytes-usedBytes {
+			return entries, true, nil
+		}
+		if err := tx.state.chargeReadValue(len(value)); err != nil {
+			clearEntries()
+			return nil, false, err
+		}
+		entries = append(entries, Entry{Key: append([]byte(nil), key...), Value: append([]byte(nil), value...)})
+		usedBytes += entryBytes
+		key, value = cursor.Next()
+	}
+	return entries, false, nil
 }
 
 type writeTx struct{ readTx }

@@ -90,7 +90,7 @@ func (directory *unixSecureDirectory) OpenFile(name string, flag int, mode os.Fi
 	var err error
 	if flag&os.O_CREATE != 0 {
 		fd, err = unix.Openat(int(directory.file.Fd()), name, openFlags|unix.O_EXCL, uint32(mode.Perm()))
-		if errors.Is(err, unix.EEXIST) {
+		if errors.Is(err, unix.EEXIST) && flag&os.O_EXCL == 0 {
 			fd, err = unix.Openat(int(directory.file.Fd()), name, openFlags&^unix.O_CREAT, uint32(mode.Perm()))
 		} else if err == nil {
 			created = true
@@ -99,6 +99,12 @@ func (directory *unixSecureDirectory) OpenFile(name string, flag int, mode os.Fi
 		fd, err = unix.Openat(int(directory.file.Fd()), name, openFlags, uint32(mode.Perm()))
 	}
 	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil, os.ErrNotExist
+		}
+		if errors.Is(err, unix.EEXIST) {
+			return nil, os.ErrExist
+		}
 		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENOTDIR) {
 			return nil, ErrInvalid
 		}

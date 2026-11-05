@@ -57,6 +57,51 @@ func TestOpenCreatesPrivateRegularFile(t *testing.T) {
 	}
 }
 
+func TestExplicitOpenModesDoNotCreateOrOverwrite(t *testing.T) {
+	t.Run("open existing missing", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing.db")
+		if _, err := OpenExisting(path); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("OpenExisting(missing) error = %v, want ErrNotFound", err)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("OpenExisting(missing) created a file: Lstat error = %v", err)
+		}
+	})
+
+	t.Run("create new existing", func(t *testing.T) {
+		path := databasePath(t)
+		original := []byte("SENTINEL_EXISTING_DATABASE_MUST_SURVIVE")
+		if err := os.WriteFile(path, original, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := CreateNew(path); !errors.Is(err, ErrExists) {
+			t.Fatalf("CreateNew(existing) error = %v, want ErrExists", err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, original) {
+			t.Fatalf("CreateNew(existing) changed bytes: got=%q err=%v", got, err)
+		}
+	})
+
+	t.Run("create then open existing", func(t *testing.T) {
+		path := databasePath(t)
+		created, err := CreateNew(path)
+		if err != nil {
+			t.Fatalf("CreateNew() error = %v", err)
+		}
+		if err := created.Close(); err != nil {
+			t.Fatal(err)
+		}
+		existing, err := OpenExisting(path)
+		if err != nil {
+			t.Fatalf("OpenExisting(created) error = %v", err)
+		}
+		if err := existing.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestOpenRefusesUnsafeDirectoryMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not expose POSIX directory permission bits")
@@ -205,6 +250,175 @@ func TestOpaqueTransactionRoundTripAndCopyBoundaries(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("View(empty value): %v", err)
 	}
+}
+
+func TestOpaqueHasChecksPresenceWithoutCopyingValue(t *testing.T) {
+	db, _ := openTestDB(t)
+	if err := db.Update(context.Background(), func(tx Writer) error {
+		return tx.Put([]byte("presence-key"), bytes.Repeat([]byte{0x63}, 1<<20))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		key  string
+		want bool
+	}{{"presence-key", true}, {"missing-key", false}} {
+		err := db.View(context.Background(), func(tx Reader) error {
+			found, err := tx.Has([]byte(tc.key))
+			if err != nil || found != tc.want {
+				return fmt.Errorf("Has(%q) = (%t, %v), want %t", tc.key, found, err, tc.want)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := testing.Benchmark(func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if err := db.View(context.Background(), func(tx Reader) error {
+				_, err := tx.Has([]byte("presence-key"))
+				return err
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	if result.AllocedBytesPerOp() > 32<<10 {
+		t.Fatalf("Has() copied the stored value: %d bytes/op", result.AllocedBytesPerOp())
+	}
+}
+
+func TestOpaquePrefixScanOrdersPagesAndReturnsCopies(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	fixtures := map[string]string{
+		"other/a": "outside",
+		"p/c":     "charlie",
+		"p/a":     "alpha",
+		"p/b":     "bravo",
+	}
+	if err := db.Update(ctx, func(tx Writer) error {
+		for key, value := range fixtures {
+			if err := tx.Put([]byte(key), []byte(value)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, more, err := scanDB(t, db, []byte("p/"), nil, 2, 1024)
+	if err != nil || !more || len(entries) != 2 || string(entries[0].Key) != "p/a" || string(entries[1].Key) != "p/b" {
+		t.Fatalf("first Scan() = (%v, %t, %v), want ordered p/a,p/b and more", entries, more, err)
+	}
+	entries[0].Key[0] = 'x'
+	entries[0].Value[0] = 'X'
+	next, more, err := scanDB(t, db, []byte("p/"), []byte("p/b"), 2, 1024)
+	if err != nil || more || len(next) != 1 || string(next[0].Key) != "p/c" || string(next[0].Value) != "charlie" {
+		t.Fatalf("second Scan() = (%v, %t, %v), want independent p/c entry", next, more, err)
+	}
+}
+
+func TestOpaquePrefixScanStopsBeforeCopyingEntryOverByteLimit(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	if err := db.Update(ctx, func(tx Writer) error {
+		if err := tx.Put([]byte("scan/a"), []byte("123")); err != nil {
+			return err
+		}
+		return tx.Put([]byte("scan/b"), []byte("12345"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	limit := len("scan/a") + len("123")
+	entries, more, err := scanDB(t, db, []byte("scan/"), nil, 5, limit)
+	if err != nil || !more || len(entries) != 1 || string(entries[0].Key) != "scan/a" {
+		t.Fatalf("Scan(byte limit) = (%v, %t, %v), want first row and more", entries, more, err)
+	}
+	result := testing.Benchmark(func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, _, err := scanDB(t, db, []byte("scan/"), nil, 5, limit); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	if result.AllocedBytesPerOp() > 32<<10 {
+		t.Fatalf("Scan copied an over-limit value: %d bytes/op", result.AllocedBytesPerOp())
+	}
+}
+
+func TestOpaquePrefixScanValidatesBoundsAndCancellation(t *testing.T) {
+	db, _ := openTestDB(t)
+	if err := db.Update(context.Background(), func(tx Writer) error {
+		if err := tx.Put([]byte("prefix/a"), []byte("one")); err != nil {
+			return err
+		}
+		return tx.Put([]byte("prefix/b"), []byte("two"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		limit int
+		max   int
+		ctx   context.Context
+		want  error
+	}{
+		{name: "zero rows", limit: 0, max: 1, ctx: context.Background(), want: ErrInvalidTx},
+		{name: "oversize byte cap", limit: 1, max: MaxTransactionBytes + 1, ctx: context.Background(), want: ErrInvalidTx},
+		{name: "cancelled", limit: 1, max: 1, ctx: cancelledContext(), want: context.Canceled},
+		{name: "cancelled after first copied row", limit: 2, max: 1024, ctx: cancelAfterChecksContext(3), want: context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := db.View(tc.ctx, func(tx Reader) error {
+				entries, _, err := tx.Scan([]byte("prefix"), nil, tc.limit, tc.max)
+				if tc.name == "cancelled after first copied row" && len(entries) != 0 {
+					return fmt.Errorf("cancelled Scan() returned partial copies: %d", len(entries))
+				}
+				return err
+			})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Scan() error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func scanDB(t *testing.T, db *DB, prefix, after []byte, limit, maxBytes int) ([]Entry, bool, error) {
+	t.Helper()
+	var entries []Entry
+	var more bool
+	err := db.View(context.Background(), func(tx Reader) error {
+		var err error
+		entries, more, err = tx.Scan(prefix, after, limit, maxBytes)
+		return err
+	})
+	return entries, more, err
+}
+
+func cancelledContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+type cancelAfterChecks struct {
+	context.Context
+	remaining int
+}
+
+func cancelAfterChecksContext(allowedChecks int) context.Context {
+	return &cancelAfterChecks{Context: context.Background(), remaining: allowedChecks}
+}
+
+func (ctx *cancelAfterChecks) Err() error {
+	if ctx.remaining == 0 {
+		return context.Canceled
+	}
+	ctx.remaining--
+	return nil
 }
 
 func TestCloseAndReopenPreservesCommittedOpaqueBytes(t *testing.T) {

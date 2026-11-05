@@ -2,6 +2,7 @@
 package capture
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -81,6 +82,12 @@ type SanitizedObservation struct {
 
 const MaxObservationTextBytes = 1 << 20
 
+const (
+	MaxAuthenticatedObservationBytes = MaxObservationTextBytes + 8192
+	observationRecordVersion         = 1
+	observationRecordHeaderBytes     = 49
+)
+
 func (o SanitizedObservation) ContentID() string                { return strings.Clone(o.contentID) }
 func (o SanitizedObservation) AppID() string                    { return strings.Clone(o.appID) }
 func (o SanitizedObservation) Domain() string                   { return strings.Clone(o.domain) }
@@ -127,6 +134,143 @@ func (o SanitizedObservation) MarshalJSON() ([]byte, error) {
 }
 func (*SanitizedObservation) UnmarshalJSON([]byte) error {
 	return captureError(InvalidObservation, nil)
+}
+
+// MarshalAuthenticatedObservation encodes a validated observation into the
+// deterministic bounded binary form used inside authenticated store records.
+func MarshalAuthenticatedObservation(o SanitizedObservation) ([]byte, error) {
+	if o.Validate() != nil {
+		return nil, captureError(InvalidObservation, nil)
+	}
+	if o.redactionVersion > 65535 || len(o.redactionCounts) > 32 {
+		return nil, captureError(InvalidObservation, nil)
+	}
+
+	encodedID, err := hex.DecodeString(o.contentID)
+	if err != nil || len(encodedID) != 32 {
+		return nil, captureError(InvalidObservation, nil)
+	}
+	total := observationRecordHeaderBytes + len(o.appID) + len(o.domain) + len(o.text)
+	for _, count := range o.redactionCounts {
+		total += 5 + len(count.Rule)
+	}
+	if total > MaxAuthenticatedObservationBytes {
+		return nil, captureError(InvalidObservation, nil)
+	}
+
+	encoded := make([]byte, total)
+	encoded[0] = observationRecordVersion
+	if o.truncated {
+		encoded[1] = 1
+	}
+	binary.BigEndian.PutUint16(encoded[2:4], uint16(o.redactionVersion))
+	binary.BigEndian.PutUint32(encoded[4:8], uint32(len(o.appID)))
+	binary.BigEndian.PutUint32(encoded[8:12], uint32(len(o.domain)))
+	binary.BigEndian.PutUint32(encoded[12:16], uint32(len(o.text)))
+	encoded[16] = byte(len(o.redactionCounts))
+	copy(encoded[17:observationRecordHeaderBytes], encodedID)
+	clear(encodedID)
+
+	offset := observationRecordHeaderBytes
+	copy(encoded[offset:], o.appID)
+	offset += len(o.appID)
+	copy(encoded[offset:], o.domain)
+	offset += len(o.domain)
+	copy(encoded[offset:], o.text)
+	offset += len(o.text)
+	for _, count := range o.redactionCounts {
+		encoded[offset] = byte(len(count.Rule))
+		binary.BigEndian.PutUint32(encoded[offset+1:offset+5], uint32(count.Count))
+		offset += 5
+		copy(encoded[offset:], count.Rule)
+		offset += len(count.Rule)
+	}
+	return encoded, nil
+}
+
+// RestoreAuthenticatedObservation parses only the canonical bounded record
+// form. Durable callers must first authenticate its bytes with recordcodec.
+func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, error) {
+	var empty SanitizedObservation
+	invalid := func() (SanitizedObservation, error) {
+		return empty, captureError(InvalidObservation, nil)
+	}
+	if len(encoded) < observationRecordHeaderBytes || len(encoded) > MaxAuthenticatedObservationBytes ||
+		encoded[0] != observationRecordVersion || encoded[1]&^byte(1) != 0 {
+		return invalid()
+	}
+	appLength := binary.BigEndian.Uint32(encoded[4:8])
+	domainLength := binary.BigEndian.Uint32(encoded[8:12])
+	textLength := binary.BigEndian.Uint32(encoded[12:16])
+	countLength := int(encoded[16])
+	if appLength > 128 || domainLength > 253 || textLength > MaxObservationTextBytes || countLength > 32 {
+		return invalid()
+	}
+	baseLength := uint64(observationRecordHeaderBytes) + uint64(appLength) + uint64(domainLength) + uint64(textLength)
+	if baseLength > uint64(len(encoded)) {
+		return invalid()
+	}
+
+	offset := int(baseLength)
+	counts := make([]privacy.Count, 0, countLength)
+	for i := 0; i < countLength; i++ {
+		if len(encoded)-offset < 5 {
+			return invalid()
+		}
+		ruleLength := int(encoded[offset])
+		count := binary.BigEndian.Uint32(encoded[offset+1 : offset+5])
+		offset += 5
+		if ruleLength == 0 || ruleLength > 64 || count == 0 || count > MaxObservationTextBytes || ruleLength > len(encoded)-offset {
+			return invalid()
+		}
+		ruleBytes := encoded[offset : offset+ruleLength]
+		if !utf8.Valid(ruleBytes) {
+			return invalid()
+		}
+		counts = append(counts, privacy.Count{Rule: string(ruleBytes), Count: int(count)})
+		offset += ruleLength
+	}
+	if offset != len(encoded) {
+		return invalid()
+	}
+
+	appStart := observationRecordHeaderBytes
+	domainStart := appStart + int(appLength)
+	textStart := domainStart + int(domainLength)
+	appBytes := encoded[appStart:domainStart]
+	domainBytes := encoded[domainStart:textStart]
+	textBytes := encoded[textStart : offset-lenCountsBytes(counts)]
+	if !utf8.Valid(appBytes) || !utf8.Valid(domainBytes) || !utf8.Valid(textBytes) {
+		return invalid()
+	}
+	contentID := hex.EncodeToString(encoded[17:observationRecordHeaderBytes])
+	o := SanitizedObservation{
+		contentID:        contentID,
+		appID:            string(appBytes),
+		domain:           string(domainBytes),
+		text:             string(textBytes),
+		truncated:        encoded[1]&1 == 1,
+		redactionVersion: int(binary.BigEndian.Uint16(encoded[2:4])),
+		redactionCounts:  counts,
+	}
+	if o.Validate() != nil {
+		return invalid()
+	}
+	canonical, err := MarshalAuthenticatedObservation(o)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		clear(canonical)
+		return invalid()
+	}
+	clear(canonical)
+	return o, nil
+}
+
+func lenCountsBytes(counts []privacy.Count) int {
+	total := 0
+	for _, count := range counts {
+		total += 5 + len(count.Rule)
+	}
+	return total
 }
 
 // SanitizeObservation is a bounded capture-owned constructor for non-pipeline

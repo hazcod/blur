@@ -1,5 +1,6 @@
-// Package storage defines the encrypted persistence contract. Its only current
-// implementation is an ephemeral conformance backend; it provides no encryption.
+// Package storage defines the encrypted persistence contract and an explicitly
+// unencrypted in-memory conformance backend. The durable implementation lives
+// in the separate internal/storage/durable package.
 package storage
 
 import (
@@ -26,9 +27,11 @@ type ObservationPageRequest struct {
 	After    string
 }
 
-// ObservationPage is ordered by ContentID. HasMore is true when another
-// observation exists after the returned page, including when it did not fit
-// MaxBytes and therefore was not cloned into Observations.
+// ObservationPage has a stable ContentID-derived order. A backend may keep
+// that order opaque (for example, a keyed physical ordering); After always
+// accepts the logical ContentID, not a physical cursor. HasMore is true when
+// another observation exists after the returned page, including when it did
+// not fit MaxBytes and therefore was not cloned into Observations.
 type ObservationPage struct {
 	Observations []capture.SanitizedObservation
 	Bytes        int
@@ -84,9 +87,10 @@ type Generation struct {
 	SchemaVersion, RedactionVersion int
 }
 
-// EncryptedStore is the contract for a future authenticated-at-rest backend.
+// EncryptedStore is the contract for authenticated-at-rest backends.
 // Implementations must truthfully report EncryptedAtRest; a production caller
-// must reject false. Every listing is bounded and ordered by stable ID.
+// must reject false. Every listing is bounded, stable across pages, and accepts
+// a logical-ID cursor even if the physical order is opaque.
 type EncryptedStore interface {
 	EncryptedAtRest() bool
 	PutObservation(context.Context, capture.SanitizedObservation) error
