@@ -57,46 +57,62 @@ func knownCapabilityID(id string) bool {
 	return false
 }
 
-func nativeAPIEvidence(evidence string) bool {
-	switch evidence {
-	case "axui_element", "ui_automation", "at_spi2":
-		return true
+// Each evidence code names one fixed platform mechanism for the reported port.
+// This prevents an unrelated API from backing an availability claim.
+func portAPIEvidence(id, evidence string) bool {
+	switch id {
+	case "capture", "text_targets":
+		return evidence == "axui_element" || evidence == "ui_automation" || evidence == "at_spi2"
+	case "gesture_hotkeys":
+		return evidence == "event_tap" || evidence == "register_hotkey" || evidence == "xdg_portal"
+	case "surface_manager":
+		return evidence == "appkit" || evidence == "win32" || evidence == "desktop_shell" || evidence == "xdg_portal"
+	case "audio_recorder":
+		return evidence == "core_audio" || evidence == "wasapi" || evidence == "pipewire"
+	case "secret_store":
+		return evidence == "keychain" || evidence == "dpapi" || evidence == "secret_service"
+	case "local_transport":
+		return evidence == "af_unix" || evidence == "named_pipe"
+	case "private_path":
+		return evidence == "filesystem_permissions"
+	case "autostart":
+		return evidence == "sm_app_service" || evidence == "startup_task" || evidence == "systemd_user"
+	case "session_state":
+		return evidence == "workspace_session" || evidence == "win_session" || evidence == "logind"
 	default:
 		return false
 	}
 }
 
-func apiEvidence(evidence string) bool {
-	return nativeAPIEvidence(evidence) || evidence == "xdg_portal"
-}
-
 // Adapters must map diagnostics to one coherent, content-free tuple. Evidence
 // names a fixed API or configuration state; captured text is never accepted.
 func coherentReport(report platform.CapabilityReport) bool {
+	portAPI := portAPIEvidence(report.ID, report.Evidence)
+	targetAPI := portAPI && report.Evidence != "xdg_portal" && report.Evidence != "desktop_shell"
 	switch report.State {
 	case platform.UserDisabled:
 		switch report.Reason {
 		case "foundation_only":
 			return report.Evidence == "adapter_not_connected"
 		case "adapter_unimplemented":
-			return apiEvidence(report.Evidence)
+			return report.Evidence == "platform_stub" || portAPI
 		case "user_disabled":
 			return report.Evidence == "configuration"
 		}
 	case platform.Available:
-		return report.Reason == "available" && (apiEvidence(report.Evidence) || report.Evidence == "configuration")
+		return report.Reason == "available" && portAPI
 	case platform.PermissionRequired:
-		return report.Reason == "permission_required" && apiEvidence(report.Evidence)
+		return report.Reason == "permission_required" && portAPI
 	case platform.UnsupportedTarget:
-		return report.Reason == "unsupported_target" && nativeAPIEvidence(report.Evidence)
+		return report.Reason == "unsupported_target" && targetAPI
 	case platform.SecureTarget:
-		return report.Reason == "secure_target" && nativeAPIEvidence(report.Evidence)
+		return report.Reason == "secure_target" && targetAPI
 	case platform.TargetElevated:
-		return report.Reason == "target_elevated" && nativeAPIEvidence(report.Evidence)
+		return report.Reason == "target_elevated" && targetAPI
 	case platform.PortalMissing:
-		return report.Reason == "portal_missing" && report.Evidence == "xdg_portal"
+		return report.Reason == "portal_missing" && portAPI && report.Evidence == "xdg_portal"
 	case platform.TemporarilyUnresponsive:
-		return report.Reason == "temporarily_unresponsive" && apiEvidence(report.Evidence)
+		return report.Reason == "temporarily_unresponsive" && portAPI
 	}
 	return false
 }

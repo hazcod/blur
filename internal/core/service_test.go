@@ -258,7 +258,7 @@ func TestCapabilityReportsRequireExactlyTheTenPortsAndClosedDiagnostics(t *testi
 	ids := []string{"capture", "text_targets", "gesture_hotkeys", "surface_manager", "audio_recorder", "secret_store", "local_transport", "private_path", "autostart", "session_state"}
 	reports := make([]platform.CapabilityReport, len(ids))
 	for i, id := range ids {
-		reports[i] = platform.CapabilityReport{ID: id, State: platform.UserDisabled, Reason: "adapter_unimplemented", Evidence: "axui_element"}
+		reports[i] = platform.CapabilityReport{ID: id, State: platform.UserDisabled, Reason: "adapter_unimplemented", Evidence: "platform_stub"}
 	}
 	svc, err := NewEphemeralDevelopmentService(grants, store, reports)
 	if err != nil {
@@ -531,48 +531,117 @@ func TestCapabilityTuplesAreCoherent(t *testing.T) {
 	}
 	store := storage.NewEphemeralMemoryStore()
 	accepted := []struct {
+		id       string
 		state    platform.CapabilityState
 		reason   string
-		evidence []string
+		evidence string
 	}{
-		{platform.UserDisabled, "foundation_only", []string{"adapter_not_connected"}},
-		{platform.UserDisabled, "adapter_unimplemented", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal"}},
-		{platform.Available, "available", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal", "configuration"}},
-		{platform.PermissionRequired, "permission_required", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal"}},
-		{platform.UnsupportedTarget, "unsupported_target", []string{"axui_element", "ui_automation", "at_spi2"}},
-		{platform.SecureTarget, "secure_target", []string{"axui_element", "ui_automation", "at_spi2"}},
-		{platform.TargetElevated, "target_elevated", []string{"axui_element", "ui_automation", "at_spi2"}},
-		{platform.PortalMissing, "portal_missing", []string{"xdg_portal"}},
-		{platform.TemporarilyUnresponsive, "temporarily_unresponsive", []string{"axui_element", "ui_automation", "at_spi2", "xdg_portal"}},
-		{platform.UserDisabled, "user_disabled", []string{"configuration"}},
+		{"capture", platform.UserDisabled, "foundation_only", "adapter_not_connected"},
+		{"capture", platform.UserDisabled, "adapter_unimplemented", "axui_element"},
+		{"capture", platform.Available, "available", "axui_element"},
+		{"capture", platform.PermissionRequired, "permission_required", "axui_element"},
+		{"capture", platform.UnsupportedTarget, "unsupported_target", "axui_element"},
+		{"capture", platform.SecureTarget, "secure_target", "axui_element"},
+		{"capture", platform.TargetElevated, "target_elevated", "axui_element"},
+		{"gesture_hotkeys", platform.PortalMissing, "portal_missing", "xdg_portal"},
+		{"gesture_hotkeys", platform.TemporarilyUnresponsive, "temporarily_unresponsive", "xdg_portal"},
+		{"autostart", platform.UserDisabled, "user_disabled", "configuration"},
 	}
 	for _, row := range accepted {
-		for _, evidence := range row.evidence {
-			reports := defaultReports()
-			reports[0].State, reports[0].Reason, reports[0].Evidence = row.state, row.reason, evidence
-			if _, err := NewEphemeralDevelopmentService(grants, store, reports); err != nil {
-				t.Fatalf("valid tuple %s/%s/%s rejected: %v", row.state, row.reason, evidence, err)
+		reports := defaultReports()
+		for i := range reports {
+			if reports[i].ID == row.id {
+				reports[i].State, reports[i].Reason, reports[i].Evidence = row.state, row.reason, row.evidence
 			}
+		}
+		if _, err := NewEphemeralDevelopmentService(grants, store, reports); err != nil {
+			t.Fatalf("valid tuple %s/%s/%s/%s rejected: %v", row.id, row.state, row.reason, row.evidence, err)
 		}
 	}
 	contradictions := []struct {
+		id               string
 		state            platform.CapabilityState
 		reason, evidence string
 	}{
-		{platform.Available, "permission_required", "adapter_not_connected"},
-		{platform.PermissionRequired, "foundation_only", "adapter_not_connected"},
-		{platform.Available, "available", "adapter_not_connected"},
-		{platform.UserDisabled, "user_disabled", "axui_element"},
-		{platform.UserDisabled, "adapter_unimplemented", "configuration"},
-		{platform.PortalMissing, "portal_missing", "axui_element"},
-		{platform.TargetElevated, "target_elevated", "xdg_portal"},
-		{platform.SecureTarget, "secure_target", "configuration"},
+		{"capture", platform.Available, "permission_required", "adapter_not_connected"},
+		{"capture", platform.PermissionRequired, "foundation_only", "adapter_not_connected"},
+		{"capture", platform.Available, "available", "adapter_not_connected"},
+		{"capture", platform.UserDisabled, "user_disabled", "axui_element"},
+		{"capture", platform.UserDisabled, "adapter_unimplemented", "configuration"},
+		{"gesture_hotkeys", platform.PortalMissing, "portal_missing", "event_tap"},
+		{"gesture_hotkeys", platform.TargetElevated, "target_elevated", "xdg_portal"},
+		{"capture", platform.SecureTarget, "secure_target", "configuration"},
 	}
 	for _, row := range contradictions {
 		reports := defaultReports()
-		reports[0].State, reports[0].Reason, reports[0].Evidence = row.state, row.reason, row.evidence
+		for i := range reports {
+			if reports[i].ID == row.id {
+				reports[i].State, reports[i].Reason, reports[i].Evidence = row.state, row.reason, row.evidence
+			}
+		}
 		if _, err := NewEphemeralDevelopmentService(grants, store, reports); err == nil {
-			t.Fatalf("contradictory tuple %s/%s/%s accepted", row.state, row.reason, row.evidence)
+			t.Fatalf("contradictory tuple %s/%s/%s/%s accepted", row.id, row.state, row.reason, row.evidence)
+		}
+	}
+}
+
+func TestCapabilityEvidenceMatchesPort(t *testing.T) {
+	grants, err := localapi.NewGrantStore(nil, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := storage.NewEphemeralMemoryStore()
+	ports := []struct {
+		id       string
+		evidence []string
+	}{
+		{"capture", []string{"axui_element", "ui_automation", "at_spi2"}},
+		{"text_targets", []string{"axui_element", "ui_automation", "at_spi2"}},
+		{"gesture_hotkeys", []string{"event_tap", "register_hotkey", "xdg_portal"}},
+		{"surface_manager", []string{"appkit", "win32", "desktop_shell", "xdg_portal"}},
+		{"audio_recorder", []string{"core_audio", "wasapi", "pipewire"}},
+		{"secret_store", []string{"keychain", "dpapi", "secret_service"}},
+		{"local_transport", []string{"af_unix", "named_pipe"}},
+		{"private_path", []string{"filesystem_permissions"}},
+		{"autostart", []string{"sm_app_service", "startup_task", "systemd_user"}},
+		{"session_state", []string{"workspace_session", "win_session", "logind"}},
+	}
+	check := func(id string, state platform.CapabilityState, reason, evidence string, want bool) {
+		t.Helper()
+		reports := defaultReports()
+		for i := range reports {
+			if reports[i].ID == id {
+				reports[i].State, reports[i].Reason, reports[i].Evidence = state, reason, evidence
+			}
+		}
+		_, err := NewEphemeralDevelopmentService(grants, store, reports)
+		if (err == nil) != want {
+			t.Fatalf("port tuple %s/%s/%s/%s accepted=%t, want %t", id, state, reason, evidence, err == nil, want)
+		}
+	}
+	for _, port := range ports {
+		check(port.id, platform.UserDisabled, "foundation_only", "adapter_not_connected", true)
+		check(port.id, platform.UserDisabled, "adapter_unimplemented", "platform_stub", true)
+		check(port.id, platform.UserDisabled, "user_disabled", "configuration", true)
+		check(port.id, platform.Available, "available", "platform_stub", false)
+		check(port.id, platform.PermissionRequired, "permission_required", "platform_stub", false)
+		for _, evidence := range port.evidence {
+			check(port.id, platform.UserDisabled, "adapter_unimplemented", evidence, true)
+			check(port.id, platform.PermissionRequired, "permission_required", evidence, true)
+			check(port.id, platform.Available, "available", evidence, true)
+		}
+		allowed := make(map[string]bool, len(port.evidence))
+		for _, evidence := range port.evidence {
+			allowed[evidence] = true
+		}
+		for _, other := range ports {
+			for _, evidence := range other.evidence {
+				if allowed[evidence] {
+					continue
+				}
+				check(port.id, platform.UserDisabled, "adapter_unimplemented", evidence, false)
+				check(port.id, platform.Available, "available", evidence, false)
+			}
 		}
 	}
 }
