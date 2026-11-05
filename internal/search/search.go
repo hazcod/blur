@@ -10,7 +10,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/nielsgroen/blur/internal/capture"
 	"github.com/nielsgroen/blur/internal/storage"
 )
 
@@ -20,8 +19,9 @@ const (
 	MaxResults       = 100
 	MaxSnippetBytes  = 512
 	MaxResponseBytes = 64 << 10
-	MaxScan          = 10000
-	StorePage        = 256
+	MaxScan          = 64
+	MaxScanBytes     = 2 << 20
+	StorePage        = 4
 )
 
 var ErrInvalidRequest = errors.New("search: invalid request")
@@ -32,6 +32,7 @@ type Request struct {
 	SnippetBytes  int    `json:"snippet_bytes"`
 	ResponseBytes int    `json:"response_bytes"`
 	ScanLimit     int    `json:"scan_limit"`
+	ScanBytes     int    `json:"scan_bytes,omitempty"`
 }
 
 type Result struct {
@@ -44,10 +45,11 @@ type Result struct {
 }
 
 type Response struct {
-	Results   []Result `json:"results"`
-	Scanned   int      `json:"scanned"`
-	Truncated bool     `json:"truncated"`
-	Omitted   int      `json:"omitted"`
+	Results      []Result `json:"results"`
+	Scanned      int      `json:"scanned"`
+	ScannedBytes int      `json:"scanned_bytes"`
+	Truncated    bool     `json:"truncated"`
+	Omitted      int      `json:"omitted"`
 }
 
 type Engine struct{ store storage.EncryptedStore }
@@ -83,18 +85,27 @@ func CanonicalQuery(query string) (string, error) {
 
 func (r Request) Validate() (string, error) {
 	query, err := CanonicalQuery(r.Query)
-	if err != nil || r.ResultLimit < 1 || r.ResultLimit > MaxResults || r.SnippetBytes < 1 || r.SnippetBytes > MaxSnippetBytes || r.ResponseBytes < 128 || r.ResponseBytes > MaxResponseBytes || r.ScanLimit < 1 || r.ScanLimit > MaxScan {
+	if err != nil || r.ResultLimit < 1 || r.ResultLimit > MaxResults || r.SnippetBytes < 1 || r.SnippetBytes > MaxSnippetBytes || r.ResponseBytes < 128 || r.ResponseBytes > MaxResponseBytes || r.ScanLimit < 1 || r.ScanLimit > MaxScan || r.ScanBytes < 0 || r.ScanBytes > MaxScanBytes {
 		return "", ErrInvalidRequest
 	}
 	return query, nil
 }
 
-func termScore(o capture.SanitizedObservation, wanted []string) int {
+// EffectiveScanBytes maps the omitted zero value to the hard maximum, keeping
+// older request shapes valid without allowing an unbounded scan.
+func (r Request) EffectiveScanBytes() int {
+	if r.ScanBytes == 0 {
+		return MaxScanBytes
+	}
+	return r.ScanBytes
+}
+
+func termScore(text, appID, domain string, wanted []string) int {
 	seen := make(map[string]int, len(wanted))
 	for _, field := range []struct {
 		s      string
 		weight int
-	}{{o.Text(), 1}, {o.AppID(), 3}, {o.Domain(), 2}} {
+	}{{text, 1}, {appID, 3}, {domain, 2}} {
 		for _, token := range tokens(field.s) {
 			for _, term := range wanted {
 				if token == term && field.weight > seen[term] {
@@ -139,33 +150,50 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 		return Response{}, err
 	}
 	wanted := strings.Fields(canonical)
+	scanBytes := request.EffectiveScanBytes()
 	response := Response{Results: make([]Result, 0, request.ResultLimit)}
 	matched := 0
 	after := ""
-	for response.Scanned < request.ScanLimit {
+	for response.Scanned < request.ScanLimit && response.ScannedBytes < scanBytes {
 		pageSize := StorePage
 		if left := request.ScanLimit - response.Scanned; left < pageSize {
 			pageSize = left
 		}
-		page, err := e.store.ListObservations(ctx, pageSize, after)
+		pageBytes := storage.MaxObservationPageBytes
+		if left := scanBytes - response.ScannedBytes; left < pageBytes {
+			pageBytes = left
+		}
+		page, err := e.store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: pageSize, MaxBytes: pageBytes, After: after})
 		if err != nil {
 			return Response{}, err
 		}
-		if len(page) > pageSize {
+		if len(page.Observations) > pageSize || page.Bytes < 0 || page.Bytes > pageBytes {
 			return Response{}, ErrInvalidRequest
 		}
-		if len(page) == 0 {
+		if len(page.Observations) == 0 {
+			response.Truncated = response.Truncated || page.HasMore
 			break
 		}
-		for _, o := range page {
+		pageUsedBytes := 0
+		for _, o := range page.Observations {
 			if err := ctx.Err(); err != nil {
 				return Response{}, err
 			}
+			text := o.Text()
+			appID := o.AppID()
+			domain := o.Domain()
+			observationBytes := len(text) + len(appID) + len(domain)
+			if observationBytes > scanBytes-response.ScannedBytes || observationBytes > pageBytes-pageUsedBytes {
+				return Response{}, ErrInvalidRequest
+			}
+			pageUsedBytes += observationBytes
 			response.Scanned++
-			after = o.ContentID()
-			if score := termScore(o, wanted); score > 0 {
+			response.ScannedBytes += observationBytes
+			sourceID := o.ContentID()
+			after = sourceID
+			if score := termScore(text, appID, domain, wanted); score > 0 {
 				matched++
-				result := Result{SourceID: after, AppID: o.AppID(), Domain: o.Domain(), Score: score, Snippet: snippet(o.Text(), request.SnippetBytes), ProvenanceKind: "raw_sanitized_observation"}
+				result := Result{SourceID: sourceID, AppID: appID, Domain: domain, Score: score, Snippet: snippet(text, request.SnippetBytes), ProvenanceKind: "raw_sanitized_observation"}
 				response.Results = append(response.Results, result)
 				sort.Slice(response.Results, func(i, j int) bool { return better(response.Results[i], response.Results[j]) })
 				if len(response.Results) > request.ResultLimit {
@@ -173,16 +201,16 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 				}
 			}
 		}
-		if len(page) < pageSize {
+		if pageUsedBytes != page.Bytes {
+			return Response{}, ErrInvalidRequest
+		}
+		if !page.HasMore {
 			break
 		}
-	}
-	if response.Scanned == request.ScanLimit {
-		more, err := e.store.ListObservations(ctx, 1, after)
-		if err != nil {
-			return Response{}, err
+		if response.Scanned >= request.ScanLimit || response.ScannedBytes >= scanBytes {
+			response.Truncated = true
+			break
 		}
-		response.Truncated = len(more) != 0
 	}
 	response.Omitted = matched - len(response.Results)
 	if response.Omitted > 0 {

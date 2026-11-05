@@ -61,8 +61,13 @@ send real sensitive data through the demo or treat this repository as a
 secure persistent memory product.
 
 Local grants use scoped HMAC request proofs with expirations, one-use nonces,
-replay limits, and revocation in memory. They do not yet protect a socket,
-process boundary, or persisted client identity. `securestore` defines a strict
+replay limits, and revocation in memory. The store caps grants at 1,024 and
+clears retained key/map state when grants are revoked or pruned after expiry.
+They do not yet protect a socket, process boundary, or persisted client
+identity. Search binds a per-request byte budget into its proof, scans at most
+64 observations and 2 MiB (the omitted byte-limit field defaults to that cap),
+fetches at most four rows per page, and the core allows at most two concurrent
+searches. `securestore` defines a strict
 key-state contract, but no OS secret backend or encrypted store is connected.
 No deletion, backup, key-rotation, or at-rest confidentiality guarantee is
 implemented. See the [threat model](docs/threat-model.md) for limits and

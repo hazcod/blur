@@ -3,6 +3,7 @@ package localapi
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,26 @@ import (
 	"testing"
 	"time"
 )
+
+type grantSequenceReader struct{ next uint64 }
+
+func (r *grantSequenceReader) Read(p []byte) (int, error) {
+	switch len(p) {
+	case 16:
+		r.next++
+		binary.BigEndian.PutUint64(p[:8], r.next)
+		binary.BigEndian.PutUint64(p[8:], ^r.next)
+	case 32:
+		for i := range p {
+			p[i] = 0x81
+		}
+	default:
+		for i := range p {
+			p[i] = 0x41
+		}
+	}
+	return len(p), nil
+}
 
 func grantFixture(t *testing.T, cap int) (*GrantStore, IssuedGrant, *time.Time) {
 	t.Helper()
@@ -281,5 +302,118 @@ func TestInvalidTimestampDoesNotEraseReplayHistory(t *testing.T) {
 	}
 	if err := store.Authorize(accepted, digest); !errors.Is(err, ErrReplay) {
 		t.Fatalf("old nonce forgotten: %v", err)
+	}
+}
+
+func TestGrantStoreRejectsIssuanceAtTheTotalGrantCap(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	store, err := NewGrantStore(func() time.Time { return now }, &grantSequenceReader{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var grants []IssuedGrant
+	for i := 0; i < 1024; i++ {
+		grant, err := store.Issue("client", []Scope{ScopeUIRead}, time.Hour)
+		if err != nil {
+			t.Fatalf("issue %d: %v", i, err)
+		}
+		grants = append(grants, grant)
+	}
+	if _, err := store.Issue("client", []Scope{ScopeUIRead}, time.Hour); err == nil {
+		t.Fatal("issuance beyond the total grant cap succeeded")
+	}
+}
+
+func TestRevokedGrantIsZeroizedRemovedAndItsCapacityReused(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	store, err := NewGrantStore(func() time.Time { return now }, &grantSequenceReader{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first IssuedGrant
+	var retained *storedGrant
+	for i := 0; i < 1024; i++ {
+		grant, err := store.Issue("client", []Scope{ScopeUIRead}, time.Hour)
+		if err != nil {
+			t.Fatalf("issue %d: %v", i, err)
+		}
+		if i == 0 {
+			first = grant
+			retained = store.grants[grant.ID]
+		}
+	}
+	keyBefore := retained.authenticatorKey
+	if keyBefore == ([32]byte{}) {
+		t.Fatal("fixture authenticator key is zero")
+	}
+	digest := sha256.Sum256([]byte("revoke-capacity"))
+	oldProof := proofFixture(t, first, ScopeUIRead, digest, now, 0x51)
+	if err := store.Revoke(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := store.grants[first.ID]; exists {
+		t.Fatal("revoked grant remains in the store")
+	}
+	if retained.authenticatorKey != ([32]byte{}) || retained.scopes != nil || retained.nonces != nil {
+		t.Fatal("revoked grant retained secret bytes or map state")
+	}
+	if err := store.Authorize(oldProof, digest); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("old proof after revocation: %v", err)
+	}
+	if _, err := store.Issue("client", []Scope{ScopeUIRead}, time.Hour); err != nil {
+		t.Fatalf("revocation did not release grant capacity: %v", err)
+	}
+}
+
+func TestExpiredGrantIsZeroizedPrunedAndItsCapacityReused(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	store, err := NewGrantStore(func() time.Time { return now }, &grantSequenceReader{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Issue("client", []Scope{ScopeUIRead}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained := store.grants[first.ID]
+	digest := sha256.Sum256([]byte("expired-capacity"))
+	oldProof := proofFixture(t, first, ScopeUIRead, digest, now, 0x52)
+	for i := 1; i < 1024; i++ {
+		if _, err := store.Issue("client", []Scope{ScopeUIRead}, time.Minute); err != nil {
+			t.Fatalf("issue %d: %v", i, err)
+		}
+	}
+	now = first.ExpiresAt
+	if _, err := store.Issue("client", []Scope{ScopeUIRead}, time.Minute); err != nil {
+		t.Fatalf("issuance did not prune expired grants at capacity: %v", err)
+	}
+	if _, exists := store.grants[first.ID]; exists {
+		t.Fatal("expired grant remains in the store")
+	}
+	if retained.authenticatorKey != ([32]byte{}) || retained.scopes != nil || retained.nonces != nil {
+		t.Fatal("pruned grant retained secret bytes or map state")
+	}
+	if err := store.Authorize(oldProof, digest); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expired proof: %v", err)
+	}
+	if len(store.grants) != 1 {
+		t.Fatalf("pruning retained %d grants; want only the new active grant", len(store.grants))
+	}
+}
+
+func TestExpiryAuthorizationZeroizesAndRemovesTheGrant(t *testing.T) {
+	store, grant, now := grantFixture(t, 1)
+	retained := store.grants[grant.ID]
+	digest := sha256.Sum256([]byte("expiry-zeroization"))
+	oldProof := proofFixture(t, grant, ScopeUIRead, digest, *now, 0x53)
+	*now = grant.ExpiresAt
+	if err := store.Authorize(oldProof, digest); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expired proof: %v", err)
+	}
+	if _, exists := store.grants[grant.ID]; exists {
+		t.Fatal("expired grant remains in the store")
+	}
+	if retained.authenticatorKey != ([32]byte{}) || retained.scopes != nil || retained.nonces != nil {
+		t.Fatal("expired grant retained secret bytes or map state")
 	}
 }

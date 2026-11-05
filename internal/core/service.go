@@ -21,12 +21,15 @@ import (
 
 var ErrInvalidService = errors.New("core: invalid service configuration")
 
+const MaxConcurrentSearches = 2
+
 type Service struct {
-	grants  *localapi.GrantStore
-	store   storage.EncryptedStore
-	search  *search.Engine
-	reports []platform.CapabilityReport
-	mode    string
+	grants      *localapi.GrantStore
+	store       storage.EncryptedStore
+	search      *search.Engine
+	searchSlots chan struct{}
+	reports     []platform.CapabilityReport
+	mode        string
 }
 
 type StatusReport struct {
@@ -167,7 +170,7 @@ func newService(grants *localapi.GrantStore, store storage.EncryptedStore, repor
 	if ephemeral {
 		mode = "ephemeral_memory"
 	}
-	return &Service{grants: grants, store: store, search: search.New(store), reports: copyReports, mode: mode}, nil
+	return &Service{grants: grants, store: store, search: search.New(store), searchSlots: make(chan struct{}, MaxConcurrentSearches), reports: copyReports, mode: mode}, nil
 }
 
 // NewService is the production constructor and requires truthful at-rest encryption.
@@ -219,7 +222,7 @@ func SearchDigest(r search.Request) [32]byte {
 	if err != nil {
 		return [32]byte{}
 	}
-	return operationDigest("search", []byte(canonical), integer(r.ResultLimit), integer(r.SnippetBytes), integer(r.ResponseBytes), integer(r.ScanLimit))
+	return operationDigest("search", []byte(canonical), integer(r.ResultLimit), integer(r.SnippetBytes), integer(r.ResponseBytes), integer(r.ScanLimit), integer(r.EffectiveScanBytes()))
 }
 
 func StatusDigest() [32]byte       { return operationDigest("cli:status") }
@@ -283,6 +286,15 @@ func (s *Service) Search(ctx context.Context, request search.Request, proof loca
 	if err := checkContext(ctx); err != nil {
 		return search.Response{}, err
 	}
+	select {
+	case s.searchSlots <- struct{}{}:
+		defer func() { <-s.searchSlots }()
+	case <-ctx.Done():
+		return search.Response{}, ctx.Err()
+	}
+	if err := checkContext(ctx); err != nil {
+		return search.Response{}, err
+	}
 	result, err := s.search.Search(ctx, request)
 	if cancelErr := checkContext(ctx); cancelErr != nil {
 		return search.Response{}, cancelErr
@@ -297,7 +309,7 @@ func (s *Service) Status(ctx context.Context, proof localapi.Proof) (StatusRepor
 	if err := checkContext(ctx); err != nil {
 		return StatusReport{}, err
 	}
-	_, err := s.store.ListObservations(ctx, 1, "")
+	_, err := s.store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 1, MaxBytes: storage.MaxObservationPageBytes})
 	if cancelErr := checkContext(ctx); cancelErr != nil {
 		return StatusReport{}, cancelErr
 	}

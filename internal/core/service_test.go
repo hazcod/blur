@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,12 +76,12 @@ func TestIngestRequiresOneUseExactProof(t *testing.T) {
 	if err := svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel: %v", err)
 	}
-	page, err := store.ListObservations(context.Background(), 10, "")
+	page, err := store.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 10, MaxBytes: storage.MaxObservationPageBytes})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page) != 0 {
-		t.Fatalf("denied requests wrote %d items", len(page))
+	if len(page.Observations) != 0 {
+		t.Fatalf("denied requests wrote %d items", len(page.Observations))
 	}
 	p := proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))
 	if err := svc.Ingest(context.Background(), o, p); err != nil {
@@ -89,9 +90,9 @@ func TestIngestRequiresOneUseExactProof(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, p); !errors.Is(err, localapi.ErrReplay) {
 		t.Fatalf("replay: %v", err)
 	}
-	page, err = store.ListObservations(context.Background(), 10, "")
-	if err != nil || len(page) != 1 {
-		t.Fatalf("stored items: %d, %v", len(page), err)
+	page, err = store.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 10, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 1 {
+		t.Fatalf("stored items: %d, %v", len(page.Observations), err)
 	}
 }
 
@@ -101,7 +102,7 @@ func TestSearchProofBindsLimitsAndReadScope(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
 		t.Fatal(err)
 	}
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
 	p := proof(t, grant, localapi.ScopeUIRead, SearchDigest(r))
 	tampered := r
 	tampered.ResultLimit = 2
@@ -120,6 +121,133 @@ func TestSearchProofBindsLimitsAndReadScope(t *testing.T) {
 	}
 	if _, err := svc.Search(context.Background(), r, p); !errors.Is(err, localapi.ErrReplay) {
 		t.Fatalf("search replay: %v", err)
+	}
+}
+
+func TestSearchDigestBindsAggregateScanByteLimit(t *testing.T) {
+	base := search.Request{Query: "alpha", ResultLimit: 2, SnippetBytes: 32, ResponseBytes: 2048, ScanLimit: 8, ScanBytes: 1024}
+	changed := base
+	changed.ScanBytes = 2048
+	if SearchDigest(base) == SearchDigest(changed) {
+		t.Fatal("search proof digest did not bind the aggregate scan-byte limit")
+	}
+	legacy := base
+	legacy.ScanBytes = 0
+	defaulted := legacy
+	defaulted.ScanBytes = search.MaxScanBytes
+	if SearchDigest(legacy) == ([32]byte{}) || SearchDigest(legacy) != SearchDigest(defaulted) {
+		t.Fatal("omitted aggregate scan-byte limit did not bind its bounded default semantics")
+	}
+}
+
+type observedDoneContext struct {
+	context.Context
+	doneObserved chan struct{}
+	once         sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.doneObserved) })
+	return c.Context.Done()
+}
+
+type blockingPageStore struct {
+	storage.EncryptedStore
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	active  int
+	maximum int
+}
+
+func (s *blockingPageStore) ListObservationPage(ctx context.Context, request storage.ObservationPageRequest) (storage.ObservationPage, error) {
+	s.mu.Lock()
+	s.active++
+	if s.active > s.maximum {
+		s.maximum = s.active
+	}
+	s.mu.Unlock()
+	s.entered <- struct{}{}
+	select {
+	case <-ctx.Done():
+		s.mu.Lock()
+		s.active--
+		s.mu.Unlock()
+		return storage.ObservationPage{}, ctx.Err()
+	case <-s.release:
+	}
+	s.mu.Lock()
+	s.active--
+	s.mu.Unlock()
+	return s.EncryptedStore.ListObservationPage(ctx, request)
+}
+
+func TestSearchSemaphoreBoundsConcurrencyAndReleasesCanceledWaiters(t *testing.T) {
+	svc, memory, _, grant := fixture(t, localapi.ScopeUIRead)
+	blocked := &blockingPageStore{EncryptedStore: memory, entered: make(chan struct{}, 4), release: make(chan struct{})}
+	svc.store, svc.search = blocked, search.New(blocked)
+	request := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 1, ScanBytes: search.MaxScanBytes}
+	start := func(ctx context.Context) <-chan error {
+		result := make(chan error, 1)
+		p := proof(t, grant, localapi.ScopeUIRead, SearchDigest(request))
+		go func() {
+			_, err := svc.Search(ctx, request, p)
+			result <- err
+		}()
+		return result
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(blocked.release) }) }
+	defer release()
+	first := start(context.Background())
+	second := start(context.Background())
+	for i := 0; i < 2; i++ {
+		select {
+		case <-blocked.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("search did not enter the store")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	thirdContext := &observedDoneContext{Context: ctx, doneObserved: make(chan struct{})}
+	third := start(thirdContext)
+	select {
+	case <-thirdContext.doneObserved:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("search did not wait on a context-aware concurrency slot")
+	}
+	blocked.mu.Lock()
+	active, maximum := blocked.active, blocked.maximum
+	blocked.mu.Unlock()
+	if active != 2 || maximum != 2 {
+		cancel()
+		t.Fatalf("search concurrency active=%d maximum=%d", active, maximum)
+	}
+	select {
+	case <-blocked.entered:
+		cancel()
+		t.Fatal("search exceeded the fixed concurrency bound")
+	default:
+	}
+	cancel()
+	if err := <-third; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter returned %v", err)
+	}
+	release()
+	for i, result := range []<-chan error{first, second} {
+		if err := <-result; err != nil {
+			t.Fatalf("active search %d: %v", i, err)
+		}
+	}
+	fourth := start(context.Background())
+	if err := <-fourth; err != nil {
+		t.Fatalf("search after canceled waiter leaked a slot: %v", err)
+	}
+	blocked.mu.Lock()
+	defer blocked.mu.Unlock()
+	if blocked.maximum != 2 || blocked.active != 0 {
+		t.Fatalf("final search concurrency active=%d maximum=%d", blocked.active, blocked.maximum)
 	}
 }
 
@@ -216,9 +344,9 @@ func TestExpiredProofCannotWrite(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, p); !errors.Is(err, localapi.ErrUnauthorized) {
 		t.Fatalf("expired proof: %v", err)
 	}
-	page, err := store.ListObservations(context.Background(), 1, "")
-	if err != nil || len(page) != 0 {
-		t.Fatalf("expired write: %d, %v", len(page), err)
+	page, err := store.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 1, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 0 {
+		t.Fatalf("expired write: %d, %v", len(page.Observations), err)
 	}
 }
 
@@ -228,7 +356,7 @@ func TestMCPReadProofIsAcceptedButMutateIsDenied(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
 		t.Fatal(err)
 	}
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
 	if _, err := svc.Search(context.Background(), r, proof(t, grant, localapi.ScopeUIMutate, SearchDigest(r))); err == nil {
 		t.Fatal("mutate scope accepted")
 	}
@@ -301,8 +429,8 @@ type cancelAfterListStore struct {
 	cancel context.CancelFunc
 }
 
-func (s cancelAfterListStore) ListObservations(ctx context.Context, limit int, after string) ([]capture.SanitizedObservation, error) {
-	page, err := s.EncryptedStore.ListObservations(ctx, limit, after)
+func (s cancelAfterListStore) ListObservationPage(ctx context.Context, request storage.ObservationPageRequest) (storage.ObservationPage, error) {
+	page, err := s.EncryptedStore.ListObservationPage(ctx, request)
 	s.cancel()
 	return page, err
 }
@@ -351,7 +479,7 @@ func TestCancellationDuringAuthorizationFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	o := sample(t)
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
 	operations := []struct {
 		name   string
 		scope  localapi.Scope
@@ -399,16 +527,16 @@ func TestCancellationDuringAuthorizationFailsClosed(t *testing.T) {
 			}
 		})
 	}
-	page, err := store.ListObservations(context.Background(), 1, "")
-	if err != nil || len(page) != 0 {
-		t.Fatalf("canceled authorization wrote: %d, %v", len(page), err)
+	page, err := store.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 1, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 0 {
+		t.Fatalf("canceled authorization wrote: %d, %v", len(page.Observations), err)
 	}
 }
 
 type deadlineProbeStore struct{ storage.EncryptedStore }
 
-func (deadlineProbeStore) ListObservations(context.Context, int, string) ([]capture.SanitizedObservation, error) {
-	return nil, context.DeadlineExceeded
+func (deadlineProbeStore) ListObservationPage(context.Context, storage.ObservationPageRequest) (storage.ObservationPage, error) {
+	return storage.ObservationPage{}, context.DeadlineExceeded
 }
 
 func TestStatusPropagatesStoreDeadline(t *testing.T) {
@@ -440,7 +568,7 @@ func TestCancellationAfterStoreOperationNeverReturnsSuccess(t *testing.T) {
 					t.Fatal("canceled status returned")
 				}
 			case "search":
-				r := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 2}
+				r := search.Request{Query: "alpha", ResultLimit: 1, SnippetBytes: 8, ResponseBytes: 1024, ScanLimit: 2, ScanBytes: search.MaxScanBytes}
 				var result search.Response
 				result, err = svc.Search(ctx, r, proof(t, grant, localapi.ScopeUIRead, SearchDigest(r)))
 				if len(result.Results) > 0 {
@@ -477,14 +605,14 @@ func TestAlreadyCanceledRequestsDoNotConsumeProofsOrReturnData(t *testing.T) {
 	if err := svc.Ingest(ctx, o, ingestProof); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled ingest: %v", err)
 	}
-	page, err := memory.ListObservations(context.Background(), 1, "")
-	if err != nil || len(page) != 0 {
-		t.Fatalf("canceled ingest wrote: %d, %v", len(page), err)
+	page, err := memory.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 1, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 0 {
+		t.Fatalf("canceled ingest wrote: %d, %v", len(page.Observations), err)
 	}
 	if err := svc.Ingest(context.Background(), o, ingestProof); err != nil {
 		t.Fatalf("canceled request consumed ingest proof: %v", err)
 	}
-	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10}
+	r := search.Request{Query: "café", ResultLimit: 1, SnippetBytes: 20, ResponseBytes: 1024, ScanLimit: 10, ScanBytes: search.MaxScanBytes}
 	searchProof := proof(t, grant, localapi.ScopeUIRead, SearchDigest(r))
 	if result, err := svc.Search(ctx, r, searchProof); !errors.Is(err, context.Canceled) || len(result.Results) != 0 {
 		t.Fatalf("canceled search: %+v, %v", result, err)
@@ -503,9 +631,9 @@ func TestSuccessfulIngestCommitWinsCancellationRace(t *testing.T) {
 	if err := svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
 		t.Fatalf("committed write reported failure: %v", err)
 	}
-	page, err := memory.ListObservations(context.Background(), 2, "")
-	if err != nil || len(page) != 1 || page[0].ContentID() != o.ContentID() {
-		t.Fatalf("successful commit missing or duplicated: %d, %v", len(page), err)
+	page, err := memory.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 2, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 1 || page.Observations[0].ContentID() != o.ContentID() {
+		t.Fatalf("successful commit missing or duplicated: %d, %v", len(page.Observations), err)
 	}
 }
 
@@ -518,9 +646,9 @@ func TestStoreCancellationErrorLeavesNoIngestWrite(t *testing.T) {
 	if err := svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); !errors.Is(err, context.Canceled) {
 		t.Fatalf("store cancellation error lost: %v", err)
 	}
-	page, err := memory.ListObservations(context.Background(), 1, "")
-	if err != nil || len(page) != 0 {
-		t.Fatalf("canceled store write committed: %d, %v", len(page), err)
+	page, err := memory.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 1, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 0 {
+		t.Fatalf("canceled store write committed: %d, %v", len(page.Observations), err)
 	}
 }
 

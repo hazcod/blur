@@ -61,6 +61,7 @@ future IPC, OS identity, encrypted persistence, and providers are not present
 | Get raw data into storage or JSON through forged observations | Raw frame types are package-private; JSON unmarshal into `SanitizedObservation` is rejected; validation checks canonical metadata, redaction fixed point, version, size, counters and content ID at boundaries. | Go visibility is not a sandbox against compromised code in the same process. The exported sanitizer accepts raw text as an in-process caller input; it sanitizes heuristically but cannot make arbitrary input safe. No wire protocol is implemented. |
 | Recover a known secret using patterned capture | Redaction handles a selected deterministic set of recognizable patterns before observation construction and counts rules, not matched values. | Heuristics can miss novel formats, unlabeled prose, split values, encodings, images, application-specific secrets, or data added after redaction. Redaction does not establish confidentiality or make the demo appropriate for real secrets. |
 | Forge, broaden, or replay a local operation | Proofs bind grant/client/scope/timestamp/nonce/request digest; authorizer checks expiration, skew, revocation, constant-time MAC equality, replay and bounded nonce capacity. Scope vocabulary is closed. | All state and credentials are in process memory; there is no peer identity, endpoint ACL, secure provisioning, persistence or revocation across restarts. Compromise of the process or credential can authorize its permitted scopes. |
+| Exhaust memory or CPU through grants or search | GrantStore holds at most 1,024 grants and prunes expired grants on issuance/authorization; removal clears nonce/scope maps and overwrites the authenticator key first. Search limits each request to 64 observations and 2 MiB of scanned text/app/domain bytes, fetches at most four rows per byte-bounded page, and the core admits at most two concurrent searches with context-aware waiting. | The caps still permit bounded transient work and memory use. Key overwrite is best-effort in Go process memory and cannot erase prior copies, runtime artifacts, swap, or credentials held by callers. A request waiting for a search slot has already consumed its one-use proof. |
 | Expose persistent memory from a lost device | Current demo retains memory only in process and reports `encrypted_at_rest=false`; production constructor refuses the in-memory store. | There is no encrypted persistent store, OS wrapping key, backup or device-loss protection to evaluate or claim. Users should not treat the demo as safe storage. |
 | Leak data through errors, status or logs | Capture and secret-store errors suppress backend details; report vocabularies and CLI output are bounded and content-free; secret-bearing grant/proof types redact formatting and JSON. | No general logger/crash/diagnostics implementation exists. Future logs, traces, crash dumps, test output and support bundles need separate review. In-process memory remains readable to a process-level attacker. |
 | Trigger hidden screenshot, OCR or network fallback | No screenshot, OCR, clipboard, keystroke, network client, AI/provider code, or native capture path is wired. Unavailable adapters return disabled/error states. | Future changes could add paths; review and CI need to preserve the explicit no-fallback contract. |
@@ -77,13 +78,34 @@ issuance and expiration times, allowed clock skew, revocation flag, scope,
 MAC, and nonce state before consuming that nonce.
 
 Replay state is bounded per grant. When full, authorization rejects new
-proofs; it does not discard old nonce values to make room. Expired grants are
-denied and their nonces are cleared on attempted authorization. Explicit
-revocation denies future authorization and clears nonce state. Current grants,
-credentials, and replay history exist only in `GrantStore` memory and vanish
-on process exit. This is not a transport-authentication design by itself:
-future IPC must add endpoint access control and OS peer identity, then bind
-those identities to grant provisioning.
+proofs; it does not discard old nonce values to make room. Revocation removes
+the record immediately after clearing nonce and scope maps and overwriting the
+authenticator key bytes. Expired records are denied and cleared when
+authorization encounters them; issuance also prunes expired/revoked records
+before enforcing the hard 1,024-record total cap. These writes are best-effort
+in-process cleanup, not a guarantee that Go's runtime, prior copies, swap,
+crash dumps, or caller-held credentials are erased. Current grants, credentials,
+and replay history exist only in `GrantStore` memory and vanish on process exit.
+This is not a transport-authentication design by itself: future IPC must add
+endpoint access control and OS peer identity, then bind those identities to
+grant provisioning.
+
+## Search resource bounds
+
+Each search request binds its normalized terms, result/snippet/response limits,
+row scan limit, and aggregate scan-byte limit into the proof digest. An omitted
+byte limit selects the same 2 MiB hard maximum as an explicit one. The scan
+limit is at most 64 observations and the byte limit at most 2 MiB over each
+observation's text, app ID, and domain. Store pages carry both a row limit and
+a byte limit, and return exact scanned-field bytes plus explicit `HasMore`
+metadata. The in-memory store indexes those byte lengths at ingest, so an
+observation that does not fit is not cloned into the returned page. Search
+fetches at most four rows at a time. Search reports bytes actually scanned,
+marks partial scans as truncated, and counts `Omitted` only for matching
+records it saw but could not return. The core
+service permits two concurrent searches; waiters can cancel without holding a
+slot. These limits bound app-level work but do not preempt Go/runtime or OS
+allocation outside the store contract.
 
 ## Capture staging and redaction limits
 

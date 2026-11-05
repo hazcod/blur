@@ -24,6 +24,7 @@ const (
 	ScopeCLIAdmin       Scope = "cli:admin"
 	NonceBytes                = 24
 	MaxClockSkew              = 30 * time.Second
+	MaxGrants                 = 1024
 )
 
 var (
@@ -95,6 +96,7 @@ type GrantStore struct {
 	now       func() time.Time
 	random    io.Reader
 	maxNonces int
+	maxGrants int
 	grants    map[string]*storedGrant
 }
 
@@ -103,7 +105,7 @@ func (s *GrantStore) GoString() string { return s.String() }
 
 // NewGrantStore accepts injected time and randomness for deterministic tests.
 // nil values select the real clock and crypto/rand.Reader. Replay capacity is
-// bounded per grant and must be positive.
+// bounded per grant and must be positive. The store also enforces MaxGrants.
 func NewGrantStore(now func() time.Time, random io.Reader, maxNonces int) (*GrantStore, error) {
 	if maxNonces <= 0 {
 		return nil, ErrInvalidGrant
@@ -114,7 +116,39 @@ func NewGrantStore(now func() time.Time, random io.Reader, maxNonces int) (*Gran
 	if random == nil {
 		random = rand.Reader
 	}
-	return &GrantStore{now: now, random: random, maxNonces: maxNonces, grants: make(map[string]*storedGrant)}, nil
+	return &GrantStore{now: now, random: random, maxNonces: maxNonces, maxGrants: MaxGrants, grants: make(map[string]*storedGrant)}, nil
+}
+
+func clearGrant(g *storedGrant) {
+	if g == nil {
+		return
+	}
+	clear(g.scopes)
+	clear(g.nonces)
+	g.scopes = nil
+	g.nonces = nil
+	for i := range g.authenticatorKey {
+		g.authenticatorKey[i] = 0
+	}
+	g.clientID = ""
+	g.issuedAt = time.Time{}
+	g.expiresAt = time.Time{}
+	g.revoked = true
+}
+
+func (s *GrantStore) removeGrant(id string, g *storedGrant) {
+	clearGrant(g)
+	if s.grants[id] == g {
+		delete(s.grants, id)
+	}
+}
+
+func (s *GrantStore) pruneLocked(now time.Time) {
+	for id, grant := range s.grants {
+		if grant.revoked || !now.Before(grant.expiresAt) {
+			s.removeGrant(id, grant)
+		}
+	}
 }
 
 func validClientID(id string) bool {
@@ -148,6 +182,10 @@ func (s *GrantStore) Issue(clientID string, scopes []Scope, ttl time.Duration) (
 	if issued.IsZero() || !expires.After(issued) {
 		return IssuedGrant{}, ErrInvalidGrant
 	}
+	s.pruneLocked(issued)
+	if len(s.grants) >= s.maxGrants {
+		return IssuedGrant{}, ErrInvalidGrant
+	}
 	var rawID [16]byte
 	var credential [32]byte
 	if _, err := io.ReadFull(s.random, rawID[:]); err != nil {
@@ -169,7 +207,7 @@ func (s *GrantStore) Issue(clientID string, scopes []Scope, ttl time.Duration) (
 	return result, nil
 }
 
-// Revoke invalidates a grant and releases its nonce state.
+// Revoke invalidates and removes a grant after clearing its replay and key data.
 func (s *GrantStore) Revoke(id string) error {
 	if s == nil {
 		return ErrUnauthorized
@@ -180,8 +218,7 @@ func (s *GrantStore) Revoke(id string) error {
 	if g == nil {
 		return ErrUnauthorized
 	}
-	g.revoked = true
-	g.nonces = nil
+	s.removeGrant(id, g)
 	return nil
 }
 
@@ -248,13 +285,10 @@ func (s *GrantStore) Authorize(p Proof, requestDigest [32]byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.now()
+	s.pruneLocked(now)
 	g := s.grants[p.GrantID]
 	if g == nil || g.revoked || g.clientID != p.ClientID || !g.scopes[p.Scope] {
-		return ErrUnauthorized
-	}
-	now := s.now()
-	if !now.Before(g.expiresAt) {
-		g.nonces = nil
 		return ErrUnauthorized
 	}
 	if now.Before(g.issuedAt) || p.Timestamp.Before(g.issuedAt) || !p.Timestamp.Before(g.expiresAt) || p.Timestamp.Before(now.Add(-MaxClockSkew)) || p.Timestamp.After(now.Add(MaxClockSkew)) {

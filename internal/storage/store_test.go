@@ -107,30 +107,60 @@ func TestObservationListIsBoundedOrderedAndCopied(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.ListObservations(ctx, 0, ""); !isStorageError(err, Invalid) {
+	if _, err := s.ListObservationPage(ctx, ObservationPageRequest{MaxBytes: MaxObservationPageBytes}); !isStorageError(err, Invalid) {
 		t.Fatalf("zero limit: %v", err)
 	}
-	if _, err := s.ListObservations(ctx, MaxListLimit+1, ""); !isStorageError(err, Invalid) {
+	if _, err := s.ListObservationPage(ctx, ObservationPageRequest{Limit: MaxObservationPageRows + 1, MaxBytes: MaxObservationPageBytes}); !isStorageError(err, Invalid) {
 		t.Fatalf("large limit: %v", err)
 	}
-	got, err := s.ListObservations(ctx, 2, "")
+	got, err := s.ListObservationPage(ctx, ObservationPageRequest{Limit: 2, MaxBytes: MaxObservationPageBytes})
 	ids := []string{idFor('a'), idFor('b'), idFor('c')}
 	sort.Strings(ids)
-	if err != nil || len(got) != 2 || got[0].ContentID() != ids[0] || got[1].ContentID() != ids[1] {
-		t.Fatalf("first page: %v %v", len(got), err)
+	if err != nil || len(got.Observations) != 2 || got.Observations[0].ContentID() != ids[0] || got.Observations[1].ContentID() != ids[1] || !got.HasMore {
+		t.Fatalf("first page: %v %v", len(got.Observations), err)
 	}
-	counts := got[0].RedactionCounts()
+	counts := got.Observations[0].RedactionCounts()
 	counts[0].Rule = "BROKEN"
 	x, ok, err := s.GetObservation(ctx, ids[0])
 	if err != nil || !ok || x.RedactionCounts()[0].Rule != "SECRET" {
 		t.Fatalf("get: %+v %t %v", x, ok, err)
 	}
-	page, err := s.ListObservations(ctx, 2, ids[1])
-	if err != nil || len(page) != 1 || page[0].ContentID() != ids[2] {
-		t.Fatalf("second page: %v %v", len(page), err)
+	page, err := s.ListObservationPage(ctx, ObservationPageRequest{Limit: 2, MaxBytes: MaxObservationPageBytes, After: ids[1]})
+	if err != nil || len(page.Observations) != 1 || page.Observations[0].ContentID() != ids[2] || page.HasMore {
+		t.Fatalf("second page: %v %v", len(page.Observations), err)
 	}
 	if _, ok, err := s.GetObservation(ctx, digest('f')); err != nil || ok {
 		t.Fatalf("missing: %t %v", ok, err)
+	}
+}
+
+func TestObservationPageStopsBeforeCloningAnObservationThatExceedsItsByteBudget(t *testing.T) {
+	store := NewEphemeralMemoryStore()
+	body := strings.Repeat("x", MaxObservationTextBytes)
+	large, err := capture.SanitizeObservation("example.app", "example.com", body, MaxObservationTextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservation(context.Background(), large); err != nil {
+		t.Fatal(err)
+	}
+	request := ObservationPageRequest{Limit: 4, MaxBytes: 64}
+	page, err := store.ListObservationPage(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Observations) != 0 || page.Bytes != 0 || !page.HasMore {
+		t.Fatalf("oversize observation was returned or hidden: %+v", page)
+	}
+	result := testing.Benchmark(func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := store.ListObservationPage(context.Background(), request); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	if result.AllocedBytesPerOp() > 32<<10 {
+		t.Fatalf("oversize observation was cloned before budget enforcement: %d bytes/op", result.AllocedBytesPerOp())
 	}
 }
 
@@ -297,13 +327,13 @@ func TestSmallPagesStayBoundedOverLargeStore(t *testing.T) {
 	}
 	var after string
 	for i := 0; i < n; i++ {
-		page, err := s.ListObservations(ctx, 1, after)
-		if err != nil || len(page) != 1 || page[0].ContentID() <= after {
+		page, err := s.ListObservationPage(ctx, ObservationPageRequest{Limit: 1, MaxBytes: MaxObservationPageBytes, After: after})
+		if err != nil || len(page.Observations) != 1 || page.Observations[0].ContentID() <= after {
 			t.Fatalf("observation page %d: %v", i, err)
 		}
-		after = page[0].ContentID()
+		after = page.Observations[0].ContentID()
 	}
-	if page, err := s.ListObservations(ctx, 1, after); err != nil || len(page) != 0 {
+	if page, err := s.ListObservationPage(ctx, ObservationPageRequest{Limit: 1, MaxBytes: MaxObservationPageBytes, After: after}); err != nil || len(page.Observations) != 0 {
 		t.Fatalf("observation end: %v", err)
 	}
 	after = ""
@@ -332,7 +362,9 @@ func TestSmallPagesStayBoundedOverLargeStore(t *testing.T) {
 		name string
 		read func()
 	}{
-		{"observations", func() { _, _ = s.ListObservations(ctx, 1, "") }},
+		{"observations", func() {
+			_, _ = s.ListObservationPage(ctx, ObservationPageRequest{Limit: 1, MaxBytes: MaxObservationPageBytes})
+		}},
 		{"derivations", func() { _, _ = s.ListDerivations(ctx, 1, "") }},
 		{"generations", func() { _, _ = s.ListGenerations(ctx, 1, "") }},
 	} {
@@ -361,9 +393,9 @@ func TestConcurrentObservationWritesAreRaceSafe(t *testing.T) {
 		}(c)
 	}
 	wg.Wait()
-	list, err := s.ListObservations(context.Background(), 10, "")
-	if err != nil || len(list) != 4 {
-		t.Fatalf("len=%d err=%v", len(list), err)
+	list, err := s.ListObservationPage(context.Background(), ObservationPageRequest{Limit: 10, MaxBytes: MaxObservationPageBytes})
+	if err != nil || len(list.Observations) != 4 {
+		t.Fatalf("len=%d err=%v", len(list.Observations), err)
 	}
 }
 

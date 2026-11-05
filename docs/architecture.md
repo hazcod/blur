@@ -74,10 +74,12 @@ random bearer credential; the store retains its SHA-256-derived HMAC key. A
 proof binds grant ID, client ID, scope, timestamp, nonce, and operation digest.
 The verifier checks scope, grant time bounds, clock skew, expiry, revocation,
 MAC, duplicate nonce, and bounded per-grant replay state. Expiry denies new
-requests; explicit revocation invalidates the grant and clears nonce state.
-Proofs are single-use within the in-memory store and the capacity limit rejects
-new proofs rather than forgetting old nonces. There is no global install
-token.
+requests; explicit revocation invalidates and removes the grant. Revocation
+and expiry clear nonce/scope maps and overwrite the retained authenticator key
+before the record is deleted. Issuance prunes expired records and rejects new
+grants at the hard 1,024-record cap. Proofs are single-use within the
+in-memory store and the nonce capacity limit rejects new proofs rather than
+forgetting old nonces. There is no global install token.
 
 This mechanism is currently exercised only in process. `MemoryTransport` is a
 bounded conformance transport, not an OS IPC implementation; endpoint
@@ -97,11 +99,17 @@ encryption; only the explicitly named ephemeral development constructor can
 accept this backend. No encrypted persistence implementation has been
 selected (see [ADR 0001](adr/0001-encrypted-store-selection.md)).
 
-Search is deterministic exact-term matching over a bounded scan, with bounded
-result count, snippets, serialized response bytes, and content IDs for
-provenance. It does not provide persistent indexing, fuzzy or semantic search,
-timeline, summaries, or AI answers. Derivation and generation types record
-provenance metadata, but the demo does not generate or persist derived content.
+Search is deterministic exact-term matching, capped at 64 observations and
+2 MiB of aggregate text/app/domain bytes per request; an omitted request byte
+limit uses that same hard maximum. It fetches at most four observations per
+page through a byte-bounded store contract; the store reports
+page bytes and whether more records remain before returning copies. The core
+service permits at most two searches at once and waits for a slot with context
+cancellation. Results, snippets, serialized response bytes, and provenance
+content IDs are bounded too. Search does not provide persistent indexing,
+fuzzy or semantic search, timeline, summaries, or AI answers. Derivation and
+generation types record provenance metadata, but the demo does not generate
+or persist derived content.
 
 ### Secrets and diagnostics
 
@@ -130,8 +138,11 @@ There is no diagnostics service or logging pipeline to claim as implemented.
 - Raw frame types are package-private and raw observation JSON decoding is
   rejected.
 - Production service construction rejects unencrypted stores.
-- Local proof verification is scoped, time-bounded, replay-aware, and
-  revocable in process.
+- Local proof verification is scoped, time-bounded, replay-aware, revocable in
+  process, and bounded to 1,024 grants with best-effort key clearing on removal.
+- Search work is bounded per request and concurrent call, including byte-aware
+  pages whose metadata prevents the store from cloning observations that do
+  not fit.
 - Command binaries and transitive non-standard dependencies pass the current
   cgo-disabled build and Cgo/import-C audit matrix.
 

@@ -15,6 +15,25 @@ import (
 
 const MaxObservationTextBytes = capture.MaxObservationTextBytes
 const MaxListLimit = 1000
+const MaxObservationPageRows = 64
+const MaxObservationPageBytes = 2 << 20
+
+// ObservationPageRequest bounds both returned rows and the aggregate bytes
+// that search will inspect. MaxBytes measures text, app ID and domain bytes.
+type ObservationPageRequest struct {
+	Limit    int
+	MaxBytes int
+	After    string
+}
+
+// ObservationPage is ordered by ContentID. HasMore is true when another
+// observation exists after the returned page, including when it did not fit
+// MaxBytes and therefore was not cloned into Observations.
+type ObservationPage struct {
+	Observations []capture.SanitizedObservation
+	Bytes        int
+	HasMore      bool
+}
 
 type ErrorCode string
 
@@ -72,7 +91,7 @@ type EncryptedStore interface {
 	EncryptedAtRest() bool
 	PutObservation(context.Context, capture.SanitizedObservation) error
 	GetObservation(context.Context, string) (capture.SanitizedObservation, bool, error)
-	ListObservations(context.Context, int, string) ([]capture.SanitizedObservation, error)
+	ListObservationPage(context.Context, ObservationPageRequest) (ObservationPage, error)
 	PutDerivation(context.Context, Derivation) error
 	GetDerivation(context.Context, string) (Derivation, bool, error)
 	ListDerivations(context.Context, int, string) ([]Derivation, error)
@@ -87,21 +106,22 @@ type EncryptedStore interface {
 // EphemeralMemoryStore is TestOnly. It is never a production default and does
 // not encrypt or persist data. It exercises the EncryptedStore contract.
 type EphemeralMemoryStore struct {
-	mu             sync.RWMutex
-	closed         bool
-	observations   map[string]capture.SanitizedObservation
-	observationIDs []string
-	derivations    map[string]Derivation
-	derivationIDs  []string
-	generations    map[string]Generation
-	generationIDs  []string
-	active         string
+	mu               sync.RWMutex
+	closed           bool
+	observations     map[string]capture.SanitizedObservation
+	observationBytes map[string]int
+	observationIDs   []string
+	derivations      map[string]Derivation
+	derivationIDs    []string
+	generations      map[string]Generation
+	generationIDs    []string
+	active           string
 }
 
 var _ EncryptedStore = (*EphemeralMemoryStore)(nil)
 
 func NewEphemeralMemoryStore() *EphemeralMemoryStore {
-	return &EphemeralMemoryStore{observations: make(map[string]capture.SanitizedObservation), derivations: make(map[string]Derivation), generations: make(map[string]Generation)}
+	return &EphemeralMemoryStore{observations: make(map[string]capture.SanitizedObservation), observationBytes: make(map[string]int), derivations: make(map[string]Derivation), generations: make(map[string]Generation)}
 }
 func (*EphemeralMemoryStore) EncryptedAtRest() bool { return false }
 func (s *EphemeralMemoryStore) Close() error {
@@ -185,9 +205,12 @@ func (s *EphemeralMemoryStore) PutObservation(ctx context.Context, o capture.San
 	if _, exists := s.observations[id]; exists {
 		return &StoreError{Code: Duplicate}
 	}
+	searchBytes := len(o.Text()) + len(o.AppID()) + len(o.Domain())
 	stored := copyObservation(o)
-	s.observations[stored.ContentID()] = stored
-	s.observationIDs = insertID(s.observationIDs, stored.ContentID())
+	storedID := stored.ContentID()
+	s.observations[storedID] = stored
+	s.observationBytes[storedID] = searchBytes
+	s.observationIDs = insertID(s.observationIDs, storedID)
 	return nil
 }
 func (s *EphemeralMemoryStore) GetObservation(ctx context.Context, id string) (capture.SanitizedObservation, bool, error) {
@@ -205,21 +228,32 @@ func (s *EphemeralMemoryStore) GetObservation(ctx context.Context, id string) (c
 func validPage(limit int, after string, hash bool) bool {
 	return limit > 0 && limit <= MaxListLimit && (after == "" || (!hash && validID(after)) || (hash && validHash(after)))
 }
-func (s *EphemeralMemoryStore) ListObservations(ctx context.Context, limit int, after string) ([]capture.SanitizedObservation, error) {
+func validObservationPage(request ObservationPageRequest) bool {
+	return request.Limit > 0 && request.Limit <= MaxObservationPageRows && request.MaxBytes > 0 && request.MaxBytes <= MaxObservationPageBytes && (request.After == "" || validHash(request.After))
+}
+func (s *EphemeralMemoryStore) ListObservationPage(ctx context.Context, request ObservationPageRequest) (ObservationPage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if err := ready(ctx, s.closed); err != nil {
-		return nil, err
+		return ObservationPage{}, err
 	}
-	if !validPage(limit, after, true) {
-		return nil, &StoreError{Code: Invalid}
+	if !validObservationPage(request) {
+		return ObservationPage{}, &StoreError{Code: Invalid}
 	}
-	ids := pageIDs(s.observationIDs, limit, after)
-	out := make([]capture.SanitizedObservation, 0, len(ids))
-	for _, id := range ids {
+	start := sort.Search(len(s.observationIDs), func(i int) bool { return s.observationIDs[i] > request.After })
+	out := make([]capture.SanitizedObservation, 0, request.Limit)
+	usedBytes, index := 0, start
+	for index < len(s.observationIDs) && len(out) < request.Limit {
+		id := s.observationIDs[index]
+		observationBytes := s.observationBytes[id]
+		if observationBytes > request.MaxBytes-usedBytes {
+			break
+		}
 		out = append(out, copyObservation(s.observations[id]))
+		usedBytes += observationBytes
+		index++
 	}
-	return out, nil
+	return ObservationPage{Observations: out, Bytes: usedBytes, HasMore: index < len(s.observationIDs)}, nil
 }
 func validDerivation(d Derivation) bool {
 	if !validID(d.ID) || !validID(d.GenerationID) || !validHash(d.ProviderModelDigest) || !validHash(d.OutputHash) || d.ProcessorVersion <= 0 || d.SchemaVersion <= 0 || d.PromptVersion <= 0 || d.RedactionVersion != privacy.Version || len(d.SourceIDs) == 0 || len(d.SourceIDs) > MaxListLimit || len(d.SourceIDs) != len(d.SourceHashes) || d.CoveredSources < 0 || d.OmittedSources < 0 || d.CoveredSources+d.OmittedSources != len(d.SourceIDs) || d.InputTokens < 0 || d.OutputTokens < 0 || d.Latency < 0 {
