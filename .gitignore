@@ -1,9 +1,13 @@
-.worktrees/
+.codegraph/
 .Codex/
-research_notes/
 .DS_Store
-dist/
-coverage.out
+.superpowers/
+.worktrees/
 *.exe
 *.test
 /blur
+capture.test
+coverage.out
+dist/
+research_notes/
+website/node_modules/

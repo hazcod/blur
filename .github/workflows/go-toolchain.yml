@@ -1,0 +1,59 @@
+name: Go toolchain bump
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  bump:
+    name: Check for a newer Go release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Find latest stable Go
+        id: go
+        run: |
+          latest=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '[.[] | select(.stable)][0].version' | sed 's/^go//')
+          current=$(awk '$1 == "go" {print $2}' go.mod)
+          echo "latest=$latest current=$current"
+          newest=$(printf '%s\n%s\n' "$latest" "$current" | sort -V | tail -n1)
+          if [ "$latest" != "$current" ] && [ "$newest" = "$latest" ]; then
+            echo "version=$latest" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Bump go directive and refresh vendor
+        if: steps.go.outputs.version != ''
+        env:
+          GOFLAGS: -mod=mod
+          GOTOOLCHAIN: local
+          VERSION: ${{ steps.go.outputs.version }}
+        run: |
+          # Keep the documented local vendor patch (docs/vendor-patches.md).
+          patched=vendor/github.com/golang-gui/goui
+          cp -a "$patched" "$RUNNER_TEMP/goui-patched"
+          go get "go@$VERSION" toolchain@none
+          go mod tidy
+          go mod vendor
+          rm -rf "$patched"
+          cp -a "$RUNNER_TEMP/goui-patched" "$patched"
+      - name: Open pull request
+        if: steps.go.outputs.version != ''
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          branch: deps/go-${{ steps.go.outputs.version }}
+          commit-message: "deps: bump Go to ${{ steps.go.outputs.version }}"
+          title: Bump Go to ${{ steps.go.outputs.version }}
+          body: |
+            Automated bump of the `go` directive to ${{ steps.go.outputs.version }}
+            (from https://go.dev/dl/). `go.mod`, `go.sum` and `vendor/` were refreshed;
+            the local goui vendor patch was preserved.
+          labels: dependencies
+          delete-branch: true
