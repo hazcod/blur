@@ -1,0 +1,1424 @@
+package gui
+
+import (
+	"fmt"
+	"image"
+	"math"
+	"slices"
+
+	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/core/signal"
+	"github.com/golang-gui/goui/internal/diagnostic"
+	"github.com/golang-gui/goui/layout"
+	"github.com/golang-gui/goui/style"
+)
+
+type Widget interface {
+	base() *WidgetBase
+
+	Parent() Widget
+	Root() Root
+	Window() Window
+
+	ID() string
+	SetID(string)
+	Name() string
+	SetName(string)
+	// Tooltip is supplementary plain text, independent of Name. Empty disables it.
+	Tooltip() string
+	SetTooltip(string)
+	// State returns simultaneous effective states, without constructing a snapshot.
+	State() style.State
+	StyleName() string // explicit style override, "" when unset
+	SetStyleName(string)
+
+	Visible() bool
+	SetVisible(bool)
+
+	// Enabled is this widget's own setting, independent of its ancestors.
+	Enabled() bool
+	SetEnabled(bool)
+
+	// Focusable allows this widget to receive logical focus and participate in
+	// default Tab navigation. It does not change its descendants' capabilities.
+	Focusable() bool
+	// SetFocusable(false) also clears focus if this widget is currently focused.
+	SetFocusable(bool)
+	Focused() bool
+	// FocusVisible reports logical focus with a keyboard-navigation hint. The
+	// host manages it: Tab enables hints, pointer presses disable them, and
+	// programmatic focus preserves the current mode. It is not a selection.
+	FocusVisible() bool
+	ContainsFocus() bool
+	ConnectFocused(func(focused bool)) signal.Handle
+	ConnectContainsFocus(func(focused bool)) signal.Handle
+
+	Cursor() Cursor
+	SetCursor(Cursor)
+
+	Rect() geometry.Rectangle
+
+	EventControllers() []EventController
+	AddEventController(EventController)
+	RemoveEventController(EventController)
+
+	LayoutManager() layout.LayoutManager
+	SetLayoutManager(layout.LayoutManager)
+
+	// MinSize returns the size preference's lower bounds; zero means no minimum.
+	MinSize() geometry.Size
+	// MaxSize returns the size preference's upper bounds. Each zero component
+	// means no upper bound, unlike a zero Max in layout.Constraint.
+	MaxSize() geometry.Size
+	// SetMinSize sets lower bounds. Negative and non-finite components become 0.
+	SetMinSize(geometry.Size)
+	// SetMaxSize sets upper bounds. Zero, negative and non-finite components
+	// clear the corresponding upper bound. Parent constraints always win.
+	SetMaxSize(geometry.Size)
+
+	// MainWeight is this widget's share of leftover main-axis space in a linear
+	// parent (0 = hug). It is also the layout.Child hint the parent reads.
+	MainWeight() float32
+	// SetMainWeight sets the weight. Negative and non-finite values become 0.
+	SetMainWeight(float32)
+
+	// Measure returns this widget's geometry for the exact parent constraint.
+	// The optional baseline is relative to the top edge of the returned size.
+	Measure(c layout.Constraint) layout.Measurement
+	Arrange(rect geometry.Rectangle)
+
+	// StyleChanged invalidates this widget's style-dependent resources. The
+	// framework calls it before subsequent layout or paint after a style sheet,
+	// style name, or widget-state change, and on first use or
+	// reattachment. Invalidations may be coalesced and need not result in
+	// different style values. It is not an input or business-state notification.
+	//
+	// Implementations should only update their own derived resources, not
+	// mutate the tree or style sheet or recursively start layout. The framework
+	// invalidates measurement and schedules layout/paint; calling the base
+	// implementation is unnecessary. Like Measure/Paint, this is a framework
+	// hook, not an application event or a method callers need to invoke.
+	StyleChanged()
+
+	// Paint draws this Widget itself in local coordinates. The GUI traversal
+	// automatically paints visible children after Paint returns.
+	Paint(p Painter)
+	RequestLayout()
+	RequestPaint()
+
+	// Children returns the direct children in sibling order: painting visits
+	// them forwards and picking visits them backwards (frontmost first).
+	// Default Tab navigation uses depth-first preorder (self, then children);
+	// Shift+Tab reverses that order. Layout managers may also use sibling order
+	// for placement; it is not a universal logical content index. An empty slice
+	// is a leaf. Focusable=false skips only self; hidden or disabled subtrees
+	// are skipped during focus navigation.
+	Children() []Widget
+
+	ConnectMount(func()) signal.Handle
+	ConnectUnmount(func()) signal.Handle
+
+	// Snapshot describes semantic content and state, not the concrete widget
+	// type or all layout details. See WidgetInfo for visibility and input limits.
+	// Call on the GUI thread and return detached data, including Attributes;
+	// copy mutable slices/maps from widget state rather than returning live data.
+	// Consumers treat the result as read-only. Snapshot must not realize offscreen
+	// content merely to describe it or defer GUI access to JSON encoding.
+	Snapshot() WidgetInfo
+}
+
+type Container interface {
+	Widget
+
+	// AddChild appends a child
+	AddChild(Widget)
+	// RemoveChild detaches a child.
+	RemoveChild(Widget)
+}
+
+// Bin is the capability of widgets whose children form a single replaceable
+// child slot.
+type Bin interface {
+	Widget
+
+	// Child returns the current child, or nil.
+	Child() Widget
+	// SetChild replaces the child; pass nil to clear.
+	SetChild(Widget)
+}
+
+type WidgetBase struct {
+	modal               *ModalScope
+	id                  string
+	name                string
+	tooltip             string
+	styleName           string // style override; "" = the control resolves with its own default name
+	hidden              bool
+	disabled            bool
+	inheritedDisabled   bool
+	enabledRevision     uint64
+	focusable           bool
+	state               style.State
+	rect                geometry.Rectangle
+	parentWidget        Widget
+	parentRoot          Root
+	children            []Widget
+	controllers         []EventController
+	self                Widget // set while mounted; preserves the actual Widget identity
+	layoutManager       layout.LayoutManager
+	minWidth, minHeight float32 // self size preference; 0 = no min
+	maxWidth, maxHeight float32 // self size preference; 0 = unbounded
+	mainWeight          float32 // main-axis extra-space share in a linear parent; 0 = hug
+	cursor              Cursor
+	mount               signal.Signal0
+	unmount             signal.Signal0
+	focusedSignal       signal.Signal1[bool]
+	containsFocusSignal signal.Signal1[bool]
+	measureConstraint   layout.Constraint
+	measureResult       layout.Measurement
+	measureValid        bool
+	styleValid          bool // zero value requests the first framework notification
+	destroyed           bool
+	reparenting         bool
+	unmounting          bool
+}
+
+func (w *WidgetBase) base() *WidgetBase {
+	return w
+}
+
+// Destroyed reports whether final host-owned destruction has begun. Unlike
+// Root() == nil, this distinguishes a reusable detached widget from one that
+// must never be attached again. It is a GUI-thread lifecycle observation.
+func (w *WidgetBase) Destroyed() bool { return w.destroyed }
+
+func (w *WidgetBase) ID() string {
+	return w.id
+}
+
+func (w *WidgetBase) SetID(id string) {
+	if w.id != id {
+		w.id = id
+		w.requestSemanticUpdate()
+	}
+}
+
+// Name is a repeatable natural name, independent of ID and StyleName.
+func (w *WidgetBase) Name() string { return w.name }
+
+func (w *WidgetBase) SetName(name string) {
+	if w.name != name {
+		w.name = name
+		w.requestSemanticUpdate()
+	}
+}
+
+// Tooltip returns the supplementary plain-text help associated with the widget.
+func (w *WidgetBase) Tooltip() string { return w.tooltip }
+
+// SetTooltip changes supplementary help. Empty removes it. Setting detached
+// widgets allocates no timer or native surface; callers supply translated text.
+func (w *WidgetBase) SetTooltip(text string) {
+	if w.destroyed || w.tooltip == text {
+		return
+	}
+	w.tooltip = text
+	w.requestSemanticUpdate()
+	tooltipChanged(w.root(), w.self)
+}
+
+// StyleName is the explicit style override, empty when unset.
+func (w *WidgetBase) StyleName() string {
+	return w.styleName
+}
+
+func (w *WidgetBase) SetStyleName(name string) {
+	if w.styleName == name {
+		return
+	}
+	w.styleName = name
+	w.styleValid = false
+	w.RequestLayout()
+}
+
+func (w *WidgetBase) Visible() bool {
+	return !w.hidden
+}
+
+func (w *WidgetBase) SetVisible(visible bool) {
+	hidden := !visible
+	if w.hidden != hidden {
+		w.hidden = hidden
+		root := w.root()
+		modalChanged(root)
+		defer ensureModalRoot(root)
+		if hidden {
+			cancelTooltipSubtree(w.root(), w.self)
+			cancelGestureSubtree(w.root(), w.self)
+			if h, ok := w.root().(EventTarget); ok && focusWithin(h, w) {
+				clearSubtreeFocus(h, w)
+			}
+		}
+		w.RequestLayout()
+		w.requestSemanticUpdate()
+	}
+}
+
+func (w *WidgetBase) Focusable() bool {
+	return w.focusable
+}
+
+func (w *WidgetBase) SetFocusable(focusable bool) {
+	if w.focusable == focusable {
+		return
+	}
+	w.focusable = focusable
+	if !focusable {
+		if h, ok := w.root().(EventTarget); ok {
+			if f := h.FocusedWidget(); f != nil && f.base() == w {
+				h.SetFocusedWidget(nil)
+			}
+		}
+	}
+	w.requestSemanticUpdate()
+}
+
+func (w *WidgetBase) Focused() bool {
+	return w.state.Has(style.Focused)
+}
+
+func (w *WidgetBase) FocusVisible() bool {
+	if !w.Focused() || w.destroyed || !w.isEnabled() {
+		return false
+	}
+	owner, ok := w.root().(interface{ rootState() *rootBase })
+	return ok && owner.rootState().focusVisible
+}
+
+func (w *WidgetBase) Cursor() Cursor {
+	return w.cursor
+}
+
+func (w *WidgetBase) SetCursor(cursor Cursor) {
+	w.cursor = cursor
+}
+
+func (w *WidgetBase) ContainsFocus() bool {
+	return w.state.Has(style.ContainsFocus)
+}
+
+func (w *WidgetBase) ConnectFocused(fn func(bool)) signal.Handle {
+	return w.focusedSignal.Connect(fn)
+}
+
+func (w *WidgetBase) ConnectContainsFocus(fn func(bool)) signal.Handle {
+	return w.containsFocusSignal.Connect(fn)
+}
+
+func (w *WidgetBase) Rect() geometry.Rectangle {
+	return w.rect
+}
+
+func (w *WidgetBase) Parent() Widget {
+	return w.parentWidget
+}
+
+// Children returns a copy of the canonical sibling sequence shared by layout,
+// painting, picking and the default Snapshot. Container implementations should
+// use the child helpers to maintain it, not override only the returned order.
+func (w *WidgetBase) Children() []Widget {
+	return slices.Clone(w.children)
+}
+
+func (w *WidgetBase) Root() Root {
+	return w.root()
+}
+
+func (w *WidgetBase) Window() Window {
+	win, _ := w.root().(Window)
+	return win
+}
+
+func (w *WidgetBase) EventControllers() []EventController {
+	return slices.Clone(w.controllers)
+}
+
+func (w *WidgetBase) AddEventController(controller EventController) {
+	if controller == nil || slices.Contains(w.controllers, controller) {
+		return
+	}
+	w.controllers = append(w.controllers, controller)
+	if owned, ok := controller.(interface{ setWidget(Widget) }); ok && w.self != nil {
+		owned.setWidget(w.self)
+	}
+	notifyDragControllersChanged(w.root())
+}
+
+func (w *WidgetBase) RemoveEventController(controller EventController) {
+	index := slices.Index(w.controllers, controller)
+	if index < 0 {
+		return
+	}
+	cancelGestureController(w.root(), controller)
+	index = slices.Index(w.controllers, controller)
+	if index < 0 {
+		return
+	}
+	w.controllers = slices.Delete(w.controllers, index, index+1)
+	if owned, ok := controller.(interface{ setWidget(Widget) }); ok {
+		owned.setWidget(nil)
+	}
+	notifyDragControllersChanged(w.root())
+}
+
+func (w *WidgetBase) LayoutManager() layout.LayoutManager {
+	return w.layoutManager
+}
+
+func (w *WidgetBase) SetLayoutManager(l layout.LayoutManager) {
+	w.layoutManager = l
+	w.RequestLayout()
+}
+
+func (w *WidgetBase) Measure(c layout.Constraint) layout.Measurement {
+	if w.hidden {
+		return layout.Measurement{}
+	}
+	c = w.layoutConstraint(c)
+	var measured layout.Measurement
+	if w.layoutManager != nil {
+		// The layout manager insets its own padding (LinearLayout.Padding etc.);
+		// WidgetBase stays padding-free — not every widget has padding.
+		measured = w.layoutManager.Measure(w.visibleChildren(), c)
+	}
+	return measured.Constrain(c)
+}
+
+// selfConstraint is the widget's own size preference (min/max). A 0 max means
+// unbounded.
+func (w *WidgetBase) selfConstraint() layout.Constraint {
+	maxW, maxH := w.maxWidth, w.maxHeight
+	if maxW <= 0 {
+		maxW = layout.Inf
+	}
+	if maxH <= 0 {
+		maxH = layout.Inf
+	}
+	return layout.Constraint{
+		Min: geometry.Size{Width: w.minWidth, Height: w.minHeight},
+		Max: geometry.Size{Width: maxW, Height: maxH},
+	}
+}
+
+// constrain applies the widget's own size preference then the parent constraint
+// to an intrinsic size. The parent constraint is applied last so it always wins
+// (§9 DesignLayout): a child min never breaks the parent max — it overflows.
+func (w *WidgetBase) constrain(c layout.Constraint, intrinsic geometry.Size) geometry.Size {
+	return c.Clamp(w.selfConstraint().Clamp(intrinsic))
+}
+
+// layoutConstraint combines size preferences with the parent's hard limits
+// before measuring children. This lets wrapping, alignment and baselines use
+// the actual size range instead of clamping only the container's result.
+func (w *WidgetBase) layoutConstraint(c layout.Constraint) layout.Constraint {
+	return layout.Constraint{
+		Min: w.constrain(c, c.Min),
+		Max: w.constrain(c, c.Max),
+	}
+}
+
+// normalizeLayoutValue is shared by GUI layout setters. Normalize before
+// comparing so repeated invalid inputs do not keep invalidating layout.
+func normalizeLayoutValue(v float32) float32 {
+	if v < 0 || math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+		return 0
+	}
+	return v
+}
+
+func normalizeInsets(padding geometry.Insets) geometry.Insets {
+	return geometry.Insets{
+		Left:   normalizeLayoutValue(padding.Left),
+		Top:    normalizeLayoutValue(padding.Top),
+		Right:  normalizeLayoutValue(padding.Right),
+		Bottom: normalizeLayoutValue(padding.Bottom),
+	}
+}
+
+func (w *WidgetBase) MinSize() geometry.Size {
+	return geometry.Size{Width: w.minWidth, Height: w.minHeight}
+}
+
+func (w *WidgetBase) MaxSize() geometry.Size {
+	maxW := w.maxWidth
+	maxH := w.maxHeight
+	if maxW <= 0 {
+		maxW = 0
+	}
+	if maxH <= 0 {
+		maxH = 0
+	}
+	return geometry.Size{Width: maxW, Height: maxH}
+}
+
+func (w *WidgetBase) SetMinSize(s geometry.Size) {
+	s.Width = normalizeLayoutValue(s.Width)
+	s.Height = normalizeLayoutValue(s.Height)
+	minChanged := w.minWidth != s.Width || w.minHeight != s.Height
+	if !minChanged {
+		return
+	}
+	w.minWidth = s.Width
+	w.minHeight = s.Height
+	w.RequestLayout()
+}
+
+func (w *WidgetBase) SetMaxSize(s geometry.Size) {
+	s.Width = normalizeLayoutValue(s.Width)
+	s.Height = normalizeLayoutValue(s.Height)
+	maxChanged := w.maxWidth != s.Width || w.maxHeight != s.Height
+	if !maxChanged {
+		return
+	}
+	w.maxWidth = s.Width
+	w.maxHeight = s.Height
+	w.RequestLayout()
+}
+
+func (w *WidgetBase) MainWeight() float32 { return w.mainWeight }
+
+func (w *WidgetBase) SetMainWeight(v float32) {
+	v = normalizeLayoutValue(v)
+	if w.mainWeight == v {
+		return
+	}
+	w.mainWeight = v
+	w.RequestLayout()
+}
+
+func (w *WidgetBase) Arrange(rect geometry.Rectangle) {
+	w.rect = rect
+	if w.layoutManager != nil {
+		w.layoutManager.Arrange(w.visibleChildren(), geometry.Rect(0, 0, rect.Width, rect.Height))
+	}
+}
+
+// Paint is the default no-op self painter. The GUI traversal paints children
+// automatically after this method returns.
+func (w *WidgetBase) Paint(Painter) {}
+
+// StyleChanged is the default no-op for widgets without cached style resources.
+func (w *WidgetBase) StyleChanged() {}
+
+func (w *WidgetBase) Snapshot() WidgetInfo {
+	state := w.State()
+	info := WidgetInfo{
+		ID:            w.ID(),
+		Name:          w.Name(),
+		Tooltip:       w.Tooltip(),
+		Role:          RoleWidget,
+		Bounds:        w.windowRect(),
+		Visible:       w.Visible(),
+		Enabled:       IsEnabled(w),
+		Focusable:     w.Focusable(),
+		Focused:       w.Focused(),
+		FocusVisible:  w.FocusVisible(),
+		ContainsFocus: w.ContainsFocus(),
+		Hovered:       state.Has(style.Hovered),
+		Pressed:       state.Has(style.Pressed),
+		Selected:      state.Has(style.Selected),
+	}
+	if w.modal != nil {
+		info.SetAttribute(ModalInfoKey, ModalInfo{Active: w.modal.Active()})
+	}
+	for _, controller := range w.controllers {
+		switch c := controller.(type) {
+		case *DragSource:
+			if info.Enabled && c.enabled && c.actions.ValidSet() && c.actions != 0 {
+				if info.DragDrop == nil {
+					info.DragDrop = new(DragDropInfo)
+				}
+				info.DragDrop.SourceActions |= c.actions
+				info.DragDrop.Dragging = info.DragDrop.Dragging || c.dragging
+			}
+		case *DropTarget:
+			if info.Enabled && c.enabled && c.actions.ValidSet() && c.actions != 0 && len(c.formats) != 0 {
+				if info.DragDrop == nil {
+					info.DragDrop = new(DragDropInfo)
+				}
+				info.DragDrop.TargetActions |= c.actions
+				info.DragDrop.DropActive = info.DragDrop.DropActive || c.active
+				for _, format := range c.formats {
+					if validDragFormat(format) && !slices.Contains(info.DragDrop.TargetFormats, format) {
+						info.DragDrop.TargetFormats = append(info.DragDrop.TargetFormats, format)
+					}
+				}
+			}
+		}
+	}
+	for _, child := range w.children {
+		info.Children = append(info.Children, child.Snapshot())
+	}
+	return info
+}
+
+func (w *WidgetBase) windowRect() geometry.Rectangle {
+	rect := w.rect
+	for parent := w.parentWidget; parent != nil; parent = parent.Parent() {
+		parentRect := parent.Rect()
+		rect.X += parentRect.X
+		rect.Y += parentRect.Y
+	}
+	return rect
+}
+
+func (w *WidgetBase) RequestLayout() {
+	if s := diagnosticWidget(w); s != nil {
+		s.LayoutRequests++
+	}
+	w.invalidateMeasureToRoot()
+	// Reach the host through the Root interface (window or popover) — never the
+	// concrete *window, which is nil for a popover-hosted widget.
+	if r := w.root(); r != nil {
+		r.RequestLayout()
+	}
+}
+
+// invalidateMeasureToRoot clears the one-entry measurement cache for this
+// widget and every ancestor whose result may include it. WidgetBase does not
+// need an owner/self pointer: its own cache is local and parentWidget provides
+// the upward path.
+func (w *WidgetBase) invalidateMeasureToRoot() {
+	w.measureValid = false
+	for parent := w.parentWidget; parent != nil; parent = parent.Parent() {
+		parent.base().measureValid = false
+	}
+}
+
+// invalidateStyleSubtree marks existing descendants without calling user code.
+// The next framework use delivers the coalesced notification through Widget.
+func invalidateStyleSubtree(widget Widget) {
+	if widget == nil || widget.base().destroyed {
+		return
+	}
+	widget.base().styleValid = false
+	widget.base().measureValid = false
+	for _, child := range widget.Children() {
+		invalidateStyleSubtree(child)
+	}
+}
+
+// ensureWidgetStyle also guards specialized layout entry points that read a
+// widget's derived geometry without calling Measure (for example Scrollable).
+func ensureWidgetStyle(widget Widget) bool {
+	if widget == nil || widget.base().destroyed {
+		return false
+	}
+	base := widget.base()
+	if !base.styleValid {
+		if s := diagnosticWidget(base); s != nil {
+			s.StyleChangedCalls++
+		}
+		base.styleValid = true // consume before calling out; do not lose a new invalidation
+		base.measureValid = false
+		widget.StyleChanged()
+	}
+	return !base.destroyed
+}
+
+// measureWidget is the framework's cached entry point for measuring a Widget.
+// Layout algorithms reach it through widgetLayoutChild, while hosts and the
+// few specialized containers call it directly. The final clamp enforces the
+// layout.Child contract even for application-defined widgets.
+func measureWidget(widget Widget, c layout.Constraint) layout.Measurement {
+	if !ensureWidgetStyle(widget) {
+		return layout.Measurement{}
+	}
+	base := widget.base()
+	if base.measureValid && base.measureConstraint == c {
+		if session := diagnostic.Current(); session != nil && session.WidgetsEnabled() {
+			if s := diagnosticWidgetFor(session, base); s != nil {
+				s.MeasureQueries++
+				s.MeasureHits++
+			}
+		}
+		return base.measureResult
+	}
+	if session := diagnostic.Current(); session != nil && session.WidgetsEnabled() {
+		if s := diagnosticWidgetFor(session, base); s != nil {
+			s.MeasureQueries++
+			s.MeasureCalls++
+		}
+	}
+	measured := widget.Measure(c)
+	measured.Size = c.Clamp(measured.Size)
+	base.measureConstraint = c
+	base.measureResult = measured
+	base.measureValid = base.styleValid && !base.destroyed
+	return measured
+}
+
+func (w *WidgetBase) RequestPaint() {
+	if s := diagnosticWidget(w); s != nil {
+		s.PaintRequests++
+	}
+	// Same as RequestLayout: reach the host through Root, never through Window().
+	if r := w.root(); r != nil {
+		_ = r.RequestPaint()
+	}
+}
+
+// liveRoot returns root, or nil if it has been destroyed — letting a host drop
+// its root pointer once the widget's lifecycle ends, without a host-specific
+// callback interface.
+func liveRoot(root Widget) Widget {
+	if root != nil && root.base().destroyed {
+		return nil
+	}
+	return root
+}
+
+// focusWithin reports whether the host's focused widget is base or a descendant
+// of it. Works for any host (window or popover) via the EventTarget interface.
+func focusWithin(host EventTarget, base *WidgetBase) bool {
+	for widget := host.FocusedWidget(); widget != nil; widget = widget.Parent() {
+		if widget.base() == base {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *WidgetBase) ConnectMount(fn func()) signal.Handle {
+	return w.mount.Connect(fn)
+}
+
+func (w *WidgetBase) ConnectUnmount(fn func()) signal.Handle {
+	return w.unmount.Connect(fn)
+}
+
+func (w *WidgetBase) requestSemanticUpdate() {
+	// Reserved for the inspector and automation layers.
+}
+
+// AddChild mounts child under parent. It is the low-level mounting primitive
+// used by Container.AddChild and Bin.SetChild implementations. External code
+// should go through those semantic entry points; as a guard, mounting on a
+// Bin is refused unless the child has already been registered via SetChild
+// (so a direct AddChild on a Button cannot desync its child slot).
+func (w *WidgetBase) AddChild(parent, child Widget) {
+	if parent == nil || parent.base() != w {
+		return
+	}
+	if child == nil {
+		return
+	}
+	// Bin guard: a Bin's child must be registered through SetChild first
+	// (SetChild updates the slot before mounting), so bypassing it is a no-op.
+	if bin, ok := parent.(Bin); ok && bin.Child() != child {
+		return
+	}
+	child.base().setParent(child, parent)
+}
+
+// AddStructuralChild mounts a widget implementation's internal child outside
+// its public Bin slot, such as a disclosure button. The implementation owns
+// its layout and removal. Application content should use SetChild/AddChild.
+// Parent must be the Widget implemented by this WidgetBase.
+func (w *WidgetBase) AddStructuralChild(parent, child Widget) {
+	if parent == nil || parent.base() != w || child == nil {
+		return
+	}
+	child.base().setParent(child, parent)
+}
+
+func (w *WidgetBase) RemoveChild(child Widget) {
+	if child == nil || child.base().parentWidget == nil || child.base().parentWidget.base() != w {
+		return
+	}
+	child.base().setParent(child, nil)
+}
+
+// MoveChildBefore moves an existing direct child immediately before sibling.
+// A nil sibling moves child to the end (frontmost in default painting).
+// This is a widget-implementation helper, not a container's content API.
+// It changes Children and default Snapshot order and may affect layout; it is
+// not a paint-only stacking operation. Ownership, focus and mount state stay
+// unchanged. A change requests layout/paint and a semantic update.
+// Invalid, destroyed, identical or already-positioned children are a no-op.
+func (w *WidgetBase) MoveChildBefore(child, sibling Widget) {
+	w.moveChild(child, sibling, false)
+}
+
+// MoveChildAfter moves an existing direct child immediately after sibling.
+// A nil sibling moves child to the beginning (backmost in default painting).
+// The same ownership, invalid-input and invalidation rules as MoveChildBefore
+// apply. Neither method attaches children or moves them between parents.
+func (w *WidgetBase) MoveChildAfter(child, sibling Widget) {
+	w.moveChild(child, sibling, true)
+}
+
+func (w *WidgetBase) moveChild(child, sibling Widget, after bool) {
+	if w.destroyed || child == nil || child == sibling || child.base().destroyed {
+		return
+	}
+	from := slices.Index(w.children, child)
+	if from < 0 || child.Parent() == nil || child.Parent().base() != w {
+		return
+	}
+	index := len(w.children)
+	if sibling != nil {
+		if sibling.base().destroyed || sibling.Parent() != child.Parent() {
+			return
+		}
+		index = slices.Index(w.children, sibling)
+		if index < 0 {
+			return
+		}
+		if after {
+			index++
+		}
+	} else if after {
+		index = 0
+	}
+	if from < index {
+		index--
+	}
+	if from == index {
+		return
+	}
+	w.children = slices.Delete(w.children, from, from+1)
+	w.children = slices.Insert(w.children, index, child)
+	modalChanged(w.root())
+	w.RequestLayout()
+	w.requestSemanticUpdate()
+}
+
+func (w *WidgetBase) setParent(child, parent Widget) {
+	if child == nil || child.base() != w || w.reparenting {
+		return
+	}
+	if child == nil || child == parent {
+		return
+	}
+	if parent != nil && parent.base().isDescendant(parent, child) {
+		return
+	}
+
+	childBase := child.base()
+	if childBase.destroyed {
+		return
+	}
+	if childBase.parentWidget == parent && childBase.parentRoot == nil {
+		return
+	}
+	if parent != nil && parent.base().destroyed {
+		return
+	}
+	w.reparenting = true
+	defer func() { w.reparenting = false }()
+
+	oldRoot := child.Root()
+	var newRoot Root
+	if parent != nil {
+		newRoot = parent.Root()
+	}
+	rootChanged := oldRoot != newRoot
+
+	if rootChanged && oldRoot != nil {
+		w.emitUnmountSubtree(child)
+		if h, ok := oldRoot.(EventTarget); ok && focusWithin(h, child.base()) {
+			clearSubtreeFocus(h, child.base())
+		}
+	}
+	// Lifecycle/focus callbacks may destroy either endpoint. Destruction wins;
+	// never attach a dead subtree or revive a parent destroyed by Unmount.
+	if w.destroyed {
+		return
+	}
+	w.detach(child)
+
+	if parent != nil && !parent.base().destroyed {
+		w.attachChild(parent, child)
+	}
+	w.updateEnabled()
+	if !rootChanged && oldRoot != nil {
+		if h, ok := oldRoot.(EventTarget); ok && focusWithin(h, child.base()) {
+			h.SetFocusedWidget(h.FocusedWidget())
+		}
+	}
+	if rootChanged && newRoot != nil && child.Root() == newRoot {
+		w.emitMountSubtree(child)
+	}
+	modalChanged(oldRoot)
+	modalChanged(newRoot)
+	ensureModalRoot(oldRoot)
+	ensureModalRoot(newRoot)
+}
+
+func (w *WidgetBase) root() Root {
+	if w == nil {
+		return nil
+	}
+	if w.parentRoot != nil {
+		return w.parentRoot
+	}
+	if w.parentWidget != nil {
+		return w.parentWidget.Root()
+	}
+	return nil
+}
+
+func (w *WidgetBase) attachRoot(root Root, child Widget) {
+	if child == nil || child.base() != w {
+		return
+	}
+	w.parentWidget = nil
+	w.parentRoot = root
+	w.updateEnabled()
+	invalidateStyleSubtree(child)
+	w.emitMountSubtree(child)
+}
+
+func (w *WidgetBase) detachRoot(child Widget) {
+	if child == nil || child.base() != w {
+		return
+	}
+	oldRoot := child.Root()
+	if oldRoot != nil {
+		w.emitUnmountSubtree(child)
+		if h, ok := oldRoot.(EventTarget); ok && focusWithin(h, child.base()) {
+			clearSubtreeFocus(h, child.base())
+		}
+	}
+	w.detach(child)
+	w.updateEnabled()
+}
+
+func (w *WidgetBase) attachChild(parent, child Widget) {
+	if child == nil || child.base() != w {
+		return
+	}
+	parentBase := parent.base()
+	w.parentWidget = parent
+	w.parentRoot = nil
+	parentBase.children = append(parentBase.children, child)
+	modalChanged(parent.Root())
+	invalidateStyleSubtree(child)
+	parent.RequestLayout()
+	parentBase.requestSemanticUpdate()
+}
+
+func (w *WidgetBase) detach(child Widget) {
+	if child == nil || child.base() != w {
+		return
+	}
+	if w.parentWidget != nil {
+		parent := w.parentWidget
+		parentBase := parent.base()
+		index := slices.Index(parentBase.children, child)
+		if index >= 0 {
+			parentBase.children = slices.Delete(parentBase.children, index, index+1)
+		}
+		modalChanged(parent.Root())
+		w.parentWidget = nil
+		parent.RequestLayout()
+		parentBase.requestSemanticUpdate()
+		return
+	}
+	if w.parentRoot != nil {
+		// A host's root widget is owned by the host and managed through its
+		// SetWidget; detaching it any other way just severs the back-link here.
+		w.parentRoot = nil
+	}
+}
+
+func (w *WidgetBase) destroy(widget Widget) {
+	if widget == nil || widget.base() != w || w.destroyed {
+		return
+	}
+	// Publish final destruction before callbacks so recursive destruction and
+	// reattachment from Unmount cannot resurrect this object.
+	w.destroyed = true
+
+	oldRoot := widget.Root()
+	if oldRoot != nil {
+		w.emitUnmountSubtree(widget)
+		if h, ok := oldRoot.(EventTarget); ok && focusWithin(h, widget.base()) {
+			clearSubtreeFocus(h, widget.base())
+		}
+	}
+	w.detach(widget)
+	if w.modal != nil {
+		w.modal.Destroy()
+	}
+
+	for _, child := range slices.Clone(w.children) {
+		child.base().destroy(child)
+	}
+
+	w.children = nil
+	w.controllers = nil
+	w.layoutManager = nil
+	w.measureValid = false
+}
+
+func (w *WidgetBase) emitMountSubtree(widget Widget) {
+	if widget == nil || widget.base() != w || w.destroyed {
+		return
+	}
+	w.self = widget
+	if w.modal != nil {
+		w.modal.mount()
+	}
+	for _, controller := range w.controllers {
+		if owned, ok := controller.(interface{ setWidget(Widget) }); ok {
+			owned.setWidget(widget)
+		}
+	}
+	w.mount.Emit()
+	if w.destroyed || widget.Root() == nil {
+		return
+	}
+	for _, child := range slices.Clone(w.children) {
+		if child.Parent() == widget {
+			child.base().emitMountSubtree(child)
+		}
+	}
+}
+
+func (w *WidgetBase) emitUnmountSubtree(widget Widget) {
+	if widget == nil || widget.base() != w || w.unmounting {
+		return
+	}
+	w.unmounting = true
+	modalChanged(w.root())
+	if w.modal != nil {
+		w.modal.unmount()
+	}
+	if owner, ok := w.root().(interface{ rootState() *rootBase }); ok {
+		delete(owner.rootState().stateStyles, widget)
+	}
+	w.updateState(style.Hovered|style.Pressed|style.DropActive, false)
+	defer func() { w.unmounting = false }()
+	cancelTooltipSubtree(w.root(), widget)
+	cancelGestureSubtree(w.root(), widget)
+	for _, child := range slices.Clone(w.children) {
+		child.base().emitUnmountSubtree(child)
+	}
+	w.unmount.Emit()
+	for _, controller := range w.controllers {
+		if owned, ok := controller.(interface{ setWidget(Widget) }); ok {
+			owned.setWidget(nil)
+		}
+	}
+	w.self = nil
+}
+
+func (w *WidgetBase) isDescendant(widget, ancestor Widget) bool {
+	for widget != nil {
+		if widget == ancestor {
+			return true
+		}
+		widget = widget.Parent()
+	}
+	return false
+}
+
+func (w *WidgetBase) setFocused(focused bool) {
+	if w.Focused() == focused {
+		return
+	}
+	w.updateState(style.Focused, focused)
+	w.focusedSignal.Emit(focused)
+	w.requestSemanticUpdate()
+}
+
+func (w *WidgetBase) setContainsFocus(containsFocus bool) {
+	if w.ContainsFocus() == containsFocus {
+		return
+	}
+	w.updateState(style.ContainsFocus, containsFocus)
+	w.containsFocusSignal.Emit(containsFocus)
+	w.requestSemanticUpdate()
+}
+
+func (w *WidgetBase) handleCrossing(ctx CrossingContext) {
+	if ctx.Type() == CrossingPointer {
+		if ctx.Mode() == CrossingContains {
+			w.updateState(style.Hovered, ctx.Direction() == CrossingEnter)
+		}
+		return
+	}
+	if ctx.Type() != CrossingFocus {
+		return
+	}
+	switch ctx.Mode() {
+	case CrossingTarget:
+		w.setFocused(ctx.Direction() == CrossingEnter)
+	case CrossingContains:
+		w.setContainsFocus(ctx.Direction() == CrossingEnter)
+	}
+}
+
+func (w *WidgetBase) visibleChildren() []layout.Child {
+	children := make([]layout.Child, 0, len(w.children))
+	for _, child := range w.children {
+		if child.Visible() {
+			children = append(children, widgetLayoutChild{widget: child})
+		}
+	}
+	return children
+}
+
+const widgetOwnedStates = style.Pressed | style.Selected | style.Checked | style.Mixed | style.DropActive
+
+// State returns the widget's simultaneous effective states. Hovered includes
+// descendants. Disabled and FocusVisible are derived from the existing enabled
+// and host-focus facts, rather than separately writable copies of them.
+func (w *WidgetBase) State() style.State {
+	state := w.state
+	if !w.isEnabled() {
+		return (state | style.Disabled) &^ (style.Hovered | style.Pressed | style.Focused | style.ContainsFocus | style.FocusVisible | style.DropActive)
+	}
+	if w.FocusVisible() {
+		state |= style.FocusVisible
+	}
+	return state
+}
+
+// SetState updates implementation-owned display flags. It does not activate,
+// select or check a business model. Use a control's dedicated setter for that.
+// Only Pressed, Selected, Checked, Mixed and DropActive are writable here;
+// passing host-owned or unknown flags panics. Normal is a no-op. Like Paint,
+// this helper is for widget implementations, on the GUI thread.
+func (w *WidgetBase) SetState(flags style.State, enabled bool) {
+	if flags&^widgetOwnedStates != 0 {
+		panic("gui: widget state contains reserved or unknown flags")
+	}
+	if w.destroyed {
+		return
+	}
+	if !w.isEnabled() {
+		flags &^= style.Pressed | style.DropActive
+	}
+	w.updateState(flags, enabled)
+}
+
+func (w *WidgetBase) updateState(flags style.State, enabled bool) {
+	next := w.state &^ flags
+	if enabled {
+		next |= flags
+	}
+	if next == w.state {
+		return
+	}
+	w.state = next
+	w.invalidateState()
+}
+
+// Retain the last measurement until the next frame can compare the new style.
+// Pointer crossing must not mark otherwise valid chrome geometry dirty mid-event.
+func (w *WidgetBase) invalidateState() {
+	w.styleValid = false
+	if w.unmounting {
+		w.measureValid = false
+		return
+	}
+	if owner, ok := w.root().(interface{ rootState() *rootBase }); ok && w.self != nil {
+		host := owner.rootState()
+		if host.stateStyles == nil {
+			host.stateStyles = make(map[Widget]stateMeasurement)
+		}
+		if _, pending := host.stateStyles[w.self]; !pending {
+			host.stateStyles[w.self] = stateMeasurement{w.measureConstraint, w.measureResult, w.measureValid}
+		}
+		w.RequestPaint()
+	} else {
+		w.RequestLayout()
+	}
+	w.requestSemanticUpdate()
+}
+
+// widgetLayoutChild adapts a GUI Widget to the pure layout.Child contract and
+// funnels framework-owned child measurement through WidgetBase's cache.
+type widgetLayoutChild struct {
+	widget Widget
+}
+
+func (c widgetLayoutChild) Measure(constraint layout.Constraint) layout.Measurement {
+	return measureWidget(c.widget, constraint)
+}
+
+func (c widgetLayoutChild) Arrange(rect geometry.Rectangle) {
+	c.widget.Arrange(rect)
+}
+
+func (c widgetLayoutChild) MainWeight() float32 {
+	return c.widget.MainWeight()
+}
+
+// Pick returns the deepest visible Widget at point in widget-local DIP, or
+// nil. It uses the same bounds clipping and child order as event delivery.
+// It searches only this subtree, not covering siblings or window decorations,
+// and causes no input, hover or focus changes.
+func Pick(widget Widget, point geometry.Point) Widget {
+	if widget == nil || widget.base().destroyed || !widget.Visible() ||
+		!containsPoint(geometry.Rect(0, 0, widget.Rect().Width, widget.Rect().Height), point) {
+		return nil
+	}
+	children := widget.Children()
+	for i := len(children) - 1; i >= 0; i-- {
+		if target := hitTest(children[i], point); target != nil {
+			return target
+		}
+	}
+	return widget
+}
+
+// RenderWidget repaints widget and its visible descendants into an independent
+// transparent image. It uses the current allocation, not the previous displayed
+// frame, and excludes ancestors, siblings and native window decorations.
+// The image origin is (0, 0); dimensions are ceil(allocation * scale).
+// A zero scale uses the host's current physical-pixels-per-DIP scale.
+//
+// Call on the GUI thread, outside Paint, after the widget has an allocation.
+// A pending layout is not flushed: this renders its currently allocated size.
+// This does not mount, arrange or move widgets. Paint must obey its
+// normal contract, including not mutating the tree. Drawing/resource failures
+// are returned; panics in Paint propagate after drawing state is restored.
+func RenderWidget(widget Widget, scale float32) (image.Image, error) {
+	if widget == nil || widget.base().destroyed || !widget.Visible() {
+		return nil, fmt.Errorf("gui: render unavailable widget")
+	}
+	host, ok := widget.Root().(interface {
+		renderWidgetImage(Widget, float32) (image.Image, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("gui: render widget without a rendering host")
+	}
+	return host.renderWidgetImage(widget, scale)
+}
+
+// FindWidget returns the currently mounted widget with id under root. A missing
+// or empty id returns nil. Call on the GUI thread; the returned widget is
+// borrowed from its Root and may become invalid after a tree update.
+func FindWidget(root Root, id string) Widget {
+	if root == nil || id == "" {
+		return nil
+	}
+	var found Widget
+	visitWidgetTree(root, func(widget Widget) bool {
+		if widget.ID() != id {
+			return true
+		}
+		found = widget
+		return false
+	})
+	return found
+}
+
+// FindWidgetsByName returns every currently mounted widget with the given
+// nonempty Name in traversal order. Names need not be unique within a Root.
+func FindWidgetsByName(root Root, name string) []Widget {
+	if root == nil || name == "" {
+		return nil
+	}
+	var matches []Widget
+	visitWidgetTree(root, func(widget Widget) bool {
+		if widget.Name() == name {
+			matches = append(matches, widget)
+		}
+		return true
+	})
+	return matches
+}
+
+// visitWidgetTree traverses the actual tree, including internal widgets that
+// a semantic Snapshot may deliberately omit. Returning false stops traversal.
+func visitWidgetTree(root Root, visit func(Widget) bool) {
+	var walk func(Widget) bool
+	walk = func(widget Widget) bool {
+		if widget == nil || widget.base().destroyed {
+			return true
+		}
+		if !visit(widget) {
+			return false
+		}
+		for _, child := range widget.Children() {
+			if !walk(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if root != nil {
+		walk(root.Widget())
+	}
+}
+
+func (w *WidgetBase) Enabled() bool { return !w.disabled }
+
+// IsEnabled reports whether widget and all its ancestors are enabled. A nil
+// widget returns false. Visibility, mounting and focusability are independent;
+// like other widget queries, call this on the GUI thread.
+func IsEnabled(widget Widget) bool { return widget != nil && widget.base().isEnabled() }
+
+func (w *WidgetBase) isEnabled() bool { return !w.disabled && !w.inheritedDisabled }
+
+func (w *WidgetBase) SetEnabled(enabled bool) {
+	if w.destroyed || w.disabled == !enabled {
+		return
+	}
+	oldEnabled := w.isEnabled()
+	w.disabled = !enabled
+	w.propagateEnabled(oldEnabled)
+}
+
+// Reparenting publishes only the final parent's restriction, never a temporary
+// enable while the widget is being detached from its old parent.
+func (w *WidgetBase) updateEnabled() {
+	oldEnabled := w.isEnabled()
+	w.inheritedDisabled = w.parentWidget != nil && !IsEnabled(w.parentWidget)
+	w.propagateEnabled(oldEnabled)
+}
+
+type enabledChange struct {
+	base     *WidgetBase
+	revision uint64
+}
+
+func (w *WidgetBase) propagateEnabled(oldEnabled bool) {
+	var changes []enabledChange
+	var commit func(*WidgetBase, bool)
+	commit = func(base *WidgetBase, old bool) {
+		if base.destroyed || base.isEnabled() == old {
+			return
+		}
+		base.enabledRevision++
+		if !base.isEnabled() {
+			base.state &^= style.Hovered | style.Pressed | style.DropActive
+		}
+		base.styleValid, base.measureValid = false, false
+		changes = append(changes, enabledChange{base, base.enabledRevision})
+		for _, child := range base.children {
+			b := child.base()
+			before := b.isEnabled()
+			b.inheritedDisabled = !base.isEnabled()
+			commit(b, before)
+		}
+	}
+	// All state and cache invalidations are visible before cancellation invokes
+	// user code. StyleChanged itself stays deferred to the framework use path.
+	commit(w, oldEnabled)
+	if len(changes) == 0 {
+		return
+	}
+	root := w.root()
+	w.RequestLayout()
+	w.requestSemanticUpdate()
+	if !w.isEnabled() {
+		w.cancelDisabledInput()
+	}
+	for _, change := range changes {
+		b := change.base
+		for _, controller := range slices.Clone(b.controllers) {
+			if b.destroyed || b.isEnabled() || b.enabledRevision != change.revision || b.root() != root {
+				break
+			}
+			if controller != nil && slices.Contains(b.controllers, controller) {
+				controller.Reset()
+			}
+		}
+	}
+	notifyDragControllersChanged(root)
+	refreshEnabledHover(root)
+}
+
+// Host-level state is cancelled once for the affected subtree. Each changed
+// node resets its own controllers separately, with reentrant lifetime checks.
+func (w *WidgetBase) cancelDisabledInput() {
+	root := w.root()
+	revision := w.enabledRevision
+	current := func() bool {
+		return !w.destroyed && !w.isEnabled() && w.enabledRevision == revision && w.root() == root
+	}
+	if w.self != nil {
+		cancelGestureSubtree(root, w.self)
+	}
+	if !current() {
+		return
+	}
+	if host, ok := root.(EventTarget); ok && focusWithin(host, w) {
+		host.SetFocusedWidget(nil)
+	}
+	if !current() {
+		return
+	}
+	if host, ok := root.(interface{ rootState() *rootBase }); ok {
+		b := host.rootState()
+		path := b.dispatcher.hoverPath
+		for i, widget := range path {
+			if !IsEnabled(widget) {
+				b.dispatcher.updatePointerHoverPath(slices.Clone(path[:i]), b.dispatcher.pointerEvent)
+				break
+			}
+		}
+		if !current() {
+			return
+		}
+		if target := b.dragTarget.target; target != nil && target.owner != nil && !IsEnabled(target.owner) {
+			state := b.dragTarget
+			b.leaveDragTarget()
+			if state.reading && state.offer != nil {
+				_ = state.offer.Finish(0)
+			}
+		}
+		if !current() {
+			return
+		}
+		b.clearDisabledDragMotion()
+		if !current() {
+			return
+		}
+		// A manually handed-off source need not be registered as a controller.
+		if app := b.app; app != nil && app.dragSession != nil {
+			run := app.dragSession
+			if run.widget != nil && run.widget.Root() == root && !IsEnabled(run.widget) {
+				run.cancel()
+			}
+		}
+	}
+}
+
+func refreshEnabledHover(root Root) {
+	if host, ok := root.(interface{ rootState() *rootBase }); ok {
+		d := &host.rootState().dispatcher
+		if d.pointerInside {
+			if target, ok := root.(EventTarget); ok {
+				d.updateHover(target, root.Widget(), d.pointerEvent)
+			}
+		}
+	}
+	if host, ok := root.(interface{ applyCursor() }); ok {
+		host.applyCursor()
+	}
+}
+
+// Keep enabled ancestors' contains-hover state without making a disabled leaf
+// an interactive target.
+func enabledHoverPath(path []Widget) []Widget {
+	for i, widget := range path {
+		if !IsEnabled(widget) {
+			return path[:i]
+		}
+	}
+	return path
+}
+
+func enabledAncestor(widget Widget) Widget {
+	for widget != nil && !IsEnabled(widget) {
+		widget = widget.Parent()
+	}
+	return widget
+}

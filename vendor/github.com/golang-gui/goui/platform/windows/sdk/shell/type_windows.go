@@ -1,0 +1,72 @@
+package shell
+
+import "github.com/golang-gui/goui/platform/windows/sdk/winapi"
+
+const SEE_MASK_FLAG_NO_UI uint32 = 0x00000400
+
+// SHELLEXECUTEINFO matches SHELLEXECUTEINFOW. IconOrMonitor is the native union.
+type SHELLEXECUTEINFO struct {
+	Size          uint32
+	Mask          uint32
+	Window        winapi.HWND
+	Verb          winapi.LPCWSTR
+	File          winapi.LPCWSTR
+	Parameters    winapi.LPCWSTR
+	Directory     winapi.LPCWSTR
+	Show          int32
+	Instance      winapi.HINSTANCE
+	IDList        uintptr
+	Class         winapi.LPCWSTR
+	ClassKey      uintptr
+	HotKey        uint32
+	IconOrMonitor uintptr
+	Process       uintptr
+}
+
+// DragImage matches SHDRAGIMAGE.
+type DragImage struct {
+	Size     struct{ Width, Height int32 }
+	Hotspot  winapi.POINT
+	Bitmap   winapi.HBITMAP
+	ColorKey uint32
+}
+
+// FILEOPENDIALOGOPTIONS specifies the options for an IFileDialog.
+type FILEOPENDIALOGOPTIONS uint32
+
+const (
+	FOS_OVERWRITEPROMPT    FILEOPENDIALOGOPTIONS = 0x2
+	FOS_STRICTFILETYPES    FILEOPENDIALOGOPTIONS = 0x4
+	FOS_NOCHANGEDIR        FILEOPENDIALOGOPTIONS = 0x8
+	FOS_PICKFOLDERS        FILEOPENDIALOGOPTIONS = 0x20
+	FOS_FORCEFILESYSTEM    FILEOPENDIALOGOPTIONS = 0x40
+	FOS_ALLNONSTORAGEITEMS FILEOPENDIALOGOPTIONS = 0x80
+	FOS_NOVALIDATE         FILEOPENDIALOGOPTIONS = 0x100
+	FOS_ALLOWMULTISELECT   FILEOPENDIALOGOPTIONS = 0x200
+	FOS_PATHMUSTEXIST      FILEOPENDIALOGOPTIONS = 0x800
+	FOS_FILEMUSTEXIST      FILEOPENDIALOGOPTIONS = 0x1000
+	FOS_CREATEPROMPT       FILEOPENDIALOGOPTIONS = 0x2000
+	FOS_SHAREAWARE         FILEOPENDIALOGOPTIONS = 0x4000
+	FOS_NOREADONLYRETURN   FILEOPENDIALOGOPTIONS = 0x8000
+	FOS_NOTESTFILECREATE   FILEOPENDIALOGOPTIONS = 0x10000
+	FOS_HIDEMRUPLACES      FILEOPENDIALOGOPTIONS = 0x20000
+	FOS_HIDEPINNEDPLACES   FILEOPENDIALOGOPTIONS = 0x40000
+	FOS_NODEREFERENCELINKS FILEOPENDIALOGOPTIONS = 0x100000
+	FOS_DONTADDTORECENT    FILEOPENDIALOGOPTIONS = 0x2000000
+	FOS_FORCESHOWHIDDEN    FILEOPENDIALOGOPTIONS = 0x10000000
+)
+
+// SIGDN specifies the display name for IShellItem.GetDisplayName.
+type SIGDN uint32
+
+const (
+	SIGDN_NORMALDISPLAY          SIGDN = 0
+	SIGDN_FILESYSPATH            SIGDN = 0x80058000
+	SIGDN_DESKTOPABSOLUTEPARSING SIGDN = 0x80028000
+)
+
+// COMDLG_FILTERSPEC defines a file type filter for IFileDialog.SetFileTypes.
+type COMDLG_FILTERSPEC struct {
+	Name *uint16 // LPCWSTR display name, e.g. "Images"
+	Spec *uint16 // LPCWSTR pattern list, e.g. "*.png;*.jpg"
+}

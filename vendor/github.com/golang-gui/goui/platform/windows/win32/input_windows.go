@@ -1,0 +1,370 @@
+package win32
+
+import (
+	"unsafe"
+
+	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/platform/events"
+	"github.com/golang-gui/goui/platform/windows/sdk/winapi"
+)
+
+// logicalPoint converts a physical client pixel position to logical (DIP)
+// coordinates so pointer events share the gui layout coordinate space.
+func (w *Window) logicalPoint(p geometry.Point) geometry.Point {
+	s := w.scale
+	if s <= 0 {
+		s = 1
+	}
+	return geometry.Point{X: p.X / s, Y: p.Y / s}
+}
+
+func (w *Window) handlePointerMove(wParam winapi.WPARAM, lParam winapi.LPARAM) {
+	w.dragMotion = true
+	defer func() { w.dragMotion = false }()
+	position := w.logicalPoint(clientPoint(lParam))
+	buttons := pointerButtons(wParam)
+	modifiers := pointerModifiers(wParam)
+	w.cancelMouseLeave(true)
+	if !w.trackingMouse {
+		w.trackMouseLeave(false)
+		w.emitPointer(events.PointerEnter, events.PointerButtonNone, position, buttons, modifiers)
+	}
+	w.emitPointer(events.PointerMove, events.PointerButtonNone, position, buttons, modifiers)
+}
+
+func (w *Window) handlePointerLeave() {
+	position := geometry.Point{
+		X: w.lastPointerX,
+		Y: w.lastPointerY,
+	}
+	w.emitPointer(events.PointerLeave, events.PointerButtonNone, position, w.lastButtons, w.lastModifiers)
+}
+
+// Client and non-client tracking describe two native input paths, not two GUI
+// surfaces. A leave queued by the old path must not clear the new path's hover
+// or pressed state after capture or a client/non-client transition.
+func (w *Window) handleTrackedPointerLeave(nonClient bool) {
+	tracking := &w.trackingMouse
+	if nonClient {
+		tracking = &w.trackingNonClient
+	}
+	if !*tracking {
+		return
+	}
+	*tracking = false
+	w.handlePointerLeave()
+}
+
+func (w *Window) handlePointerButton(eventType events.EventType, button events.PointerButton, wParam winapi.WPARAM, lParam winapi.LPARAM) {
+	if button == events.PointerButtonLeft {
+		w.dragPress = eventType == events.PointerDown
+	}
+	if eventType == events.PointerDown {
+		winapi.SetCapture(w.hwnd)
+	} else if eventType == events.PointerUp {
+		if pointerButtons(wParam) == 0 {
+			winapi.ReleaseCapture()
+		}
+	}
+	w.emitPointer(eventType, button, w.logicalPoint(clientPoint(lParam)), pointerButtons(wParam), pointerModifiers(wParam))
+}
+
+func (w *Window) handleWheel(horizontal bool, wParam winapi.WPARAM, lParam winapi.LPARAM) {
+	position := w.logicalPoint(screenPointToClient(w.hwnd, lParam))
+	delta := float32(int16(highWord(uintptr(wParam)))) / float32(winapi.WHEEL_DELTA)
+	event := events.WheelEvent{
+		Position:  position,
+		Mode:      events.WheelDeltaLine,
+		Buttons:   pointerButtons(wParam),
+		Modifiers: pointerModifiers(wParam),
+	}
+	if horizontal {
+		event.DeltaX = delta
+	} else {
+		event.DeltaY = -delta
+	}
+	w.onEvent(event)
+}
+
+func (w *Window) handleKey(eventType events.EventType, wParam winapi.WPARAM, lParam winapi.LPARAM) (handled bool) {
+	key, location := keyFromVirtualKey(int(wParam), lParam)
+	w.onEvent(events.KeyEvent{
+		EventType: eventType,
+		Key:       key,
+		Code:      events.KeyCodeUnknown,
+		Location:  location,
+		Modifiers: keyModifiers(winapi.GetKeyState),
+		Repeat:    eventType == events.KeyDown && (uintptr(lParam)&(1<<30)) != 0,
+		Handled:   &handled,
+	})
+	return
+}
+
+// GetKeyState describes the state associated with the dequeued message, unlike
+// GetAsyncKeyState. Query both sides instead of clearing an entire modifier on
+// either key-up. This also works when a key was pressed before gaining focus.
+func keyModifiers(state func(int) winapi.SHORT) events.Modifiers {
+	var mods events.Modifiers
+	for _, pair := range [...]struct {
+		left, right int
+		modifier    events.Modifiers
+	}{
+		{winapi.VK_LSHIFT, winapi.VK_RSHIFT, events.ModifierShift},
+		{winapi.VK_LCONTROL, winapi.VK_RCONTROL, events.ModifierControl},
+		{winapi.VK_LMENU, winapi.VK_RMENU, events.ModifierAlt},
+		{winapi.VK_LWIN, winapi.VK_RWIN, events.ModifierWin},
+	} {
+		if state(pair.left) < 0 || state(pair.right) < 0 {
+			mods |= pair.modifier
+		}
+	}
+	return mods
+}
+
+func (w *Window) emitPointer(eventType events.EventType, button events.PointerButton, position geometry.Point, buttons events.PointerButtons, modifiers events.Modifiers) {
+	w.lastPointerX = position.X
+	w.lastPointerY = position.Y
+	w.lastButtons = buttons
+	w.lastModifiers = modifiers
+	w.onEvent(events.PointerEvent{
+		EventType: eventType,
+		Position:  position,
+		Button:    button,
+		Buttons:   buttons,
+		Modifiers: modifiers,
+	})
+}
+
+func (w *Window) trackMouseLeave(nonClient bool) {
+	event := winapi.TRACKMOUSEEVENT{
+		Size:  winapi.DWORD(unsafe.Sizeof(winapi.TRACKMOUSEEVENT{})),
+		Flags: winapi.TME_LEAVE,
+		Track: w.hwnd,
+	}
+	tracking := &w.trackingMouse
+	if nonClient {
+		event.Flags |= winapi.TME_NONCLIENT
+		tracking = &w.trackingNonClient
+	}
+	if winapi.TrackMouseEvent(&event) != winapi.FALSE {
+		*tracking = true
+	}
+}
+
+func (w *Window) cancelMouseLeave(nonClient bool) {
+	tracking := &w.trackingMouse
+	flags := winapi.DWORD(winapi.TME_CANCEL | winapi.TME_LEAVE)
+	if nonClient {
+		tracking = &w.trackingNonClient
+		flags |= winapi.TME_NONCLIENT
+	}
+	if !*tracking {
+		return
+	}
+	*tracking = false // Also invalidate a leave notification already queued.
+	event := winapi.TRACKMOUSEEVENT{
+		Size:  winapi.DWORD(unsafe.Sizeof(winapi.TRACKMOUSEEVENT{})),
+		Flags: flags, Track: w.hwnd,
+	}
+	winapi.TrackMouseEvent(&event)
+}
+
+func clientPoint(lParam winapi.LPARAM) geometry.Point {
+	return geometry.Point{
+		X: float32(int16(lowWord(uintptr(lParam)))),
+		Y: float32(int16(highWord(uintptr(lParam)))),
+	}
+}
+
+func screenPointToClient(hwnd winapi.HWND, lParam winapi.LPARAM) geometry.Point {
+	point := winapi.POINT{
+		X: winapi.LONG(int16(lowWord(uintptr(lParam)))),
+		Y: winapi.LONG(int16(highWord(uintptr(lParam)))),
+	}
+	winapi.ScreenToClient(hwnd, &point)
+	return geometry.Point{
+		X: float32(point.X),
+		Y: float32(point.Y),
+	}
+}
+
+func xButton(wParam winapi.WPARAM) events.PointerButton {
+	switch highWord(uintptr(wParam)) {
+	case winapi.XBUTTON1:
+		return events.PointerButtonBack
+	case winapi.XBUTTON2:
+		return events.PointerButtonForward
+	default:
+		return events.PointerButtonNone
+	}
+}
+
+func pointerButtons(wParam winapi.WPARAM) events.PointerButtons {
+	var buttons events.PointerButtons
+	if wParam&winapi.MK_LBUTTON != 0 {
+		buttons |= events.PointerButtonLeftDown
+	}
+	if wParam&winapi.MK_RBUTTON != 0 {
+		buttons |= events.PointerButtonRightDown
+	}
+	if wParam&winapi.MK_MBUTTON != 0 {
+		buttons |= events.PointerButtonMiddleDown
+	}
+	if wParam&winapi.MK_XBUTTON1 != 0 {
+		buttons |= events.PointerButtonBackDown
+	}
+	if wParam&winapi.MK_XBUTTON2 != 0 {
+		buttons |= events.PointerButtonForwardDown
+	}
+	return buttons
+}
+
+func pointerModifiers(wParam winapi.WPARAM) events.Modifiers {
+	var mods events.Modifiers
+	if wParam&winapi.MK_SHIFT != 0 {
+		mods |= events.ModifierShift
+	}
+	if wParam&winapi.MK_CONTROL != 0 {
+		mods |= events.ModifierControl
+	}
+	return mods
+}
+
+func keyFromVirtualKey(vk int, lParam winapi.LPARAM) (events.Key, events.KeyLocation) {
+	extended := uintptr(lParam)&(1<<24) != 0
+	scanCode := (uintptr(lParam) >> 16) & 0xFF
+
+	if 'A' <= vk && vk <= 'Z' {
+		return events.Key(int(events.KeyA) + vk - 'A'), events.KeyLocationStandard
+	}
+	if '0' <= vk && vk <= '9' {
+		return events.Key(int(events.Key0) + vk - '0'), events.KeyLocationStandard
+	}
+	if winapi.VK_F1 <= vk && vk <= winapi.VK_F24 {
+		return events.Key(int(events.KeyF1) + vk - winapi.VK_F1), events.KeyLocationStandard
+	}
+	if winapi.VK_NUMPAD0 <= vk && vk <= winapi.VK_NUMPAD9 {
+		return events.Key(int(events.KeyNumpad0) + vk - winapi.VK_NUMPAD0), events.KeyLocationNumpad
+	}
+
+	switch vk {
+	case winapi.VK_ESCAPE:
+		return events.KeyEscape, events.KeyLocationStandard
+	case winapi.VK_RETURN:
+		if extended {
+			return events.KeyNumpadEnter, events.KeyLocationNumpad
+		}
+		return events.KeyEnter, events.KeyLocationStandard
+	case winapi.VK_TAB:
+		return events.KeyTab, events.KeyLocationStandard
+	case winapi.VK_BACK:
+		return events.KeyBackspace, events.KeyLocationStandard
+	case winapi.VK_DELETE:
+		return events.KeyDelete, events.KeyLocationStandard
+	case winapi.VK_INSERT:
+		return events.KeyInsert, events.KeyLocationStandard
+	case winapi.VK_SNAPSHOT:
+		return events.KeyPrintScreen, events.KeyLocationStandard
+	case winapi.VK_SPACE:
+		return events.KeySpace, events.KeyLocationStandard
+	case winapi.VK_APPS:
+		return events.KeyMenu, events.KeyLocationStandard
+	case winapi.VK_PAUSE, winapi.VK_CANCEL:
+		return events.KeyPause, events.KeyLocationStandard
+	case winapi.VK_LEFT:
+		return events.KeyArrowLeft, events.KeyLocationStandard
+	case winapi.VK_RIGHT:
+		return events.KeyArrowRight, events.KeyLocationStandard
+	case winapi.VK_UP:
+		return events.KeyArrowUp, events.KeyLocationStandard
+	case winapi.VK_DOWN:
+		return events.KeyArrowDown, events.KeyLocationStandard
+	case winapi.VK_HOME:
+		return events.KeyHome, events.KeyLocationStandard
+	case winapi.VK_END:
+		return events.KeyEnd, events.KeyLocationStandard
+	case winapi.VK_PRIOR:
+		return events.KeyPageUp, events.KeyLocationStandard
+	case winapi.VK_NEXT:
+		return events.KeyPageDown, events.KeyLocationStandard
+	case winapi.VK_SHIFT:
+		if scanCode == 0x36 {
+			return events.KeyShift, events.KeyLocationRight
+		}
+		return events.KeyShift, events.KeyLocationLeft
+	case winapi.VK_LSHIFT:
+		return events.KeyShift, events.KeyLocationLeft
+	case winapi.VK_RSHIFT:
+		return events.KeyShift, events.KeyLocationRight
+	case winapi.VK_CONTROL:
+		if extended {
+			return events.KeyControl, events.KeyLocationRight
+		}
+		return events.KeyControl, events.KeyLocationLeft
+	case winapi.VK_LCONTROL:
+		return events.KeyControl, events.KeyLocationLeft
+	case winapi.VK_RCONTROL:
+		return events.KeyControl, events.KeyLocationRight
+	case winapi.VK_MENU:
+		if extended {
+			return events.KeyAlt, events.KeyLocationRight
+		}
+		return events.KeyAlt, events.KeyLocationLeft
+	case winapi.VK_LMENU:
+		return events.KeyAlt, events.KeyLocationLeft
+	case winapi.VK_RMENU:
+		return events.KeyAlt, events.KeyLocationRight
+	case winapi.VK_LWIN:
+		return events.KeyWin, events.KeyLocationLeft
+	case winapi.VK_RWIN:
+		return events.KeyWin, events.KeyLocationRight
+	case winapi.VK_CAPITAL:
+		return events.KeyCapsLock, events.KeyLocationStandard
+	case winapi.VK_NUMLOCK:
+		return events.KeyNumLock, events.KeyLocationNumpad
+	case winapi.VK_SCROLL:
+		return events.KeyScrollLock, events.KeyLocationStandard
+	case winapi.VK_OEM_MINUS:
+		return events.KeyMinus, events.KeyLocationStandard
+	case winapi.VK_OEM_PLUS:
+		return events.KeyEqual, events.KeyLocationStandard
+	case winapi.VK_OEM_4:
+		return events.KeyBracketLeft, events.KeyLocationStandard
+	case winapi.VK_OEM_6:
+		return events.KeyBracketRight, events.KeyLocationStandard
+	case winapi.VK_OEM_5:
+		return events.KeyBackslash, events.KeyLocationStandard
+	case winapi.VK_OEM_1:
+		return events.KeySemicolon, events.KeyLocationStandard
+	case winapi.VK_OEM_7:
+		return events.KeyQuote, events.KeyLocationStandard
+	case winapi.VK_OEM_COMMA:
+		return events.KeyComma, events.KeyLocationStandard
+	case winapi.VK_OEM_PERIOD:
+		return events.KeyPeriod, events.KeyLocationStandard
+	case winapi.VK_OEM_2:
+		return events.KeySlash, events.KeyLocationStandard
+	case winapi.VK_OEM_3:
+		return events.KeyBackquote, events.KeyLocationStandard
+	case winapi.VK_ADD:
+		return events.KeyNumpadAdd, events.KeyLocationNumpad
+	case winapi.VK_SUBTRACT:
+		return events.KeyNumpadSubtract, events.KeyLocationNumpad
+	case winapi.VK_MULTIPLY:
+		return events.KeyNumpadMultiply, events.KeyLocationNumpad
+	case winapi.VK_DIVIDE:
+		return events.KeyNumpadDivide, events.KeyLocationNumpad
+	case winapi.VK_DECIMAL:
+		return events.KeyNumpadDecimal, events.KeyLocationNumpad
+	default:
+		return events.KeyUnknown, events.KeyLocationStandard
+	}
+}
+
+func lowWord(v uintptr) uint16 {
+	return uint16(v & 0xFFFF)
+}
+
+func highWord(v uintptr) uint16 {
+	return uint16((v >> 16) & 0xFFFF)
+}

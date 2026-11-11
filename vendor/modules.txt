@@ -1,0 +1,197 @@
+# github.com/Microsoft/go-winio v0.6.4
+## explicit; go 1.26.0
+github.com/Microsoft/go-winio
+github.com/Microsoft/go-winio/internal/fs
+github.com/Microsoft/go-winio/internal/socket
+github.com/Microsoft/go-winio/internal/stringbuffer
+github.com/Microsoft/go-winio/pkg/guid
+# github.com/ebitengine/purego v0.10.0
+## explicit; go 1.18
+github.com/ebitengine/purego
+github.com/ebitengine/purego/internal/cgo
+github.com/ebitengine/purego/internal/fakecgo
+github.com/ebitengine/purego/internal/strings
+github.com/ebitengine/purego/internal/xreflect
+github.com/ebitengine/purego/objc
+# github.com/godbus/dbus/v5 v5.2.4
+## explicit; go 1.20
+github.com/godbus/dbus/v5
+# github.com/goexlib/cgo v0.1.1
+## explicit; go 1.23
+github.com/goexlib/cgo
+# github.com/goexlib/mathx v0.0.1
+## explicit; go 1.23
+github.com/goexlib/mathx
+# github.com/golang-gui/goui v0.6.0
+## explicit; go 1.24
+github.com/golang-gui/goui/core/bits
+github.com/golang-gui/goui/core/colors
+github.com/golang-gui/goui/core/geometry
+github.com/golang-gui/goui/core/optional
+github.com/golang-gui/goui/core/signal
+github.com/golang-gui/goui/core/state
+github.com/golang-gui/goui/gui
+github.com/golang-gui/goui/gui/textedit
+github.com/golang-gui/goui/gui/textformat
+github.com/golang-gui/goui/internal/diagnostic
+github.com/golang-gui/goui/internal/identity
+github.com/golang-gui/goui/internal/resource
+github.com/golang-gui/goui/layout
+github.com/golang-gui/goui/mlang
+github.com/golang-gui/goui/platform
+github.com/golang-gui/goui/platform/common
+github.com/golang-gui/goui/platform/darwin/cocoa
+github.com/golang-gui/goui/platform/darwin/frameworks
+github.com/golang-gui/goui/platform/darwin/frameworks/appkit
+github.com/golang-gui/goui/platform/darwin/frameworks/core_foundation
+github.com/golang-gui/goui/platform/darwin/frameworks/core_graphics
+github.com/golang-gui/goui/platform/darwin/frameworks/core_text
+github.com/golang-gui/goui/platform/darwin/frameworks/foundation
+github.com/golang-gui/goui/platform/darwin/frameworks/iokit
+github.com/golang-gui/goui/platform/darwin/frameworks/opengl
+github.com/golang-gui/goui/platform/darwin/frameworks/security
+github.com/golang-gui/goui/platform/darwin/frameworks/utils
+github.com/golang-gui/goui/platform/dragdrop
+github.com/golang-gui/goui/platform/events
+github.com/golang-gui/goui/platform/graphics
+github.com/golang-gui/goui/platform/graphics/direct2d
+github.com/golang-gui/goui/platform/graphics/internal/boxshadow
+github.com/golang-gui/goui/platform/graphics/internal/offscreen
+github.com/golang-gui/goui/platform/graphics/internal/pixelsnap
+github.com/golang-gui/goui/platform/graphics/internal/textbitmap
+github.com/golang-gui/goui/platform/graphics/opengl
+github.com/golang-gui/goui/platform/graphics/software
+github.com/golang-gui/goui/platform/graphics/utils
+github.com/golang-gui/goui/platform/internal/desktopopen
+github.com/golang-gui/goui/platform/internal/eventloop
+github.com/golang-gui/goui/platform/internal/fileaccess
+github.com/golang-gui/goui/platform/internal/workarea
+github.com/golang-gui/goui/platform/internal/xerrors
+github.com/golang-gui/goui/platform/linux/internal/portal
+github.com/golang-gui/goui/platform/linux/libs/cairo
+github.com/golang-gui/goui/platform/linux/libs/fontconfig
+github.com/golang-gui/goui/platform/linux/libs/glib
+github.com/golang-gui/goui/platform/linux/libs/glx
+github.com/golang-gui/goui/platform/linux/libs/gtk
+github.com/golang-gui/goui/platform/linux/libs/libc
+github.com/golang-gui/goui/platform/linux/libs/pango
+github.com/golang-gui/goui/platform/linux/libs/pango_cairo
+github.com/golang-gui/goui/platform/linux/libs/xcursor
+github.com/golang-gui/goui/platform/linux/libs/xlib
+github.com/golang-gui/goui/platform/linux/libs/xrandr
+github.com/golang-gui/goui/platform/linux/libs/xrender
+github.com/golang-gui/goui/platform/linux/libs/xshape
+github.com/golang-gui/goui/platform/linux/libs/xsync
+github.com/golang-gui/goui/platform/linux/x11
+github.com/golang-gui/goui/platform/typography
+github.com/golang-gui/goui/platform/typography/coretext
+github.com/golang-gui/goui/platform/typography/directwrite
+github.com/golang-gui/goui/platform/typography/internal/lifecycle
+github.com/golang-gui/goui/platform/typography/pango
+github.com/golang-gui/goui/platform/typography/utils
+github.com/golang-gui/goui/platform/windows/sdk/com
+github.com/golang-gui/goui/platform/windows/sdk/d2d1
+github.com/golang-gui/goui/platform/windows/sdk/d3d11
+github.com/golang-gui/goui/platform/windows/sdk/dcomp
+github.com/golang-gui/goui/platform/windows/sdk/dwrite
+github.com/golang-gui/goui/platform/windows/sdk/dxgi
+github.com/golang-gui/goui/platform/windows/sdk/shell
+github.com/golang-gui/goui/platform/windows/sdk/wgl
+github.com/golang-gui/goui/platform/windows/sdk/wic
+github.com/golang-gui/goui/platform/windows/sdk/winapi
+github.com/golang-gui/goui/platform/windows/win32
+github.com/golang-gui/goui/style
+github.com/golang-gui/goui/theme/basic
+github.com/golang-gui/goui/theme/modern
+github.com/golang-gui/goui/ui
+# github.com/golang-gui/nanovgo v0.0.10
+## explicit; go 1.24
+github.com/golang-gui/nanovgo
+github.com/golang-gui/nanovgo/fontstashmini
+github.com/golang-gui/nanovgo/fontstashmini/truetype
+github.com/golang-gui/nanovgo/gl
+# github.com/golang-gui/rasterx v0.1.0
+## explicit; go 1.17
+github.com/golang-gui/rasterx
+# github.com/golang-gui/scanFT v0.1.0
+## explicit; go 1.17
+github.com/golang-gui/scanFT
+# github.com/google/jsonschema-go v0.4.3
+## explicit; go 1.23.0
+github.com/google/jsonschema-go/jsonschema
+# github.com/lpintes/walk v0.0.0-20261029133242-6a00370d773d
+## explicit; go 1.23.0
+github.com/lpintes/walk/internal/com
+github.com/lpintes/walk/internal/win
+github.com/lpintes/walk/uia
+# github.com/modelcontextprotocol/go-sdk v1.8.0
+## explicit; go 1.25.0
+github.com/modelcontextprotocol/go-sdk/auth
+github.com/modelcontextprotocol/go-sdk/internal/authutil
+github.com/modelcontextprotocol/go-sdk/internal/json
+github.com/modelcontextprotocol/go-sdk/internal/jsonrpc2
+github.com/modelcontextprotocol/go-sdk/internal/mcpgodebug
+github.com/modelcontextprotocol/go-sdk/internal/util
+github.com/modelcontextprotocol/go-sdk/internal/xcontext
+github.com/modelcontextprotocol/go-sdk/jsonrpc
+github.com/modelcontextprotocol/go-sdk/mcp
+github.com/modelcontextprotocol/go-sdk/oauthex
+# github.com/rivo/uniseg v0.4.7
+## explicit; go 1.18
+github.com/rivo/uniseg
+# github.com/segmentio/asm v1.1.3
+## explicit; go 1.17
+github.com/segmentio/asm/ascii
+github.com/segmentio/asm/base64
+github.com/segmentio/asm/cpu
+github.com/segmentio/asm/cpu/arm
+github.com/segmentio/asm/cpu/arm64
+github.com/segmentio/asm/cpu/cpuid
+github.com/segmentio/asm/cpu/x86
+github.com/segmentio/asm/internal/unsafebytes
+github.com/segmentio/asm/keyset
+# github.com/segmentio/encoding v0.5.4
+## explicit; go 1.23
+github.com/segmentio/encoding/ascii
+github.com/segmentio/encoding/iso8601
+github.com/segmentio/encoding/json
+# github.com/xuges/gothread v0.0.1
+## explicit; go 1.20
+github.com/xuges/gothread
+# github.com/yosida95/uritemplate/v3 v3.0.2
+## explicit; go 1.14
+github.com/yosida95/uritemplate/v3
+# go.etcd.io/bbolt v1.5.0
+## explicit; go 1.25.0
+go.etcd.io/bbolt
+go.etcd.io/bbolt/errors
+go.etcd.io/bbolt/internal/common
+go.etcd.io/bbolt/internal/freelist
+# golang.org/x/image v0.45.0
+## explicit; go 1.25.0
+golang.org/x/image/draw
+golang.org/x/image/math/f64
+golang.org/x/image/math/fixed
+golang.org/x/image/vector
+# golang.org/x/oauth2 v0.35.0
+## explicit; go 1.24.0
+golang.org/x/oauth2
+golang.org/x/oauth2/internal
+# golang.org/x/sync v0.23.0
+## explicit; go 1.26.0
+golang.org/x/sync/errgroup
+# golang.org/x/sys v0.49.0
+## explicit; go 1.26.0
+golang.org/x/sys/cpu
+golang.org/x/sys/unix
+golang.org/x/sys/windows
+# golang.org/x/text v0.41.0
+## explicit; go 1.25.0
+golang.org/x/text/internal/language
+golang.org/x/text/internal/language/compact
+golang.org/x/text/internal/tag
+golang.org/x/text/language
+golang.org/x/text/unicode/bidi
+# golang.org/x/time v0.15.0
+## explicit; go 1.25.0
+golang.org/x/time/rate

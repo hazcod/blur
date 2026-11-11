@@ -1,0 +1,303 @@
+package win32
+
+import (
+	"runtime"
+	"strings"
+	"syscall"
+
+	"github.com/golang-gui/goui/platform/common"
+	"github.com/golang-gui/goui/platform/internal/fileaccess"
+	"github.com/golang-gui/goui/platform/windows/sdk/shell"
+)
+
+// fileDialog implements the native file dialog capability for Windows
+// using the Common Item Dialog API (IFileDialog/IFileOpenDialog/IFileSaveDialog).
+type fileDialog struct {
+	p *Platform
+}
+
+func newFileDialog() (common.FileDialog, error) {
+	return &fileDialog{p: platform}, nil
+}
+
+// OpenFile opens a file selection dialog.
+func (fd *fileDialog) OpenFile(owner common.Window, opts common.DialogOptions, cb func([]common.FileAccess, error)) {
+	dlg, hr := shell.CreateFileOpenDialog()
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	defer dlg.Release()
+
+	if opts.Title != "" {
+		if hr := dlg.SetTitle(opts.Title); hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+	}
+
+	if opts.InitialDir != "" {
+		if item := shell.CreateShellItemFromPath(opts.InitialDir); item != nil {
+			dlg.SetFolder(item)
+			item.Release()
+		}
+	}
+
+	if len(opts.Filters) > 0 {
+		specs, cleanup := toFilterSpecs(opts.Filters)
+		defer cleanup()
+		if hr := dlg.SetFileTypes(specs); hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+	}
+
+	var fos shell.FILEOPENDIALOGOPTIONS = shell.FOS_PATHMUSTEXIST | shell.FOS_FILEMUSTEXIST | shell.FOS_FORCEFILESYSTEM
+	if opts.AllowMultiple {
+		fos |= shell.FOS_ALLOWMULTISELECT
+	}
+	if hr := dlg.SetOptions(fos); hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+
+	if !showFileDialog(owner, &dlg.FileDialog, cb) {
+		return
+	}
+
+	if opts.AllowMultiple {
+		arr, hr := dlg.GetResults()
+		if hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+		defer arr.Release()
+		count, hr := arr.GetCount()
+		if hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+		paths := make([]string, 0, count)
+		for i := uint32(0); i < count; i++ {
+			item, hr := arr.GetItemAt(i)
+			if hr.Failed() {
+				cb(nil, hr)
+				return
+			}
+			name, hr := item.GetDisplayName(shell.SIGDN_FILESYSPATH)
+			item.Release()
+			if hr.Failed() {
+				cb(nil, hr)
+				return
+			}
+			paths = append(paths, name)
+		}
+		access, err := fileaccess.Paths(paths)
+		cb(access, err)
+		return
+	}
+
+	item, hr := dlg.GetResult()
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	defer item.Release()
+	name, hr := item.GetDisplayName(shell.SIGDN_FILESYSPATH)
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	access, err := fileaccess.Paths([]string{name})
+	cb(access, err)
+}
+
+// OpenDirectory opens a directory selection dialog.
+func (fd *fileDialog) OpenDirectory(owner common.Window, opts common.DialogOptions, cb func([]common.FileAccess, error)) {
+	dlg, hr := shell.CreateFileOpenDialog()
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	defer dlg.Release()
+
+	if opts.Title != "" {
+		if hr := dlg.SetTitle(opts.Title); hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+	}
+
+	if opts.InitialDir != "" {
+		if item := shell.CreateShellItemFromPath(opts.InitialDir); item != nil {
+			dlg.SetFolder(item)
+			item.Release()
+		}
+	}
+
+	fos := shell.FOS_PICKFOLDERS | shell.FOS_PATHMUSTEXIST | shell.FOS_FORCEFILESYSTEM
+	if hr := dlg.SetOptions(fos); hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+
+	if !showFileDialog(owner, &dlg.FileDialog, cb) {
+		return
+	}
+
+	item, hr := dlg.GetResult()
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	defer item.Release()
+	name, hr := item.GetDisplayName(shell.SIGDN_FILESYSPATH)
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	access, err := fileaccess.Paths([]string{name})
+	cb(access, err)
+}
+
+// SaveFile opens a save file dialog.
+func (fd *fileDialog) SaveFile(owner common.Window, opts common.DialogOptions, cb func([]common.FileAccess, error)) {
+	dlg, hr := shell.CreateFileSaveDialog()
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	defer dlg.Release()
+
+	if opts.Title != "" {
+		if hr := dlg.SetTitle(opts.Title); hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+	}
+
+	if opts.InitialDir != "" {
+		if item := shell.CreateShellItemFromPath(opts.InitialDir); item != nil {
+			dlg.SetFolder(item)
+			item.Release()
+		}
+	}
+
+	if opts.DefaultName != "" {
+		if hr := dlg.SetFileName(opts.DefaultName); hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+	}
+
+	if len(opts.Filters) > 0 {
+		specs, cleanup := toFilterSpecs(opts.Filters)
+		defer cleanup()
+		if hr := dlg.SetFileTypes(specs); hr.Failed() {
+			cb(nil, hr)
+			return
+		}
+	}
+
+	fos := shell.FOS_OVERWRITEPROMPT | shell.FOS_PATHMUSTEXIST | shell.FOS_FORCEFILESYSTEM
+	if hr := dlg.SetOptions(fos); hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+
+	if !showFileDialog(owner, &dlg.FileDialog, cb) {
+		return
+	}
+
+	item, hr := dlg.GetResult()
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	defer item.Release()
+	name, hr := item.GetDisplayName(shell.SIGDN_FILESYSPATH)
+	if hr.Failed() {
+		cb(nil, hr)
+		return
+	}
+	access, err := fileaccess.Paths([]string{name})
+	cb(access, err)
+}
+
+// The native modal loop can reenter window destruction or application quit.
+// Keep each COM dialog registered only while Show owns it, on the GUI thread.
+type fileDialogCall struct {
+	owner     *Window
+	dialog    *shell.FileDialog
+	cancelled bool
+}
+
+var nativeFileDialogs = map[*fileDialogCall]struct{}{}
+
+func cancelFileDialogs(owner *Window) {
+	for call := range nativeFileDialogs {
+		if !call.cancelled && (owner == nil || call.owner == owner) {
+			call.cancelled = true
+			_ = call.dialog.Close(shell.HRESULT_CANCEL)
+		}
+	}
+}
+
+func showFileDialog(owner common.Window, dialog *shell.FileDialog, cb func([]common.FileAccess, error)) bool {
+	if platform == nil || platform.eventLoop == nil || platform.eventLoop.state.Quitting() || platform.eventLoop.state.Destroyed() {
+		cb(nil, common.ErrUnavailable)
+		return false
+	}
+	var w *Window
+	var hwnd uintptr
+	if owner != nil {
+		var ok bool
+		w, ok = owner.(*Window)
+		if !ok || w.destroying || w.closed || w.hwnd == 0 {
+			cb(nil, common.ErrUnavailable)
+			return false
+		}
+		hwnd = owner.NativeHandle()
+	}
+	call := &fileDialogCall{owner: w, dialog: dialog}
+	nativeFileDialogs[call] = struct{}{}
+	hr := dialog.Show(hwnd)
+	delete(nativeFileDialogs, call)
+	if call.cancelled || w != nil && (w.closed || w.hwnd == 0) {
+		cb(nil, common.ErrUnavailable)
+		return false
+	}
+	if hr == shell.HRESULT_CANCEL {
+		cb(nil, nil)
+		return false
+	}
+	if hr.Failed() {
+		cb(nil, hr)
+		return false
+	}
+	return true
+}
+
+func (fd *fileDialog) RestoreAccess(credential []byte) (common.FileAccess, error) {
+	return fileaccess.RestorePath(credential)
+}
+
+// toFilterSpecs converts common.FileFilter to shell.COMDLG_FILTERSPEC.
+// The cleanup function must be called to free UTF16 memory.
+func toFilterSpecs(filters []common.FileFilter) ([]shell.COMDLG_FILTERSPEC, func()) {
+	specs := make([]shell.COMDLG_FILTERSPEC, 0, len(filters))
+	var keepers []*uint16
+	for _, f := range filters {
+		wName, _ := syscall.UTF16PtrFromString(f.Name)
+		pattern := strings.Join(f.Patterns, ";")
+		wSpec, _ := syscall.UTF16PtrFromString(pattern)
+		keepers = append(keepers, wName, wSpec)
+		specs = append(specs, shell.COMDLG_FILTERSPEC{
+			Name: wName,
+			Spec: wSpec,
+		})
+	}
+	return specs, func() {
+		runtime.KeepAlive(keepers)
+	}
+}

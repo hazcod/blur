@@ -1,0 +1,8 @@
+# IDE
+.idea/
+.vscode/
+
+# Locally built test libraries (see testdata/*.c for build commands)
+testdata/*.so
+testdata/*.dylib
+testdata/*.dll

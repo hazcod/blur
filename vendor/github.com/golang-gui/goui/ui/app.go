@@ -1,0 +1,644 @@
+package ui
+
+import (
+	"errors"
+	"fmt"
+	"reflect"
+	"sync"
+	"time"
+
+	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/core/signal"
+	"github.com/golang-gui/goui/gui"
+	"github.com/golang-gui/goui/mlang"
+	"github.com/golang-gui/goui/style"
+
+	"github.com/xuges/gothread"
+)
+
+// App is the running application handle passed into the Run build closure. It is
+// the running *app itself: valid for the whole run and safe to stash,
+// capture in handlers, or call from any goroutine. After Quit, work is not
+// dispatched; result-bearing commands report ErrAppStopped as documented.
+type App interface {
+	// Post runs f on the UI thread asynchronously.
+	Post(func())
+	// Sync runs f on the UI thread and waits, running inline when already on the
+	// UI thread.
+	Sync(func())
+	// Quit asks the running app to stop.
+	Quit()
+	// RequestUpdate coalesces an application-wide declarative rebuild on the UI
+	// thread. Use property bindings or ComposeView.Build for local updates.
+	RequestUpdate()
+	// FindWindow borrows the currently mounted GUI window with id. Empty or
+	// missing IDs, an unmounting window, and a stopped app return nil. Lookup is
+	// synchronized, but the returned object remains GUI-thread-affine: use it
+	// in an event callback or put both lookup and use inside Post/Sync.
+	// It does not create a window or transfer ownership. Do not mutate its ID or
+	// declaratively managed content. A recreated ID denotes a new object; an old
+	// reference is not retargeted. A registered hidden window is discoverable
+	// during AfterUpdate, so it can be prepared before its first Show.
+	FindWindow(id string) gui.Window
+	// FindWidget borrows the currently mounted widget with id in a Window's
+	// content tree. Missing IDs return nil
+	FindWidget(windowID, widgetID string) gui.Widget
+	// Clipboard returns the system clipboard view (never nil).
+	Clipboard() Clipboard
+	// Settings returns the system settings view (never nil).
+	Settings() Settings
+	// FileDialog returns the system file dialog view (never nil).
+	FileDialog() FileDialog
+	// OpenURL asks the system's registered handler to open an absolute URL,
+	// including custom schemes. It executes on the GUI thread and returns the
+	// native request result, not external app completion. It may block during
+	// dispatch. After Quit, or if exit discards the request, returns ErrAppStopped.
+	OpenURL(rawURL string) error
+	// OpenPath opens a file or directory with its default application. Relative
+	// paths use the working directory at execution; no shell expansion is done.
+	// Threading, request completion and exit semantics are the same as OpenURL.
+	OpenPath(path string) error
+	// TimeoutFunc starts a one-shot GUI-thread callback. The returned timer can
+	// be stopped or restarted with the same callback. See Timer for lifetime rules.
+	// Panics if delay is not positive or fn is nil; after Quit returns an inert timer.
+	TimeoutFunc(delay time.Duration, fn func()) *Timer
+	// TickFunc starts periodic GUI-thread callbacks, first after interval.
+	// Panics if interval is not positive or fn is nil; after Quit returns an inert timer.
+	TickFunc(interval time.Duration, fn func()) *Timer
+}
+
+var (
+	ErrAppStopped      = errors.New("ui: application has stopped")
+	ErrAppRunOnce      = errors.New("ui: Run may be called only once per process")
+	ErrAppBuildNil     = errors.New("ui app build function is nil")
+	ErrWindowIDEmpty   = errors.New("ui window id is empty")
+	ErrWindowDuplicate = errors.New("ui window id is duplicated")
+)
+
+// Run creates the application, mounts the declarative tree returned by build, and
+// runs the event loop until the app quits. build receives the App handle, which it
+// may stash, capture in handlers, or call from other goroutines.
+// Call Run from main, not a background goroutine. Platform initialization already
+// keeps main on the startup OS thread. Use App.Post/Sync for background work.
+// System settings and mlang language changes automatically request a coalesced
+// rebuild. Resource getters should be called inside build, not resolved once
+// outside it. Change language on the UI thread, or inside App.Post.
+// appId is the immutable application identity (for example "com.example.Editor"),
+// not a window ID. Empty leaves it unspecified. It is passed to gui.NewApplication
+// before build runs and does not participate in declarative updates.
+func Run(appId string, build func(app App) RootView) error {
+	if build == nil {
+		return ErrAppBuildNil
+	}
+	if err := activeRun(); err != nil {
+		return err
+	}
+
+	guiApp, err := gui.NewApplication(appId)
+	if err != nil {
+		return err
+	}
+
+	var a *app
+	a = newApp(guiApp, func() RootView { return build(a) })
+	return a.run()
+}
+
+// run owns settings and language subscriptions, including the initial build's
+// failure path and native-loop exit (which need not pass through ui.App.Quit).
+func (a *app) run() error {
+	defer a.stop()
+	languageHandle := mlang.ConnectChanged(a.RequestUpdate)
+	defer languageHandle.Disconnect()
+	if settings := a.gui.Settings(); settings != nil {
+		handle := settings.ConnectChanged(a.RequestUpdate)
+		defer handle.Disconnect()
+	}
+
+	if err := a.rebuild(); err != nil {
+		// Timers may already have been started by the initial build, before Run.
+		a.Quit()
+		a.destroyAll()
+		return err
+	}
+
+	a.gui.Run()
+	return a.error()
+}
+
+// Post runs f on the UI thread asynchronously; it is dropped after the app stops.
+func (a *app) Post(f func()) {
+	if f != nil {
+		a.postTask(f)
+	}
+}
+
+// Sync runs f on the UI thread and waits. It runs f inline when already on the UI
+// thread; after the app stops it is a no-op.
+func (a *app) Sync(f func()) {
+	if f == nil || a.isStopping() {
+		return
+	}
+	if a.onUI() {
+		f()
+		return
+	}
+
+	done := make(chan struct{})
+	if !a.postTask(func() {
+		defer close(done)
+		if !a.isStopping() {
+			f()
+		}
+	}) {
+		return
+	}
+	select {
+	case <-done:
+	case <-a.finished:
+		// Run has returned, so no in-flight UI callback can still be writing
+		// results. Queued work that did not execute is discarded.
+	}
+}
+
+func (a *app) OpenURL(rawURL string) (err error) {
+	err = ErrAppStopped
+	a.Sync(func() { err = a.gui.OpenURL(rawURL) })
+	return
+}
+
+func (a *app) OpenPath(path string) (err error) {
+	err = ErrAppStopped
+	a.Sync(func() { err = a.gui.OpenPath(path) })
+	return
+}
+
+func (a *app) FindWindow(id string) (window gui.Window) {
+	if id == "" {
+		return nil
+	}
+	a.Sync(func() {
+		if mount := a.windows[id]; mount != nil && !mount.destroying {
+			window = mount.window
+		}
+	})
+	return
+}
+
+func (a *app) FindWidget(windowID, widgetID string) (widget gui.Widget) {
+	a.Sync(func() {
+		if mount := a.windows[windowID]; mount != nil && mount.window != nil {
+			widget = gui.FindWidget(mount.window, widgetID)
+		}
+	})
+	return
+}
+
+type app struct {
+	mu                 sync.Mutex
+	gui                gui.Application
+	build              func() RootView
+	windows            map[string]*windowMount
+	updatingWindows    bool // guards the whole batch, including completion callbacks and Show
+	reconcilingWindows bool // defer root completion callbacks until every window tree is updated
+	appliedSheet       style.StyleSheet
+	fullUpdate         bool
+	dirty              map[*node]updateKind
+	dirtyOrder         []*node
+	updateDepth        int
+	batch              uint64
+	updatePending      bool
+	stopping           bool
+	finished           chan struct{} // closed only after run returns, not on a Quit request
+	err                error
+	uiThread           int
+}
+
+type windowMount struct {
+	shortcuts        shortcutBindings
+	runtime          *app
+	id               string
+	window           gui.Window
+	root             *root
+	view             WindowView
+	appliedMinSize   geometry.Size // last min-size forwarded to the window; dedupes native calls
+	closeHandle      signal.Handle
+	afterPaintHandle signal.Handle
+	destroyHandle    signal.Handle
+	destroying       bool
+}
+
+var activeApp struct {
+	sync.Mutex
+	ran bool // one-shot: set on the first Run, never cleared (the loop is consumed)
+}
+
+// activeRun claims the process-wide, one-shot Run. ui.Run may run only once: the
+// platform event loop is consumed when Run returns and cannot be restarted, and on
+// Wayland/Android/web the app cannot own a restartable loop at all (see DesignApp).
+// A second call — concurrent or after the first returned — fails here. To show a
+// different UI, change state and let the tree rebuild within the single Run.
+func activeRun() error {
+	activeApp.Lock()
+	defer activeApp.Unlock()
+
+	if activeApp.ran {
+		return ErrAppRunOnce
+	}
+	activeApp.ran = true
+	return nil
+}
+
+func newApp(guiApp gui.Application, build func() RootView) *app {
+	return &app{
+		gui:      guiApp,
+		build:    build,
+		windows:  make(map[string]*windowMount),
+		finished: make(chan struct{}),
+		uiThread: gothread.GetId(),
+	}
+}
+
+func (a *app) onUI() bool {
+	return a.uiThread != 0 && a.uiThread == gothread.GetId()
+}
+
+func (a *app) postTask(f func()) bool {
+	if a.isStopping() {
+		return false
+	}
+	if a.gui == nil {
+		f()
+		return true
+	}
+	a.gui.Post(f)
+	return true
+}
+
+// RequestUpdate coalesces a declarative rebuild onto the UI thread.
+func (a *app) RequestUpdate() {
+	a.mu.Lock()
+	if !a.stopping {
+		a.fullUpdate = true
+	}
+	a.mu.Unlock()
+	a.scheduleUpdate()
+}
+
+func (a *app) runPendingUpdate() {
+	a.mu.Lock()
+	a.updatePending = false
+	if a.stopping || a.updateDepth != 0 {
+		a.mu.Unlock()
+		return
+	}
+	full := a.fullUpdate
+	jobs := make([]nodeUpdate, 0, len(a.dirtyOrder))
+	for _, n := range a.dirtyOrder {
+		jobs = append(jobs, nodeUpdate{n, a.dirty[n]})
+	}
+	a.fullUpdate = false
+	a.dirty = nil
+	a.dirtyOrder = nil
+	a.mu.Unlock()
+	var err error
+	if full {
+		err = a.rebuildWith(jobs)
+	} else if len(jobs) > 0 {
+		err = a.reconcileBatch(nil, jobs, false)
+	}
+	if err != nil {
+		a.fail(err)
+	}
+}
+
+func (a *app) rebuild() error { return a.rebuildWith(nil) }
+
+func (a *app) rebuildWith(jobs []nodeUpdate) error {
+	defer a.holdUpdates()()
+	if a.build == nil {
+		return ErrAppBuildNil
+	}
+	windows, sheet, err := resolveRoot(a.build())
+	if err != nil {
+		return err
+	}
+	a.applyStyleSheet(sheet)
+	return a.reconcileBatch(windows, jobs, true)
+}
+
+// resolveRoot extracts the windows and the optional application style sheet from
+// the declarative root: a bare WindowView is one window with no app-level sheet; a
+// RootNode carries both.
+func resolveRoot(root RootView) ([]WindowView, style.StyleSheet, error) {
+	switch root := root.(type) {
+	case nil:
+		return nil, nil, nil
+	case WindowView:
+		return []WindowView{root}, nil, nil
+	case *WindowView:
+		if root == nil {
+			return nil, nil, nil
+		}
+		return []WindowView{*root}, nil, nil
+	case RootNode:
+		return root.windows, root.styleSheet, nil
+	case *RootNode:
+		if root == nil {
+			return nil, nil, nil
+		}
+		return root.windows, root.styleSheet, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported ui root view %T", root)
+	}
+}
+
+// applyStyleSheet reconciles the application style sheet onto gui when it changed
+// since the last rebuild. A nil sheet reverts to gui's built-in default. The diff
+// avoids a redundant app-wide relayout on every rebuild; sheets are compared by
+// content because they are value types (== is unsafe on them).
+func (a *app) applyStyleSheet(sheet style.StyleSheet) {
+	if a.gui == nil || sameSheet(a.appliedSheet, sheet) {
+		return
+	}
+	a.appliedSheet = sheet
+	a.gui.SetStyleSheet(sheet)
+}
+
+func sameSheet(a, b style.StyleSheet) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func (a *app) reconcileWindows(views []WindowView) error { return a.reconcileBatch(views, nil, true) }
+
+func (a *app) reconcileBatch(views []WindowView, jobs []nodeUpdate, full bool) error {
+	seen := make(map[string]WindowView, len(views))
+	for _, view := range views {
+		if view.id == "" {
+			return ErrWindowIDEmpty
+		}
+		if _, exists := seen[view.id]; exists {
+			return fmt.Errorf("%w: %q", ErrWindowDuplicate, view.id)
+		}
+		seen[view.id] = view
+	}
+
+	if a.updatingWindows {
+		return fmt.Errorf("ui: cannot nest window reconciliation; request a later update")
+	}
+	defer a.holdUpdates()()
+	a.batch++
+	a.updatingWindows, a.reconcilingWindows = true, true
+	defer func() { a.updatingWindows, a.reconcilingWindows = false, false }()
+	mounted := make([]*windowMount, 0, len(views))
+	created := make([]*windowMount, 0, len(views))
+	for _, view := range views {
+		mount := a.windows[view.id]
+		if mount == nil {
+			var err error
+			mount, err = a.createWindow(view)
+			if err != nil {
+				return err
+			}
+			created = append(created, mount)
+		} else if err := mount.update(view); err != nil {
+			return err
+		}
+		mounted = append(mounted, mount)
+	}
+
+	if full {
+		for id, mount := range a.windows {
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			delete(a.windows, id)
+			mount.destroy()
+		}
+	}
+	localRoots := a.processNodeUpdates(jobs)
+	// Completion callbacks can transfer nodes and update the declarations. No
+	// tree may still consume this rebuild's old declarations after that point.
+	a.reconcilingWindows = false
+	for _, mount := range mounted {
+		if !mount.destroying {
+			mount.root.flushAfterUpdate()
+		}
+	}
+	for _, r := range localRoots {
+		r.flushAfterUpdate()
+	}
+	for _, mount := range created {
+		if !mount.destroying {
+			if err := mount.window.Show(); err != nil {
+				// Completion may have transferred retained content into this
+				// window. Keep ownership until the caller's normal cleanup.
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (a *app) createWindow(view WindowView) (*windowMount, error) {
+	if a.gui == nil {
+		return nil, gui.ErrAppNil
+	}
+
+	window, err := a.gui.NewWindow(&view.options)
+	if err != nil {
+		return nil, err
+	}
+
+	mount := &windowMount{
+		runtime: a,
+		id:      view.id,
+		window:  window,
+		root:    newRoot(),
+		view:    view,
+	}
+	mount.root.runtime = a
+
+	if err := mount.applyWindowProperties(view); err != nil {
+		window.Destroy()
+		return nil, err
+	}
+	// Register the hidden host before mounting its tree. AfterUpdate callbacks
+	// may position the window or adopt a node from another root;
+	// both need the same ordinary ID lookup and ownership as visible windows.
+	a.windows[view.id] = mount
+	mount.connect()
+	mount.root.mountWindow(window, func() View {
+		return mount.view.content
+	})
+	return mount, nil
+}
+
+func (m *windowMount) connect() {
+	m.afterPaintHandle = m.window.ConnectAfterPaint(func(p gui.Painter, bounds geometry.Rectangle) {
+		if fn := m.view.onAfterPaint; fn != nil {
+			fn(p, bounds)
+		}
+	})
+	m.closeHandle = m.window.ConnectCloseRequest(func(allow *bool) {
+		if m.view.onCloseRequest == nil {
+			return
+		}
+		m.view.onCloseRequest(allow)
+	})
+	m.destroyHandle = m.window.ConnectDestroy(func() {
+		m.runtime.windowDestroyed(m)
+	})
+}
+
+func (m *windowMount) update(view WindowView) error {
+	if view.options != m.view.options {
+		return fmt.Errorf("window %q: Size, Chrome, Transparent, SkipTaskbar and Center are creation-only; use a new window ID to change them", view.id)
+	}
+	if err := m.applyWindowProperties(view); err != nil {
+		return err
+	}
+	paint := m.view.onAfterPaint != nil || view.onAfterPaint != nil
+	m.view = view
+	m.root.updateWindow(m.window, view.content)
+	if paint {
+		_ = m.window.RequestPaint()
+	}
+	return nil
+}
+
+func (m *windowMount) applyWindowProperties(view WindowView) error {
+	m.window.SetID(view.id)
+	if err := m.window.SetTitle(view.title); err != nil {
+		return err
+	}
+	// Forward only when the resolved minimum actually changes, so routine
+	// rebuilds do not issue redundant native calls. A declaration removed by a
+	// rebuild resolves to the zero size, which clears the platform hint.
+	if min := view.mergedMinSize(); min != m.appliedMinSize {
+		m.appliedMinSize = min
+		m.window.SetMinSize(min)
+	}
+	if len(view.shortcuts) != 0 || m.shortcuts.controller != nil {
+		m.shortcuts.update(m.window.Shortcuts(), view.shortcuts)
+	}
+	return nil
+}
+
+func (m *windowMount) destroy() {
+	if m.destroying {
+		return
+	}
+	m.destroying = true
+	m.window.Destroy()
+}
+
+func (m *windowMount) disconnect() {
+	m.shortcuts.clear()
+	if m.afterPaintHandle != nil {
+		m.afterPaintHandle.Disconnect()
+		m.afterPaintHandle = nil
+	}
+	if m.closeHandle != nil {
+		m.closeHandle.Disconnect()
+		m.closeHandle = nil
+	}
+	if m.destroyHandle != nil {
+		m.destroyHandle.Disconnect()
+		m.destroyHandle = nil
+	}
+}
+
+func (a *app) windowDestroyed(mount *windowMount) {
+	mount.destroying = true
+	if current := a.windows[mount.id]; current == mount {
+		delete(a.windows, mount.id)
+	}
+
+	mount.disconnect()
+	if mount.view.onDestroy != nil {
+		mount.view.onDestroy()
+	}
+	// Quitting when the last window closes is gui.Application's policy
+	// (QuitOnLastWindowClosed); the ui runtime does not decide it.
+}
+
+func (a *app) destroyAll() {
+	for id, mount := range a.windows {
+		delete(a.windows, id)
+		mount.destroy()
+	}
+}
+
+func (a *app) fail(err error) {
+	if err == nil {
+		return
+	}
+
+	a.mu.Lock()
+	if a.err == nil {
+		a.err = err
+	}
+	a.mu.Unlock()
+
+	a.Quit()
+}
+
+// Quit asks the running app to stop; it is idempotent.
+func (a *app) Quit() {
+	a.mu.Lock()
+	if a.stopping {
+		a.mu.Unlock()
+		return
+	}
+	a.stopping = true
+	a.fullUpdate = false
+	a.dirty = nil
+	a.dirtyOrder = nil
+	a.mu.Unlock()
+
+	if a.gui != nil {
+		a.gui.Quit()
+	}
+}
+
+func (a *app) isStopping() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stopping
+}
+
+// stop runs on the UI thread after run has finished, including initial-build
+// failure. It invalidates queued work and releases synchronous callers even when
+// the native loop exits without processing their posts. Quit must not close
+// finished: a currently executing callback may still be writing caller results.
+func (a *app) stop() {
+	a.mu.Lock()
+	a.stopping = true
+	a.updatePending = false
+	a.fullUpdate = false
+	a.dirty = nil
+	a.dirtyOrder = nil
+	select {
+	case <-a.finished:
+		a.mu.Unlock()
+		return
+	default:
+		close(a.finished)
+	}
+	a.mu.Unlock()
+	// The loop may exit while native windows still exist. Release declarative
+	// connections without taking the GUI window's ownership of its widget tree.
+	for _, mount := range a.windows {
+		mount.root.unmountForWindowDestroy()
+	}
+}
+
+func (a *app) error() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.err
+}

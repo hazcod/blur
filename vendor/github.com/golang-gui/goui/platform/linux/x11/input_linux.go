@@ -1,0 +1,464 @@
+package x11
+
+import (
+	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/platform/events"
+	"github.com/golang-gui/goui/platform/linux/libs/xlib"
+)
+
+// There is one current native input dispatch on the platform thread. Do not
+// retain an XEvent pointer or restore an outer press after nested dispatch.
+type nativePress struct {
+	window *Window
+	event  xlib.ButtonEvent
+	motion bool
+}
+
+var moveResizePress nativePress
+
+func (w *Window) emitEvent(event events.Event) {
+	moveResizePress = nativePress{}
+	if focus, ok := event.(events.FocusEvent); ok && !focus.Focused {
+		w.dragPress = false
+	}
+	if w.wid != 0 {
+		w.onEvent(event)
+	}
+}
+
+func (w *Window) handlePointerMove(event *xlib.MotionEvent) {
+	moveResizePress = nativePress{}
+	w.buttons = buttonsFromState(event.State, w.buttons)
+	if w.dragPress && event.Window == w.wid && event.SendEvent == 0 && event.SameScreen != 0 && w.buttons&events.PointerButtonLeftDown != 0 {
+		moveResizePress = nativePress{window: w, motion: true, event: xlib.ButtonEvent{
+			Window: event.Window, Root: event.Root, Time: event.Time, XRoot: event.XRoot, YRoot: event.YRoot, Button: xlib.Button1,
+		}}
+	}
+	defer func() { moveResizePress = nativePress{} }()
+	if w.wid == 0 {
+		return
+	}
+	w.onEvent(events.PointerEvent{
+		EventType: events.PointerMove,
+		Position:  point(event.X, event.Y),
+		Button:    events.PointerButtonNone,
+		Buttons:   w.buttons,
+		Modifiers: modifiersFromState(event.State),
+	})
+}
+
+func (w *Window) handlePointerCrossing(eventType events.EventType, event *xlib.CrossingEvent) {
+	w.buttons = buttonsFromState(event.State, w.buttons)
+	w.emitEvent(events.PointerEvent{
+		EventType: eventType,
+		Position:  point(event.X, event.Y),
+		Button:    events.PointerButtonNone,
+		Buttons:   w.buttons,
+		Modifiers: modifiersFromState(event.State),
+	})
+}
+
+func (w *Window) handleButton(eventType events.EventType, event *xlib.ButtonEvent) {
+	moveResizePress = nativePress{}
+	if event.Type == xlib.ButtonPress {
+		if wheel, ok := wheelEvent(event, buttonsFromState(event.State, w.buttons)); ok {
+			w.emitEvent(wheel)
+			return
+		}
+	}
+	if event.Button == xlib.Button1 {
+		w.dragPress = eventType == events.PointerDown && event.SendEvent == 0 && event.Window == w.wid
+		if eventType == events.PointerDown {
+			w.moveResize = false
+		} else if w.moveResize {
+			// Release can race the WM's grab. EWMH requires cancellation when
+			// the client receives that release instead of the WM.
+			w.moveResize = false
+			w.sendMoveResize(event, 11)
+		}
+	}
+
+	button := pointerButton(event.Button)
+	if button == events.PointerButtonNone {
+		return
+	}
+
+	buttons := buttonsFromState(event.State, w.buttons)
+	buttonFlag := pointerButtonFlag(button)
+	if eventType == events.PointerDown {
+		buttons |= buttonFlag
+	} else {
+		buttons &^= buttonFlag
+	}
+	w.buttons = buttons
+
+	pointer := events.PointerEvent{
+		EventType: eventType,
+		Position:  point(event.X, event.Y),
+		Button:    button,
+		Buttons:   buttons,
+		Modifiers: modifiersFromState(event.State),
+	}
+	if w.wid == 0 {
+		return
+	}
+	if eventType == events.PointerDown && event.Type == xlib.ButtonPress &&
+		event.Button == xlib.Button1 && event.Window == w.wid && event.SendEvent == 0 && event.SameScreen != 0 {
+		moveResizePress = nativePress{window: w, event: *event}
+	}
+	defer func() { moveResizePress = nativePress{} }()
+	w.onEvent(pointer)
+}
+
+func (w *Window) handleKey(eventType events.EventType, event *xlib.KeyEvent, repeat bool) {
+	// When a text widget is focused, run key-downs through the input method: it
+	// turns them into committed text (handler.Commit) or, for keys it does not
+	// consume, a plain KeyEvent (see doc/DesignIME.md §4). Key-ups and the
+	// no-IME case take the plain path below.
+	if eventType == events.KeyDown && w.im != nil && w.im.enabled {
+		w.im.handleKey(event, repeat)
+		return
+	}
+
+	key, location := keyFromNativeEvent(event)
+	var handled bool
+	w.emitEvent(events.KeyEvent{
+		EventType: eventType,
+		Key:       key,
+		Code:      events.KeyCodeUnknown,
+		Location:  location,
+		Modifiers: w.keyModifiers(eventType, key, event.KeyCode, event.State),
+		Repeat:    repeat,
+		Handled:   &handled,
+	})
+}
+
+// Track the input stream delivered after XIM filtering, not its transport.
+// XIM may consume an original press/release and later put the same event back
+// into the queue. Counting both would mark a first press as auto-repeat, or
+// let an original release clear state before a forwarded repeat arrives.
+func (w *Window) trackKey(code uint32, down, filtered bool) bool {
+	if filtered || code == 0 || code >= uint32(len(w.pressedKeys)) {
+		return false
+	}
+	repeat := down && w.pressedKeys[code]
+	w.pressedKeys[code] = down
+	mask := byte(1 << (code % 8))
+	if down {
+		w.modifierKeys[code/8] |= mask
+	} else {
+		w.modifierKeys[code/8] &^= mask
+	}
+	return repeat
+}
+
+func keyFromNativeEvent(event *xlib.KeyEvent) (events.Key, events.KeyLocation) {
+	// XKB encodes the effective group in core state bits 13..14. Level zero
+	// preserves the letter identity independently of Shift/CapsLock/AltGr;
+	// text is obtained separately from XIM, never from this shortcut lookup.
+	// XkbLookupKeySym applies each key's group wrap/redirect policy as well;
+	// indexing group 1 directly would lose single-group function keys.
+	keysym, _, _ := event.Display.XkbLookupKeySym(uint8(event.KeyCode), keyboardGroup(event.State)<<13)
+	return keyFromKeysym(keysym, event.State, platform.numLockMask)
+}
+
+func keyboardGroup(state uint32) uint32 { return (state >> 13) & 3 }
+
+func wheelEvent(event *xlib.ButtonEvent, buttons events.PointerButtons) (events.WheelEvent, bool) {
+	wheel := events.WheelEvent{
+		Position:  point(event.X, event.Y),
+		Mode:      events.WheelDeltaLine,
+		Buttons:   buttons,
+		Modifiers: modifiersFromState(event.State),
+	}
+	switch event.Button {
+	case xlib.Button4:
+		wheel.DeltaY = -1
+	case xlib.Button5:
+		wheel.DeltaY = 1
+	case xlib.Button6:
+		wheel.DeltaX = -1
+	case xlib.Button7:
+		wheel.DeltaX = 1
+	default:
+		return events.WheelEvent{}, false
+	}
+	return wheel, true
+}
+
+// point converts physical X11 pixel coordinates to logical (DIP) coordinates so
+// pointer/wheel events share the gui layout coordinate space.
+func point(x, y int32) geometry.Point {
+	s := currentScale()
+	return geometry.Point{
+		X: float32(x) / s,
+		Y: float32(y) / s,
+	}
+}
+
+func pointerButton(button uint32) events.PointerButton {
+	switch button {
+	case xlib.Button1:
+		return events.PointerButtonLeft
+	case xlib.Button2:
+		return events.PointerButtonMiddle
+	case xlib.Button3:
+		return events.PointerButtonRight
+	case xlib.Button8:
+		return events.PointerButtonBack
+	case xlib.Button9:
+		return events.PointerButtonForward
+	default:
+		return events.PointerButtonNone
+	}
+}
+
+func pointerButtonFlag(button events.PointerButton) events.PointerButtons {
+	switch button {
+	case events.PointerButtonLeft:
+		return events.PointerButtonLeftDown
+	case events.PointerButtonRight:
+		return events.PointerButtonRightDown
+	case events.PointerButtonMiddle:
+		return events.PointerButtonMiddleDown
+	case events.PointerButtonBack:
+		return events.PointerButtonBackDown
+	case events.PointerButtonForward:
+		return events.PointerButtonForwardDown
+	default:
+		return 0
+	}
+}
+
+func buttonsFromState(state uint32, current events.PointerButtons) events.PointerButtons {
+	buttons := current & (events.PointerButtonBackDown | events.PointerButtonForwardDown)
+	if state&xlib.Button1Mask != 0 {
+		buttons |= events.PointerButtonLeftDown
+	}
+	if state&xlib.Button2Mask != 0 {
+		buttons |= events.PointerButtonMiddleDown
+	}
+	if state&xlib.Button3Mask != 0 {
+		buttons |= events.PointerButtonRightDown
+	}
+	return buttons
+}
+
+func modifiersFromState(state uint32) events.Modifiers {
+	var mods events.Modifiers
+	if state&xlib.ShiftMask != 0 {
+		mods |= events.ModifierShift
+	}
+	if state&xlib.ControlMask != 0 {
+		mods |= events.ModifierControl
+	}
+	if state&xlib.Mod1Mask != 0 {
+		mods |= events.ModifierAlt
+	}
+	if platform != nil && state&platform.altGraphMasks[keyboardGroup(state)] != 0 {
+		mods |= events.ModifierAltGraph
+	}
+	return mods
+}
+
+func (w *Window) keyModifiers(eventType events.EventType, key events.Key, code, state uint32) events.Modifiers {
+	mods := keyModifiersFromState(state)
+	bit := modifierForKey(key)
+	if bit == 0 {
+		return mods
+	}
+	if platform != nil && code < uint32(len(platform.modifierMasks)) {
+		// One native modifier slot may represent more than one public bit
+		// (e.g. Level3 assigned to Mod1). Release all of this key's contributions.
+		bit |= keyModifiersFromState(platform.modifierMasks[code] | keyboardGroup(state)<<13)
+	}
+	switch key {
+	case events.KeyShift, events.KeyControl, events.KeyAlt, events.KeySuper, events.KeyAltGraph:
+		if eventType == events.KeyDown {
+			mods |= bit
+		} else {
+			mods &^= bit
+			// Core X11 state describes the instant BEFORE this release. Keep
+			// the bit if another down key contributes the same native modifier.
+			if platform != nil {
+				for code, mask := range platform.modifierMasks {
+					if w.modifierKeys[code/8]&(1<<uint(code%8)) != 0 {
+						mods |= keyModifiersFromState(mask|keyboardGroup(state)<<13) & bit
+					}
+				}
+			}
+		}
+	}
+	return mods
+}
+
+func keyModifiersFromState(state uint32) events.Modifiers {
+	mods := modifiersFromState(state)
+	if state&xlib.Mod4Mask != 0 {
+		mods |= events.ModifierSuper
+	}
+	return mods
+}
+
+func modifierForKey(key events.Key) events.Modifiers {
+	switch key {
+	case events.KeyShift:
+		return events.ModifierShift
+	case events.KeyControl:
+		return events.ModifierControl
+	case events.KeyAlt:
+		return events.ModifierAlt
+	case events.KeySuper:
+		return events.ModifierSuper
+	case events.KeyAltGraph:
+		return events.ModifierAltGraph
+	default:
+		return 0
+	}
+}
+
+func keyFromKeysym(keysym xlib.KeySym, state, numLockMask uint32) (events.Key, events.KeyLocation) {
+	if 'a' <= keysym && keysym <= 'z' {
+		return events.Key(int(events.KeyA) + int(keysym-'a')), events.KeyLocationStandard
+	}
+	if 'A' <= keysym && keysym <= 'Z' {
+		return events.Key(int(events.KeyA) + int(keysym-'A')), events.KeyLocationStandard
+	}
+	if '0' <= keysym && keysym <= '9' {
+		return events.Key(int(events.Key0) + int(keysym-'0')), events.KeyLocationStandard
+	}
+	if xlib.XK_F1 <= keysym && keysym <= xlib.XK_F24 {
+		return events.Key(int(events.KeyF1) + int(keysym-xlib.XK_F1)), events.KeyLocationStandard
+	}
+	if xlib.XK_KP_0 <= keysym && keysym <= xlib.XK_KP_9 {
+		return events.Key(int(events.KeyNumpad0) + int(keysym-xlib.XK_KP_0)), events.KeyLocationNumpad
+	}
+
+	switch keysym {
+	case xlib.XK_ISO_Level3_Shift:
+		return events.KeyAltGraph, events.KeyLocationStandard
+	case xlib.XK_Escape:
+		return events.KeyEscape, events.KeyLocationStandard
+	case xlib.XK_Menu:
+		return events.KeyMenu, events.KeyLocationStandard
+	case xlib.XK_Print:
+		return events.KeyPrintScreen, events.KeyLocationStandard
+	case xlib.XK_Scroll_Lock:
+		return events.KeyScrollLock, events.KeyLocationStandard
+	case xlib.XK_Pause, xlib.XK_Break:
+		return events.KeyPause, events.KeyLocationStandard
+	case xlib.XK_Return:
+		return events.KeyEnter, events.KeyLocationStandard
+	case xlib.XK_KP_Enter:
+		return events.KeyNumpadEnter, events.KeyLocationNumpad
+	case xlib.XK_Tab:
+		return events.KeyTab, events.KeyLocationStandard
+	case xlib.XK_BackSpace:
+		return events.KeyBackspace, events.KeyLocationStandard
+	case xlib.XK_Delete:
+		return events.KeyDelete, events.KeyLocationStandard
+	case xlib.XK_Insert:
+		return events.KeyInsert, events.KeyLocationStandard
+	case xlib.XK_Left:
+		return events.KeyArrowLeft, events.KeyLocationStandard
+	case xlib.XK_Right:
+		return events.KeyArrowRight, events.KeyLocationStandard
+	case xlib.XK_Up:
+		return events.KeyArrowUp, events.KeyLocationStandard
+	case xlib.XK_Down:
+		return events.KeyArrowDown, events.KeyLocationStandard
+	case xlib.XK_Home:
+		return events.KeyHome, events.KeyLocationStandard
+	case xlib.XK_End:
+		return events.KeyEnd, events.KeyLocationStandard
+	case xlib.XK_Page_Up:
+		return events.KeyPageUp, events.KeyLocationStandard
+	case xlib.XK_Page_Down:
+		return events.KeyPageDown, events.KeyLocationStandard
+	case xlib.XK_KP_Home:
+		return keypadNavigationKey(events.KeyHome, events.KeyNumpad7, state, numLockMask)
+	case xlib.XK_KP_Up:
+		return keypadNavigationKey(events.KeyArrowUp, events.KeyNumpad8, state, numLockMask)
+	case xlib.XK_KP_Page_Up:
+		return keypadNavigationKey(events.KeyPageUp, events.KeyNumpad9, state, numLockMask)
+	case xlib.XK_KP_Left:
+		return keypadNavigationKey(events.KeyArrowLeft, events.KeyNumpad4, state, numLockMask)
+	case xlib.XK_KP_Begin:
+		return events.KeyNumpad5, events.KeyLocationNumpad
+	case xlib.XK_KP_Right:
+		return keypadNavigationKey(events.KeyArrowRight, events.KeyNumpad6, state, numLockMask)
+	case xlib.XK_KP_End:
+		return keypadNavigationKey(events.KeyEnd, events.KeyNumpad1, state, numLockMask)
+	case xlib.XK_KP_Down:
+		return keypadNavigationKey(events.KeyArrowDown, events.KeyNumpad2, state, numLockMask)
+	case xlib.XK_KP_Page_Down:
+		return keypadNavigationKey(events.KeyPageDown, events.KeyNumpad3, state, numLockMask)
+	case xlib.XK_KP_Insert:
+		return keypadNavigationKey(events.KeyInsert, events.KeyNumpad0, state, numLockMask)
+	case xlib.XK_KP_Delete:
+		return keypadNavigationKey(events.KeyDelete, events.KeyNumpadDecimal, state, numLockMask)
+	case xlib.XK_Shift_L:
+		return events.KeyShift, events.KeyLocationLeft
+	case xlib.XK_Shift_R:
+		return events.KeyShift, events.KeyLocationRight
+	case xlib.XK_Control_L:
+		return events.KeyControl, events.KeyLocationLeft
+	case xlib.XK_Control_R:
+		return events.KeyControl, events.KeyLocationRight
+	case xlib.XK_Alt_L:
+		return events.KeyAlt, events.KeyLocationLeft
+	case xlib.XK_Alt_R:
+		return events.KeyAlt, events.KeyLocationRight
+	case xlib.XK_Super_L:
+		return events.KeySuper, events.KeyLocationLeft
+	case xlib.XK_Super_R:
+		return events.KeySuper, events.KeyLocationRight
+	case xlib.XK_Caps_Lock:
+		return events.KeyCapsLock, events.KeyLocationStandard
+	case xlib.XK_Num_Lock:
+		return events.KeyNumLock, events.KeyLocationNumpad
+	case ' ':
+		return events.KeySpace, events.KeyLocationStandard
+	case '-':
+		return events.KeyMinus, events.KeyLocationStandard
+	case '=':
+		return events.KeyEqual, events.KeyLocationStandard
+	case '[':
+		return events.KeyBracketLeft, events.KeyLocationStandard
+	case ']':
+		return events.KeyBracketRight, events.KeyLocationStandard
+	case '\\':
+		return events.KeyBackslash, events.KeyLocationStandard
+	case ';':
+		return events.KeySemicolon, events.KeyLocationStandard
+	case '\'':
+		return events.KeyQuote, events.KeyLocationStandard
+	case ',':
+		return events.KeyComma, events.KeyLocationStandard
+	case '.':
+		return events.KeyPeriod, events.KeyLocationStandard
+	case '/':
+		return events.KeySlash, events.KeyLocationStandard
+	case '`':
+		return events.KeyBackquote, events.KeyLocationStandard
+	case xlib.XK_KP_Add:
+		return events.KeyNumpadAdd, events.KeyLocationNumpad
+	case xlib.XK_KP_Subtract:
+		return events.KeyNumpadSubtract, events.KeyLocationNumpad
+	case xlib.XK_KP_Multiply:
+		return events.KeyNumpadMultiply, events.KeyLocationNumpad
+	case xlib.XK_KP_Divide:
+		return events.KeyNumpadDivide, events.KeyLocationNumpad
+	case xlib.XK_KP_Decimal:
+		return events.KeyNumpadDecimal, events.KeyLocationNumpad
+	default:
+		return events.KeyUnknown, events.KeyLocationStandard
+	}
+}
+
+func keypadNavigationKey(navigationKey, numlockKey events.Key, state, numLockMask uint32) (events.Key, events.KeyLocation) {
+	if numLockMask != 0 && state&numLockMask != 0 {
+		return numlockKey, events.KeyLocationNumpad
+	}
+	return navigationKey, events.KeyLocationNumpad
+}

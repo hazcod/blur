@@ -1,0 +1,161 @@
+package gui
+
+import (
+	"fmt"
+	"unicode/utf8"
+
+	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/core/signal"
+)
+
+// IMClient is implemented by widgets that accept text input. On every focus
+// change the window asks the newly focused widget for its IMContext and, when
+// present, binds it to the window's native input method for the duration of
+// focus.
+type IMClient interface {
+	IMContext() IMContext
+}
+
+// IMCommit is one native text insertion. Composed means the native input method
+// identified a composition/text-service result, possibly without any preedit.
+// False does not rule out composition on APIs that cannot identify the source.
+// Editors can use this fact to separate undo groups; IMContext does not edit.
+type IMCommit struct {
+	Text     string
+	Composed bool
+}
+
+// IMContext is a text widget's handle to the input method. The widget creates
+// one with NewIMContext, connects Commit/Preedit, and reports its caret; the
+// framework does the rest — focus binding, key routing, candidate positioning.
+type IMContext interface {
+	// ConnectCommit registers a handler for committed text (ordinary typed text,
+	// a converted CJK phrase, an emoji, ...). This is the widget's text path.
+	ConnectCommit(fn func(commit IMCommit)) signal.Handle
+	// ConnectPreedit registers a handler for the in-progress composition string.
+	// caret is the cursor position within text as a byte offset; empty text means
+	// the composition ended.
+	ConnectPreedit(fn func(text string, caret int)) signal.Handle
+	// SetCaretRect reports the caret rectangle in the widget's local coordinates
+	// so the native IME can position the candidate window. It is a no-op while
+	// the context is not the focused one.
+	SetCaretRect(rect geometry.Rectangle)
+	// Reset cancels any in-progress composition. Widgets rarely need it (focus
+	// changes reset automatically); it exists for cases like dropping a
+	// composition on Escape.
+	Reset()
+
+	// Framework-internal
+	emitCommit(commit IMCommit)
+	emitPreedit(text string, caret int)
+	hasPreedit() bool
+	setWindow(w *window) // binds to the focused window; nil unbinds
+}
+
+// imContext is the sole IMContext implementation.
+type imContext struct {
+	commit     signal.Signal1[IMCommit]
+	preedit    signal.Signal2[string, int]
+	window     *window // non-nil only while the owning widget is focused
+	preediting bool    // known native preedit; maintained before signal callbacks
+}
+
+// NewIMContext creates an input-method context. A text widget owns one for its
+// lifetime and returns it from IMClient.IMContext.
+func NewIMContext() IMContext {
+	return &imContext{}
+}
+
+func (c *imContext) ConnectCommit(fn func(commit IMCommit)) signal.Handle {
+	return c.commit.Connect(fn)
+}
+
+func (c *imContext) ConnectPreedit(fn func(text string, caret int)) signal.Handle {
+	return c.preedit.Connect(fn)
+}
+
+func (c *imContext) SetCaretRect(rect geometry.Rectangle) {
+	if c.window != nil {
+		c.window.imSetCaretRect(rect)
+	}
+}
+
+func (c *imContext) Reset() {
+	c.preediting = false
+	if c.window != nil {
+		c.window.imReset()
+	}
+}
+
+func (c *imContext) emitCommit(commit IMCommit) {
+	c.preediting = false
+	c.commit.Emit(commit)
+}
+
+func (c *imContext) emitPreedit(text string, caret int) {
+	c.preediting = text != ""
+	c.preedit.Emit(text, caret)
+}
+
+func (c *imContext) hasPreedit() bool { return c.preediting }
+
+func (c *imContext) setWindow(w *window) {
+	c.window = w
+	if w == nil {
+		c.preediting = false
+	}
+}
+
+// commitText shares the native IMContext commit path, never a concrete editor API.
+func commitText(root Root, text string) error {
+	if !utf8.ValidString(text) {
+		return fmt.Errorf("commit text: invalid UTF-8")
+	}
+	focused, err := textInputFocus(root)
+	if err != nil {
+		return err
+	}
+	im := imContextOf(focused)
+	// IMClient is implemented by application widgets too: querying it may
+	// reenter the GUI. Recheck lifetime, focus AND modal ownership afterwards.
+	current, err := textInputFocus(root)
+	if err != nil {
+		return err
+	}
+	if im == nil || current != focused {
+		return fmt.Errorf("commit text: no editable focus")
+	}
+	if im.hasPreedit() {
+		return fmt.Errorf("commit text: input method composition is active")
+	}
+	if text != "" {
+		im.emitCommit(IMCommit{Text: text})
+	}
+	return nil
+}
+
+func textInputFocus(root Root) (Widget, error) {
+	ensureModalRoot(root)
+	switch host := root.(type) {
+	case *window:
+		if host.destroyed || host.frameSuspended {
+			return nil, fmt.Errorf("commit text: window is unavailable")
+		}
+		if modalRootBlocked(host) || host.modalTarget != nil {
+			return nil, fmt.Errorf("commit text: window input is blocked by a modal target")
+		}
+	case *popover:
+		if host.destroyed || !host.visible {
+			return nil, fmt.Errorf("commit text: popover is unavailable")
+		}
+		if !host.ownsModalInput() {
+			return nil, fmt.Errorf("commit text: popover does not own modal input")
+		}
+	}
+	focused := root.(EventTarget).FocusedWidget()
+	if focused == nil || focused.base().destroyed || focused.Root() != root ||
+		!focused.Focused() || !visibleInTree(focused) || !IsEnabled(focused) || !modalWidgetAllowed(focused) {
+		return nil, fmt.Errorf("commit text: no editable focus")
+	}
+	return focused, nil
+}

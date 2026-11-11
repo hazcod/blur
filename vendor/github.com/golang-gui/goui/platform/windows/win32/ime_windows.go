@@ -1,0 +1,207 @@
+package win32
+
+import (
+	"errors"
+	"strings"
+	"unicode/utf16"
+
+	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/platform/common"
+	"github.com/golang-gui/goui/platform/windows/sdk/winapi"
+)
+
+// inputMethod is the win32 InputMethod: IMM32 driving composition for a window.
+type inputMethod struct {
+	window   *Window
+	handler  common.InputMethodHandler
+	enabled  bool
+	savedIMC winapi.HIMC // context detached while IME is disabled (non-text focus)
+	spot     winapi.RECT // last pushed caret rect (client physical px), deduped
+	spotSet  bool
+	charHigh uint16 // pending WM_CHAR high surrogate, cleared when focus changes
+}
+
+// newInputMethod creates the IMM32 input method for window.
+func newInputMethod(window common.Window, handler common.InputMethodHandler) (*inputMethod, error) {
+	win, ok := window.(*Window)
+	if !ok || win.hwnd == 0 {
+		return nil, errors.New("win32: invalid window for input method")
+	}
+	im := &inputMethod{window: win, handler: handler}
+	win.im = im // WndProc routes WM_IME_* to this
+	return im, nil
+}
+
+// SetEnabled associates/detaches the window's input context so composition is on
+// only while a text widget is focused.
+func (im *inputMethod) SetEnabled(enabled bool) {
+	if im.window == nil || im.window.hwnd == 0 || im.enabled == enabled {
+		return
+	}
+	im.enabled = enabled
+	im.charHigh = 0
+	im.spotSet = false
+	if enabled {
+		if im.savedIMC != 0 {
+			winapi.ImmAssociateContext(im.window.hwnd, im.savedIMC)
+			im.savedIMC = 0
+		}
+		return
+	}
+	im.savedIMC = winapi.ImmAssociateContext(im.window.hwnd, 0)
+}
+
+// SetCaretRect positions the composition and candidate windows at the caret.
+// rect is window-logical; IMM wants client physical pixels.
+//
+// The candidate window uses CFS_EXCLUDE: rcArea is the whole caret line, which
+// the IME treats as a region it must not cover, so it places the candidate list
+// just outside that rect — below the line by default, auto-flipping above when
+// near the screen bottom. This matches Chromium/Firefox and keeps the list off
+// the text instead of overlapping it (the earlier CFS_CANDIDATEPOS-at-top
+// anchor pinned the list to the line top, which read as "too high").
+//
+// The composition window anchors at the caret top-left, where inline preedit is
+// drawn; goui suppresses the default composition UI, but some IMEs still read
+// this point when placing candidates, so it must agree with the caret.
+func (im *inputMethod) SetCaretRect(rect geometry.Rectangle) {
+	if im.window == nil || im.window.hwnd == 0 || !im.enabled {
+		return
+	}
+	scale := im.window.scale
+	if scale == 0 {
+		scale = 1
+	}
+	area := winapi.RECT{
+		Left:   winapi.LONG(rect.X * scale),
+		Top:    winapi.LONG(rect.Y * scale),
+		Right:  winapi.LONG((rect.X + rect.Width) * scale),
+		Bottom: winapi.LONG((rect.Y + rect.Height) * scale),
+	}
+	if im.spotSet && area == im.spot {
+		return
+	}
+	im.spot, im.spotSet = area, true
+
+	himc := winapi.ImmGetContext(im.window.hwnd)
+	if himc == 0 {
+		return
+	}
+	defer winapi.ImmReleaseContext(im.window.hwnd, himc)
+
+	topLeft := winapi.POINT{X: area.Left, Y: area.Top}
+	winapi.ImmSetCompositionWindow(himc, &winapi.COMPOSITIONFORM{
+		DwStyle:      winapi.CFS_POINT | winapi.CFS_FORCE_POSITION,
+		PtCurrentPos: topLeft,
+	})
+	winapi.ImmSetCandidateWindow(himc, &winapi.CANDIDATEFORM{
+		DwStyle:      winapi.CFS_EXCLUDE,
+		PtCurrentPos: winapi.POINT{X: area.Left, Y: area.Bottom},
+		RcArea:       area,
+	})
+}
+
+func (im *inputMethod) Reset() {
+	im.charHigh = 0
+	if im.window == nil || im.window.hwnd == 0 {
+		return
+	}
+	himc := winapi.ImmGetContext(im.window.hwnd)
+	if himc == 0 {
+		return
+	}
+	winapi.ImmNotifyIME(himc, winapi.NI_COMPOSITIONSTR, winapi.CPS_CANCEL, 0)
+	winapi.ImmReleaseContext(im.window.hwnd, himc)
+}
+
+func (im *inputMethod) Destroy() {
+	im.charHigh = 0
+	if im.savedIMC != 0 && im.window != nil && im.window.hwnd != 0 {
+		winapi.ImmAssociateContext(im.window.hwnd, im.savedIMC)
+		im.savedIMC = 0
+	}
+	if im.window != nil {
+		im.window.im = nil
+		im.window = nil
+	}
+}
+
+// handleChar delivers translated native text, independent of physical keys,
+// Shift, Caps Lock, dead keys and AltGr. Editing control characters are handled
+// by the key-event path instead. A Unicode HWND receives UTF-16 code units.
+func (im *inputMethod) handleChar(unit uint16, repeat int, composed bool) {
+	if im.window == nil || !im.enabled || im.handler == nil {
+		return
+	}
+	var text string
+	high := im.charHigh
+	im.charHigh = 0
+	if 0xd800 <= unit && unit <= 0xdbff {
+		im.charHigh = unit
+		if high == 0 {
+			return
+		}
+		text = "\ufffd"
+	} else if 0xdc00 <= unit && unit <= 0xdfff {
+		text = string(utf16.DecodeRune(rune(high), rune(unit)))
+	} else {
+		if high != 0 {
+			text = "\ufffd"
+		}
+		if unit >= 0x20 && unit != 0x7f {
+			text += string(rune(unit))
+		}
+	}
+	if text != "" {
+		im.handler(common.InputMethodResult{Kind: common.InputMethodCommit, Text: strings.Repeat(text, max(1, repeat)), Composed: composed})
+	}
+}
+
+// handleComposition handles WM_IME_COMPOSITION: a result string commits, a
+// composition string updates the inline preedit.
+func (im *inputMethod) handleComposition(lParam winapi.LPARAM) {
+	if im.window == nil || im.window.hwnd == 0 || !im.enabled {
+		return
+	}
+	himc := winapi.ImmGetContext(im.window.hwnd)
+	if himc == 0 {
+		return
+	}
+	defer winapi.ImmReleaseContext(im.window.hwnd, himc)
+
+	flags := winapi.DWORD(lParam)
+	if flags&winapi.GCS_RESULTSTR != 0 {
+		if text := winapi.ImmGetCompositionString(himc, winapi.GCS_RESULTSTR); text != "" {
+			im.handler(common.InputMethodResult{Kind: common.InputMethodCommit, Text: text, Composed: true})
+		}
+	}
+	// A commit callback can destroy the window or move focus out of text input.
+	if im.window == nil || im.window.hwnd == 0 || !im.enabled {
+		return
+	}
+	if flags&winapi.GCS_COMPSTR != 0 {
+		text := winapi.ImmGetCompositionString(himc, winapi.GCS_COMPSTR)
+		caret := imeByteCaret(text, winapi.ImmGetCompositionCursorPos(himc))
+		im.handler(common.InputMethodResult{Kind: common.InputMethodPreedit, Text: text, Caret: caret})
+	}
+}
+
+// endComposition clears the inline preedit.
+func (im *inputMethod) endComposition() {
+	if im.window != nil && im.enabled && im.handler != nil {
+		im.handler(common.InputMethodResult{Kind: common.InputMethodPreedit})
+	}
+}
+
+// imeByteCaret converts a UTF-16-code-unit cursor position within the
+// composition string to a byte offset into its UTF-8 form.
+func imeByteCaret(text string, utf16Pos int) int {
+	if utf16Pos <= 0 {
+		return 0
+	}
+	units := utf16.Encode([]rune(text))
+	if utf16Pos >= len(units) {
+		return len(text)
+	}
+	return len(string(utf16.Decode(units[:utf16Pos])))
+}

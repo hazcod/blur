@@ -1,0 +1,220 @@
+package platform
+
+import (
+	"fmt"
+	"runtime"
+	"strings"
+
+	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/platform/common"
+	"github.com/golang-gui/goui/platform/events"
+	"github.com/golang-gui/goui/platform/graphics"
+	"github.com/golang-gui/goui/platform/typography"
+)
+
+func init() {
+	// Keep main on the startup OS thread before application initialization.
+	// Locking only in Run is too late for AppKit and previously created resources.
+	// Retain the lock after Run returns so native cleanup stays on this thread.
+	runtime.LockOSThread()
+}
+
+type (
+	Event              = events.Event
+	Image              = common.Image
+	Settings           = common.Settings
+	ColorScheme        = common.ColorScheme
+	Surface            = common.Surface
+	Window             = common.Window
+	DesktopWindow      = common.DesktopWindow
+	WindowOptions      = common.WindowOptions
+	PopupOptions       = common.PopupOptions
+	WindowChrome       = common.WindowChrome
+	WindowState        = common.WindowState
+	WindowHit          = common.WindowHit
+	WindowEdge         = common.WindowEdge
+	Popup              = common.Popup
+	EventLoop          = common.EventLoop
+	Clipboard          = common.Clipboard
+	InputMethod        = common.InputMethod
+	InputMethodHandler = common.InputMethodHandler
+	InputMethodResult  = common.InputMethodResult
+	InputMethodKind    = common.InputMethodKind
+	Cursor             = common.Cursor
+	DragDrop           = common.DragDrop
+	CursorShape        = common.CursorShape
+	EventHandler       = events.EventHandler
+	FileFilter         = common.FileFilter
+	DialogOptions      = common.DialogOptions
+	FileDialog         = common.FileDialog
+	FileAccess         = common.FileAccess
+)
+
+const (
+	WindowChromeUnknown    = common.WindowChromeUnknown
+	WindowChromeNative     = common.WindowChromeNative
+	WindowChromeIntegrated = common.WindowChromeIntegrated
+	WindowChromeNone       = common.WindowChromeNone
+
+	WindowStateUnknown    = common.WindowStateUnknown
+	WindowStateNormal     = common.WindowStateNormal
+	WindowStateHidden     = common.WindowStateHidden
+	WindowStateMinimized  = common.WindowStateMinimized
+	WindowStateMaximized  = common.WindowStateMaximized
+	WindowStateFullscreen = common.WindowStateFullscreen
+
+	WindowHitDefault     = common.WindowHitDefault
+	WindowHitClient      = common.WindowHitClient
+	WindowHitSysMenu     = common.WindowHitSysMenu
+	WindowHitCaption     = common.WindowHitCaption
+	WindowHitMinimize    = common.WindowHitMinimize
+	WindowHitMaximize    = common.WindowHitMaximize
+	WindowHitClose       = common.WindowHitClose
+	WindowHitTop         = common.WindowHitTop
+	WindowHitBottom      = common.WindowHitBottom
+	WindowHitLeft        = common.WindowHitLeft
+	WindowHitRight       = common.WindowHitRight
+	WindowHitTopLeft     = common.WindowHitTopLeft
+	WindowHitTopRight    = common.WindowHitTopRight
+	WindowHitBottomLeft  = common.WindowHitBottomLeft
+	WindowHitBottomRight = common.WindowHitBottomRight
+
+	WindowEdgeTop         = common.WindowEdgeTop
+	WindowEdgeBottom      = common.WindowEdgeBottom
+	WindowEdgeLeft        = common.WindowEdgeLeft
+	WindowEdgeRight       = common.WindowEdgeRight
+	WindowEdgeTopLeft     = common.WindowEdgeTopLeft
+	WindowEdgeTopRight    = common.WindowEdgeTopRight
+	WindowEdgeBottomLeft  = common.WindowEdgeBottomLeft
+	WindowEdgeBottomRight = common.WindowEdgeBottomRight
+
+	ColorSchemeLight = common.ColorSchemeLight
+	ColorSchemeDark  = common.ColorSchemeDark
+
+	InputMethodCommit  = common.InputMethodCommit
+	InputMethodPreedit = common.InputMethodPreedit
+
+	CursorDefault           = common.CursorDefault
+	CursorText              = common.CursorText
+	CursorPointing          = common.CursorPointing
+	CursorCrosshair         = common.CursorCrosshair
+	CursorForbidden         = common.CursorForbidden
+	CursorNone              = common.CursorNone
+	CursorResizeHorizontal  = common.CursorResizeHorizontal
+	CursorResizeVertical    = common.CursorResizeVertical
+	CursorResizeNWSE        = common.CursorResizeNWSE
+	CursorResizeNESW        = common.CursorResizeNESW
+	CursorResizeLeft        = common.CursorResizeLeft
+	CursorResizeRight       = common.CursorResizeRight
+	CursorResizeTop         = common.CursorResizeTop
+	CursorResizeBottom      = common.CursorResizeBottom
+	CursorResizeTopLeft     = common.CursorResizeTopLeft
+	CursorResizeTopRight    = common.CursorResizeTopRight
+	CursorResizeBottomLeft  = common.CursorResizeBottomLeft
+	CursorResizeBottomRight = common.CursorResizeBottomRight
+)
+
+// Platform owns low-level operating-system resources. It and every object
+// created from it must be used on the same OS thread, except for EventLoop.Post
+// and EventLoop.Quit.
+type Platform interface {
+	Destroy()
+	Name() string
+	// OpenURL asks the registered handler to open an absolute URL, including
+	// custom schemes. It does not infer a scheme or interpret filesystem paths.
+	// Invalid input and native request failures are returned. Success only means
+	// the native API accepted the request, not that the target finished opening.
+	// The call may block during dispatch, but does not wait for the target to exit.
+	OpenURL(rawURL string) error
+	// OpenPath opens a file or directory with its default application. Relative
+	// paths use the working directory; shell expressions and ~ are not expanded.
+	// Like OpenURL, this reports the native request result, not final completion.
+	OpenPath(path string) error
+	NewImage(width, height uint) (Image, error)
+	// NewWindow creates a top-level window with a requested client-area size in
+	// DIP. Native decoration/frame offsets are handled by the backend in every
+	// Chrome mode; GUI-drawn decoration is inside this client area.
+	// The authoritative client size arrives via SizeEvent. Initial notifications
+	// may arrive synchronously before NewWindow returns.
+	NewWindow(size geometry.Size, handler EventHandler, options WindowOptions) (Window, error)
+	// NewPopup creates a borderless popup owned by owner. width/height is its
+	// requested logical (DIP) size; native pixel quantization may adjust it, and
+	// the authoritative logical and physical client size arrives via SizeEvent.
+	NewPopup(owner Window, size geometry.Size, handler EventHandler, options PopupOptions) (Popup, error)
+	NewEventLoop() (EventLoop, error)
+	NewTypography() (typography.Context, error)
+	// NewPainter creates a painter for any paint target — a Window or a Popup.
+	NewPainter(surface Surface) (graphics.Painter, error)
+	NewSettings() (Settings, error)
+	NewClipboard() (Clipboard, error)
+	// NewInputMethod creates the text-composition (IME) capability for window.
+	// handler receives committed/preedit text. Returns ErrUnsupported when the
+	// platform or window does not support input methods.
+	NewInputMethod(window Window, handler InputMethodHandler) (InputMethod, error)
+	// NewCursor creates the mouse-cursor capability for window, used to change
+	// the window's current cursor shape. Returns ErrUnsupported when the platform
+	// or window does not support cursor control.
+	NewCursor(window Window) (Cursor, error)
+	// NewDragDrop creates the native drag/drop service for a live Window or
+	// Popup surface. A backend without native DnD returns ErrUnsupported.
+	NewDragDrop(surface Surface) (DragDrop, error)
+	// NewFileDialog creates the native file dialog capability. Returns
+	// ErrUnsupported when the platform does not support file dialogs.
+	NewFileDialog() (FileDialog, error)
+}
+
+var ErrUnsupported = common.ErrUnsupported
+var ErrUnavailable = common.ErrUnavailable
+
+// NewPlatform creates the named backend with an immutable application identity.
+// appId may be empty; explicit IDs are checked here before backend creation.
+// Initialize once per process. An ID does not install icon resources or turn a
+// bare macOS executable into an application bundle.
+// Call from main and run the event loop on that same goroutine. Importing this
+// package locks main to the startup OS thread; it does not dispatch calls from
+// other goroutines to that thread. Use EventLoop.Post for background work.
+// On failure, the returned Platform interface is nil.
+func NewPlatform(name, appId string) (Platform, error) {
+	if err := checkAppId(appId); err != nil {
+		return nil, err
+	}
+	return newPlatform(name, appId)
+}
+
+func DefaultName() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win32"
+	case "linux":
+		return "x11"
+	case "darwin":
+		return "cocoa"
+	}
+	return ""
+}
+
+func checkAppId(appId string) error {
+	if appId == "" {
+		return nil
+	}
+	invalid := func() error { return fmt.Errorf("invalid application ID %q", appId) }
+	if len(appId) > 128 || !strings.Contains(appId, ".") {
+		return invalid()
+	}
+	for _, part := range strings.Split(appId, ".") {
+		if part == "" || !asciiLetter(part[0]) {
+			return invalid()
+		}
+		for i := 1; i < len(part); i++ {
+			c := part[i]
+			if !asciiLetter(c) && !(c >= '0' && c <= '9') && c != '-' {
+				return invalid()
+			}
+		}
+	}
+	return nil
+}
+
+func asciiLetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
