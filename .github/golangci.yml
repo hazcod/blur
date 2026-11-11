@@ -1,0 +1,60 @@
+version: "2"
+
+run:
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - misspell
+    - gosec
+    - revive
+  settings:
+    gosec:
+      excludes:
+        - G104 # unchecked errors: errcheck already covers this with better context
+        - G115 # integer overflow conversions: too noisy for bounded protocol/size code
+        - G204 # subprocess with variable: platform adapters launch fixed helper tools
+        - G301 # directory permissions: stricter modes are set where data is private
+        - G302 # file permissions on OpenFile: modes are set explicitly where needed
+        - G304 # file inclusion via variable: paths come from the app's own data dir
+        - G306 # WriteFile permissions: private files use explicit 0600 elsewhere
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: increment-decrement
+        - name: var-declaration
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+  exclusions:
+    generated: lax
+    paths:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    paths:

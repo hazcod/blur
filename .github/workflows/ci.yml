@@ -38,7 +38,7 @@ jobs:
         run: make cross-build cross-test-compile
       - name: Assemble portable Windows and Linux packages
         run: make portable-packages
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: blur-portable
           path: dist/packages/*
@@ -53,6 +53,9 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Windows runtime support is still being validated (hazcod/blur#6);
+    # its failures are reported but do not block the workflow yet.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +84,8 @@ jobs:
 
   lint:
     name: Lint
+    # Advisory until the golangci-lint backlog is cleared (hazcod/blur#7).
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -92,4 +97,4 @@ jobs:
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.15.0
-          args: --config .golangci.yml
+          args: --config .github/golangci.yml

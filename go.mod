@@ -1,22 +1,22 @@
 module github.com/hazcod/blur
 
-go 1.27.0
+go 1.27.3
 
 require (
 	github.com/Microsoft/go-winio v0.6.4
-	github.com/ebitengine/purego v0.10.0
+	github.com/ebitengine/purego v0.11.3
 	github.com/godbus/dbus/v5 v5.2.4
-	github.com/goexlib/cgo v0.1.1
-	github.com/golang-gui/goui v0.6.0
+	github.com/goexlib/cgo v0.1.2
+	github.com/golang-gui/goui v0.7.0
 	github.com/lpintes/walk v0.0.0-20261029133242-6a00370d773d
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	go.etcd.io/bbolt v1.5.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 )
 
 require (
 	github.com/goexlib/mathx v0.0.1 // indirect
-	github.com/golang-gui/nanovgo v0.0.10 // indirect
+	github.com/golang-gui/nanovgo v0.0.13 // indirect
 	github.com/golang-gui/rasterx v0.1.0 // indirect
 	github.com/golang-gui/scanFT v0.1.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
@@ -31,3 +31,7 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
+
+replace github.com/golang-gui/goui => github.com/hazcod/goui v0.7.1-0.20261111152538-25870244b3a9
+
+replace github.com/lpintes/walk => github.com/hazcod/walk v0.0.0-20261111152548-ea2df068d42e

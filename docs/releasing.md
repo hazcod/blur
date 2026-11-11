@@ -26,7 +26,7 @@ The workflow runs two jobs:
 
 1. `goreleaser` (Ubuntu): builds cgo-free Linux (amd64, arm64) and Windows
    (amd64 GUI plus the `blur-mcp` console companion) binaries with
-   `-mod=vendor -trimpath`, packages `tar.gz` and `zip` archives, writes
+   `-trimpath`, packages `tar.gz` and `zip` archives, writes
    `checksums.txt`, signs it keylessly with cosign (GitHub OIDC), and creates
    the GitHub release with a changelog.
 2. `macos` (macOS runner, after the first job): builds the universal app with
@@ -53,7 +53,6 @@ cosign verify-blob --bundle checksums.txt.sigstore.json \
 | `APP_STORE_CONNECT_API_KEY_ID` | Key ID of the App Store Connect API key. |
 | `APP_STORE_CONNECT_API_ISSUER_ID` | Issuer ID shown on the App Store Connect Keys page. |
 | `APP_STORE_CONNECT_API_KEY_P8_BASE64` | Base64 of the downloaded `AuthKey_<id>.p8`. |
-| `WEBSITE_DEPLOY_TOKEN` | Fine-grained PAT used by `website.yml` (see below). |
 
 The cosign signature needs no secret; it uses the workflow's OIDC token.
 
@@ -64,17 +63,9 @@ The cosign signature needs no secret; it uses the workflow's OIDC token.
 - API key: App Store Connect > Users and Access > Integrations > Team Keys, create
   a key with at least the Developer role, download the `.p8` once, then
   `base64 -i AuthKey_XXXX.p8 | pbcopy`.
-- Website PAT: a fine-grained personal access token restricted to the single
-  repository `hazcod/blur.hazcod.com` with Repository permissions > Contents:
-  Read and write.
 
 Set each with `gh secret set NAME` (or in the repository settings).
 
-## Website
-
-`.github/workflows/website.yml` publishes `website/` to `hazcod/blur.hazcod.com`
-on pushes to `main` that touch `website/`. It force-pushes a single-commit
-history to that repository's `main` branch, so do not edit it by hand.
 
 ## Local dry run
 

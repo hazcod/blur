@@ -25,9 +25,21 @@ func TestMCPSocketPathFitsAFUnix(t *testing.T) {
 }
 
 func TestMCPSocketAddressIsUsableAndShort(t *testing.T) {
-	address := MCPSocketAddress(strings.Repeat("/x", 60))
-	if len(address) > 103 || !strings.HasSuffix(address, mcpSocketFileName) {
+	long := strings.Repeat("/x", 60)
+	address := MCPSocketAddress(long)
+	if !strings.HasSuffix(address, mcpSocketFileName) {
 		t.Fatalf("address %q", address)
+	}
+	if userTempDir() == "" {
+		// No per-user runtime directory on this host: the socket stays in the
+		// data directory, however long that is.
+		if address != filepath.Join(long, mcpSocketFileName) {
+			t.Fatalf("address %q, want data-directory fallback", address)
+		}
+		return
+	}
+	if len(address) > 103 {
+		t.Fatalf("address %q is %d bytes", address, len(address))
 	}
 }
 

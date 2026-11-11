@@ -10,4 +10,4 @@ capture.test
 coverage.out
 dist/
 research_notes/
-website/node_modules/
+vendor/

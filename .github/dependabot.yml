@@ -8,9 +8,9 @@ updates:
     commit-message:
       prefix: deps
     labels: [dependencies]
-    # Vendored dependencies: Dependabot runs `go mod vendor`, which overwrites
-    # the local patch documented in docs/vendor-patches.md. Re-apply the patch
-    # (see that file) before merging any goui update.
+    # github.com/golang-gui/goui and github.com/lpintes/walk are replaced by
+    # forks (see docs/dependency-forks.md); Dependabot cannot bump a replaced
+    # module, so those two are updated by hand until the upstream PRs merge.
   - package-ecosystem: github-actions
     directory: /
     schedule:

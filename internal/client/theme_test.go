@@ -91,7 +91,7 @@ func TestThemeSheetStylesNavigationAndButtons(t *testing.T) {
 			t.Errorf("dark=%v flat rest border = %v, want none", dark, width)
 		}
 		card := sheet.Resolve(style.Sel{Name: modern.Card})
-		if radius, _ := card.Radius(); radius != surfaceRadius {
+		if radius, _ := card.CornerRadius(); radius.TopLeft != surfaceRadius || radius.BottomRight != surfaceRadius {
 			t.Errorf("dark=%v card radius = %v", dark, radius)
 		}
 		if shadow, _ := card.Shadow(); shadow != (style.Shadow{}) {

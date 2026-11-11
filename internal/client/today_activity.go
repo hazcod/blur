@@ -388,7 +388,9 @@ func sortedBoundedSet(values map[string]struct{}, limit int) []string {
 }
 
 func sortedUnion(a, b []string, limit int) []string {
-	set := make(map[string]struct{}, len(a)+len(b))
+	// Bound the capacity hint: the inputs are caller-sized lists, and the result
+	// is cut to limit anyway, so a hint above that only wastes memory.
+	set := make(map[string]struct{}, min(len(a)+len(b), max(limit, 0)))
 	for _, value := range a {
 		set[value] = struct{}{}
 	}

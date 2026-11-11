@@ -11,9 +11,9 @@ version:
 	@echo $(VERSION)
 
 # Local dry run of the release pipeline: no signing, no publishing. GoReleaser
-# is intentionally not vendored; it is fetched on demand.
+# is fetched on demand.
 release-snapshot:
-	go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean --skip=sign,publish
+	go run github.com/goreleaser/goreleaser/v2@latest release --config .github/goreleaser.yaml --snapshot --clean --skip=sign,publish
 
 test:
 	go test ./...
@@ -62,7 +62,7 @@ cross-test-compile:
 		if [ "$$GOOS" = windows ]; then \
 			echo "Compiling Windows UI Automation API contract tests"; \
 			CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go test -c -o /dev/null ./internal/capture; \
-			CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go test -c -o /dev/null ./vendor/github.com/lpintes/walk/uia; \
+			CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go test -c -o /dev/null github.com/lpintes/walk/uia; \
 		fi; \
 		if [ "$$GOOS" = linux ]; then \
 			echo "Compiling Linux adapter tests for $$GOOS/$$GOARCH with cgo disabled"; \
@@ -71,7 +71,7 @@ cross-test-compile:
 	done
 
 no-cgo-audit:
-	go run ./tools/no-cgo-audit
+	go run ./cmd/no-cgo-audit
 
 PORTABLE_PACKAGE_DIR ?= dist/packages
 
@@ -135,7 +135,7 @@ MACOS_BINARY_ARM64 ?= $(MACOS_BINARY).arm64
 MACOS_BINARY_AMD64 ?= $(MACOS_BINARY).amd64
 MACOS_BUNDLE_ID ?= com.hazcod.blur
 MACOS_MINIMUM_SYSTEM_VERSION ?= 13.0
-MACOS_CODESIGN_IDENTITY ?= $(shell go run ./tools/macos-signing-identity -app "$(MACOS_APP)" 2>/dev/null)
+MACOS_CODESIGN_IDENTITY ?= $(shell go run ./cmd/macos-signing-identity -app "$(MACOS_APP)" 2>/dev/null)
 MACOS_HOST_PROVISIONING_PROFILE ?=
 MACOS_EXTENSION_PROVISIONING_PROFILE ?=
 BLUR_APP_GROUP_ID ?=
