@@ -11,7 +11,7 @@ require (
 	github.com/lpintes/walk v0.0.0-20261029133242-6a00370d773d
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	go.etcd.io/bbolt v1.5.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 )
 
 require (

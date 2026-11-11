@@ -9,7 +9,6 @@ package uia
 import (
 	"image"
 	"runtime"
-	"sync"
 
 	"golang.org/x/sys/windows"
 
@@ -21,9 +20,8 @@ import (
 // owns it at each call, so they are always current. The methods of a nil
 // *Element return an error.
 type Element struct {
-	a           *Automation
-	p           *win.IUIAutomationElement // used only on the thread of a
-	releaseOnce sync.Once
+	a *Automation
+	p *win.IUIAutomationElement // used only on the thread of a
 }
 
 // Release frees the element. Its methods return ErrReleased afterwards.
@@ -44,24 +42,6 @@ func (e *Element) Release() error {
 		runtime.SetFinalizer(e, nil)
 	}
 	return err
-}
-
-// ReleaseLater queues COM cleanup on the Automation worker and returns
-// immediately. It is suitable for cancellation paths where a provider call
-// may still be inside the worker's bounded transaction timeout.
-func (e *Element) ReleaseLater() {
-	if e == nil || e.a == nil {
-		return
-	}
-	e.releaseOnce.Do(func() {
-		e.a.releaseLater(func() {
-			if e.p != nil {
-				e.p.Release()
-				e.p = nil
-			}
-			runtime.SetFinalizer(e, nil)
-		})
-	})
 }
 
 // call runs f with the COM object of e on the thread of the Automation.
