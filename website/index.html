@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Blur: personal memory that does not hand an AI all your data</title>
+<meta name="description" content="Blur is an open-source, local-first personal memory app for macOS. It remembers what you worked on, stores it encrypted on your Mac, and a model only sees the few items a question needs.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#15161A">
+<link rel="canonical" href="https://blur.hazcod.com/">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><span class="dot" aria-hidden="true"></span>Blur</a>
+    <nav aria-label="Main">
+      <ul>
+        <li><a href="#how">How it works</a></li>
+        <li><a href="#privacy">Privacy</a></li>
+        <li><a href="#developers">For developers</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero" style="border-top:0;padding-top:clamp(2rem,6vw,5rem)">
+    <div class="wrap">
+      <div>
+        <h1 aria-label="Remember what you worked on.">
+          <span class="rot" aria-hidden="true">
+            <span>Remember what you worked on.</span>
+            <span>Remember what that PR changed.</span>
+            <span>Remember where you saw that error.</span>
+            <span>Remember what the client wanted.</span>
+            <span>Remember who said what, and where.</span>
+            <span>Remember which doc had the answer.</span>
+          </span>
+        </h1>
+        <p class="lede">Blur is an open-source personal memory app for macOS that keeps a searchable record of your day and answers questions about it.</p>
+        <p class="muted">The alternative to letting an AI read everything: your memory stays encrypted on your device, a local planner picks the few items a question needs, and a model only ever sees those.</p>
+        <div class="actions">
+          <a class="btn primary" href="https://github.com/hazcod/blur">View on GitHub</a>
+          <a class="btn" href="https://github.com/hazcod/blur/releases">Releases</a>
+        </div>
+        <ul class="platforms" aria-label="Platform status">
+          <li>
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="10" rx="1.5"/><path d="M3 19h18l-1.5-4h-15z"/></svg>
+            <span><strong>macOS</strong> <span class="muted">available now</span></span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="1.5"/><path d="M12 4.5v15M3.5 12h17"/></svg>
+            <span><strong>Windows</strong> <span class="muted">in progress</span></span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="12.5" rx="6" ry="8.5"/><ellipse cx="12" cy="14.5" rx="3.2" ry="5" fill="currentColor" fill-opacity=".22"/><path d="M10.6 9.4l1.4 1.3 1.4-1.3-1.4-.9z" fill="currentColor"/><path d="M7 20.5c-1.3.2-2.2.2-2.8-.4M17 20.5c1.3.2 2.2.2 2.8-.4"/></svg>
+            <span><strong>Linux</strong> <span class="muted">in progress</span></span>
+          </li>
+        </ul>
+      </div>
+
+      <figure class="stage" style="margin:0">
+        <div class="screen">
+        <div class="menubar" aria-hidden="true"><span class="mb-l"><b class="apple"><svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M16.4 12.7c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9-.7 0-1.8-.9-3-.8-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.8 3-.8s1.8.8 3 .8c1.3 0 2.1-1.2 2.8-2.3.9-1.3 1.3-2.6 1.3-2.7 0 0-2.5-1-2.5-3.7zM14.1 5.9c.6-.8 1.1-1.9.9-3-.9 0-2 .6-2.7 1.4-.6.7-1.1 1.8-1 2.9 1.1.1 2.1-.5 2.8-1.3z"/></svg></b><b>Finder</b><span>File</span><span>Edit</span><span>View</span><span>Go</span><span>Window</span><span>Help</span></span><span class="mb-r"><span>14:36</span><i></i></span></div>
+        <div class="win" aria-hidden="true"><div class="tb"></div></div>
+        <div class="dock" aria-hidden="true"><i></i><i></i><i class="on"></i><i></i><i></i></div>
+        <div class="panel" role="img" aria-label="Illustration of the Blur quick ask panel hanging from the notch on a Mac desktop. The question is what did we decide about the sync passphrase, and the answer cites two captured sources.">
+          <div class="ask" aria-hidden="true"><span>What did we decide about the sync passphrase?</span><span class="caret"></span></div>
+          <div class="answer" aria-hidden="true">
+            <p>You settled on a <mark>passphrase-protected sync folder</mark>, with the database itself never synced. Deletions propagate to your other Macs.</p>
+            <ul class="src">
+              <li><span>Sync design notes</span><span>Notes, 10:42</span></li>
+              <li><span>Pull request: sealed segments</span><span>Safari, 11:15</span></li>
+            </ul>
+          </div>
+          <div class="foot" aria-hidden="true"><span>Answered from your memory</span><span>Esc to close</span></div>
+        </div>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section id="not-an-ai" class="alt">
+    <div class="wrap">
+      <h2>Not an AI that reads everything</h2>
+      <p class="intro">Most memory tools send your history to a model and let it work things out. Blur is designed the other way round.</p>
+      <ul class="facts">
+        <li><strong>Nothing leaves your Mac unless you turn on a model.</strong> That model is a local Ollama model or an endpoint you configure.</li>
+        <li><strong>A local planner reads your question, not a model.</strong> It is deterministic. Time questions and "what did you capture from WhatsApp" are answered with no model at all.</li>
+        <li><strong>A model only gets a handful of items.</strong> They are selected and size-limited, each with its time and app, never your whole memory. Blur shows how many items were sent for each answer.</li>
+        <li><strong>Recaps start from summaries.</strong> They are built from short hourly summaries Blur already wrote, so a recap of today is a few kilobytes, not hundreds of captures.</li>
+        <li><strong>You stay in control.</strong> You decide what is captured with allowed and blocked apps and sites and timed pauses, how long it is kept, and you can delete all of it.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <h2>How it works</h2>
+      <p class="intro">Blur reads, stores and answers in three steps, all on your Mac.</p>
+      <ol class="steps">
+        <li>
+          <h3>Capture</h3>
+          <p>Blur reads text from the app you are focused on through macOS Accessibility. It never takes screenshots.</p>
+        </li>
+        <li>
+          <h3>Encrypted store</h3>
+          <p>Captured text goes into a local encrypted database. The key lives on your device.</p>
+        </li>
+        <li>
+          <h3>Ask or recap</h3>
+          <p>The LLM is only used when necessary, and it only sees the few items a local planner picked for your question. Answers cite what they came from.</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="wrap">
+      <h2>What you get</h2>
+      <div class="grid">
+        <div><h3>Today</h3><p>A recap of your day with next steps and notes.</p></div>
+        <div><h3>Ask</h3><p>Questions answered from your memory. General questions never send captured data.</p></div>
+        <div><h3>Search</h3><p>Find anything you saw or wrote, by exact words.</p></div>
+        <div><h3>Library</h3><p>Facts about people and projects that you review and keep.</p></div>
+        <div><h3>Time</h3><p>Where your time went, per app and per range.</p></div>
+        <div><h3>Quick ask</h3><p>A panel under the notch. Open it by hovering the notch, from a link in the window, or with a keyboard shortcut you choose.</p></div>
+        <div><h3>Safari capture</h3><p>Optional page capture through a Safari extension.</p></div>
+        <div><h3>Sync</h3><p>Between your own Macs, through any synced folder such as iCloud Drive or Dropbox.</p></div>
+        <div><h3>MCP</h3><p>Let Claude and other MCP clients read your memory, if you set it up.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="privacy" class="privacy">
+    <div class="wrap">
+      <div>
+        <h2>Private by default</h2>
+        <p class="muted">Blur is built so that you decide what is captured, what is kept and what leaves your Mac.</p>
+      </div>
+      <ul class="facts">
+        <li><strong>Stored locally and encrypted.</strong> The database key is in your macOS Keychain, and the app runs in the macOS App Sandbox.</li>
+        <li><strong>You grant access once.</strong> Capture uses macOS Accessibility. Blur never records the screen.</li>
+        <li><strong>You choose what it sees.</strong> Pick the apps and sites it may capture and the ones it must never capture. Pause any time, including for 15 minutes, 1 hour or until tomorrow morning.</li>
+        <li><strong>AI is optional and off by default.</strong> Use a local Ollama model or an OpenAI-compatible endpoint you configure. With a model on, you get hourly recaps and a daily recap. Without one, you get a model-free "This hour so far" draft.</li>
+        <li><strong>Sync without a shared database.</strong> Blur writes encrypted, append-only segments, protected by a passphrase, to a folder you pick. The database is never synced, and deletions propagate.</li>
+        <li><strong>Retention is yours.</strong> Keep 30, 90 or 180 days, 1 year, or turn it off. "Delete all memory" removes everything.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="developers" class="dev">
+    <div class="wrap">
+      <div>
+        <h2>For developers</h2>
+        <p class="muted">Blur is written in Go and the source is open on GitHub. Windows and Linux capture exist in the codebase but are not finished. macOS is the supported target.</p>
+        <div class="actions" style="margin-top:1.5rem">
+          <a class="btn primary" href="https://github.com/hazcod/blur">View on GitHub</a>
+        </div>
+      </div>
+      <div>
+        <h3>Read your memory from MCP clients</h3>
+        <p class="muted">If you set it up, Claude and other MCP clients can read your memory through a local MCP server.</p>
+        <pre><code>blur mcp</code></pre>
+        <h3>Where to look</h3>
+        <ul class="paths">
+          <li><code>make macos-app</code> builds the macOS app bundle. It uses the GoUI CLI to package the app and signs it with the App Sandbox entitlements by default.</li>
+          <li><code>platform/macos</code> holds the entitlements, the Safari extension project and its signing inputs.</li>
+          <li><code>cmd/blur-package</code> packages the Windows and Linux builds as archives.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Blur is open source. This site sets no cookies and runs no analytics.</p>
+    <ul>
+      <li><a href="https://github.com/hazcod/blur">GitHub</a></li>
+      <li><a href="https://github.com/hazcod/blur/releases">Releases</a></li>
+    </ul>
+  </div>
+</footer>
+</body>
+</html>
