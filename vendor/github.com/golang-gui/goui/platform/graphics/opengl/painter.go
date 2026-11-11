@@ -17,7 +17,6 @@ import (
 	"github.com/golang-gui/goui/platform/graphics/internal/textbitmap"
 	"github.com/golang-gui/goui/platform/graphics/utils"
 	"github.com/golang-gui/goui/platform/typography"
-
 	"github.com/golang-gui/nanovgo"
 	"github.com/golang-gui/nanovgo/gl"
 )
@@ -111,6 +110,12 @@ func NewPainter(win NativeWindow) (_ graphics.Painter, err error) {
 
 	p.images = make(map[*imageResource]struct{})
 	p.textImages = textbitmap.NewImageCache(textbitmap.CacheCapacity, func(img graphics.Image) { img.Destroy() })
+	// Construction does not leave a native target borrowed or a context bound.
+	// In particular a mobile target may be revoked before the first frame.
+	if err = p.ctx.ClearCurrent(); err != nil {
+		p.Destroy()
+		return nil, fmt.Errorf("clear context after initialization: %w", err)
+	}
 	return p, nil
 }
 
@@ -359,7 +364,7 @@ func (p *Painter) Clear(color graphics.Color) {
 	gl.Clear(gl.COLOR_BUFFER_BIT)
 }
 
-func (p *Painter) DrawBoxShadow(rect graphics.Rectangle, radius float32, shadow graphics.BoxShadow) {
+func (p *Painter) DrawBoxShadow(rect graphics.Rectangle, radius geometry.CornerRadius, shadow graphics.BoxShadow) {
 	if p.frameSkipped || !p.surfaceAvailable() {
 		return
 	}
@@ -377,14 +382,18 @@ func (p *Painter) DrawBoxShadow(rect graphics.Rectangle, radius float32, shadow 
 	p.vg.BeginPath()
 	if shape.BlurRadius <= 0 {
 		rect := pixelsnap.Rect(shape.Rect, p.transform, p.scale)
-		p.vg.RoundedRect(rect.X, rect.Y, rect.Width, rect.Height, shape.Radius)
+		if shape.Radius.Uniform() {
+			p.vg.RoundedRect(rect.X, rect.Y, rect.Width, rect.Height, shape.Radius.TopLeft)
+		} else {
+			p.doPath(utils.RoundRectPath(rect, shape.Radius))
+		}
 		p.vg.SetFillColor(color)
 	} else {
 		bounds := shape.Bounds()
 		p.vg.Rect(bounds.X, bounds.Y, bounds.Width, bounds.Height)
-		p.vg.SetFillPaint(nanovgo.BoxShadow(
+		p.vg.SetFillPaint(nanovgo.BoxShadowVarying(
 			shape.Rect.X, shape.Rect.Y, shape.Rect.Width, shape.Rect.Height,
-			shape.Radius, shape.BlurRadius, color,
+			shape.Radius.TopLeft, shape.Radius.TopRight, shape.Radius.BottomRight, shape.Radius.BottomLeft, shape.BlurRadius, color,
 		))
 	}
 	p.vg.Fill()
@@ -658,6 +667,7 @@ func (p *Painter) doPath(path graphics.Path) (closed bool) {
 	path.Range(func(op graphics.PathOperation, args []float32) (stop bool) {
 		switch op {
 		case graphics.PathMoveTo:
+			closed = false
 			p.vg.MoveTo(args[0], args[1])
 			x, y = args[0], args[1]
 
@@ -676,8 +686,10 @@ func (p *Painter) doPath(path graphics.Path) (closed bool) {
 		case graphics.PathClose:
 			closed = true
 			p.vg.ClosePath()
+		case graphics.PathHole:
+			p.vg.PathWinding(nanovgo.Hole)
 		}
-		return closed
+		return false
 	})
 	return
 }

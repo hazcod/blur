@@ -3,15 +3,15 @@
 package nanovgo
 
 import (
+	"fmt"
 	"log"
 	"unsafe"
 )
 
 type Float float32
 
-var shaderHeader string = `
-#version 100
-#define NANOVG_GL2 1
+var shaderHeader string = `#version 300 es
+#define NANOVG_GL3 1
 #define UNIFORMARRAY_SIZE 11
 `
 
@@ -26,6 +26,6 @@ func castFloat32ToByte(vertexes []float32) []byte {
 	return b
 }
 
-func dumpLog(values ...interface{}) {
-	log.Println(values...)
+func dumpLog(format string, args ...interface{}) {
+	log.Output(2, fmt.Sprintf(format, args...))
 }

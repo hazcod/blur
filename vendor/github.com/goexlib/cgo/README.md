@@ -169,6 +169,10 @@ AAPCS64 incl. Apple's stack packing, and the Microsoft x64 convention).
 ## Platform-Specific Notes
 
 For Go memory passed to native code, see the [pointer lifetime contract](doc/PointerLifetime.md).
+The [ARM64 backend](doc/ARM64.md) owns typed calls and callbacks on Linux,
+Android, macOS and iOS, using an unmodified official purego dependency. Mobile
+application packaging and precompiled runtime support remain the host tool's
+responsibility; ordinary library use does not require a private purego fork.
 Raw calls require pointer-to-uintptr conversions directly in the call arguments;
 typed calls should receive pointers as pointers. Memory retained after return
 needs an explicit owner and lifetime.

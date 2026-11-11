@@ -12,6 +12,8 @@ const (
 	glnvgLocVIEWSIZE = iota
 	glnvgLocTEX
 	glnvgLocFRAG
+	glnvgLocPATHEDGES
+	glnvgLocPATHPARAMS
 	glnvgMaxLOCS
 )
 
@@ -44,10 +46,20 @@ type glShader struct {
 	tcoordAttrib gl.Attrib
 }
 
-func (s *glShader) createShader(name, header, opts, vShader, fShader string) error {
+func (s *glShader) createShader(name, header, opts, vShader, fShader string) (err error) {
 	program := gl.CreateProgram()
 
 	vertexShader := gl.CreateShader(gl.VERTEX_SHADER)
+	var fragmentShader gl.Shader
+	defer func() {
+		if err != nil {
+			gl.DeleteProgram(program)
+			gl.DeleteShader(vertexShader)
+			if fragmentShader.Valid() {
+				gl.DeleteShader(fragmentShader)
+			}
+		}
+	}()
 	gl.ShaderSource(vertexShader, strings.Join([]string{header, opts, vShader}, "\n"))
 	gl.CompileShader(vertexShader)
 	status := gl.Enum(gl.GetShaderi(vertexShader, gl.COMPILE_STATUS))
@@ -55,12 +67,12 @@ func (s *glShader) createShader(name, header, opts, vShader, fShader string) err
 		return dumpShaderError(vertexShader, name, "vert")
 	}
 
-	fragmentShader := gl.CreateShader(gl.FRAGMENT_SHADER)
+	fragmentShader = gl.CreateShader(gl.FRAGMENT_SHADER)
 	gl.ShaderSource(fragmentShader, strings.Join([]string{header, opts, fShader}, "\n"))
 	gl.CompileShader(fragmentShader)
 	status = gl.Enum(gl.GetShaderi(fragmentShader, gl.COMPILE_STATUS))
 	if status != gl.TRUE {
-		return dumpShaderError(fragmentShader, name, "vert")
+		return dumpShaderError(fragmentShader, name, "frag")
 	}
 
 	gl.AttachShader(program, vertexShader)
@@ -98,10 +110,15 @@ func (s *glShader) getUniforms() {
 	s.locations[glnvgLocVIEWSIZE] = gl.GetUniformLocation(s.program, "viewSize")
 	s.locations[glnvgLocTEX] = gl.GetUniformLocation(s.program, "tex")
 	s.locations[glnvgLocFRAG] = gl.GetUniformLocation(s.program, "frag")
+	s.locations[glnvgLocPATHEDGES] = gl.GetUniformLocation(s.program, "pathEdges")
+	s.locations[glnvgLocPATHPARAMS] = gl.GetUniformLocation(s.program, "pathParams")
 }
 
 const (
 	glnvgGLUniformArraySize = 11
+	// Keep in sync with the shader's pathEdges array. GL 3.3 / ES 3.0
+	// guarantee sufficient fragment uniforms without allocating a texture.
+	maxAreaCoverageEdges = 128
 )
 
 const (
@@ -110,18 +127,20 @@ const (
 )
 
 type glContext struct {
-	shader       glShader
-	view         [2]float32
-	textures     []*glTexture
-	textureID    int
-	vertexBuffer gl.Buffer
-	vertexArray  gl.Uint
-	defaultTex   gl.Texture
-	flags        CreateFlags
-	calls        []glCall
-	paths        []glPath
-	vertexes     []float32
-	uniforms     []glFragUniforms
+	shader         glShader
+	view           [2]float32
+	textures       []*glTexture
+	textureID      int
+	vertexBuffer   gl.Buffer
+	vertexArray    gl.Uint
+	defaultTex     gl.Texture
+	flags          CreateFlags
+	calls          []glCall
+	paths          []glPath
+	vertexes       []float32
+	uniforms       []glFragUniforms
+	coverageEdges  []float32
+	coverageActive bool
 
 	stencilMask     uint32
 	stencilFunc     gl.Enum
@@ -261,6 +280,7 @@ func (c *glContext) convertPaint(frag *glFragUniforms, paint *Paint, scissor *nv
 	} else {
 		if paint.kind == paintBoxShadow {
 			frag.setType(nsvgShaderBOXSHADOW)
+			frag.setShadowCorners(paint.shadowCorners)
 		} else {
 			frag.setType(nsvgShaderFILLGRAD)
 		}
@@ -273,6 +293,10 @@ func (c *glContext) convertPaint(frag *glFragUniforms, paint *Paint, scissor *nv
 }
 
 func (c *glContext) setUniforms(uniformOffset, image int) {
+	if c.coverageActive {
+		gl.Uniform2fv(c.shader.locations[glnvgLocPATHPARAMS], []float32{0, 1})
+		c.coverageActive = false
+	}
 	frag := c.uniforms[uniformOffset]
 	gl.Uniform4fv(c.shader.locations[glnvgLocFRAG], frag[:])
 
@@ -307,24 +331,43 @@ func (c *glContext) fill(call *glCall) {
 	}
 	gl.Enable(gl.CULL_FACE)
 
-	// Draw anti-aliased pixels
+	// Paint the covered interior once, retaining its stencil for the fringe.
 	gl.ColorMask(true, true, true, true)
 	c.setUniforms(call.uniformOffset+1, call.image)
+	if call.coverageCount > 0 {
+		edges := c.coverageEdges[call.coverageOffset : call.coverageOffset+4*call.coverageCount]
+		gl.Uniform4fv(c.shader.locations[glnvgLocPATHEDGES], edges)
+		gl.Uniform2fv(c.shader.locations[glnvgLocPATHPARAMS], []float32{float32(call.coverageCount), call.coveragePixel})
+		c.coverageActive = true
+	}
+	c.setStencilFunc(gl.NOTEQUAL, 0x00, 0xff)
+	if c.flags&AntiAlias == 0 {
+		gl.StencilOp(gl.ZERO, gl.ZERO, gl.ZERO)
+		gl.DrawArrays(gl.TRIANGLES, call.triangleOffset, call.triangleCount)
+		gl.Disable(gl.STENCIL_TEST)
+		return
+	}
+	gl.StencilOp(gl.KEEP, gl.KEEP, gl.KEEP)
+	gl.DrawArrays(gl.TRIANGLES, call.triangleOffset, call.triangleCount)
 
 	if c.flags&AntiAlias != 0 {
 		c.setStencilFunc(gl.EQUAL, 0x00, 0xff)
-		gl.StencilOp(gl.KEEP, gl.KEEP, gl.KEEP)
-		// Draw fringes
+		// Fringes can overlap at short arcs, concave joins and thin holes.
+		// Consume each uncovered pixel after its first contribution, just as
+		// stencil strokes prevent repeated alpha composition at joins.
+		gl.StencilOp(gl.KEEP, gl.KEEP, gl.INCR)
 		for i := call.pathOffset; i < pathSentinel; i++ {
 			path := &c.paths[i]
 			gl.DrawArrays(gl.TRIANGLE_STRIP, path.strokeOffset, path.strokeCount)
 		}
 	}
 
-	// Draw fill
-	c.setStencilFunc(gl.NOTEQUAL, 0x00, 0xff)
+	// Clear both the original winding stencil and the consumed fringe pixels.
+	gl.ColorMask(false, false, false, false)
+	c.setStencilFunc(gl.ALWAYS, 0x00, 0xff)
 	gl.StencilOp(gl.ZERO, gl.ZERO, gl.ZERO)
 	gl.DrawArrays(gl.TRIANGLES, call.triangleOffset, call.triangleCount)
+	gl.ColorMask(true, true, true, true)
 
 	gl.Disable(gl.STENCIL_TEST)
 }
@@ -491,7 +534,7 @@ func (p *glParams) renderCreateTexture(texType nvgTextureType, w, h int, flags I
 		gl.TexImage2D(gl.TEXTURE_2D, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data)
 	} else {
 		data = prepareTextureBuffer(data, w, h, 1)
-		gl.TexImage2D(gl.TEXTURE_2D, 0, w, h, gl.RED, gl.UNSIGNED_BYTE, data)
+		gl.TexImage2DFormat(gl.TEXTURE_2D, 0, gl.R8, w, h, gl.RED, gl.UNSIGNED_BYTE, data)
 	}
 
 	if (flags & ImageGenerateMipmaps) != 0 {
@@ -592,6 +635,7 @@ func (p *glParams) renderCancel() {
 	c.paths = c.paths[:0]
 	c.calls = c.calls[:0]
 	c.uniforms = c.uniforms[:0]
+	c.coverageEdges = c.coverageEdges[:0]
 }
 
 func (p *glParams) renderFlush() {
@@ -660,6 +704,80 @@ func (p *glParams) renderFlush() {
 	c.paths = c.paths[:0]
 	c.calls = c.calls[:0]
 	c.uniforms = c.uniforms[:0]
+	c.coverageEdges = c.coverageEdges[:0]
+}
+
+// Sharp convex turns can make the half-pixel inset overlap itself. The usual
+// fringe cannot represent the coverage of the resulting narrow tip. Use area
+// coverage for bounded path data; complex paths retain the standard renderer.
+func needsAreaCoverage(paths []nvgPath) bool {
+	count, sharp := 0, false
+	for _, path := range paths {
+		if len(path.points) < 3 || path.winding != Solid {
+			return false
+		}
+		count += len(path.points)
+		if count > maxAreaCoverageEdges {
+			return false
+		}
+		for _, p := range path.points {
+			if p.flags&(nvgPtLEFT|nvgPtBEVEL) == nvgPtLEFT|nvgPtBEVEL {
+				sharp = true
+			}
+		}
+	}
+	if !sharp {
+		return false
+	}
+	// An integral of winding equals covered area for simple, disjoint solid
+	// contours. Keep intersections, touching contours and nested windings on
+	// the standard stencil renderer rather than changing their fill semantics.
+	for pi, path := range paths {
+		for ei, a := range path.points {
+			b := path.points[(ei+1)%len(path.points)]
+			for pj := 0; pj <= pi; pj++ {
+				other := paths[pj]
+				for ej, c := range other.points {
+					if pi == pj && (ej >= ei || ej+1 == ei || ei == len(path.points)-1 && ej == 0) {
+						continue
+					}
+					if coverageEdgesTouch(a, b, c, other.points[(ej+1)%len(other.points)]) {
+						return false
+					}
+				}
+			}
+		}
+		for pj := 0; pj < pi; pj++ {
+			if coverageContains(path.points, paths[pj].points[0]) || coverageContains(paths[pj].points, path.points[0]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func coverageEdgesTouch(a, b, c, d nvgPoint) bool {
+	if maxF(minF(a.x, b.x), minF(c.x, d.x)) > minF(maxF(a.x, b.x), maxF(c.x, d.x)) ||
+		maxF(minF(a.y, b.y), minF(c.y, d.y)) > minF(maxF(a.y, b.y), maxF(c.y, d.y)) {
+		return false
+	}
+	cross := func(a, b, c nvgPoint) float64 {
+		return float64(b.x-a.x)*float64(c.y-a.y) - float64(b.y-a.y)*float64(c.x-a.x)
+	}
+	return cross(a, b, c)*cross(a, b, d) <= 0 && cross(c, d, a)*cross(c, d, b) <= 0
+}
+
+func coverageContains(polygon []nvgPoint, point nvgPoint) bool {
+	inside := false
+	previous := polygon[len(polygon)-1]
+	for _, current := range polygon {
+		if (previous.y > point.y) != (current.y > point.y) &&
+			point.x < (current.x-previous.x)*(point.y-previous.y)/(current.y-previous.y)+previous.x {
+			inside = !inside
+		}
+		previous = current
+	}
+	return inside
 }
 
 func (p *glParams) renderFill(paint *Paint, operation CompositeOperation, scissor *nvgScissor, fringe float32, bounds [4]float32, paths []nvgPath) {
@@ -673,10 +791,27 @@ func (p *glParams) renderFill(paint *Paint, operation CompositeOperation, scisso
 	call := &c.calls[len(c.calls)-1]
 	glPaths, call.pathOffset = c.allocPath(call.pathCount)
 
-	if len(paths) == 1 && paths[0].convex {
+	// Curved translucent outlines can have overlapping AA triangles when a
+	// radius is smaller than the fringe. Use the stencil fill in that case.
+	translucentCurve := len(paths) == 1 && paths[0].count > 4 && c.flags&AntiAlias != 0 &&
+		(paint.innerColor.A < 1 || paint.outerColor.A < 1 || paint.image != 0 || operation != SourceOver)
+	if len(paths) == 1 && paths[0].convex && !translucentCurve {
 		call.callType = glnvgCONVEXFILL
 	} else {
 		call.callType = glnvgFILL
+	}
+	if c.flags&AntiAlias != 0 && strings.Contains(shaderHeader, "NANOVG_GL3") && needsAreaCoverage(paths) {
+		call.callType = glnvgFILL
+		call.coverageOffset = len(c.coverageEdges)
+		call.coveragePixel = fringe
+		for _, path := range paths {
+			previous := path.points[len(path.points)-1]
+			for _, point := range path.points {
+				c.coverageEdges = append(c.coverageEdges, previous.x, previous.y, point.x, point.y)
+				previous = point
+				call.coverageCount++
+			}
+		}
 	}
 
 	// Allocate vertices for all the paths
@@ -909,6 +1044,12 @@ func (p *glParams) renderDelete() {
 	if c.vertexBuffer.Valid() {
 		gl.DeleteBuffer(c.vertexBuffer)
 	}
+	if c.vertexArray != 0 {
+		gl.DeleteVertexArray(c.vertexArray)
+	}
+	if c.defaultTex.Valid() {
+		gl.DeleteTexture(c.defaultTex)
+	}
 	for _, texture := range c.textures {
 		if texture.tex.Valid() && (texture.flags&ImageNoDelete) == 0 {
 			gl.DeleteTexture(texture.tex)
@@ -1027,6 +1168,46 @@ var fillFragmentShader = `
        #define type int(frag[10].w)
 #endif
 
+#ifdef NANOVG_GL3
+// GL 3.3 and ES 3.0 guarantee room for these 128 vec4 edges plus paint uniforms.
+uniform vec4 pathEdges[128];
+uniform vec2 pathParams; // edge count, logical pixel width
+
+// Signed area contributed by an oriented edge clipped to a unit pixel. Summing
+// these integrals gives polygon coverage, including holes and subpixel tips.
+float edgeArea(vec2 a, vec2 b) {
+       if (a.y == b.y) return 0.0;
+       float direction = sign(b.y-a.y);
+       if (a.y > b.y) { vec2 tmp = a; a = b; b = tmp; }
+       float lo = max(a.y, 0.0), hi = min(b.y, 1.0);
+       if (hi <= lo) return 0.0;
+       float slope = (b.x-a.x)/(b.y-a.y);
+       float x0 = a.x+(lo-a.y)*slope;
+       float x1 = a.x+(hi-a.y)*slope;
+       float xmin = min(x0,x1), xmax = max(x0,x1);
+       float average;
+       if (xmin >= 1.0) average = 1.0;
+       else if (xmax <= 0.0) average = 0.0;
+       else if (xmax-xmin < 0.00001) average = clamp((x0+x1)*0.5,0.0,1.0);
+       else {
+               float a0 = clamp(xmin,0.0,1.0), a1 = clamp(xmax,0.0,1.0);
+               average = (0.5*(a1*a1-a0*a0)+max(xmax-1.0,0.0))/(xmax-xmin);
+       }
+       return direction*(hi-lo)*average;
+}
+
+float pathCoverage() {
+       vec2 origin = fpos/pathParams.y-vec2(0.5);
+       float area = 0.0;
+       for (int i = 0; i < 128; i++) {
+               if (i >= int(pathParams.x)) break;
+               vec4 edge = pathEdges[i]/pathParams.y;
+               area += edgeArea(edge.xy-origin,edge.zw-origin);
+       }
+       return clamp(abs(area),0.0,1.0);
+}
+#endif
+
 float sdroundrect(vec2 pt, vec2 ext, float rad) {
        vec2 ext2 = ext - vec2(rad,rad);
        vec2 d = abs(pt) - ext2;
@@ -1055,15 +1236,20 @@ float gaussianDensity(float distance, float sigma) {
 }
 
 float roundedCornerCutout(vec2 pt, vec2 ext, float rad, float sigma, float sx, float sy) {
+       if (rad <= 0.0) return 0.0;
        vec2 corner = vec2(sx*(ext.x-rad), sy*(ext.y-rad));
        vec2 outer = vec2(sx*ext.x, sy*ext.y);
        vec2 lo = min(corner, outer) - vec2(3.0*sigma);
        vec2 hi = max(corner, outer) + vec2(3.0*sigma);
        if (pt.x < lo.x || pt.x > hi.x || pt.y < lo.y || pt.y > hi.y) return 0.0;
-       float stepSize = rad/16.0;
+       float center = sx*(pt.x-corner.x);
+       float u0 = max(0.0, center-3.0*sigma);
+       float u1 = min(rad, center+3.0*sigma);
+       if (u1 <= u0) return 0.0;
+       float stepSize = (u1-u0)/16.0;
        float sum = 0.0;
        for (int i = 0; i < 16; i++) {
-               float u = (float(i)+0.5)*stepSize;
+               float u = u0+(float(i)+0.5)*stepSize;
                float x = corner.x + sx*u;
                float arc = sqrt(max(rad*rad-u*u, 0.0));
                float y0 = corner.y + sy*arc;
@@ -1074,15 +1260,13 @@ float roundedCornerCutout(vec2 pt, vec2 ext, float rad, float sigma, float sx, f
        return sum*stepSize;
 }
 
-float roundedBoxGaussian(vec2 pt, vec2 ext, float rad, float sigma) {
+float roundedBoxGaussian(vec2 pt, vec2 ext, vec4 radii, float sigma) {
        float coverage = gaussianRange(-ext.x, ext.x, pt.x, sigma) *
                         gaussianRange(-ext.y, ext.y, pt.y, sigma);
-       if (rad > 0.0) {
-               coverage -= roundedCornerCutout(pt, ext, rad, sigma, -1.0, -1.0);
-               coverage -= roundedCornerCutout(pt, ext, rad, sigma,  1.0, -1.0);
-               coverage -= roundedCornerCutout(pt, ext, rad, sigma, -1.0,  1.0);
-               coverage -= roundedCornerCutout(pt, ext, rad, sigma,  1.0,  1.0);
-       }
+       coverage -= roundedCornerCutout(pt, ext, radii.x, sigma, -1.0, -1.0);
+       coverage -= roundedCornerCutout(pt, ext, radii.y, sigma,  1.0, -1.0);
+       coverage -= roundedCornerCutout(pt, ext, radii.z, sigma,  1.0,  1.0);
+       coverage -= roundedCornerCutout(pt, ext, radii.w, sigma, -1.0,  1.0);
        return clamp(coverage, 0.0, 1.0);
 }
 
@@ -1106,6 +1290,9 @@ void main(void) {
        float strokeAlpha = strokeMask();
 #else
        float strokeAlpha = 1.0;
+#endif
+#ifdef NANOVG_GL3
+       if (pathParams.x > 0.0) strokeAlpha = pathCoverage();
 #endif
        if (type == 0) {                        // Gradient
                // Calculate gradient color using box gradient
@@ -1144,7 +1331,7 @@ void main(void) {
                result = color * innerCol;
        } else if (type == 4) {         // Gaussian rounded-box shadow
                vec2 pt = (paintMat * vec3(fpos,1.0)).xy;
-               float coverage = roundedBoxGaussian(pt, extent, radius, feather);
+               float coverage = roundedBoxGaussian(pt, extent, outerCol, feather);
                result = innerCol * coverage * strokeAlpha * scissor;
        }
 #ifdef EDGE_AA

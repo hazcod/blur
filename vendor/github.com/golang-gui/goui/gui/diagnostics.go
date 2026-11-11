@@ -1,7 +1,9 @@
 package gui
 
 import (
+	"context"
 	"fmt"
+	"runtime/trace"
 	"sort"
 	"time"
 	"weak"
@@ -14,6 +16,49 @@ const (
 	diagnosticRoots   = 64
 	diagnosticWidgets = 4096
 )
+
+// frameTrace belongs to one accepted root frame, independently of Capture.
+// Sequential phases close before the next starts; layout uses its own scope.
+type frameTrace struct {
+	context context.Context
+	task    *trace.Task
+	phase   *trace.Region
+}
+
+func (b *rootBase) beginTraceFrame() bool {
+	if !trace.IsEnabled() {
+		return false
+	}
+	ctx, task := trace.NewTask(context.Background(), "goui.frame")
+	b.frameTrace = &frameTrace{context: ctx, task: task}
+	trace.Logf(ctx, "goui.root", "%p", b)
+	b.traceFramePhase("goui.callbacks")
+	return true
+}
+
+func (b *rootBase) traceFramePhase(name string) {
+	if f := b.frameTrace; f != nil {
+		f.nextPhase(name)
+	}
+}
+
+func (f *frameTrace) nextPhase(name string) {
+	if f.phase != nil {
+		f.phase.End()
+		f.phase = nil
+	}
+	if name != "" {
+		f.phase = trace.StartRegion(f.context, name)
+	}
+}
+
+func (b *rootBase) endTraceFrame() {
+	b.traceFramePhase("")
+	if f := b.frameTrace; f != nil {
+		b.frameTrace = nil
+		f.task.End()
+	}
+}
 
 // diagnosticCollector is the GUI's private weak-reference adapter. Control,
 // history and public reporting live outside gui; this adapter knows private GUI
@@ -135,6 +180,28 @@ func (d *diagnosticCollector) rootMetadata(b *rootBase, r *diagnostic.RootRecord
 	}
 }
 
+// ReadRoot uses the same private identity as recording. HUD queries do not walk
+// widget trees, allocate snapshots or create missing diagnostic records.
+func (d *diagnosticCollector) ReadRoot(target any, now time.Time) (diagnostic.RootSample, bool) {
+	owner, ok := target.(interface{ rootState() *rootBase })
+	if !ok {
+		return diagnostic.RootSample{}, false
+	}
+	b := owner.rootState()
+	if b == nil || b.app != d.app {
+		return diagnostic.RootSample{}, false
+	}
+	r := d.roots[weak.Make(b)]
+	if r == nil {
+		return diagnostic.RootSample{}, false
+	}
+	// Live metadata is unnecessary here: the overlay only needs the backend,
+	// completion intervals and last completed frame.
+	return diagnostic.RootSample{
+		Root: r.Snapshot(now, b.frameDestroyed, b.frameSuspended), Frame: r.LastFrame(),
+	}, true
+}
+
 func (d *diagnosticCollector) Snapshot(now time.Time) diagnostic.GUIData {
 	out := diagnostic.GUIData{DroppedRoots: d.droppedRoots, DroppedWidgets: d.droppedWidgets}
 	pruneRoots := len(d.roots) == diagnosticRoots
@@ -190,17 +257,25 @@ func (d *diagnosticCollector) Snapshot(now time.Time) diagnostic.GUIData {
 type layoutObservation struct {
 	frame   *diagnostic.FrameRecord
 	started time.Time
+	region  *trace.Region
 }
 
 func (b *rootBase) observeLayout() layoutObservation {
+	var observation layoutObservation
 	if f := b.frameCapture; f != nil {
-		return layoutObservation{frame: f, started: time.Now()}
+		observation.frame, observation.started = f, time.Now()
 	}
-	return layoutObservation{}
+	if f := b.frameTrace; f != nil {
+		observation.region = trace.StartRegion(f.context, "goui.layout")
+	}
+	return observation
 }
 
 func (s layoutObservation) end() {
 	if s.frame != nil {
 		s.frame.Layout += time.Since(s.started)
+	}
+	if s.region != nil {
+		s.region.End()
 	}
 }

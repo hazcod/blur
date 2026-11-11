@@ -10,6 +10,25 @@ API Reference
 
 See `GoDoc <https://godoc.org/github.com/shibukawa/nanovgo>`_
 
+Sharp filled tips
+-----------------
+
+The GL 3.3 / ES 3.0 renderer uses polygon pixel-area coverage for sharp convex
+turns where the usual half-pixel inset and feather can overlap. This reuses the
+existing stencil passes and paint shader; it does not allocate a bitmap, texture
+or offscreen target. Gradients, images, scissoring and compositing use the same
+coverage as solid colors. Ordinary paths keep the existing rendering path.
+
+This correction is limited to simple, disjoint solid contours with at most 128
+flattened edges, fitting the guaranteed fragment-uniform budget. Intersections,
+touching or nested contours, holes, larger paths and the legacy WebGL shader keep
+the original stencil/fringe algorithm. Area is calculated from the flattened
+polygon, so curve approximation still depends on the normal tessellation tolerance.
+It is not a new promise of exact coverage for arbitrary winding arrangements.
+
+The underlying inset limitation is described in
+`NanoVG issue 415 <https://github.com/memononen/nanovg/issues/415>`_.
+
 Porting Memo
 --------------
 

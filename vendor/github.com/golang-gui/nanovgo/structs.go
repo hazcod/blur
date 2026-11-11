@@ -41,9 +41,12 @@ func (vtx *nvgVertex) set(x, y, u, v float32) {
 }
 
 type nvgPath struct {
-	first   int
-	count   int
-	closed  bool
+	first  int
+	count  int
+	closed bool
+	// Borrowed until renderFill records its draw command; queued commands copy
+	// any coordinates they need before the path cache can be reused.
+	points  []nvgPoint
 	nBevel  int
 	fills   []nvgVertex
 	strokes []nvgVertex

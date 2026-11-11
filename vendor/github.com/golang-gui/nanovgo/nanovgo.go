@@ -1387,7 +1387,10 @@ func createInternal(params nvgParams) (*Context, error) {
 	context.Save()
 	context.Reset()
 	context.setDevicePixelRatio(1.0)
-	context.params.renderCreate()
+	if err := context.params.renderCreate(); err != nil {
+		context.params.renderDelete()
+		return nil, err
+	}
 
 	context.fs = fontstashmini.New(nvgInitFontImageSize, nvgInitFontImageSize)
 
@@ -1519,6 +1522,7 @@ func (c *Context) flattenPaths() {
 				p1 = &points[p1Index]
 			}
 		}
+		path.points = points[:path.count]
 	}
 }
 

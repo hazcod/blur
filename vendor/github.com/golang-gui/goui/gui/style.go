@@ -5,29 +5,32 @@ import (
 
 	"github.com/golang-gui/goui/core/geometry"
 	"github.com/golang-gui/goui/platform/graphics"
+	"github.com/golang-gui/goui/platform/graphics/utils"
 	"github.com/golang-gui/goui/platform/typography"
 	"github.com/golang-gui/goui/style"
 	"github.com/golang-gui/goui/theme/basic"
 )
 
 const (
-	styleNameWindow               = "window"
-	styleNamePopover              = "popover"
-	styleNameWidget               = "widget"
-	styleNameLabel                = "label"
-	styleNameIcon                 = "icon"
-	styleNameButton               = "button"
-	styleNameTextInput            = "text-input"
-	styleNameTextView             = "text-view"
-	styleNameScrollView           = "scroll-view"
-	stylePartTrough               = "trough"
-	stylePartThumb                = "thumb"
-	stylePartFocus                = "focus"
-	styleNameMenu                 = "menu"
-	styleNameMenuItem             = "menu-item"
-	styleNameMenuItemText         = "menu-item-text"
-	styleNameMenuItemTextDisabled = "menu-item-text-disabled"
-	styleNameMenuSeparator        = "menu-separator"
+	styleNameWindow                   = "window"
+	styleNamePopover                  = "popover"
+	styleNameWidget                   = "widget"
+	styleNameLabel                    = "label"
+	styleNameIcon                     = "icon"
+	styleNameButton                   = "button"
+	styleNameTextInput                = "text-input"
+	styleNameTextView                 = "text-view"
+	styleNameScrollView               = "scroll-view"
+	stylePartTrough                   = "trough"
+	stylePartThumb                    = "thumb"
+	stylePartFocus                    = "focus"
+	styleNameMenu                     = "menu"
+	styleNameMenuItem                 = "menu-item"
+	styleNameMenuItemText             = "menu-item-text"
+	styleNameMenuItemTextDisabled     = "menu-item-text-disabled"
+	styleNameMenuItemShortcut         = "menu-item-shortcut"
+	styleNameMenuItemShortcutDisabled = "menu-item-shortcut-disabled"
+	styleNameMenuSeparator            = "menu-separator"
 )
 
 // DefaultStyleSheet returns the complete Basic fallback used when the
@@ -99,6 +102,11 @@ func PaintWidgetStyle(p Painter, widget Widget, defaultName string) {
 // radius. Missing or transparent colors and empty rectangles emit no commands.
 // A rounded background does not clip children.
 func PaintStyledBackground(p Painter, rect geometry.Rectangle, s style.Style) {
+	radius, _ := s.CornerRadius()
+	paintStyledBackground(p, rect, s, radius, geometry.Insets{})
+}
+
+func paintStyledBackground(p Painter, rect geometry.Rectangle, s style.Style, radius geometry.CornerRadius, insets geometry.Insets) {
 	if rect.Width <= 0 || rect.Height <= 0 {
 		return
 	}
@@ -110,29 +118,98 @@ func PaintStyledBackground(p Painter, rect geometry.Rectangle, s style.Style) {
 	if fill.A == 0 {
 		return
 	}
-	radius, _ := s.Radius()
-	if radius > 0 {
-		p.FillRoundRect(rect, radius, fill)
+	paintInsetBackground(p, rect, radius, insets, fill)
+}
+
+func paintInsetBackground(p Painter, rect geometry.Rectangle, radius geometry.CornerRadius, insets geometry.Insets, brush graphics.Brush) {
+	if insets == geometry.UniformInsets(insets.Left) {
+		if insets.Left > 0 {
+			radius = radius.Normalize(rect.Size).Inset(insets.Left)
+			rect = rect.Inset(insets.Left)
+		}
+		paintRoundedBackground(p, rect, radius, brush)
 	} else {
-		p.FillRect(rect, fill)
+		p.FillPath(utils.RoundRectInsetPath(rect, radius, insets), brush)
 	}
 }
 
-// PaintStyledBox paints the background then the border. Shadow and text are
-// separate drawing operations; unset fields emit no commands.
+func paintRoundedBackground(p Painter, rect geometry.Rectangle, radius geometry.CornerRadius, brush graphics.Brush) {
+	if emptyRect(rect) {
+		return
+	}
+	radius = radius.Normalize(rect.Size)
+	if radius == (geometry.CornerRadius{}) {
+		p.FillRect(rect, brush)
+	} else if radius.Uniform() {
+		p.FillRoundRect(rect, radius.TopLeft, brush)
+	} else {
+		p.FillPath(utils.RoundRectPath(rect, radius), brush)
+	}
+}
+
+// PaintStyledBox paints the background then the border. An opaque border hides
+// the background's AA edge beneath its centerline. Translucent borders retain
+// the complete background beneath them. Shadow and text are separate operations.
 func PaintStyledBox(p Painter, rect geometry.Rectangle, s style.Style) {
-	PaintStyledBackground(p, rect, s)
-	PaintStyledBorder(p, rect, s)
+	radius, _ := s.CornerRadius()
+	paintStyledBox(p, rect, s, radius, styledBorderSides(s))
+}
+
+func paintStyledBox(p Painter, rect geometry.Rectangle, s style.Style, radius geometry.CornerRadius, sides style.BorderSides) {
+	paintStyledBackground(p, rect, s, radius, borderInsets(sides, opaqueBorderInset(s)))
+	paintStyledBorder(p, rect, s, radius, sides)
+}
+
+func styledBorderSides(s style.Style) style.BorderSides {
+	if sides, set := s.BorderSides(); set {
+		return sides
+	}
+	return style.BorderAll
+}
+
+func borderInsets(sides style.BorderSides, width float32) (insets geometry.Insets) {
+	if sides&style.BorderTop != 0 {
+		insets.Top = width
+	}
+	if sides&style.BorderRight != 0 {
+		insets.Right = width
+	}
+	if sides&style.BorderBottom != 0 {
+		insets.Bottom = width
+	}
+	if sides&style.BorderLeft != 0 {
+		insets.Left = width
+	}
+	return
+}
+
+func opaqueBorderInset(s style.Style) float32 {
+	width, ok := s.BorderWidth()
+	width = normalizeLayoutValue(width)
+	border, hasColor := s.BorderColor()
+	if ok && hasColor && width > 0 && border != nil {
+		if _, _, _, alpha := border.RGBA(); alpha == 65535 {
+			return width / 2
+		}
+	}
+	return 0
 }
 
 // PaintStyledBorder paints an inset border without repainting the background.
 // It does not reserve layout space. Missing/transparent colors, nonpositive
-// widths and empty rectangles emit no commands.
+// widths, empty rectangles and an explicit empty BorderSides emit no commands.
+// Unset BorderSides paints all edges; selected edges share one width and color.
 func PaintStyledBorder(p Painter, rect geometry.Rectangle, s style.Style) {
-	if rect.Width <= 0 || rect.Height <= 0 {
+	radius, _ := s.CornerRadius()
+	paintStyledBorder(p, rect, s, radius, styledBorderSides(s))
+}
+
+func paintStyledBorder(p Painter, rect geometry.Rectangle, s style.Style, radius geometry.CornerRadius, sides style.BorderSides) {
+	if sides == 0 || rect.Width <= 0 || rect.Height <= 0 {
 		return
 	}
 	width, ok := s.BorderWidth()
+	width = normalizeLayoutValue(width)
 	if !ok || width <= 0 {
 		return
 	}
@@ -144,19 +221,25 @@ func PaintStyledBorder(p Painter, rect geometry.Rectangle, s style.Style) {
 	if stroke.A == 0 {
 		return
 	}
-	radius, _ := s.Radius()
+	radius = radius.Normalize(rect.Size)
+	if sides != style.BorderAll {
+		p.FillPath(utils.RoundRectBorderInsetsPath(rect, radius, borderInsets(sides, width)), stroke)
+		return
+	}
 	// Once the inner contour collapses, the border covers the whole shape.
 	if width >= min(rect.Width, rect.Height)/2 {
-		if radius > 0 {
-			p.FillRoundRect(rect, radius, stroke)
-		} else {
-			p.FillRect(rect, stroke)
-		}
+		paintRoundedBackground(p, rect, radius, stroke)
+		return
+	}
+	// Small radii cannot retain their outer contour through a centerline
+	// stroke. Fill the actual ring, including when inner corners collapse.
+	if !radius.Uniform() || radius.TopLeft > 0 && radius.TopLeft < width/2 {
+		p.FillPath(utils.RoundRectBorderPath(rect, radius, width), stroke)
 		return
 	}
 	halfWidth := width / 2
 	borderRect := rect.Inset(halfWidth)
-	borderRadius := max(radius-halfWidth, 0)
+	borderRadius := max(radius.TopLeft-halfWidth, 0)
 	if borderRadius > 0 {
 		p.DrawRoundRect(borderRect, borderRadius, width, stroke)
 	} else {

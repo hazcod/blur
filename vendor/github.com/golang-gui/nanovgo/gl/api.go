@@ -67,8 +67,15 @@ func ActiveTexture(texture Enum) {
 }
 
 func TexImage2D(target Enum, level int, width, height int, format Enum, ty Enum, data []byte) {
+	TexImage2DFormat(target, level, format, width, height, format, ty, data)
+}
+
+// TexImage2DFormat separates GPU storage from the source pixel format. For
+// example, GLES 3 requires R8 storage for RED/UNSIGNED_BYTE texture uploads.
+func TexImage2DFormat(target Enum, level int, internalFormat Enum, width, height int, format Enum, ty Enum, data []byte) {
 	// glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
-	call(glTexImage2D, uintptr(target), uintptr(level), uintptr(format), uintptr(width), uintptr(height), 0, uintptr(format), uintptr(ty), uintptr(cgo.CSlice(data)))
+	call(glTexImage2D, uintptr(target), uintptr(level), uintptr(internalFormat), uintptr(width), uintptr(height), 0, uintptr(format), uintptr(ty), uintptr(cgo.CSlice(data)))
+	runtime.KeepAlive(data)
 }
 
 func TexSubImage2D(target Enum, level int, x, y, width, height int, format, ty Enum, data []byte) {

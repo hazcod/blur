@@ -18,7 +18,6 @@ import (
 	"github.com/golang-gui/goui/platform/graphics/internal/textbitmap"
 	"github.com/golang-gui/goui/platform/graphics/utils"
 	"github.com/golang-gui/goui/platform/typography"
-
 	"github.com/golang-gui/rasterx"
 	"github.com/golang-gui/scanFT"
 	"golang.org/x/image/math/fixed"
@@ -235,7 +234,7 @@ func (p *Painter) Clear(color graphics.Color) {
 	}
 }
 
-func (p *Painter) DrawBoxShadow(rect graphics.Rectangle, radius float32, shadow graphics.BoxShadow) {
+func (p *Painter) DrawBoxShadow(rect graphics.Rectangle, radius geometry.CornerRadius, shadow graphics.BoxShadow) {
 	if shadow.Color.A <= 0 {
 		return
 	}
@@ -871,6 +870,7 @@ func (p *Painter) doPath(add rasterx.Adder, path graphics.Path) (closed bool, cl
 	path.Range(func(op graphics.PathOperation, args []float32) (stop bool) {
 		switch op {
 		case graphics.PathMoveTo:
+			closed = false
 			add.Start(devicePoint(args[0], args[1]))
 			px, py = args[0], args[1]
 
@@ -891,7 +891,7 @@ func (p *Painter) doPath(add rasterx.Adder, path graphics.Path) (closed bool, cl
 			add.Stop(true)
 		}
 
-		return closed
+		return false
 	})
 
 	return closed, p.clipForPoints(points, 0)

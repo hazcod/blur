@@ -73,11 +73,28 @@ type rootBase struct {
 	frameEpoch     uint64
 	lastFrame      time.Time
 	frameCapture   *diagnostic.FrameRecord
+	frameTrace     *frameTrace
 	frameTimer     *Timer
 	frameRequester paintRequester
+
+	screenClip      geometry.Rectangle // host-provided structural clip, never an offscreen target
+	screenClipValid bool
 }
 
 func (b *rootBase) rootState() *rootBase { return b }
+
+// Query the live lease, rather than relying on a queued SurfaceEvent. Native
+// destruction can revoke it while the GOUI thread is still processing a frame.
+func (b *rootBase) surfaceReady() bool {
+	return b.surface == nil || b.surface.SurfaceState().Ready
+}
+
+func (b *rootBase) surfaceChanged() {
+	b.surfaceEpoch++
+	b.framePending = false
+	b.paintDirty = true
+	b.stopFrameTimer()
+}
 
 func (b *rootBase) cancelInput(reason GestureCancelReason) {
 	b.clearDragMotion()
@@ -182,7 +199,7 @@ func (b *rootBase) drawDecoratedFrame(content Widget, background, border style.S
 
 // Hosts supply geometry; the frame renderer knows neither menu nor chrome policy.
 func (b *rootBase) drawSurfaceFrame(content Widget, background, border style.Style, body, safe geometry.Rectangle, shadow graphics.BoxShadow, finish func(Painter), decorations ...Widget) {
-	if b.painter == nil {
+	if b.painter == nil || !b.surfaceReady() {
 		return
 	}
 	size := geometry.Size{Width: b.width, Height: b.height}
@@ -196,6 +213,7 @@ func (b *rootBase) drawSurfaceFrame(content Widget, background, border style.Sty
 	bounds := geometry.Rect(0, 0, size.Width, size.Height)
 	guiPainter := newPainter(b.painter, bounds, scale)
 	drawn := false
+	b.traceFramePhase("goui.begin")
 	if f := b.frameCapture; f != nil {
 		backend := b.painter // Preserve the receiver across user callbacks, like defer End below.
 		started := time.Now()
@@ -203,7 +221,7 @@ func (b *rootBase) drawSurfaceFrame(content Widget, background, border style.Sty
 		f.Begin += time.Since(started)
 		defer func() {
 			started := time.Now()
-			backend.End()
+			b.endPainter(backend)
 			f.End += time.Since(started)
 			f.EndReturned = true
 			f.Completed = drawn
@@ -212,9 +230,10 @@ func (b *rootBase) drawSurfaceFrame(content Widget, background, border style.Sty
 		defer func() { f.Paint += time.Since(started) }()
 	} else {
 		b.painter.Begin(pixelWidth, pixelHeight, scale)
-		defer b.painter.End()
+		defer b.endPainter(b.painter)
 	}
-	if b.frameDestroyed || b.frameSuspended || b.surfaceEpoch != b.frameEpoch {
+	b.traceFramePhase("goui.paint")
+	if b.frameDestroyed || b.frameSuspended || b.surfaceEpoch != b.frameEpoch || !b.surfaceReady() {
 		return
 	}
 	// Initialize storage independently of the visible body background. Opaque
@@ -225,21 +244,23 @@ func (b *rootBase) drawSurfaceFrame(content Widget, background, border style.Sty
 	}
 	b.painter.Clear(clearColor)
 	guiPainter.applyState()
-	radius, _ := border.Radius()
+	radius, _ := border.CornerRadius()
 	if shadow.Color.A > 0 && body.Width > 0 && body.Height > 0 {
 		b.painter.DrawBoxShadow(body, radius, shadow)
 	}
 	// Hosts choose their background geometry and structural content clip. A
 	// final shape erasure permits full-client content with a rounded silhouette.
 	if bg, ok := background.BackgroundColor(); ok && bg != nil {
-		radius = min(normalizeLayoutValue(radius), max(0, min(body.Width, body.Height)/2))
-		if radius > 0 && finish == nil {
-			guiPainter.FillRoundRect(body, radius, graphics.ColorOf(bg))
+		radius = radius.Normalize(body.Size)
+		if finish == nil {
+			insets := borderInsets(styledBorderSides(border), opaqueBorderInset(border))
+			paintInsetBackground(guiPainter, body, radius, insets, graphics.ColorOf(bg))
 		} else {
 			guiPainter.FillRect(body, graphics.ColorOf(bg))
 		}
 	}
 	guiPainter.state.scopeClip, guiPainter.state.clip = safe, safe
+	b.screenClip, b.screenClipValid = safe.Intersect(bounds), true
 	guiPainter.applyState()
 	if !emptyRect(safe) {
 		paintWidget(content, guiPainter)
@@ -253,13 +274,13 @@ func (b *rootBase) drawSurfaceFrame(content Widget, background, border style.Sty
 	// outer contour beyond that boundary while preserving its inner contour,
 	// so its own AA is not multiplied by the same boundary a second time.
 	borderBounds := body
-	if finish != nil && radius > 0 {
+	if finish != nil && radius.Max() > 0 {
 		width, _ := border.BorderWidth()
 		if width > 0 {
 			margin := 2 / scale
 			borderBounds = body.Inset(-margin)
 			color, _ := border.BorderColor()
-			border = style.Default().Radius(radius + margin).BorderWidth(width + margin).BorderColor(color).Style
+			border = style.Default().CornerRadius(radius.Inset(-margin)).BorderWidth(width + margin).BorderColor(color).BorderSides(styledBorderSides(border)).Style
 		}
 	}
 	PaintStyledBorder(guiPainter, borderBounds, border)
@@ -267,7 +288,17 @@ func (b *rootBase) drawSurfaceFrame(content Widget, background, border style.Sty
 	if finish != nil {
 		finish(guiPainter)
 	}
-	drawn = !b.frameDestroyed && !b.frameSuspended && b.surfaceEpoch == b.frameEpoch
+	drawn = !b.frameDestroyed && !b.frameSuspended && b.surfaceEpoch == b.frameEpoch && b.surfaceReady()
+}
+
+func (b *rootBase) endPainter(backend graphics.Painter) {
+	if b.frameTrace == nil {
+		backend.End()
+		return
+	}
+	b.traceFramePhase("goui.end")
+	defer b.traceFramePhase("")
+	backend.End()
 }
 
 // ConnectAfterPaint observes the host's real presentation frame only.
@@ -316,7 +347,7 @@ func (b *rootBase) ConnectFrame(fn func(time.Time)) signal.Handle {
 		return signal.Handles(nil)
 	}
 	return b.frames.Connect(func(now time.Time) {
-		if !b.frameDestroyed && !b.frameSuspended && b.surfaceEpoch == b.frameEpoch {
+		if !b.frameDestroyed && !b.frameSuspended && b.surfaceEpoch == b.frameEpoch && b.surfaceReady() {
 			fn(now)
 		}
 	})
@@ -328,7 +359,7 @@ func (b *rootBase) requestPaint(native paintRequester) error {
 	}
 	b.paintDirty = true
 	b.frameRequester = native
-	if native == nil || b.frameDestroyed || b.frameSuspended || b.framePainting || b.framePending {
+	if native == nil || b.frameDestroyed || b.frameSuspended || b.framePainting || b.framePending || !b.surfaceReady() {
 		return nil
 	}
 	if b.frameTimer != nil && b.frameTimer.Active() {
@@ -357,7 +388,7 @@ func (b *rootBase) frameNow() time.Time {
 }
 
 func (b *rootBase) submitFrame() error {
-	if !b.paintDirty || b.frameDestroyed || b.frameSuspended || b.frameRequester == nil {
+	if !b.paintDirty || b.frameDestroyed || b.frameSuspended || b.frameRequester == nil || !b.surfaceReady() {
 		return nil
 	}
 	b.framePending = true
@@ -372,6 +403,11 @@ func (b *rootBase) beginFrame() bool {
 	if b.frameDestroyed || b.frameSuspended {
 		return false
 	}
+	if !b.surfaceReady() {
+		b.framePending, b.paintDirty = false, true
+		b.stopFrameTimer()
+		return false
+	}
 	if b.framePainting {
 		b.paintDirty = true
 		return false
@@ -381,21 +417,34 @@ func (b *rootBase) beginFrame() bool {
 	b.framePainting = true
 	b.lastFrame, b.frameEpoch = b.frameNow(), b.surfaceEpoch
 	b.frameCapture = b.beginDiagnosticFrame()
+	ready := false
+	if b.beginTraceFrame() {
+		// The caller only installs endFrame after beginFrame returns successfully.
+		defer func() {
+			if !ready {
+				b.endTraceFrame()
+			}
+		}()
+	}
 	if f := b.frameCapture; f != nil {
 		started := time.Now()
 		b.frames.Emit(b.lastFrame)
 		f.Callbacks = time.Since(started)
+		b.traceFramePhase("goui.styles")
 		started = time.Now()
 		b.updateStateStyles()
 		f.Styles = time.Since(started)
 	} else {
 		b.frames.Emit(b.lastFrame)
+		b.traceFramePhase("goui.styles")
 		b.updateStateStyles()
 	}
-	if b.frameDestroyed || b.frameSuspended || b.surfaceEpoch != b.frameEpoch {
+	b.traceFramePhase("")
+	if b.frameDestroyed || b.frameSuspended || b.surfaceEpoch != b.frameEpoch || !b.surfaceReady() {
 		b.endFrame()
 		return false
 	}
+	ready = true
 	return true
 }
 
@@ -404,6 +453,7 @@ func (b *rootBase) endFrame() {
 		b.frameCapture = nil
 		f.Finish()
 	}
+	b.endTraceFrame()
 	b.framePainting = false
 	if b.paintDirty && !b.frameDestroyed && !b.frameSuspended {
 		if err := b.requestPaint(b.frameRequester); err != nil {
@@ -420,6 +470,7 @@ func (b *rootBase) stopFrameTimer() {
 
 func (b *rootBase) suspendFrames() {
 	b.frameSuspended = true
+	b.screenClipValid = false
 	b.framePending = false
 	b.stopFrameTimer()
 }

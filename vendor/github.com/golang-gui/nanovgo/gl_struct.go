@@ -32,6 +32,9 @@ type glCall struct {
 	triangleOffset int
 	triangleCount  int
 	uniformOffset  int
+	coverageOffset int
+	coverageCount  int
+	coveragePixel  float32
 }
 
 type glPath struct {
@@ -69,6 +72,12 @@ func (u *glFragUniforms) setInnerColor(color Color) {
 
 func (u *glFragUniforms) setOuterColor(color Color) {
 	copy(u[28:32], color.List())
+}
+
+// Shadows use a single color, so their otherwise unused outer-color uniform
+// stores corner geometry. Ordinary paints retain the existing uniform layout.
+func (u *glFragUniforms) setShadowCorners(corners [4]float32) {
+	copy(u[28:32], corners[:])
 }
 
 func (u *glFragUniforms) setScissorExt(a, b float32) {

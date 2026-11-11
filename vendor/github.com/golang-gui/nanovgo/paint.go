@@ -7,14 +7,15 @@ import (
 // Paint structure represent paint information including gradient and image painting.
 // Context.SetFillPaint() and Context.SetStrokePaint() accept this instance.
 type Paint struct {
-	xform      TransformMatrix
-	extent     [2]float32
-	radius     float32
-	feather    float32
-	innerColor Color
-	outerColor Color
-	image      int
-	kind       paintKind
+	xform         TransformMatrix
+	extent        [2]float32
+	radius        float32
+	feather       float32
+	innerColor    Color
+	outerColor    Color
+	image         int
+	kind          paintKind
+	shadowCorners [4]float32
 }
 
 type paintKind uint8
@@ -34,6 +35,7 @@ func (p *Paint) setPaintColor(color Color) {
 	p.outerColor = color
 	p.image = 0
 	p.kind = paintDefault
+	p.shadowCorners = [4]float32{}
 }
 
 // LinearGradient creates and returns a linear gradient. Parameters (sx,sy)-(ex,ey) specify the start and end coordinates
@@ -99,14 +101,23 @@ func BoxGradient(x, y, w, h, r, f float32, iColor, oColor Color) Paint {
 // blurRadius is mapped to a Gaussian standard deviation of blurRadius/2. The
 // caller should fill a rectangle extending 1.5*blurRadius beyond the box.
 func BoxShadow(x, y, w, h, radius, blurRadius float32, color Color) Paint {
+	p := BoxShadowVarying(x, y, w, h, radius, radius, radius, radius, blurRadius, color)
+	p.radius = radius
+	return p
+}
+
+// BoxShadowVarying creates a Gaussian box shadow with independent circular
+// corners in top-left, top-right, bottom-right, bottom-left order. The caller
+// normalizes adjacent radii to the box and fills its expanded blur bounds.
+func BoxShadowVarying(x, y, w, h, topLeft, topRight, bottomRight, bottomLeft, blurRadius float32, color Color) Paint {
 	return Paint{
-		xform:      TranslateMatrix(x+w*0.5, y+h*0.5),
-		extent:     [2]float32{w * 0.5, h * 0.5},
-		radius:     radius,
-		feather:    maxF(0.0001, blurRadius*0.5),
-		innerColor: color,
-		outerColor: color,
-		kind:       paintBoxShadow,
+		xform:         TranslateMatrix(x+w*0.5, y+h*0.5),
+		extent:        [2]float32{w * 0.5, h * 0.5},
+		feather:       maxF(0.0001, blurRadius*0.5),
+		innerColor:    color,
+		outerColor:    color,
+		kind:          paintBoxShadow,
+		shadowCorners: [4]float32{topLeft, topRight, bottomRight, bottomLeft},
 	}
 }
 

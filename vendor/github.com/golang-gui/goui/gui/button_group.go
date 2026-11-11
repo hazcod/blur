@@ -3,7 +3,6 @@ package gui
 import (
 	"github.com/golang-gui/goui/core/geometry"
 	"github.com/golang-gui/goui/layout"
-	"github.com/golang-gui/goui/platform/graphics"
 	"github.com/golang-gui/goui/style"
 )
 
@@ -120,68 +119,32 @@ func paintButtonBox(p Painter, widget Widget, s style.Style, focus bool) {
 	if rect.Width <= 0 || rect.Height <= 0 {
 		return
 	}
-	radius, _ := s.Radius()
-	radius = max(0, min(radius, rect.Width/2, rect.Height/2))
-	if bg, ok := s.BackgroundColor(); ok && bg != nil {
-		fill := graphics.ColorOf(bg)
-		if fill.A > 0 {
-			p.FillPath(buttonContour(rect, radius, corners, -1), fill)
-		}
-	}
-	width, _ := s.BorderWidth()
-	border, ok := s.BorderColor()
-	if !ok || border == nil || width <= 0 {
-		return
-	}
-	stroke := graphics.ColorOf(border)
-	if stroke.A == 0 {
-		return
-	}
-	if width >= min(rect.Width, rect.Height)/2 {
-		p.FillPath(buttonContour(rect, radius, corners, -1), stroke)
-		return
-	}
+	radius, _ := s.CornerRadius()
+	radius = buttonCornerRadius(radius, corners).Normalize(rect.Size)
 	if focus {
 		omitEdge = -1
 	}
-	p.DrawPath(buttonContour(rect.Inset(width/2), max(radius-width/2, 0), corners, omitEdge), width, stroke)
+	sides := styledBorderSides(s)
+	if omitEdge == 1 {
+		sides &^= style.BorderRight
+	} else if omitEdge == 2 {
+		sides &^= style.BorderBottom
+	}
+	paintStyledBox(p, rect, s, radius, sides)
 }
 
-// A closed contour walks clockwise. Starting after the omitted edge produces
-// an open three-sided stroke without clipping or repainting a sibling.
-func buttonContour(rect geometry.Rectangle, radius float32, corners buttonCorners, omitEdge int) graphics.Path {
-	x, y, right, bottom := rect.X, rect.Y, rect.X+rect.Width, rect.Y+rect.Height
-	r := [4]float32{}
-	for i := range r {
-		if corners&(1<<i) != 0 {
-			r[i] = radius
-		}
+func buttonCornerRadius(r geometry.CornerRadius, corners buttonCorners) geometry.CornerRadius {
+	if corners&buttonTopLeft == 0 {
+		r.TopLeft = 0
 	}
-	starts := [4]geometry.Point{{X: x, Y: y + r[0]}, {X: right - r[1], Y: y}, {X: right, Y: bottom - r[2]}, {X: x + r[3], Y: bottom}}
-	ends := [4]geometry.Point{{X: x + r[0], Y: y}, {X: right, Y: y + r[1]}, {X: right - r[2], Y: bottom}, {X: x, Y: bottom - r[3]}}
-	const k float32 = 0.55228475
-	controls := [4][2]geometry.Point{
-		{{X: x, Y: y + r[0]*(1-k)}, {X: x + r[0]*(1-k), Y: y}},
-		{{X: right - r[1]*(1-k), Y: y}, {X: right, Y: y + r[1]*(1-k)}},
-		{{X: right, Y: bottom - r[2]*(1-k)}, {X: right - r[2]*(1-k), Y: bottom}},
-		{{X: x + r[3]*(1-k), Y: bottom}, {X: x, Y: bottom - r[3]*(1-k)}},
+	if corners&buttonTopRight == 0 {
+		r.TopRight = 0
 	}
-	start := 0
-	if omitEdge >= 0 {
-		start = (omitEdge + 1) % 4
+	if corners&buttonBottomRight == 0 {
+		r.BottomRight = 0
 	}
-	path := graphics.MoveTo(starts[start].X, starts[start].Y)
-	for step := 0; step < 4; step++ {
-		i := (start + step) % 4
-		if step > 0 {
-			path = path.LineTo(starts[i].X, starts[i].Y)
-		}
-		if r[i] > 0 {
-			path = path.BezierTo(controls[i][0].X, controls[i][0].Y, controls[i][1].X, controls[i][1].Y, ends[i].X, ends[i].Y)
-		}
+	if corners&buttonBottomLeft == 0 {
+		r.BottomLeft = 0
 	}
-	if omitEdge < 0 {
-		path = path.Close()
-	}
-	return path
+	return r
 }
