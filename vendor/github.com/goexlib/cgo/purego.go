@@ -3,7 +3,6 @@ package cgo
 import (
 	"errors"
 	"fmt"
-	"github.com/ebitengine/purego"
 )
 
 func RegisterFunc(pf any, cfn uintptr) (err error) {
@@ -12,7 +11,7 @@ func RegisterFunc(pf any, cfn uintptr) (err error) {
 			err = errors.New(fmt.Sprint(msg))
 		}
 	}()
-	purego.RegisterFunc(pf, cfn)
+	registerFunc(pf, cfn)
 	return
 }
 
@@ -22,6 +21,10 @@ func RegisterLibFunc(pf any, lib uintptr, symbol string) (err error) {
 			err = errors.New(fmt.Sprint(msg))
 		}
 	}()
-	purego.RegisterLibFunc(pf, lib, symbol)
+	address, err := Dlsym(lib, symbol)
+	if err != nil {
+		return err
+	}
+	registerFunc(pf, address)
 	return
 }

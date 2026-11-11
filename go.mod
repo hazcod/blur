@@ -4,9 +4,9 @@ go 1.27.0
 
 require (
 	github.com/Microsoft/go-winio v0.6.4
-	github.com/ebitengine/purego v0.10.0
+	github.com/ebitengine/purego v0.10.2
 	github.com/godbus/dbus/v5 v5.2.4
-	github.com/goexlib/cgo v0.1.1
+	github.com/goexlib/cgo v0.1.2
 	github.com/golang-gui/goui v0.6.0
 	github.com/lpintes/walk v0.0.0-20261029133242-6a00370d773d
 	github.com/modelcontextprotocol/go-sdk v1.8.0

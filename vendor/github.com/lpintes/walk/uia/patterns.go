@@ -352,33 +352,6 @@ func (e *Element) Text() (string, error) {
 	return text, err
 }
 
-// TextBounded reads at most maxLength UTF-16 code units from a Text pattern.
-// Unlike ValuePattern.Value, the provider bounds the returned allocation.
-func (e *Element) TextBounded(maxLength int) (string, error) {
-	if maxLength < 0 || uint64(maxLength) > uint64(1<<31-1) {
-		return "", errors.New("uia: invalid text limit")
-	}
-	if maxLength == 0 {
-		return "", nil
-	}
-	var text string
-	err := withPattern(e, "TextBounded", win.UIA_TextPatternId, &win.IID_IUIAutomationTextPattern, func(p *win.IUIAutomationTextPattern) error {
-		var r *win.IUIAutomationTextRange
-		if err := check("TextBounded", p.Get_DocumentRange(&r)); err != nil {
-			return err
-		}
-		defer r.Release()
-		var b *uint16
-		if err := check("TextBounded", r.GetText(int32(maxLength), &b)); err != nil {
-			return err
-		}
-		defer win.SysFreeString(b)
-		text = bstr(b)
-		return nil
-	})
-	return text, err
-}
-
 // SelectedText returns the selected text of a document or edit field, one
 // string per selected range (the Text pattern). Where nothing is selected,
 // the controls usually return one empty range at the caret.
