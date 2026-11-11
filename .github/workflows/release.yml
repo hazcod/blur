@@ -1,0 +1,120 @@
+name: Release
+
+# Pushing a semantic-version tag (vX.Y.Z, optionally -rc.1 etc.) publishes a release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write # keyless cosign signing via GitHub OIDC
+
+jobs:
+  goreleaser:
+    name: Windows and Linux archives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  macos:
+    name: macOS universal app (signed, notarized)
+    runs-on: macos-latest
+    needs: goreleaser # the GitHub release must exist before assets are attached
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Import Developer ID certificate into a temporary keychain
+        env:
+          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/blur-release.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Put the temporary keychain first in the search list so codesign finds it.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -n 1)"
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found in the imported certificate" >&2
+            exit 1
+          fi
+          echo "MACOS_CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Build and sign universal app (Hardened Runtime, sandbox entitlements)
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          make macos-app \
+            MACOS_APP="$RUNNER_TEMP/Blur.app" \
+            MACOS_CODESIGN_IDENTITY="$MACOS_CODESIGN_IDENTITY" \
+            MACOS_CODESIGN_EXTRA_FLAGS="--options runtime --timestamp" \
+            VERSION="$VERSION"
+          make macos-app-sandbox-check MACOS_APP="$RUNNER_TEMP/Blur.app"
+
+      - name: Notarize and staple
+        env:
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          echo "$API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent "$RUNNER_TEMP/Blur.app" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/notarize.zip"
+          xcrun stapler staple "$RUNNER_TEMP/Blur.app"
+          xcrun stapler validate "$RUNNER_TEMP/Blur.app"
+
+      - name: Verify Gatekeeper acceptance
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Blur.app"
+          spctl -a -vv -t install "$RUNNER_TEMP/Blur.app"
+
+      - name: Package and upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="$RUNNER_TEMP/Blur_${VERSION}_macos_universal.zip"
+          ditto -c -k --keepParent "$RUNNER_TEMP/Blur.app" "$ZIP"
+          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ]; then security delete-keychain "$KEYCHAIN" || true; fi

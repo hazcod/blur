@@ -1,0 +1,35 @@
+name: Website
+
+# Publishes website/ to the hazcod/blur.hazcod.com repository (GitHub Pages).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - '.github/workflows/website.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
+        with:
+          # Fine-grained PAT with Contents: read/write on hazcod/blur.hazcod.com only.
+          personal_token: ${{ secrets.WEBSITE_DEPLOY_TOKEN }}
+          external_repository: hazcod/blur.hazcod.com
+          publish_branch: main
+          publish_dir: ./website
+          force_orphan: true # force-push a single-commit history
+          cname: blur.hazcod.com
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_message: 'Deploy website from ${{ github.sha }}'
