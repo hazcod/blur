@@ -134,6 +134,24 @@ func TestGrantExpiryRevocationSkewAndReplayBound(t *testing.T) {
 	}
 }
 
+func TestGrantReplayCacheReclaimsProofsOutsideAcceptedClockWindow(t *testing.T) {
+	store, grant, now := grantFixture(t, 1)
+	digest := sha256.Sum256([]byte("replay-window"))
+	if err := store.Authorize(proofFixture(t, grant, ScopeUIRead, digest, *now, 0x61), digest); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(MaxClockSkew)
+	boundary := proofFixture(t, grant, ScopeUIRead, digest, *now, 0x62)
+	if err := store.Authorize(boundary, digest); !errors.Is(err, ErrReplayLimit) {
+		t.Fatalf("nonce was reclaimed while its proof remained acceptable: %v", err)
+	}
+	*now = now.Add(time.Nanosecond)
+	proof := proofFixture(t, grant, ScopeUIRead, digest, *now, 0x62)
+	if err := store.Authorize(proof, digest); err != nil {
+		t.Fatalf("expired nonce exhausted a live grant's replay cache: %v", err)
+	}
+}
+
 func TestGrantRejectsInvalidInputsAndDoesNotLeak(t *testing.T) {
 	store, grant, now := grantFixture(t, 3)
 	for _, scopes := range [][]Scope{nil, {"unknown"}, {ScopeUIRead, ScopeUIRead}} {

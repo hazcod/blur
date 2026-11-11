@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/memory"
+	"github.com/hazcod/blur/internal/memory"
 )
 
 func TestDoctorContainsOnlyCountersAndClosedStates(t *testing.T) {

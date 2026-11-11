@@ -643,8 +643,10 @@ text scaling to 150% without clipping.
 
 - Power policy is configurable: `Follow system`, `Balanced`, `Blur Saver`,
   `Performance`, and user-defined budgets. Follow system maps verified OS
-  battery-saver state to Blur Saver and otherwise Balanced; an unknown signal
-  uses the user's configured fallback, defaulting to Blur Saver.
+  battery-saver state to Blur Saver and otherwise Balanced. Battery power by
+  itself is not battery-saver mode; an unknown signal uses Balanced unless the
+  user explicitly selects another mode, so an 8-hour battery workday does not
+  suppress optional work indefinitely.
 - Saver mode reduces optional indexing, compaction, and AI concurrency. It does
   not disable passive capture, deterministic indexing, retention-critical
   summarization, or user-requested AI. Balanced allows at most one

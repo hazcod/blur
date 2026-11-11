@@ -19,14 +19,15 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/privacy"
-	"github.com/nielsgroen/blur/internal/securestore"
-	"github.com/nielsgroen/blur/internal/storage"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
-	"github.com/nielsgroen/blur/internal/storage/recordcodec"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/securestore"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/storage/recordcodec"
 )
 
 const (
@@ -46,26 +47,38 @@ const (
 	kindGeneration  byte = 0x03
 	kindIndex       byte = 0x04
 
-	physicalKeyBytes = 34
-	sizeRecordBytes  = 1 + 4 + physicalKeyBytes
+	physicalKeyBytes      = 34
+	legacySizeRecordBytes = 1 + 4 + physicalKeyBytes
+	sizeRecordBytes       = 1 + 4 + 8 + physicalKeyBytes
 
 	maxLogicalIDBytes = 4096
 )
 
 var (
-	ErrOpenMode          = errors.New("durable store: invalid open mode")
-	ErrInvalidPath       = errors.New("durable store: invalid path")
-	ErrAlreadyExists     = errors.New("durable store: store already exists")
-	ErrMissing           = errors.New("durable store: store not found")
-	ErrWrongKey          = errors.New("durable store: key rejected")
-	ErrCorrupt           = errors.New("durable store: corrupt store")
-	ErrUnsupportedSchema = errors.New("durable store: unsupported schema")
-	ErrMigration         = errors.New("durable store: migration failed")
-	ErrUnavailable       = errors.New("durable store: unavailable")
-	ErrTransaction       = errors.New("durable store: transaction failed")
+	ErrOpenMode                         = errors.New("durable store: invalid open mode")
+	ErrInvalidPath                      = errors.New("durable store: invalid path")
+	ErrAlreadyExists                    = errors.New("durable store: store already exists")
+	ErrMissing                          = errors.New("durable store: store not found")
+	ErrWrongKey                         = errors.New("durable store: key rejected")
+	ErrCorrupt                    error = &classifiedStoreError{code: "corrupt", message: "durable store: corrupt store"}
+	ErrUnsupportedSchema                = errors.New("durable store: unsupported schema")
+	ErrMigration                        = errors.New("durable store: migration failed")
+	ErrProjectionIndexUnavailable       = errors.New("durable store: projection index migration required")
+	ErrUnavailable                      = errors.New("durable store: unavailable")
+	ErrTransaction                error = &classifiedStoreError{code: "transaction", message: "durable store: transaction failed"}
 
 	errAbortTransaction = errors.New("durable store: abort")
 )
+
+type classifiedStoreError struct{ code, message string }
+
+func (e *classifiedStoreError) Error() string { return e.message }
+func (e *classifiedStoreError) SafeFailureCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.code
+}
 
 var (
 	schemaKey   = []byte{0x00, 's', 'c', 'h', 1}
@@ -94,6 +107,8 @@ type Store struct{ state *storeState }
 
 type storeState struct {
 	mu          sync.RWMutex
+	knowledgeMu sync.RWMutex
+	noteMu      sync.Mutex
 	db          *bolt.DB
 	codec       *recordcodec.Codec
 	idKey       []byte
@@ -104,6 +119,7 @@ type storeState struct {
 }
 
 var _ storage.EncryptedStore = (*Store)(nil)
+var _ storage.ChronicleStore = (*Store)(nil)
 
 // Tx groups record and future index mutations into one bbolt transaction. The
 // extension writes are keyed and encrypted by the same record/manifest boundary.
@@ -158,6 +174,12 @@ func openDurableWithHook(path string, key securestore.Key, mode OpenMode, migrat
 	if err := store.ensureSearchIndex(context.Background()); err != nil {
 		_ = store.Close()
 		return nil, err
+	}
+	if mode == OpenExisting {
+		if err := store.ensureCaptureTimeMetadata(context.Background()); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
 	}
 	return store, nil
 }
@@ -254,6 +276,22 @@ func (s *Store) initialize() error {
 			return errAbortTransaction
 		}
 		clear(envelope)
+		if err := tx.PutIndexRecord(projectionIndexNamespace, projectionIndexMarkerID, projectionIndexMarkerValue); err != nil {
+			callbackErr = err
+			tx.active = false
+			return errAbortTransaction
+		}
+		captureTimeBaseline := time.Now().UTC()
+		if !validCaptureTime(captureTimeBaseline) {
+			callbackErr = ErrMigration
+			tx.active = false
+			return errAbortTransaction
+		}
+		if err := tx.PutIndexRecord(captureTimeMigrationNamespace, captureTimeMigrationID, encodeCaptureTimeMigration(captureTimeBaseline, true)); err != nil {
+			callbackErr = err
+			tx.active = false
+			return errAbortTransaction
+		}
 		if err := tx.flushManifestLocked(); err != nil {
 			callbackErr = err
 			tx.active = false
@@ -654,6 +692,10 @@ func sanitizeCallbackError(err error) error {
 		return ErrUnsupportedSchema
 	case errors.Is(err, ErrMigration):
 		return ErrMigration
+	case errors.Is(err, ErrProjectionIndexUnavailable):
+		return ErrProjectionIndexUnavailable
+	case errors.Is(err, ErrInvalidRetentionPolicy):
+		return ErrInvalidRetentionPolicy
 	case errors.Is(err, ErrTransaction):
 		return ErrTransaction
 	}
@@ -1051,6 +1093,10 @@ func (tx *Tx) finish() {
 }
 
 func (tx *Tx) PutObservation(observation capture.SanitizedObservation) error {
+	return tx.PutObservationAt(observation, time.Now())
+}
+
+func (tx *Tx) PutObservationAt(observation capture.SanitizedObservation, capturedAt time.Time) error {
 	if tx == nil {
 		return &storage.StoreError{Code: storage.Closed}
 	}
@@ -1059,7 +1105,7 @@ func (tx *Tx) PutObservation(observation capture.SanitizedObservation) error {
 	if err := tx.checkLocked(); err != nil {
 		return tx.failLocked(err)
 	}
-	if observation.Validate() != nil {
+	if observation.Validate() != nil || capturedAt.IsZero() || !validCaptureTime(capturedAt) {
 		return tx.failLocked(&storage.StoreError{Code: storage.Invalid})
 	}
 	plaintext, err := capture.MarshalAuthenticatedObservation(observation)
@@ -1084,7 +1130,7 @@ func (tx *Tx) PutObservation(observation capture.SanitizedObservation) error {
 		return tx.failLocked(err)
 	}
 	clear(envelope)
-	sizeValue, err := tx.store.encodeSizeEntry(orderKey, recordKey, searchBytes)
+	sizeValue, err := tx.store.encodeSizeEntry(orderKey, recordKey, searchBytes, capturedAt)
 	if err != nil {
 		clear(recordKey)
 		clear(orderKey)
@@ -1098,6 +1144,11 @@ func (tx *Tx) PutObservation(observation capture.SanitizedObservation) error {
 	}
 	clear(sizeValue)
 	if err := tx.indexObservationLocked(observation); err != nil {
+		clear(recordKey)
+		clear(orderKey)
+		return tx.failLocked(err)
+	}
+	if err := tx.indexCaptureHourLocked(logicalID, capturedAt); err != nil {
 		clear(recordKey)
 		clear(orderKey)
 		return tx.failLocked(err)
@@ -1206,14 +1257,18 @@ func validOpaqueID(id string) bool {
 	return id != "" && len(id) <= maxLogicalIDBytes && utf8.ValidString(id) && !strings.ContainsRune(id, 0)
 }
 
-func (s *Store) encodeSizeEntry(orderKey, recordKey []byte, size int) ([]byte, error) {
+func (s *Store) encodeSizeEntry(orderKey, recordKey []byte, size int, capturedAt time.Time) ([]byte, error) {
 	if len(recordKey) != physicalKeyBytes || size < 0 || size > storage.MaxObservationPageBytes {
 		return nil, ErrCorrupt
 	}
+	if capturedAt.IsZero() || !validCaptureTime(capturedAt) {
+		return nil, &storage.StoreError{Code: storage.Invalid}
+	}
 	plain := make([]byte, sizeRecordBytes)
-	plain[0] = 1
+	plain[0] = 2
 	binary.BigEndian.PutUint32(plain[1:5], uint32(size))
-	copy(plain[5:], recordKey)
+	binary.BigEndian.PutUint64(plain[5:13], uint64(capturedAt.UTC().UnixNano()))
+	copy(plain[13:], recordKey)
 	envelope, err := s.seal(orderKey, "observation-size", plain)
 	clear(plain)
 	if err != nil {
@@ -1222,31 +1277,149 @@ func (s *Store) encodeSizeEntry(orderKey, recordKey []byte, size int) ([]byte, e
 	return envelope, nil
 }
 
-func (s *Store) decodeSizeEntry(orderKey, encoded []byte) (int, []byte, error) {
+func (s *Store) decodeSizeEntry(orderKey, encoded []byte) (int, time.Time, []byte, error) {
 	plain, err := s.open(orderKey, "observation-size", encoded)
 	if err != nil {
-		return 0, nil, ErrCorrupt
+		return 0, time.Time{}, nil, ErrCorrupt
 	}
 	defer clear(plain)
-	if len(plain) != sizeRecordBytes || plain[0] != 1 {
-		return 0, nil, ErrCorrupt
+	if len(plain) == legacySizeRecordBytes && plain[0] == 1 {
+		recordKey := bytes.Clone(plain[5:])
+		if !bytes.HasPrefix(recordKey, observationRecordPrefix) || binary.BigEndian.Uint32(plain[1:5]) > uint32(storage.MaxObservationTextBytes+128+253) {
+			clear(recordKey)
+			return 0, time.Time{}, nil, ErrCorrupt
+		}
+		return int(binary.BigEndian.Uint32(plain[1:5])), time.Time{}, recordKey, nil
 	}
-	recordKey := bytes.Clone(plain[5:])
+	if len(plain) != sizeRecordBytes || plain[0] != 2 {
+		return 0, time.Time{}, nil, ErrCorrupt
+	}
+	capturedAt := time.Unix(0, int64(binary.BigEndian.Uint64(plain[5:13]))).UTC()
+	recordKey := bytes.Clone(plain[13:])
 	if !bytes.HasPrefix(recordKey, observationRecordPrefix) {
 		clear(recordKey)
-		return 0, nil, ErrCorrupt
+		return 0, time.Time{}, nil, ErrCorrupt
 	}
 	size := binary.BigEndian.Uint32(plain[1:5])
 	maxSize := uint32(storage.MaxObservationTextBytes + 128 + 253)
 	if size > maxSize {
 		clear(recordKey)
-		return 0, nil, ErrCorrupt
+		return 0, time.Time{}, nil, ErrCorrupt
 	}
-	return int(size), recordKey, nil
+	if !validCaptureTime(capturedAt) {
+		clear(recordKey)
+		return 0, time.Time{}, nil, ErrCorrupt
+	}
+	return int(size), capturedAt, recordKey, nil
 }
 
+func validCaptureTime(value time.Time) bool {
+	if value.IsZero() {
+		return false
+	}
+	return time.Unix(0, value.UTC().UnixNano()).UTC().Equal(value.UTC())
+}
+
+// ValidCapturedAt reports whether a timestamp can be represented losslessly in
+// the authenticated nanosecond metadata format.
+func ValidCapturedAt(value time.Time) bool { return validCaptureTime(value) }
+
 func (s *Store) PutObservation(ctx context.Context, observation capture.SanitizedObservation) error {
-	return s.Update(ctx, func(tx *Tx) error { return tx.PutObservation(observation) })
+	return s.PutObservationAt(ctx, observation, time.Now())
+}
+
+func (s *Store) PutObservationAt(ctx context.Context, observation capture.SanitizedObservation, capturedAt time.Time) error {
+	if capturedAt.IsZero() || !validCaptureTime(capturedAt) {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	return s.Update(ctx, func(tx *Tx) error { return tx.PutObservationAt(observation, capturedAt) })
+}
+
+// DeleteObservationRecord atomically removes a source and its exact-search
+// postings. Separate materialized projections must be invalidated by callers.
+func (s *Store) DeleteObservationRecord(ctx context.Context, logicalID string) error {
+	if ctx == nil || !validHash(logicalID) {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	return s.Update(ctx, func(tx *Tx) error { return tx.deleteObservationRecord(logicalID) })
+}
+
+// MaxObservationDeleteBatch bounds deletion work per atomic transaction. It is
+// deliberately far below the physical transaction operation cap because each
+// source can touch several authenticated projection indexes.
+const MaxObservationDeleteBatch = 8
+
+// DeleteObservationRecords atomically removes a small batch of sources. Every
+// ID is validated before opening the transaction, so malformed input cannot
+// cause a partial delete. Callers can safely retry a failed batch.
+func (s *Store) DeleteObservationRecords(ctx context.Context, logicalIDs []string) error {
+	if ctx == nil || len(logicalIDs) == 0 || len(logicalIDs) > MaxObservationDeleteBatch {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	seen := make(map[string]struct{}, len(logicalIDs))
+	for _, id := range logicalIDs {
+		if !validHash(id) {
+			return &storage.StoreError{Code: storage.Invalid}
+		}
+		if _, exists := seen[id]; exists {
+			return &storage.StoreError{Code: storage.Invalid}
+		}
+		seen[id] = struct{}{}
+	}
+	return s.Update(ctx, func(tx *Tx) error {
+		operationBudget := 2 // manifest read/write and shared transaction overhead
+		for _, id := range logicalIDs {
+			observation, found, err := s.getObservationReader(tx.writer, id)
+			if err != nil {
+				return err
+			}
+			if found {
+				cost, err := estimatedSearchIndexOperations(observation)
+				if err != nil {
+					return err
+				}
+				operationBudget += cost
+			}
+		}
+		if operationBudget > bolt.MaxTransactionOps-64 {
+			return ErrTransaction
+		}
+		for _, id := range logicalIDs {
+			if err := tx.deleteObservationRecord(id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// MaxObservationDeleteBatchWithinSearchBudget returns the largest prefix that
+// fits the estimated search-index transaction budget with headroom. Other
+// source-linked projections still run inside the transaction; the physical
+// writer remains authoritative and aborts atomically if its hard cap is hit.
+func (s *Store) MaxObservationDeleteBatchWithinSearchBudget(observations []capture.SanitizedObservation) (int, error) {
+	if s == nil || len(observations) == 0 {
+		return 0, &storage.StoreError{Code: storage.Invalid}
+	}
+	limit := len(observations)
+	if limit > MaxObservationDeleteBatch {
+		limit = MaxObservationDeleteBatch
+	}
+	operations := 2
+	for i := 0; i < limit; i++ {
+		cost, err := estimatedSearchIndexOperations(observations[i])
+		if err != nil {
+			return 0, err
+		}
+		if operations+cost > bolt.MaxTransactionOps-64 {
+			if i == 0 {
+				return 0, ErrTransaction
+			}
+			return i, nil
+		}
+		operations += cost
+	}
+	return limit, nil
 }
 
 func (s *Store) GetObservation(ctx context.Context, logicalID string) (capture.SanitizedObservation, bool, error) {
@@ -1300,7 +1473,7 @@ func (s *Store) getObservationReader(reader bolt.Reader, logicalID string) (capt
 		clear(indexValue)
 		return capture.SanitizedObservation{}, false, ErrCorrupt
 	}
-	pageBytes, indexedRecordKey, err := s.decodeSizeEntry(orderKey, indexValue)
+	pageBytes, _, indexedRecordKey, err := s.decodeSizeEntry(orderKey, indexValue)
 	clear(indexValue)
 	if err != nil {
 		return capture.SanitizedObservation{}, false, ErrCorrupt
@@ -1329,7 +1502,7 @@ func (s *Store) ListObservationPage(ctx context.Context, request storage.Observa
 		}
 		defer clear(after)
 	}
-	page := storage.ObservationPage{Observations: make([]capture.SanitizedObservation, 0, request.Limit)}
+	page := storage.ObservationPage{Observations: make([]capture.SanitizedObservation, 0, request.Limit), CapturedAt: make([]time.Time, 0, request.Limit)}
 	err := s.view(ctx, func(reader bolt.Reader) error {
 		entries, hasMore, err := reader.Scan(observationOrderPrefix, after, request.Limit, bolt.MaxTransactionBytes-bolt.MaxKeyBytes)
 		if err != nil {
@@ -1338,7 +1511,7 @@ func (s *Store) ListObservationPage(ctx context.Context, request storage.Observa
 		defer clearBoltEntries(entries)
 		page.HasMore = hasMore
 		for _, entry := range entries {
-			size, recordKey, err := s.decodeSizeEntry(entry.Key, entry.Value)
+			size, capturedAt, recordKey, err := s.decodeSizeEntry(entry.Key, entry.Value)
 			if err != nil {
 				return ErrCorrupt
 			}
@@ -1373,6 +1546,7 @@ func (s *Store) ListObservationPage(ctx context.Context, request storage.Observa
 			}
 			clear(recordKey)
 			page.Observations = append(page.Observations, observation)
+			page.CapturedAt = append(page.CapturedAt, capturedAt)
 			page.Bytes += size
 		}
 		return nil

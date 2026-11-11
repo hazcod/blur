@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/hazcod/blur/internal/platform"
 )
 
 func TestCapabilityStatesValidateAndJSON(t *testing.T) {

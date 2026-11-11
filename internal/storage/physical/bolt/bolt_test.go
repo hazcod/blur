@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/storage/recordcodec"
+	"github.com/hazcod/blur/internal/storage/recordcodec"
 )
 
 func databasePath(t *testing.T) string {

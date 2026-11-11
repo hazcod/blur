@@ -10,10 +10,10 @@ import (
 	"io"
 	"sort"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/search"
-	"github.com/nielsgroen/blur/internal/storage"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 const (
@@ -443,11 +443,16 @@ func (tx *Tx) removeSearchIndexSourceLocked(sourceID string) error {
 	return nil
 }
 
-// deleteObservation is an internal lifecycle fixture until public deletion is
-// introduced. It atomically removes the source and every exact-index posting.
+// deleteObservation is the low-level source/index removal used only inside a
+// coordinated transaction.
 func (tx *Tx) deleteObservation(sourceID string) error {
 	if tx == nil {
 		return &storage.StoreError{Code: storage.Closed}
+	}
+	// Remove this source from the exact-hour recovery index in the same
+	// transaction, regardless of which deletion entry point was used.
+	if err := tx.removeCaptureHourSource(sourceID); err != nil {
+		return err
 	}
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
@@ -480,6 +485,52 @@ func (tx *Tx) deleteObservation(sourceID string) error {
 	clear(recordKey)
 	clear(orderKey)
 	return nil
+}
+
+func (tx *Tx) deleteObservationRecord(sourceID string) error {
+	if tx == nil {
+		return &storage.StoreError{Code: storage.Closed}
+	}
+	tx.mu.Lock()
+	if err := tx.checkLocked(); err != nil {
+		defer tx.mu.Unlock()
+		return tx.failLocked(err)
+	}
+	if !validHash(sourceID) {
+		defer tx.mu.Unlock()
+		return tx.failLocked(&storage.StoreError{Code: storage.Invalid})
+	}
+	tx.mu.Unlock()
+	if err := tx.requireProjectionIndexes(); err != nil {
+		return err
+	}
+	tx.mu.Lock()
+	if err := tx.checkLocked(); err != nil {
+		tx.mu.Unlock()
+		return tx.failLocked(err)
+	}
+	_, found, err := tx.store.getObservationReader(tx.writer, sourceID)
+	if err != nil {
+		defer tx.mu.Unlock()
+		return tx.failLocked(err)
+	}
+	tx.mu.Unlock()
+	if err := tx.removeTodaySource(sourceID); err != nil {
+		return err
+	}
+	if err := tx.removeActivitySource(sourceID); err != nil {
+		return err
+	}
+	if err := tx.removeChroniclesForSource(sourceID); err != nil {
+		return err
+	}
+	if err := tx.quarantineKnowledgeSource(sourceID); err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	return tx.deleteObservation(sourceID)
 }
 
 func (tx *Tx) writeSearchIndexStateLocked() error {
@@ -692,7 +743,7 @@ func findSearchIndexRef(refs []searchIndexRef, kind byte, digest [sha256.Size]by
 }
 
 func (s *Store) SearchExact(ctx context.Context, query search.ExactQuery) (search.ExactPage, error) {
-	if ctx == nil || len(query.Terms) == 0 || len(query.Terms) > search.MaxTerms || query.TopK < 0 || query.TopK > search.MaxResults || query.MaxRows < 1 || query.MaxRows > search.MaxIndexRows || query.MaxBytes < 1 || query.MaxBytes > search.MaxIndexBytes {
+	if ctx == nil || len(query.Terms) == 0 || len(query.Terms) > search.MaxTerms || query.MinTermMatches < 0 || query.MinTermMatches > len(query.Terms) || query.TopK < 0 || query.TopK > search.MaxResults || query.MaxRows < 1 || query.MaxRows > search.MaxIndexRows || query.MaxBytes < 1 || query.MaxBytes > search.MaxIndexBytes {
 		return search.ExactPage{}, search.ErrInvalidRequest
 	}
 	if query.TopK == 0 {
@@ -732,9 +783,11 @@ type searchIndexSearchStream struct {
 }
 
 type searchIndexEvaluatedCandidate struct {
-	fields  []byte
-	matches bool
-	score   int
+	fields       []byte
+	matches      bool
+	termMatches  int
+	metadataOkay bool
+	score        int
 }
 
 func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, query search.ExactQuery, result *search.ExactPage) error {
@@ -768,6 +821,10 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 			iterator:        newSearchIndexTreeIterator(ctx, reader, s, constraints[i].kind, constraints[i].digest),
 			seen:            make(map[string]struct{}),
 		}
+	}
+	minTermMatches := query.MinTermMatches
+	if minTermMatches == 0 {
+		minTermMatches = len(query.Terms) // zero preserves exact all-term behavior
 	}
 	evaluated := make(map[string]searchIndexEvaluatedCandidate, min(query.MaxRows, 128))
 	matchedCount := 0
@@ -827,15 +884,18 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 		if stopped {
 			return search.ErrIndexBudget
 		}
-		candidate := searchIndexEvaluatedCandidate{fields: make([]byte, len(constraints)), matches: true}
+		candidate := searchIndexEvaluatedCandidate{fields: make([]byte, len(constraints)), metadataOkay: true}
 		for i, constraint := range constraints {
 			ref, found := findSearchIndexRef(refs, constraint.kind, constraint.digest)
 			if !found {
-				candidate.matches = false
+				if constraint.kind != searchIndexTerm {
+					candidate.metadataOkay = false
+				}
 				continue
 			}
 			candidate.fields[i] = ref.fields
 			if constraint.kind == searchIndexTerm {
+				candidate.termMatches++
 				weight := searchIndexWeight(ref.fields)
 				if weight == 0 {
 					clearSearchIndexRefs(refs)
@@ -848,6 +908,7 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 			}
 		}
 		clearSearchIndexRefs(refs)
+		candidate.matches = candidate.metadataOkay && candidate.termMatches >= minTermMatches
 		if candidate.fields[stream.constraintIndex] != posting.fields {
 			clear(candidate.fields)
 			return ErrCorrupt

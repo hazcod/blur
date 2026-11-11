@@ -115,7 +115,7 @@ Wasm SQLite remain measured alternatives, not transitive fallbacks.
 - [ ] Let the search engine prefer the bounded index capability and retain the
   existing scan engine only as an explicit small-store conformance fallback.
   Query proofs bind every effective filter, row, byte, and response limit.
-- [ ] Benchmark 100k and 1M synthetic observations for ingest, exact search,
+- [x] Benchmark 100k and 1M synthetic observations for ingest, exact search,
   reopen, memory, and disk. Establish measured p50/p95 budgets in the ADR; do
   not claim semantic retrieval in this phase.
 

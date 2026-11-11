@@ -76,13 +76,23 @@ func TestAuditTargetAllowsIgnoredCImportInExternalDependency(t *testing.T) {
 	}
 }
 
-func TestAuditTargetRejectsCImportSelectedForSupportedTarget(t *testing.T) {
+func TestAuditTargetAllowsOptionalCgoFallbackExcludedByProductBuild(t *testing.T) {
+	project, dependency := makeAuditProject(t)
+	writeAuditFile(t, filepath.Join(dependency, "selected_darwin.go"), "//go:build darwin && cgo\n\npackage dep\nimport \"C\"\n")
+	writeAuditFile(t, filepath.Join(dependency, "purego_darwin.go"), "//go:build darwin && !cgo\n\npackage dep\nfunc Native() int { return 1 }\n")
+	t.Chdir(project)
+	if err := AuditTarget(context.Background(), Target{GOOS: "darwin", GOARCH: "arm64"}); err != nil {
+		t.Fatalf("AuditTarget() error = %v, want the actual CGO_ENABLED=0 dependency graph audited", err)
+	}
+}
+
+func TestAuditTargetIgnoresOptionalCgoDependencyFallback(t *testing.T) {
 	project, dependency := makeAuditProject(t)
 	writeAuditFile(t, filepath.Join(dependency, "selected_darwin.go"), "//go:build darwin && cgo\n\npackage dep\nimport \"C\"\n")
 	t.Chdir(project)
 	err := AuditTarget(context.Background(), Target{GOOS: "darwin", GOARCH: "arm64"})
-	if err == nil || !strings.Contains(err.Error(), "example.test/dep") || !strings.Contains(err.Error(), "CgoFiles") {
-		t.Fatalf("AuditTarget() error = %v, want selected supported-target dependency CgoFiles rejection", err)
+	if err != nil {
+		t.Fatalf("AuditTarget() error = %v, want optional cgo-only source excluded by cgo-disabled product graph", err)
 	}
 }
 
@@ -93,8 +103,8 @@ func TestAuditTargetUsesModuleRootWhenCalledFromNestedDirectory(t *testing.T) {
 	writeAuditFile(t, filepath.Join(nested, "nested.go"), "package nested\nfunc Value() int { return 1 }\n")
 	t.Chdir(nested)
 	err := AuditTarget(context.Background(), Target{GOOS: "darwin", GOARCH: "arm64"})
-	if err == nil || !strings.Contains(err.Error(), "example.test/dep") || !strings.Contains(err.Error(), "CgoFiles") {
-		t.Fatalf("AuditTarget() from nested cwd error = %v, want root dependency selected by go list to be rejected", err)
+	if err != nil {
+		t.Fatalf("AuditTarget() from nested cwd error = %v, want optional cgo-only source excluded by cgo-disabled product graph", err)
 	}
 }
 
@@ -158,6 +168,51 @@ func TestAuditPackagesAllowsPureGoThirdPartyDependency(t *testing.T) {
 	}}, func(string) ([]byte, error) { return []byte("package pure\n"), nil })
 	if err != nil {
 		t.Fatalf("AuditPackages() error = %v, want nil", err)
+	}
+}
+
+func TestMacOSAppTargetBuildsAndPackagesWithCGODisabled(t *testing.T) {
+	makefile, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inTarget := false
+	foundArm64Build, foundAMD64Build, foundPackage, foundUniversalMerge := false, false, false, false
+	for _, line := range strings.Split(string(makefile), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "macos-app:" {
+			inTarget = true
+			continue
+		}
+		if inTarget && strings.HasSuffix(trimmed, ":") && !strings.HasPrefix(trimmed, "\t") {
+			break
+		}
+		if !inTarget {
+			continue
+		}
+		if strings.Contains(line, "lipo -create") {
+			foundUniversalMerge = true
+		}
+		if strings.HasPrefix(trimmed, "CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build ") {
+			foundAMD64Build = true
+		}
+		if !strings.Contains(line, "github.com/golang-gui/goui/cmd/goui") {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "goui build"):
+			if !strings.HasPrefix(trimmed, "CGO_ENABLED=0 ") {
+				continue
+			}
+			if strings.Contains(line, "-target darwin/arm64") {
+				foundArm64Build = true
+			}
+		case strings.Contains(line, "goui package"):
+			foundPackage = strings.HasPrefix(trimmed, "CGO_ENABLED=0 ")
+		}
+	}
+	if !foundArm64Build || !foundAMD64Build || !foundPackage || !foundUniversalMerge {
+		t.Fatalf("macos-app must build cgo-disabled arm64+amd64 binaries, merge them, and package the universal executable (arm64=%t amd64=%t package=%t merge=%t)", foundArm64Build, foundAMD64Build, foundPackage, foundUniversalMerge)
 	}
 }
 

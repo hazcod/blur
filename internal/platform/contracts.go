@@ -13,11 +13,20 @@ const (
 	SecretCorrupt     SecretState = "corrupt"
 	SecretDenied      SecretState = "denied"
 	SecretUnavailable SecretState = "unavailable"
+	SecretAmbiguous   SecretState = "ambiguous"
 )
 
 // SecretStoreError carries only a closed status; backend details and secret
 // values must never appear in its formatting.
-type SecretStoreError struct{ State SecretState }
+// Operation is an optional closed startup-stage label: read, create, or verify.
+// BackendCode is an optional numeric OS status for diagnostics; neither field
+// may contain backend strings or user-controlled values. Error formatting
+// intentionally exposes only the closed State.
+type SecretStoreError struct {
+	State       SecretState
+	Operation   string
+	BackendCode int32
+}
 
 func (e *SecretStoreError) Error() string { return "platform.secret_store: " + string(e.State) }
 
@@ -47,6 +56,25 @@ type CaptureSource interface {
 	CapabilityReporter
 	Probe(context.Context) (CaptureProbe, error)
 	Next(context.Context) (CaptureEvent, error)
+}
+
+// ActiveApplicationReporter exposes only the current app identifier for
+// preference/status UI. It never reports titles, URLs, or captured content.
+type ActiveApplicationReporter interface {
+	ActiveApplicationID() (string, bool)
+}
+
+// CaptureSuspender releases passive platform subscriptions while capture is
+// paused. Capability/Start may establish them again when the user resumes.
+type CaptureSuspender interface {
+	Suspend(context.Context) error
+}
+
+// CapturePermissionRequester may ask the operating system to show its own
+// permission guidance. Capability checks remain non-interactive; a caller
+// invokes this only after an explicit capture-enabled startup attempt.
+type CapturePermissionRequester interface {
+	RequestPermission(context.Context) error
 }
 
 // TargetLease is an opaque handle; adapters must revalidate it before writing.

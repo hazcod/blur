@@ -5,7 +5,7 @@ package conformance_test
 import (
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/platform/linux"
+	"github.com/hazcod/blur/internal/platform/linux"
 )
 
 func TestLinuxAdapterReportsEvidenceAndRefusesUnimplementedCapture(t *testing.T) {

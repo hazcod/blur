@@ -57,6 +57,20 @@ func openDirectoryPath(path string, requirePrivate bool) (*unixSecureDirectory, 
 			if errors.Is(openErr, unix.ELOOP) || errors.Is(openErr, unix.ENOTDIR) {
 				return nil, ErrInvalid
 			}
+			if errors.Is(openErr, unix.EPERM) || errors.Is(openErr, unix.EACCES) {
+				// The macOS App Sandbox denies opening ancestors above the
+				// container. Ancestors are already alias-resolved, so open the
+				// final component directly (still O_NOFOLLOW) and apply the
+				// same ownership and mode checks.
+				directFD, directErr := unix.Open(absolute, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+				if directErr != nil {
+					if errors.Is(directErr, unix.ELOOP) || errors.Is(directErr, unix.ENOTDIR) {
+						return nil, ErrInvalid
+					}
+					return nil, ErrUnavailable
+				}
+				return finishSecureDirectory(directFD, absolute, requirePrivate)
+			}
 			return nil, ErrUnavailable
 		}
 		currentFD = nextFD
@@ -64,6 +78,10 @@ func openDirectoryPath(path string, requirePrivate bool) (*unixSecureDirectory, 
 	if currentFD != rootFD {
 		_ = unix.Close(rootFD)
 	}
+	return finishSecureDirectory(currentFD, absolute, requirePrivate)
+}
+
+func finishSecureDirectory(currentFD int, absolute string, requirePrivate bool) (*unixSecureDirectory, error) {
 	var stat unix.Stat_t
 	if err := unix.Fstat(currentFD, &stat); err != nil {
 		_ = unix.Close(currentFD)

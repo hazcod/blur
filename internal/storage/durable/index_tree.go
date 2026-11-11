@@ -9,8 +9,8 @@ import (
 	"encoding/hex"
 	"io"
 
-	"github.com/nielsgroen/blur/internal/search"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 const (

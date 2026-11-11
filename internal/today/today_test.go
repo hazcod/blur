@@ -108,6 +108,32 @@ func TestSnapshotCloneDoesNotShareMutableSlices(t *testing.T) {
 	}
 }
 
+func TestWithoutSourceDropsEveryTextBearingProjectionFromThatSource(t *testing.T) {
+	at := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	snapshot, err := Build(Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: at, GenerationID: "g1", Evidence: []Evidence{{
+		SourceID: "source-a", At: at, SubjectID: "topic-a", Subject: "private subject", Change: "private change", Todo: "private task", TodoMarker: MarkerTODO, OpenLoop: "private loop",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := WithoutSource(snapshot, "source-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.SourceIDs) != 0 || len(got.ActiveSubjects) != 0 || len(got.RecentChanges) != 0 || len(got.TodoCandidates) != 0 || len(got.OpenLoops) != 0 {
+		t.Fatalf("source-derived projection survived removal: %+v", got)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("cleaned snapshot invalid: %v", err)
+	}
+	if cap(got.RecentChanges) > 0 && got.RecentChanges[:cap(got.RecentChanges)][0].Text != "" {
+		t.Fatal("deleted change text remains in the returned slice backing array")
+	}
+	if cap(got.TodoCandidates) > 0 && got.TodoCandidates[:cap(got.TodoCandidates)][0].Text != "" {
+		t.Fatal("deleted task text remains in the returned slice backing array")
+	}
+}
+
 func TestMaterializerIncrementalLateDuplicateDeleteAndTodoDisposition(t *testing.T) {
 	day := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	m, err := NewMaterializer("2026-11-05", "UTC")
@@ -147,5 +173,46 @@ func TestMaterializerIncrementalLateDuplicateDeleteAndTodoDisposition(t *testing
 	}
 	if len(s.ActiveSubjects) != 1 || s.ActiveSubjects[0].FirstSeen != late.At || len(s.ConfirmedTodos) != 0 || len(s.TodoCandidates) != 0 || len(s.SourceIDs) != 1 || s.SourceIDs[0] != "src-2" {
 		t.Fatalf("corrected/deleted snapshot %#v", s)
+	}
+}
+
+func TestFollowUpQuestionIsBoundedAndSourceLinked(t *testing.T) {
+	generated := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	snapshot, err := Build(Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: generated, GenerationID: "gen-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.SourceIDs = []string{"source-1"}
+	snapshot.Questions = []Question{{ID: "question-1", Text: "Who owns sending the revised draft?", Reason: "Possible missing owner after meeting.", SourceIDs: []string{"source-1"}, CreatedAt: generated}}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("valid question rejected: %v", err)
+	}
+	copy := snapshot.Clone()
+	copy.Questions[0].SourceIDs[0] = "source-2"
+	if snapshot.Questions[0].SourceIDs[0] != "source-1" {
+		t.Fatal("Clone shared question source IDs")
+	}
+	invalid := snapshot.Clone()
+	invalid.Questions[0].SourceIDs = nil
+	if invalid.Validate() == nil {
+		t.Fatal("unlinked follow-up question accepted")
+	}
+}
+
+func TestSnapshotRejectsSourceLinksOutsideDeletionIndex(t *testing.T) {
+	generated := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	snapshot, err := Build(Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: generated, GenerationID: "gen-1", Evidence: []Evidence{{SourceID: "source-1", At: generated, Change: "Review plan"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := snapshot.Clone()
+	bad.SourceIDs = nil
+	if bad.Validate() == nil {
+		t.Fatal("recent change without a reverse-deletion source link was accepted")
+	}
+	bad = snapshot.Clone()
+	bad.Questions = []Question{{ID: "question-1", Text: "Who owns the plan?", SourceIDs: []string{"source-1"}, CreatedAt: generated, Resolved: true, AnswerSourceID: "source-2"}}
+	if bad.Validate() == nil {
+		t.Fatal("question answer outside the reverse-deletion index was accepted")
 	}
 }

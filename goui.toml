@@ -1,0 +1,13 @@
+id = "com.hazcod.blur"
+name = "Blur"
+executable = "blur"
+main = "./cmd/blur"
+version = "0.1.0"
+build = 1
+icon = "assets/blur.svg"
+
+[windows]
+console = false
+
+[linux]
+categories = ["Utility", "Office"]

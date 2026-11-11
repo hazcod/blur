@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/hazcod/blur/internal/platform"
 )
 
 type secretBackend struct {
@@ -30,7 +30,7 @@ func (b *secretBackend) Get(context.Context, string, int) ([]byte, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.gets++
-	return b.value, b.err
+	return append([]byte(nil), b.value...), b.err
 }
 func (b *secretBackend) Put(_ context.Context, _ string, value []byte) error {
 	b.mu.Lock()
@@ -53,7 +53,7 @@ type failReader struct{}
 func (failReader) Read(p []byte) (int, error) { p[0] = 7; return 1, io.ErrUnexpectedEOF }
 
 func TestOnlyExplicitNotFoundCreatesKey(t *testing.T) {
-	for _, state := range []SecretState{Locked, Corrupt, Denied, Unavailable} {
+	for _, state := range []SecretState{Locked, Corrupt, Denied, Unavailable, Ambiguous} {
 		t.Run(string(state), func(t *testing.T) {
 			b := &secretBackend{err: &SecretError{State: state}}
 			_, err := ResolveKey(context.Background(), b, "database", bytes.NewReader(bytes.Repeat([]byte{9}, 32)))
@@ -89,6 +89,24 @@ func TestOnlyExplicitNotFoundCreatesKey(t *testing.T) {
 	}
 }
 
+func TestLoadKeyNeverCreatesWhenMissing(t *testing.T) {
+	b := &secretBackend{err: &SecretError{State: NotFound}}
+	_, err := LoadKey(context.Background(), b, "database")
+	var secretErr *SecretError
+	if !errors.As(err, &secretErr) || secretErr.State != NotFound || b.gets != 1 || b.puts != 0 {
+		t.Fatalf("LoadKey() error=%v gets=%d puts=%d", err, b.gets, b.puts)
+	}
+}
+
+func TestLoadKeyReturnsExistingKeyWithoutMutation(t *testing.T) {
+	want := bytes.Repeat([]byte{0x5a}, 32)
+	b := &secretBackend{value: append([]byte(nil), want...)}
+	key, err := LoadKey(context.Background(), b, "database")
+	if err != nil || key.Bytes() != [32]byte(want) || b.puts != 0 {
+		t.Fatalf("LoadKey() match=%t error=%v puts=%d", key.Bytes() == [32]byte(want), err, b.puts)
+	}
+}
+
 func TestRandomAndPersistenceFailuresFailClosed(t *testing.T) {
 	b := &secretBackend{err: &SecretError{State: NotFound}}
 	if _, err := ResolveKey(context.Background(), b, "database", failReader{}); err == nil || b.puts != 0 {
@@ -98,6 +116,24 @@ func TestRandomAndPersistenceFailuresFailClosed(t *testing.T) {
 	_, err := ResolveKey(context.Background(), b, "database", bytes.NewReader(bytes.Repeat([]byte{4}, 32)))
 	if err == nil || b.puts != 1 || strings.Contains(err.Error(), "PRIVATE") {
 		t.Fatalf("err=%v puts=%d", err, b.puts)
+	}
+	b = &secretBackend{err: &SecretError{State: NotFound}, putErr: &SecretError{State: Denied}}
+	_, err = ResolveKey(context.Background(), b, "database", bytes.NewReader(bytes.Repeat([]byte{4}, 32)))
+	var secretErr *SecretError
+	if !errors.As(err, &secretErr) || secretErr.State != Denied || secretErr.Operation != "create" {
+		t.Fatalf("typed Put failure = %v, want denied during create", err)
+	}
+}
+
+func TestResolveKeyPreservesNumericReadStatusOnly(t *testing.T) {
+	b := &secretBackend{err: &SecretError{State: Unavailable, BackendCode: -50}}
+	_, err := ResolveKey(context.Background(), b, "database", failReader{})
+	var secretErr *SecretError
+	if !errors.As(err, &secretErr) || secretErr.State != Unavailable || secretErr.Operation != "read" || secretErr.BackendCode != -50 {
+		t.Fatalf("read failure = %#v, want only numeric status and operation", err)
+	}
+	if strings.Contains(err.Error(), "-50") {
+		t.Fatalf("formatted secret-store error exposed backend code: %v", err)
 	}
 }
 

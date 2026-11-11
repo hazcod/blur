@@ -15,12 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/platform"
-	"github.com/nielsgroen/blur/internal/privacy"
-	"github.com/nielsgroen/blur/internal/securestore"
-	"github.com/nielsgroen/blur/internal/storage"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/securestore"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 func TestOpenDurableRequiresExplicitCreateOrOpenMode(t *testing.T) {
@@ -72,6 +73,62 @@ func TestOpenDurableRejectsMissingZeroKeyWithoutCreating(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("zero-key open created a store: %v", err)
+	}
+}
+
+func TestDeleteObservationRecordsIsBoundedAndValidatesAtomically(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x62), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, err := capture.SanitizeObservation("batch.app", "", "first batch source", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := capture.SanitizeObservation("batch.app", "", "second batch source", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, observation := range []capture.SanitizedObservation{first, second} {
+		if err := store.PutObservation(ctx, observation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.DeleteObservationRecords(ctx, []string{first.ContentID(), "not-a-content-id"}); err == nil {
+		t.Fatal("DeleteObservationRecords(invalid ID) succeeded")
+	}
+	if _, found, err := store.GetObservation(ctx, first.ContentID()); err != nil || !found {
+		t.Fatalf("validation failure partially removed first source: found=%t err=%v", found, err)
+	}
+	if err := store.DeleteObservationRecords(ctx, []string{first.ContentID(), second.ContentID()}); err != nil {
+		t.Fatalf("DeleteObservationRecords(valid batch): %v", err)
+	}
+	for _, observation := range []capture.SanitizedObservation{first, second} {
+		if _, found, err := store.GetObservation(ctx, observation.ContentID()); err != nil || found {
+			t.Fatalf("source remains after batch delete: found=%t err=%v", found, err)
+		}
+	}
+}
+
+func TestDeleteBatchSizerLeavesHeadroomForDenseSearchIndexes(t *testing.T) {
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x63), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	terms := make([]string, search.MaxIndexedObservationTerms-2)
+	for i := range terms {
+		terms[i] = fmt.Sprintf("batchterm%03d", i)
+	}
+	dense, err := capture.SanitizeObservation("editor", "docs", strings.Join(terms, " "), capture.MaxObservationTextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit, err := store.MaxObservationDeleteBatchWithinSearchBudget([]capture.SanitizedObservation{dense, dense})
+	if err != nil || limit != 1 {
+		t.Fatalf("MaxObservationDeleteBatchWithinSearchBudget(dense pair) = (%d, %v), want (1, nil)", limit, err)
 	}
 }
 
@@ -647,6 +704,158 @@ func TestDurablePageSkipsDecryptingOverBudgetRecord(t *testing.T) {
 	}
 }
 
+func TestDurableObservationCaptureTimePersistsOutsideContentIdentity(t *testing.T) {
+	ctx := context.Background()
+	path := durableTestPath(t)
+	key := durableTestKey(t, 0x64)
+	store, err := OpenDurable(path, key, CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := capture.SanitizeObservation("editor", "docs.example", "same content", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := observation.ContentID()
+	capturedAt := time.Date(2026, 10, 2, 3, 4, 5, 0, time.UTC)
+	if err := store.PutObservationAt(ctx, observation, capturedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenDurable(path, key, OpenExisting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	page, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 4, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 1 || len(page.CapturedAt) != 1 || !page.CapturedAt[0].Equal(capturedAt) {
+		t.Fatalf("persisted capture metadata = (%d, %v, %v), want one record at %s", len(page.Observations), page.CapturedAt, err, capturedAt)
+	}
+	if page.Observations[0].ContentID() != id {
+		t.Fatalf("capture time changed content identity: got %s want %s", page.Observations[0].ContentID(), id)
+	}
+}
+
+func TestDurableOpenBackfillsLegacyCaptureTimeMetadataOnce(t *testing.T) {
+	ctx := context.Background()
+	path := durableTestPath(t)
+	key := durableTestKey(t, 0x65)
+	store, err := OpenDurable(path, key, CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := capture.SanitizeObservation("editor", "docs.example", "legacy timestamp", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservationAt(ctx, observation, time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	orderKey := store.logicalKey(groupOrder, kindObservation, "", observation.ContentID())
+	recordKey := store.logicalKey(groupRecord, kindObservation, "", observation.ContentID())
+	legacyPlain := make([]byte, legacySizeRecordBytes)
+	legacyPlain[0] = 1
+	binary.BigEndian.PutUint32(legacyPlain[1:5], uint32(observationSearchBytes(observation)))
+	copy(legacyPlain[5:], recordKey)
+	legacyEnvelope, err := store.seal(orderKey, "observation-size", legacyPlain)
+	clear(legacyPlain)
+	clear(recordKey)
+	if err != nil {
+		clear(orderKey)
+		t.Fatal(err)
+	}
+	if err := store.Update(ctx, func(tx *Tx) error { return tx.writeEntryLocked(orderKey, legacyEnvelope, true) }); err != nil {
+		clear(orderKey)
+		clear(legacyEnvelope)
+		t.Fatal(err)
+	}
+	clear(orderKey)
+	clear(legacyEnvelope)
+	baseline := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(tx *Tx) error {
+		return tx.PutIndexRecord(captureTimeMigrationNamespace, captureTimeMigrationID, encodeCaptureTimeMigration(baseline, false))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenDurable(path, key, OpenExisting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	page, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 2, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 1 || len(page.CapturedAt) != 1 || !page.CapturedAt[0].Equal(baseline) {
+		t.Fatalf("legacy capture metadata after migration = (%d, %v, %v), want persisted conservative baseline %s", len(page.Observations), page.CapturedAt, err, baseline)
+	}
+}
+
+func TestCreateNewStoreMarksCaptureTimeMigrationComplete(t *testing.T) {
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x66), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	baseline, complete, found, err := store.readCaptureTimeMigration(context.Background())
+	if err != nil || !found || !complete || !validCaptureTime(baseline) {
+		t.Fatalf("fresh store capture-time migration marker = (%v, %t, %t, %v), want valid completed marker", baseline, complete, found, err)
+	}
+}
+
+func TestDurableRetentionPolicyDefaultsToNinetyDaysAndPersists(t *testing.T) {
+	ctx := context.Background()
+	path := durableTestPath(t)
+	key := durableTestKey(t, 0x66)
+	store, err := OpenDurable(path, key, CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := store.GetRetentionPolicy(ctx)
+	if err != nil || policy.Days != 90 || !policy.LastSweepAt.IsZero() {
+		t.Fatalf("default retention policy = %+v, %v; want 90 days", policy, err)
+	}
+	if err := store.SetRetentionDays(ctx, 14); err == nil {
+		t.Fatal("SetRetentionDays(14) succeeded; unsupported intervals must fail")
+	}
+	if err := store.SetRetentionDays(ctx, 30); err != nil {
+		t.Fatal(err)
+	}
+	sweptAt := time.Date(2026, 11, 5, 2, 0, 0, 0, time.UTC)
+	if err := store.MarkRetentionSweep(ctx, sweptAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenDurable(path, key, OpenExisting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	policy, err = store.GetRetentionPolicy(ctx)
+	if err != nil || policy.Days != 30 || !policy.LastSweepAt.Equal(sweptAt) {
+		t.Fatalf("reopened retention policy = %+v, %v; want 30 days at %s", policy, err, sweptAt)
+	}
+	if err := store.SetRetentionDays(ctx, 90); err != nil {
+		t.Fatal(err)
+	}
+	policy, err = store.GetRetentionPolicy(ctx)
+	if err != nil || policy.Days != 90 || !policy.LastSweepAt.IsZero() {
+		t.Fatalf("changed retention policy = %+v, %v; want 90 days and immediate sweep due", policy, err)
+	}
+	if err := store.SetRetentionDays(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	policy, err = store.GetRetentionPolicy(ctx)
+	if err != nil || policy.Days != 0 {
+		t.Fatalf("explicitly disabled retention = %+v, %v; want Off", policy, err)
+	}
+}
+
 func TestDurableObservationSizeMetadataIsSealedAndBoundToOrderKey(t *testing.T) {
 	path := durableTestPath(t)
 	store, err := OpenDurable(path, durableTestKey(t, 0x59), CreateNew)
@@ -694,11 +903,12 @@ func TestDurableObservationSizeMetadataIsSealedAndBoundToOrderKey(t *testing.T) 
 	defer clear(firstEnvelope)
 	defer clear(secondEnvelope)
 
-	plainSizeAndKey := make([]byte, 1+4+len(firstRecordKey))
-	plainSizeAndKey[0] = 1
+	plainSizeAndKey := make([]byte, sizeRecordBytes)
+	plainSizeAndKey[0] = 2
 	pageSize := uint32(len(first.Text()) + len(first.AppID()) + len(first.Domain()))
 	binary.BigEndian.PutUint32(plainSizeAndKey[1:5], pageSize)
-	copy(plainSizeAndKey[5:], firstRecordKey)
+	binary.BigEndian.PutUint64(plainSizeAndKey[5:13], uint64(time.Now().UnixNano()))
+	copy(plainSizeAndKey[13:], firstRecordKey)
 	plainSizeBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(plainSizeBytes, pageSize)
 	if bytes.Contains(firstEnvelope, firstRecordKey) || bytes.Contains(firstEnvelope, plainSizeAndKey) || bytes.Contains(firstEnvelope, plainSizeBytes) {
@@ -708,7 +918,8 @@ func TestDurableObservationSizeMetadataIsSealedAndBoundToOrderKey(t *testing.T) 
 	if err != nil {
 		t.Fatalf("open authenticated size metadata: %v", err)
 	}
-	if !bytes.Equal(plain, plainSizeAndKey) {
+	if len(plain) != len(plainSizeAndKey) || plain[0] != 2 || binary.BigEndian.Uint32(plain[1:5]) != pageSize ||
+		!validCaptureTime(time.Unix(0, int64(binary.BigEndian.Uint64(plain[5:13])))) || !bytes.Equal(plain[13:], firstRecordKey) {
 		clear(plain)
 		t.Fatal("authenticated size metadata did not contain the versioned expected record")
 	}
@@ -877,8 +1088,8 @@ func TestDurable100kTinyExtensionRecords(t *testing.T) {
 			break
 		}
 	}
-	if count != total {
-		t.Fatalf("stored extension record count = %d; want %d", count, total)
+	if count != total+2 {
+		t.Fatalf("stored extension and mandatory metadata record count = %d; want %d", count, total+2)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

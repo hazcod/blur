@@ -161,13 +161,20 @@ the DB is open; it excludes bbolt-mapped pages and process RSS. The benchmark
 stores about 913 MB (870.9 MiB) for 1M records, so disk footprint remains a
 material trade-off even though exact read latency stays bounded.
 
-The table above is the format-v3 scale baseline. In the format-v4 sibling-link
-follow-up, the same opt-in command completed the 100k case: setup/ingest
-69.875 s; 32-row write p50/p95 21.606/27.554 ms; index read 0.220/0.462 ms;
-100-result search 1.606/1.799 ms; reopen 0.239/0.240 s; database 101,040,128
-bytes; heap-in-use 4.859 MiB. Per owner direction, the v4 1M rerun was
-interrupted after 359.689 s before it completed, so there is no v4 1M result;
-the v3 1M metrics above remain the last completed 1M evidence.
+The table above is the format-v3 scale baseline. The current format-v4
+sibling-link implementation has now completed both corpus sizes on the same
+host. These are fresh `-benchtime=1x` focused runs; the 1M run used
+`-timeout=30m` and completed in 788.072 s total test time:
+
+| Format-v4 scale | Total setup/ingest | 32-row write p50 / p95 | Index read p50 / p95 | Search p50 / p95 | Reopen p50 / p95 | DB bytes | Heap-in-use |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100k | 66.707 s | 21.615 / 24.581 ms | 0.209 / 0.388 ms | 1.657 / 1.862 ms | 0.227 / 0.230 s | 101,253,120 | 1.633 MiB |
+| 1M | 773.275 s (12m53.275s) | 23.784 / 29.752 ms | 0.220 / 0.429 ms | 1.613 / 1.672 ms | 2.384 / 2.403 s | 913,293,312 | 7.930 MiB |
+
+Both current-format scales remain below the local regression budgets above.
+The 1M corpus consumes 871.0 MiB on disk, which remains a material storage
+trade-off. These results do not represent low-end hardware, cold-cache
+percentiles, or real user corpora.
 
 A separate `BenchmarkDurableExactIndexRankedOverCap` run exercises a 1,036-
 record corpus where field-score winners occur beyond the prior 1,000-row

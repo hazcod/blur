@@ -20,6 +20,7 @@ const (
 	MaxSubjects      = 32
 	MaxChanges       = 64
 	MaxTodos         = 64
+	MaxQuestions     = 8
 	MaxOpenLoops     = 64
 	MaxTimeSplits    = 32
 	MaxSources       = 512
@@ -53,6 +54,7 @@ type Evidence struct {
 	At                 time.Time
 	SubjectID, Subject string
 	Change             string
+	ChangeOrigin       ChangeOrigin
 	Todo               string
 	TodoMarker         TodoMarker
 	TodoConfirmed      bool
@@ -69,10 +71,19 @@ type Subject struct {
 }
 
 type Change struct {
-	At        time.Time `json:"at"`
-	Text      string    `json:"text"`
-	SourceIDs []string  `json:"source_ids"`
+	At        time.Time    `json:"at"`
+	Text      string       `json:"text"`
+	SourceIDs []string     `json:"source_ids"`
+	Origin    ChangeOrigin `json:"origin,omitempty"`
 }
+
+// ChangeOrigin records trusted pipeline provenance, never inferred from text.
+type ChangeOrigin string
+
+const (
+	ChangeOriginUser     ChangeOrigin = "user"
+	ChangeOriginActivity ChangeOrigin = "activity"
+)
 
 type Todo struct {
 	ID        string   `json:"id"`
@@ -84,6 +95,19 @@ type Todo struct {
 type OpenLoop struct {
 	Text      string   `json:"text"`
 	SourceIDs []string `json:"source_ids"`
+}
+
+// Question is a bounded, source-linked request for the user to clarify a
+// possible missing meeting follow-up. It is not a task or an external action.
+type Question struct {
+	ID             string    `json:"id"`
+	Text           string    `json:"text"`
+	Reason         string    `json:"reason,omitempty"`
+	SourceIDs      []string  `json:"source_ids"`
+	CreatedAt      time.Time `json:"created_at"`
+	Resolved       bool      `json:"resolved,omitempty"`
+	Dismissed      bool      `json:"dismissed,omitempty"`
+	AnswerSourceID string    `json:"answer_source_id,omitempty"`
 }
 
 type TimeSplit struct {
@@ -117,6 +141,7 @@ type Snapshot struct {
 	ConfirmedTodos []Todo       `json:"confirmed_todos"`
 	TodoCandidates []Todo       `json:"todo_candidates"`
 	OpenLoops      []OpenLoop   `json:"open_loops"`
+	Questions      []Question   `json:"questions,omitempty"`
 	TimeSplit      []TimeSplit  `json:"time_split"`
 	SourceIDs      []string     `json:"source_ids"`
 	Completeness   Completeness `json:"completeness"`
@@ -168,6 +193,107 @@ func (m *Materializer) DeleteSource(sourceID string) error {
 	defer m.mu.Unlock()
 	delete(m.evidence, sourceID)
 	return nil
+}
+
+// WithoutSource returns a snapshot with every text-bearing entry linked to
+// sourceID removed. An aggregate entry is dropped whole rather than retaining
+// text whose contribution cannot be separated from the deleted source.
+func WithoutSource(snapshot Snapshot, sourceID string) (Snapshot, error) {
+	if snapshot.Validate() != nil || !validID(sourceID) {
+		return Snapshot{}, ErrInvalid
+	}
+	out := snapshot.Clone()
+	out.SourceIDs = filterIDs(out.SourceIDs, sourceID)
+	out.ActiveSubjects = filterSubjects(out.ActiveSubjects, sourceID)
+	out.RecentChanges = filterChanges(out.RecentChanges, sourceID)
+	out.ConfirmedTodos = filterTodos(out.ConfirmedTodos, sourceID)
+	out.TodoCandidates = filterTodos(out.TodoCandidates, sourceID)
+	out.OpenLoops = filterOpenLoops(out.OpenLoops, sourceID)
+	questions := out.Questions[:0]
+	for _, item := range out.Questions {
+		if item.AnswerSourceID != sourceID && !referencesSource(item.SourceIDs, sourceID) {
+			questions = append(questions, item)
+		}
+	}
+	clear(out.Questions[len(questions):])
+	out.Questions = questions
+	splits := out.TimeSplit[:0]
+	for _, item := range out.TimeSplit {
+		if !referencesSource(item.SourceIDs, sourceID) {
+			splits = append(splits, item)
+		}
+	}
+	clear(out.TimeSplit[len(splits):])
+	out.TimeSplit = splits
+	if out.Validate() != nil {
+		return Snapshot{}, ErrInvalid
+	}
+	return out, nil
+}
+
+func referencesSource(ids []string, sourceID string) bool {
+	i := sort.SearchStrings(ids, sourceID)
+	return i < len(ids) && ids[i] == sourceID
+}
+
+func filterIDs(ids []string, sourceID string) []string {
+	originalLength := len(ids)
+	out := ids[:0]
+	for _, id := range ids {
+		if id != sourceID {
+			out = append(out, id)
+		}
+	}
+	clear(ids[len(out):originalLength])
+	return out
+}
+
+func filterSubjects(items []Subject, sourceID string) []Subject {
+	originalLength := len(items)
+	out := items[:0]
+	for _, item := range items {
+		if !referencesSource(item.SourceIDs, sourceID) {
+			out = append(out, item)
+		}
+	}
+	clear(items[len(out):originalLength])
+	return out
+}
+
+func filterChanges(items []Change, sourceID string) []Change {
+	originalLength := len(items)
+	out := items[:0]
+	for _, item := range items {
+		if !referencesSource(item.SourceIDs, sourceID) {
+			out = append(out, item)
+		}
+	}
+	clear(items[len(out):originalLength])
+	return out
+}
+
+func filterTodos(items []Todo, sourceID string) []Todo {
+	originalLength := len(items)
+	out := items[:0]
+	for _, item := range items {
+		if !referencesSource(item.SourceIDs, sourceID) {
+			out = append(out, item)
+		}
+	}
+	clear(items[len(out):originalLength])
+	return out
+}
+
+func filterOpenLoops(items []OpenLoop, sourceID string) []OpenLoop {
+	originalLength := len(items)
+	out := items[:0]
+	for _, item := range items {
+		if !referencesSource(item.SourceIDs, sourceID) {
+			out = append(out, item)
+		}
+	}
+	clear(items[len(out):originalLength])
+	return out
 }
 
 func (m *Materializer) Snapshot(generatedAt time.Time, generationID string, split []TimeSplit) (Snapshot, error) {
@@ -271,7 +397,7 @@ func Build(in Input) (Snapshot, error) {
 			a.value.SourceIDs = append(a.value.SourceIDs, strings.Clone(ev.SourceID))
 		}
 		if ev.Change != "" {
-			out.RecentChanges = append(out.RecentChanges, Change{At: ev.At, Text: strings.Clone(ev.Change), SourceIDs: []string{strings.Clone(ev.SourceID)}})
+			out.RecentChanges = append(out.RecentChanges, Change{At: ev.At, Text: strings.Clone(ev.Change), SourceIDs: []string{strings.Clone(ev.SourceID)}, Origin: ev.ChangeOrigin})
 		}
 		if ev.Todo != "" && ev.TodoMarker != MarkerNone && !ev.TodoDismissed {
 			item := Todo{ID: strings.Clone(ev.SourceID), Text: strings.Clone(ev.Todo), SourceIDs: []string{strings.Clone(ev.SourceID)}, Confirmed: ev.TodoConfirmed}
@@ -336,10 +462,26 @@ func Build(in Input) (Snapshot, error) {
 		out.TimeSplit = out.TimeSplit[:MaxTimeSplits]
 	}
 	sort.Strings(out.SourceIDs)
+	// Time aggregates may refer to evidence that did not produce a textual
+	// change, so include their source links in the reverse-deletion index.
+	indexed := make(map[string]struct{}, len(out.SourceIDs))
+	for _, sourceID := range out.SourceIDs {
+		indexed[sourceID] = struct{}{}
+	}
+	for _, split := range out.TimeSplit {
+		for _, sourceID := range split.SourceIDs {
+			if _, exists := indexed[sourceID]; !exists {
+				out.SourceIDs = append(out.SourceIDs, sourceID)
+				indexed[sourceID] = struct{}{}
+			}
+		}
+	}
+	sort.Strings(out.SourceIDs)
 	if len(out.SourceIDs) > MaxSources {
 		out.Completeness.SourcesOmitted = len(out.SourceIDs) - MaxSources
 		out.SourceIDs = out.SourceIDs[:MaxSources]
 	}
+	out = pruneUnindexed(out)
 	if err := out.Validate(); err != nil {
 		return Snapshot{}, err
 	}
@@ -347,7 +489,7 @@ func Build(in Input) (Snapshot, error) {
 }
 
 func (s Snapshot) Validate() error {
-	if !validDate(s.Date) || !validText(s.Zone, 128) || s.GeneratedAt.IsZero() || !validID(s.GenerationID) || len(s.ActiveSubjects) > MaxSubjects || len(s.RecentChanges) > MaxChanges || len(s.ConfirmedTodos) > MaxTodos || len(s.TodoCandidates) > MaxTodos || len(s.OpenLoops) > MaxOpenLoops || len(s.TimeSplit) > MaxTimeSplits || len(s.SourceIDs) > MaxSources {
+	if !validDate(s.Date) || !validText(s.Zone, 128) || s.GeneratedAt.IsZero() || !validID(s.GenerationID) || len(s.ActiveSubjects) > MaxSubjects || len(s.RecentChanges) > MaxChanges || len(s.ConfirmedTodos) > MaxTodos || len(s.TodoCandidates) > MaxTodos || len(s.OpenLoops) > MaxOpenLoops || len(s.Questions) > MaxQuestions || len(s.TimeSplit) > MaxTimeSplits || len(s.SourceIDs) > MaxSources {
 		return ErrInvalid
 	}
 	location, err := time.LoadLocation(s.Zone)
@@ -361,8 +503,12 @@ func (s Snapshot) Validate() error {
 	if !validSortedIDs(s.SourceIDs) {
 		return ErrInvalid
 	}
+	indexed := make(map[string]struct{}, len(s.SourceIDs))
+	for _, sourceID := range s.SourceIDs {
+		indexed[sourceID] = struct{}{}
+	}
 	for i, x := range s.ActiveSubjects {
-		if !validID(x.ID) || !validOptionalText(x.Label) || x.FirstSeen.IsZero() || x.LastSeen.Before(x.FirstSeen) || !validSortedIDs(x.SourceIDs) {
+		if !validID(x.ID) || !validOptionalText(x.Label) || x.FirstSeen.IsZero() || x.LastSeen.Before(x.FirstSeen) || !validLinkedIDs(x.SourceIDs, indexed) {
 			return ErrInvalid
 		}
 		for j := 0; j < i; j++ {
@@ -372,13 +518,13 @@ func (s Snapshot) Validate() error {
 		}
 	}
 	for _, x := range s.RecentChanges {
-		if x.At.IsZero() || !validText(x.Text, MaxTextBytes) || !validSortedIDs(x.SourceIDs) {
+		if x.At.IsZero() || !validText(x.Text, MaxTextBytes) || !validLinkedIDs(x.SourceIDs, indexed) || !validChangeOrigin(x.Origin) {
 			return ErrInvalid
 		}
 	}
 	for _, set := range [][]Todo{s.ConfirmedTodos, s.TodoCandidates} {
 		for _, x := range set {
-			if !validID(x.ID) || !validText(x.Text, MaxTextBytes) || !validSortedIDs(x.SourceIDs) {
+			if !validID(x.ID) || !validText(x.Text, MaxTextBytes) || !validLinkedIDs(x.SourceIDs, indexed) {
 				return ErrInvalid
 			}
 		}
@@ -394,12 +540,22 @@ func (s Snapshot) Validate() error {
 		}
 	}
 	for _, x := range s.OpenLoops {
-		if !validText(x.Text, MaxTextBytes) || !validSortedIDs(x.SourceIDs) {
+		if !validText(x.Text, MaxTextBytes) || !validLinkedIDs(x.SourceIDs, indexed) {
 			return ErrInvalid
 		}
 	}
+	seenQuestions := make(map[string]struct{}, len(s.Questions))
+	for _, question := range s.Questions {
+		if !validID(question.ID) || !validText(question.Text, MaxTextBytes) || !validOptionalText(question.Reason) || !validLinkedIDs(question.SourceIDs, indexed) || question.CreatedAt.IsZero() || !validOptionalID(question.AnswerSourceID) || question.AnswerSourceID != "" && !hasIndexed(indexed, question.AnswerSourceID) || question.Dismissed && !question.Resolved || question.Resolved && !question.Dismissed && question.AnswerSourceID == "" || !question.Resolved && (question.Dismissed || question.AnswerSourceID != "") {
+			return ErrInvalid
+		}
+		if _, duplicate := seenQuestions[question.ID]; duplicate {
+			return ErrInvalid
+		}
+		seenQuestions[question.ID] = struct{}{}
+	}
 	for _, x := range s.TimeSplit {
-		if !validID(x.Key) || !validText(x.Label, MaxTextBytes) || x.Duration < 0 || !validSortedIDs(x.SourceIDs) {
+		if !validID(x.Key) || !validText(x.Label, MaxTextBytes) || x.Duration < 0 || !validLinkedIDs(x.SourceIDs, indexed) {
 			return ErrInvalid
 		}
 	}
@@ -410,6 +566,99 @@ func (s Snapshot) Validate() error {
 	}
 	clear(b)
 	return nil
+}
+
+func validLinkedIDs(ids []string, indexed map[string]struct{}) bool {
+	if len(ids) == 0 || !validSortedIDs(ids) {
+		return false
+	}
+	for _, id := range ids {
+		if !hasIndexed(indexed, id) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasIndexed(indexed map[string]struct{}, id string) bool {
+	_, ok := indexed[id]
+	return ok
+}
+
+func pruneUnindexed(snapshot Snapshot) Snapshot {
+	indexed := make(map[string]struct{}, len(snapshot.SourceIDs))
+	for _, id := range snapshot.SourceIDs {
+		indexed[id] = struct{}{}
+	}
+	subjectCount := len(snapshot.ActiveSubjects)
+	subjects := snapshot.ActiveSubjects[:0]
+	for _, item := range snapshot.ActiveSubjects {
+		if validLinkedIDs(item.SourceIDs, indexed) {
+			subjects = append(subjects, item)
+		} else {
+			snapshot.Completeness.SubjectsOmitted++
+		}
+	}
+	clear(snapshot.ActiveSubjects[len(subjects):subjectCount])
+	snapshot.ActiveSubjects = subjects
+	changeCount := len(snapshot.RecentChanges)
+	changes := snapshot.RecentChanges[:0]
+	for _, item := range snapshot.RecentChanges {
+		if validLinkedIDs(item.SourceIDs, indexed) {
+			changes = append(changes, item)
+		} else {
+			snapshot.Completeness.ChangesOmitted++
+		}
+	}
+	clear(snapshot.RecentChanges[len(changes):changeCount])
+	snapshot.RecentChanges = changes
+	filterTodos := func(items []Todo) []Todo {
+		originalLength := len(items)
+		out := items[:0]
+		for _, item := range items {
+			if validLinkedIDs(item.SourceIDs, indexed) {
+				out = append(out, item)
+			} else {
+				snapshot.Completeness.TodosOmitted++
+			}
+		}
+		clear(items[len(out):originalLength])
+		return out
+	}
+	snapshot.ConfirmedTodos = filterTodos(snapshot.ConfirmedTodos)
+	snapshot.TodoCandidates = filterTodos(snapshot.TodoCandidates)
+	loopCount := len(snapshot.OpenLoops)
+	loops := snapshot.OpenLoops[:0]
+	for _, item := range snapshot.OpenLoops {
+		if validLinkedIDs(item.SourceIDs, indexed) {
+			loops = append(loops, item)
+		} else {
+			snapshot.Completeness.OpenLoopsOmitted++
+		}
+	}
+	clear(snapshot.OpenLoops[len(loops):loopCount])
+	snapshot.OpenLoops = loops
+	questionCount := len(snapshot.Questions)
+	questions := snapshot.Questions[:0]
+	for _, item := range snapshot.Questions {
+		if validLinkedIDs(item.SourceIDs, indexed) && (item.AnswerSourceID == "" || hasIndexed(indexed, item.AnswerSourceID)) {
+			questions = append(questions, item)
+		}
+	}
+	clear(snapshot.Questions[len(questions):questionCount])
+	snapshot.Questions = questions
+	splitCount := len(snapshot.TimeSplit)
+	splits := snapshot.TimeSplit[:0]
+	for _, item := range snapshot.TimeSplit {
+		if validLinkedIDs(item.SourceIDs, indexed) {
+			splits = append(splits, item)
+		} else {
+			snapshot.Completeness.TimeSplitsOmitted++
+		}
+	}
+	clear(snapshot.TimeSplit[len(splits):splitCount])
+	snapshot.TimeSplit = splits
+	return snapshot
 }
 
 func validSortedIDs(ids []string) bool {
@@ -452,8 +701,11 @@ func validOptionalText(s string) bool { return s == "" || validText(s, MaxTextBy
 func validMarker(m TodoMarker) bool {
 	return m == MarkerNone || m == MarkerTODO || m == MarkerUnchecked || m == MarkerUserCreated
 }
+func validChangeOrigin(origin ChangeOrigin) bool {
+	return origin == "" || origin == ChangeOriginUser || origin == ChangeOriginActivity
+}
 func validEvidence(e Evidence) bool {
-	return validID(e.SourceID) && !e.At.IsZero() && validOptionalID(e.SubjectID) && validOptionalText(e.Subject) && validOptionalText(e.Change) && validOptionalText(e.Todo) && validOptionalText(e.OpenLoop) && validMarker(e.TodoMarker) && !(e.TodoConfirmed && e.TodoDismissed)
+	return validID(e.SourceID) && !e.At.IsZero() && validOptionalID(e.SubjectID) && validOptionalText(e.Subject) && validOptionalText(e.Change) && validChangeOrigin(e.ChangeOrigin) && validOptionalText(e.Todo) && validOptionalText(e.OpenLoop) && validMarker(e.TodoMarker) && !(e.TodoConfirmed && e.TodoDismissed)
 }
 func cloneEvidence(e Evidence) Evidence {
 	e.SourceID = strings.Clone(e.SourceID)
@@ -500,6 +752,7 @@ func cloneTimeSplits(v []TimeSplit) ([]TimeSplit, error) {
 func capSlice[T any](v *[]T, max int, omitted *int) {
 	if len(*v) > max {
 		*omitted += len(*v) - max
+		clear((*v)[max:])
 		*v = (*v)[:max]
 	}
 }

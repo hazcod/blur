@@ -10,7 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/nielsgroen/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage"
 )
 
 const (

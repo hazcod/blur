@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/privacy"
 )
 
 func observation(id string) capture.SanitizedObservation {

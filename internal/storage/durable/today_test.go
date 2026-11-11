@@ -3,12 +3,119 @@ package durable
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/today"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/today"
 )
+
+func TestDeleteObservationRecordRemovesItsTodayProjection(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x74), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	generated := time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC)
+	source, err := capture.SanitizeObservation("editor.app", "docs.example", "sensitive note", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservation(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: generated, GenerationID: "g-1", Evidence: []today.Evidence{{SourceID: source.ContentID(), At: generated, Change: "sensitive note"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutTodaySnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteObservationRecord(ctx, source.ContentID()); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := store.GetTodaySnapshot(ctx, snapshot.Date); err != nil || found {
+		t.Fatalf("deleted source projection still exists: snapshot=%+v found=%t err=%v", got, found, err)
+	}
+}
+
+func TestDeleteSourceCleansEveryIndexedTodayDateAndPreservesUnrelatedEvidence(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x75), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sourceID, otherID := repeatHex("a"), repeatHex("b")
+	firstAt := time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC)
+	first, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: firstAt, GenerationID: "g-1", Evidence: []today.Evidence{{SourceID: sourceID, At: firstAt, Change: "private first day"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAt := firstAt.Add(24 * time.Hour)
+	second, err := today.Build(today.Input{Date: "2026-11-06", Zone: "UTC", GeneratedAt: secondAt, GenerationID: "g-2", Evidence: []today.Evidence{
+		{SourceID: sourceID, At: secondAt.Add(-time.Minute), Change: "private deleted content"},
+		{SourceID: otherID, At: secondAt, Change: "unrelated retained content"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range []today.Snapshot{first, second} {
+		if err := store.PutTodaySnapshot(ctx, snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.DeleteObservationRecord(ctx, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.GetTodaySnapshot(ctx, first.Date); err != nil || found {
+		t.Fatalf("single-source date remains: found=%t err=%v", found, err)
+	}
+	got, found, err := store.GetTodaySnapshot(ctx, second.Date)
+	if err != nil || !found || len(got.SourceIDs) != 1 || got.SourceIDs[0] != otherID || len(got.RecentChanges) != 1 || got.RecentChanges[0].Text != "unrelated retained content" {
+		t.Fatalf("source removal damaged or leaked adjacent evidence: %+v found=%t err=%v", got, found, err)
+	}
+}
+
+func TestDeleteObservationTransactionRollbackRestoresTodayProjection(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x76), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	at := time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC)
+	source, err := capture.SanitizeObservation("editor.app", "docs.example", "rollback source", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservation(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: at, GenerationID: "g-1", Evidence: []today.Evidence{{SourceID: source.ContentID(), At: at, Change: "must survive rollback"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutTodaySnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	err = store.Update(ctx, func(tx *Tx) error {
+		if err := tx.deleteObservationRecord(source.ContentID()); err != nil {
+			return err
+		}
+		return errors.New("force rollback")
+	})
+	if !errors.Is(err, ErrTransaction) {
+		t.Fatalf("rollback error = %v", err)
+	}
+	got, found, err := store.GetTodaySnapshot(ctx, snapshot.Date)
+	if err != nil || !found || len(got.RecentChanges) != 1 || got.RecentChanges[0].Text != "must survive rollback" {
+		t.Fatalf("today projection changed after rollback: snapshot=%+v found=%t err=%v", got, found, err)
+	}
+}
 
 func TestTodaySnapshotIsEncryptedReplaceableAndReopenable(t *testing.T) {
 	ctx := context.Background()

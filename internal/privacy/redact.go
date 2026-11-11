@@ -187,6 +187,9 @@ func sensitiveMalformedURL(raw string) bool { return classifyMalformedURL(raw).m
 func Redact(input string) (string, []Count) {
 	counts := map[string]int{}
 	replace := func(re *regexp.Regexp, rule string, valid func(string) bool) {
+		if !re.MatchString(input) {
+			return
+		}
 		input = re.ReplaceAllStringFunc(input, func(match string) string {
 			if valid != nil && !valid(match) {
 				return match
@@ -196,68 +199,75 @@ func Redact(input string) (string, []Count) {
 		})
 	}
 	replace(pem, "PRIVATE_KEY", nil)
-	input = auth.ReplaceAllStringFunc(input, func(match string) string {
-		colon := strings.IndexByte(match, ':')
-		if colon >= 0 && exactPlaceholder(strings.TrimSpace(match[colon+1:]), "AUTHORIZATION") {
-			return match
-		}
-		counts["AUTHORIZATION"]++
-		return placeholder("AUTHORIZATION")
-	})
-	input = webURL.ReplaceAllStringFunc(input, func(raw string) string {
-		parseRaw := strings.Replace(raw, placeholder("URL_CREDENTIAL"), "%5BREDACTED%3AURL_CREDENTIAL%5D", 1)
-		u, err := url.Parse(parseRaw)
-		if err != nil || u.Host == "" {
-			if sensitiveMalformedURL(raw) {
-				counts["MALFORMED_URL"]++
-				return placeholder("MALFORMED_URL")
+	if auth.MatchString(input) {
+		input = auth.ReplaceAllStringFunc(input, func(match string) string {
+			colon := strings.IndexByte(match, ':')
+			if colon >= 0 && exactPlaceholder(strings.TrimSpace(match[colon+1:]), "AUTHORIZATION") {
+				return match
 			}
-			return raw
-		}
-		q, queryErr := url.ParseQuery(u.RawQuery)
-		if queryErr != nil {
-			if sensitiveMalformedURL(raw) {
-				counts["MALFORMED_URL"]++
-				return placeholder("MALFORMED_URL")
+			counts["AUTHORIZATION"]++
+			return placeholder("AUTHORIZATION")
+		})
+	}
+	if webURL.MatchString(input) {
+		input = webURL.ReplaceAllStringFunc(input, func(raw string) string {
+			parseRaw := strings.Replace(raw, placeholder("URL_CREDENTIAL"), "%5BREDACTED%3AURL_CREDENTIAL%5D", 1)
+			u, err := url.Parse(parseRaw)
+			if err != nil || u.Host == "" {
+				if sensitiveMalformedURL(raw) {
+					counts["MALFORMED_URL"]++
+					return placeholder("MALFORMED_URL")
+				}
+				return raw
 			}
-			return raw
-		}
-		changed := false
-		if u.User != nil {
-			_, hasPassword := u.User.Password()
-			if !exactPlaceholder(u.User.Username(), "URL_CREDENTIAL") || hasPassword {
-				u.User = url.User(placeholder("URL_CREDENTIAL"))
-				counts["URL_CREDENTIAL"]++
-				changed = true
+			q, queryErr := url.ParseQuery(u.RawQuery)
+			if queryErr != nil {
+				if sensitiveMalformedURL(raw) {
+					counts["MALFORMED_URL"]++
+					return placeholder("MALFORMED_URL")
+				}
+				return raw
 			}
-		}
-		for key, vals := range q {
-			decodedKey, decodeErr := decodeURLComponent(key)
-			if decodeErr != nil {
-				counts["MALFORMED_URL"]++
-				return placeholder("MALFORMED_URL")
-			}
-			if sensitiveQueryKey(decodedKey) {
-				if len(vals) != 1 || !exactPlaceholder(vals[0], "URL_QUERY") {
-					for _, v := range vals {
-						if !exactPlaceholder(v, "URL_QUERY") {
-							counts["URL_QUERY"]++
-						}
-					}
-					q.Set(key, placeholder("URL_QUERY"))
+			changed := false
+			if u.User != nil {
+				_, hasPassword := u.User.Password()
+				if !exactPlaceholder(u.User.Username(), "URL_CREDENTIAL") || hasPassword {
+					u.User = url.User(placeholder("URL_CREDENTIAL"))
+					counts["URL_CREDENTIAL"]++
 					changed = true
 				}
 			}
-		}
-		if changed {
-			u.RawQuery = q.Encode()
-			out := strings.ReplaceAll(u.String(), "%5BREDACTED%3AURL_CREDENTIAL%5D", placeholder("URL_CREDENTIAL"))
-			return strings.ReplaceAll(out, "%5BREDACTED%3AURL_QUERY%5D", placeholder("URL_QUERY"))
-		}
-		return raw
-	})
+			for key, vals := range q {
+				decodedKey, decodeErr := decodeURLComponent(key)
+				if decodeErr != nil {
+					counts["MALFORMED_URL"]++
+					return placeholder("MALFORMED_URL")
+				}
+				if sensitiveQueryKey(decodedKey) {
+					if len(vals) != 1 || !exactPlaceholder(vals[0], "URL_QUERY") {
+						for _, v := range vals {
+							if !exactPlaceholder(v, "URL_QUERY") {
+								counts["URL_QUERY"]++
+							}
+						}
+						q.Set(key, placeholder("URL_QUERY"))
+						changed = true
+					}
+				}
+			}
+			if changed {
+				u.RawQuery = q.Encode()
+				out := strings.ReplaceAll(u.String(), "%5BREDACTED%3AURL_CREDENTIAL%5D", placeholder("URL_CREDENTIAL"))
+				return strings.ReplaceAll(out, "%5BREDACTED%3AURL_QUERY%5D", placeholder("URL_QUERY"))
+			}
+			return raw
+		})
+	}
 	maskLabels := func(segment string) string {
 		maskQuoted := func(re *regexp.Regexp, json bool) {
+			if !re.MatchString(segment) {
+				return
+			}
 			segment = re.ReplaceAllStringFunc(segment, func(match string) string {
 				parts := re.FindStringSubmatch(match)
 				if len(parts) != 4 {
@@ -276,29 +286,36 @@ func Redact(input string) (string, []Count) {
 		}
 		maskQuoted(jsonLabel, true)
 		maskQuoted(quotedLabel, false)
-		segment = label.ReplaceAllStringFunc(segment, func(match string) string {
-			parts := label.FindStringSubmatch(match)
-			if len(parts) != 4 {
-				return match
-			}
-			rule := labelRule(parts[1])
-			if exactPlaceholder(strings.TrimSpace(parts[3]), rule) {
-				return match
-			}
-			counts[rule]++
-			return parts[1] + parts[2] + placeholder(rule)
-		})
+		if label.MatchString(segment) {
+			segment = label.ReplaceAllStringFunc(segment, func(match string) string {
+				parts := label.FindStringSubmatch(match)
+				if len(parts) != 4 {
+					return match
+				}
+				rule := labelRule(parts[1])
+				if exactPlaceholder(strings.TrimSpace(parts[3]), rule) {
+					return match
+				}
+				counts[rule]++
+				return parts[1] + parts[2] + placeholder(rule)
+			})
+		}
 		return segment
 	}
-	var labelled strings.Builder
-	last := 0
-	for _, span := range webURL.FindAllStringIndex(input, -1) {
-		labelled.WriteString(maskLabels(input[last:span[0]]))
-		labelled.WriteString(input[span[0]:span[1]])
-		last = span[1]
+	spans := webURL.FindAllStringIndex(input, -1)
+	if len(spans) == 0 {
+		input = maskLabels(input)
+	} else {
+		var labelled strings.Builder
+		last := 0
+		for _, span := range spans {
+			labelled.WriteString(maskLabels(input[last:span[0]]))
+			labelled.WriteString(input[span[0]:span[1]])
+			last = span[1]
+		}
+		labelled.WriteString(maskLabels(input[last:]))
+		input = labelled.String()
 	}
-	labelled.WriteString(maskLabels(input[last:]))
-	input = labelled.String()
 	replace(token, "TOKEN", nil)
 	replace(ssn, "SSN", validSSN)
 	replace(card, "CARD", validCard)

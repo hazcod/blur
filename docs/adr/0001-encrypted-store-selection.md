@@ -18,10 +18,13 @@ from the OS wrapping key. The platform `SecretStore` may report exactly found,
 not_found, locked, corrupt, denied, or unavailable. Only an explicit, valid
 not_found result authorizes creation. A found key of the wrong size, nil/nil,
 unknown state, cancellation, or backend failure fails closed. The current port
-has Get/Put, not conditional create: in-process serialization prevents duplicate
-creations by this process, but a future OS backend or core single-instance gate
-must make creation atomic across processes before production use. It must never
-overwrite a found key. Key material must not enter logs, JSON, or error text.
+has Get/Put, not conditional create. In-process serialization prevents
+duplicate creations within the process; desktop bootstrap additionally holds
+an owner-only data-directory lock for the lifetime of the opened app, so two
+desktop instances cannot race key/store creation or access the same store.
+Direct securestore callers remain responsible for cross-process coordination.
+The backend must never overwrite a found key. Key material must not enter logs,
+JSON, or error text.
 
 ## Candidates for the same evaluation
 

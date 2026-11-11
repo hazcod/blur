@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/platform"
-	"github.com/nielsgroen/blur/internal/platform/fake"
-	"github.com/nielsgroen/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/platform/fake"
+	"github.com/hazcod/blur/internal/privacy"
 )
 
 func available() platform.CapabilityReport {
@@ -18,6 +18,13 @@ func available() platform.CapabilityReport {
 }
 func limits() Limits {
 	return Limits{MaxBytes: 256, MaxNodes: 3, MaxDepth: 2, MaxDuration: time.Second}
+}
+
+func TestDefaultLimitsAreValidAndBounded(t *testing.T) {
+	got := DefaultLimits()
+	if !got.valid() || got.MaxBytes > 256<<10 || got.MaxNodes > 2048 || got.MaxDepth > 32 || got.MaxDuration > time.Second {
+		t.Fatalf("unsafe or invalid production limits: %+v", got)
+	}
 }
 func reader(text string, calls *int) readBounded {
 	return func(_ context.Context, _ platform.CaptureProbe, _ Limits) (rawFrame, error) {
@@ -186,6 +193,155 @@ func TestMalformedOpaqueTargetIDsNeverReachReader(t *testing.T) {
 	}
 }
 
+func TestSlackProfileSkipsStaticControlsBeforeReadingValues(t *testing.T) {
+	reads := []string{}
+	value := func(s string) func(context.Context, int) (string, error) {
+		return func(context.Context, int) (string, error) { reads = append(reads, s); return s, nil }
+	}
+	p := Pipeline{
+		Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "opaque", AppID: "com.tinyspeck.slackmacgap"}},
+		Limits: limits(),
+		Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+			return rawFrame{roots: []*rawNode{
+				{role: "AXButton", declaredBytes: 4, value: value("Send")},
+				{role: "AXTab", declaredBytes: 4, value: value("Files")},
+				{role: "AXStaticText", declaredBytes: 7, value: value("message")},
+			}}, nil
+		},
+	}
+	observation, err := p.Capture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(reads, ",") != "message" || observation.Text() != "message" {
+		t.Fatalf("static control labels reached read: reads=%v text=%q", reads, observation.Text())
+	}
+}
+
+func TestBuiltinProfilesAreDefensiveAndDeclareSlackChrome(t *testing.T) {
+	profiles := BuiltinProfiles()
+	if len(profiles) == 0 {
+		t.Fatal("built-in app profiles are missing")
+	}
+	profiles[0].AppID = "changed"
+	profiles[0].IgnoreRoles[0] = "AXSecret"
+	again := BuiltinProfiles()
+	found := false
+	for _, profile := range again {
+		if profile.AppID != "com.tinyspeck.slackmacgap" && profile.AppID != "com.slack" {
+			continue
+		}
+		for _, role := range profile.IgnoreRoles {
+			if role == "AXTab" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Slack tab chrome is not declared in a built-in profile")
+	}
+}
+
+func TestCustomProfileAddsIgnoredRolesWithoutPruningDescendants(t *testing.T) {
+	reads := []string{}
+	p := Pipeline{
+		Source:   &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.notes"}},
+		Limits:   limits(),
+		Profiles: []AppProfile{{AppID: "org.example.notes", IgnoreRoles: []string{"AXToolbar"}}},
+		Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+			return rawFrame{roots: []*rawNode{{role: "AXToolbar", declaredBytes: 4,
+				value:    func(context.Context, int) (string, error) { reads = append(reads, "toolbar"); return "Save", nil },
+				children: []*rawNode{{role: "AXStaticText", declaredBytes: 4, value: func(context.Context, int) (string, error) { reads = append(reads, "child"); return "Note", nil }}},
+			}}}, nil
+		},
+	}
+	observation, err := p.Capture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(reads, ",") != "child" || observation.Text() != "Note" {
+		t.Fatalf("custom role filtering failed or pruned descendants: reads=%v text=%q", reads, observation.Text())
+	}
+}
+
+func TestInvalidProfilesFailBeforeCapabilityProbe(t *testing.T) {
+	for _, profiles := range [][]AppProfile{
+		{{AppID: "org.example.app", IgnoreRoles: []string{"AXButton/secret"}}},
+		{{AppID: "org.example.app"}, {AppID: "ORG.EXAMPLE.APP"}},
+		{{AppID: "org.example.app", IgnoreRoles: make([]string, maxProfileRoles+1)}},
+	} {
+		source := &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.app"}}
+		p := Pipeline{Source: source, Read: reader("unused", new(int)), Limits: limits(), Profiles: profiles}
+		_, err := p.Capture(context.Background())
+		var typed *CaptureError
+		if !errors.As(err, &typed) || typed.Code != InvalidProfiles || source.Calls != 0 {
+			t.Fatalf("invalid profile reached capture: err=%v calls=%d", err, source.Calls)
+		}
+	}
+}
+
+func TestCaptureCleansNativeFrameAfterSuccessAndPropagatesTruncation(t *testing.T) {
+	cleaned := false
+	text := "already loaded"
+	p := Pipeline{
+		Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}},
+		Limits: limits(),
+		Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+			return rawFrame{truncated: true, cleanup: func() { cleaned = true }, roots: []*rawNode{{
+				declaredBytes: -1, boundedValue: true,
+				value: func(_ context.Context, max int) (string, error) {
+					if len(text) > max {
+						return "", platform.ErrReadLimit
+					}
+					return text, nil
+				},
+			}}}, nil
+		},
+	}
+	observation, err := p.Capture(context.Background())
+	if err != nil || !cleaned || !observation.Truncated() || observation.Text() != text {
+		t.Fatalf("frame cleanup/truncation: observation=%+v cleaned=%t err=%v", observation, cleaned, err)
+	}
+}
+
+func TestCaptureCleansFrameWhenStructuralValidationFails(t *testing.T) {
+	cleaned := false
+	p := Pipeline{
+		Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}},
+		Limits: limits(),
+		Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+			return rawFrame{cleanup: func() { cleaned = true }, roots: []*rawNode{{children: []*rawNode{{}, {}, {}}}}}, nil
+		},
+	}
+	if _, err := p.Capture(context.Background()); err == nil || !cleaned {
+		t.Fatalf("invalid frame leaked native references: cleaned=%t err=%v", cleaned, err)
+	}
+}
+
+func TestCaptureAcceptsBoundedValuePrefixAndNeverReadsSensitiveNode(t *testing.T) {
+	calls := 0
+	p := Pipeline{
+		Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}},
+		Limits: limits(),
+		Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+			return rawFrame{roots: []*rawNode{
+				{declaredBytes: -1, boundedValue: true, value: func(_ context.Context, max int) (string, error) {
+					calls++
+					return "visible prefix", errAXValueTruncated
+				}},
+				{sensitive: true, declaredBytes: -1, boundedValue: true, value: func(context.Context, int) (string, error) {
+					t.Fatal("sensitive value callback invoked")
+					return "", nil
+				}},
+			}}, nil
+		},
+	}
+	observation, err := p.Capture(context.Background())
+	if err != nil || calls != 1 || observation.Text() != "visible prefix" || !observation.Truncated() {
+		t.Fatalf("bounded prefix result=%+v calls=%d err=%v", observation, calls, err)
+	}
+}
+
 func TestSanitizedObservationAndStableHash(t *testing.T) {
 	calls := 0
 	src := &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "target-a", AppID: "  ORG.EXAMPLE.Editor  ", Domain: " Example.TEST "}}
@@ -327,6 +483,21 @@ func TestDeadlineStopsBeforeValueAndErrorsStayContentFree(t *testing.T) {
 	var typed *CaptureError
 	if !errors.As(err, &typed) || typed.Code != ReadFailed || strings.Contains(err.Error(), "raw-secret") {
 		t.Fatalf("unsafe read error: %v", err)
+	}
+}
+
+func TestReaderDeadlineIsReportedAsCaptureTimeout(t *testing.T) {
+	p := Pipeline{
+		Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t"}},
+		Limits: Limits{MaxBytes: 20, MaxNodes: 1, MaxDepth: 1, MaxDuration: time.Second},
+		Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+			return rawFrame{}, context.DeadlineExceeded
+		},
+	}
+	_, err := p.Capture(context.Background())
+	var captureErr *CaptureError
+	if !errors.As(err, &captureErr) || captureErr.Code != TimedOut || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("reader deadline = %v, want sanitized timed_out error", err)
 	}
 }
 

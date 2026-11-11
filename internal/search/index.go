@@ -22,23 +22,26 @@ var (
 )
 
 // ExactQuery contains canonical exact terms and optional canonical app/domain
-// filters. TopK asks the index for a globally proven ranked prefix (zero uses
-// MaxResults). MaxRows, MaxBytes, and the fixed node budget bound work; if the
-// index cannot prove the prefix within those budgets it returns ErrIndexBudget
-// instead of exposing a potentially misranked partial page. Each hit's
-// authenticated Bytes estimate lets callers budget source hydration.
+// filters. MinTermMatches zero requires every term; a positive value permits
+// a bounded ranked partial-term query. TopK asks the index for a globally
+// proven ranked prefix (zero uses MaxResults). MaxRows, MaxBytes, and the fixed
+// node budget bound work; if the index cannot prove the prefix within those
+// budgets it returns ErrIndexBudget instead of exposing a potentially
+// misranked partial page. Each hit's authenticated Bytes estimate lets callers
+// budget source hydration.
 type ExactQuery struct {
-	Terms    []string
-	AppID    string
-	Domain   string
-	TopK     int
-	MaxRows  int
-	MaxBytes int
+	Terms          []string
+	AppID          string
+	Domain         string
+	TopK           int
+	MaxRows        int
+	MaxBytes       int
+	MinTermMatches int
 }
 
-// IndexHit identifies a source whose terms and filters all matched. Bytes is
-// the encrypted index's authenticated estimate of its observation payload;
-// callers use it to enforce a read budget before decrypting the source.
+// IndexHit identifies a source meeting the query's term threshold and filters.
+// Bytes is the encrypted index's authenticated estimate of its observation
+// payload; callers use it to enforce a read budget before decrypting the source.
 type IndexHit struct {
 	SourceID string
 	Score    int

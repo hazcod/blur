@@ -11,13 +11,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/platform"
-	"github.com/nielsgroen/blur/internal/privacy"
-	"github.com/nielsgroen/blur/internal/securestore"
-	"github.com/nielsgroen/blur/internal/storage"
-	"github.com/nielsgroen/blur/internal/storage/durable"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/securestore"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/durable"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 type storeOpener struct {
@@ -64,6 +64,71 @@ func TestEncryptedStoreContractObservationCopiesAndDuplicates(t *testing.T) {
 			got, found, err := store.GetObservation(ctx, observation.ContentID())
 			if err != nil || !found || got.ContentID() != observation.ContentID() || got.RedactionCounts()[0].Rule == "MUTATED" {
 				t.Fatalf("GetObservation() did not return an independent copy: found=%t err=%v", found, err)
+			}
+		})
+	}
+}
+
+func TestEncryptedStoreContractPreservesCaptureTimesWithoutChangingSourceID(t *testing.T) {
+	for _, opener := range storeOpeners() {
+		t.Run(opener.name, func(t *testing.T) {
+			store := opener.open(t)
+			t.Cleanup(func() { _ = store.Close() })
+			observation := contractObservation(t, "timestamped contract observation")
+			capturedAt := time.Date(2026, 10, 2, 3, 4, 5, 0, time.UTC)
+			if err := store.PutObservationAt(context.Background(), observation, time.Time{}); !contractStoreError(err, storage.Invalid) {
+				t.Fatalf("zero capture time error = %v, want Invalid", err)
+			}
+			if err := store.PutObservationAt(context.Background(), observation, capturedAt); err != nil {
+				t.Fatal(err)
+			}
+			page, err := store.ListObservationPage(context.Background(), storage.ObservationPageRequest{Limit: 2, MaxBytes: storage.MaxObservationPageBytes})
+			if err != nil || len(page.Observations) != 1 || len(page.CapturedAt) != 1 || !page.CapturedAt[0].Equal(capturedAt) {
+				t.Fatalf("timestamped page = (%d observations, %v, %v), want capture time %s", len(page.Observations), page.CapturedAt, err, capturedAt)
+			}
+			if page.Observations[0].ContentID() != observation.ContentID() {
+				t.Fatal("capture metadata changed the stable content ID")
+			}
+		})
+	}
+}
+
+func TestEncryptedStoreContractDeletesSourceRecordIdempotently(t *testing.T) {
+	for _, opener := range storeOpeners() {
+		t.Run(opener.name, func(t *testing.T) {
+			store := opener.open(t)
+			t.Cleanup(func() { _ = store.Close() })
+			ctx := context.Background()
+			observation := contractObservation(t, "delete me")
+			if err := store.PutObservation(ctx, observation); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DeleteObservationRecord(ctx, "invalid"); !contractStoreError(err, storage.Invalid) {
+				t.Fatalf("invalid deletion ID error = %v", err)
+			}
+			cancelled, cancel := context.WithCancel(ctx)
+			cancel()
+			if err := store.DeleteObservationRecord(cancelled, observation.ContentID()); !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled deletion error = %v", err)
+			}
+			if _, found, err := store.GetObservation(ctx, observation.ContentID()); err != nil || !found {
+				t.Fatalf("cancelled deletion changed source: found=%t err=%v", found, err)
+			}
+			if err := store.DeleteObservationRecord(ctx, observation.ContentID()); err != nil {
+				t.Fatalf("DeleteObservationRecord(): %v", err)
+			}
+			if _, found, err := store.GetObservation(ctx, observation.ContentID()); err != nil || found {
+				t.Fatalf("deleted source still retrievable: found=%t err=%v", found, err)
+			}
+			page, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 1, MaxBytes: storage.MaxObservationPageBytes})
+			if err != nil || len(page.Observations) != 0 || page.HasMore {
+				t.Fatalf("deleted source still listed: %+v err=%v", page, err)
+			}
+			if err := store.DeleteObservationRecord(ctx, observation.ContentID()); err != nil {
+				t.Fatalf("repeat deletion: %v", err)
+			}
+			if err := store.PutObservation(ctx, observation); err != nil {
+				t.Fatalf("reinsert after deletion: %v", err)
 			}
 		})
 	}

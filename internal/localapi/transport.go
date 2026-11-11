@@ -6,6 +6,8 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
 type EndpointKind string
@@ -37,9 +39,11 @@ func (e EndpointDescriptor) Validate() error {
 		if len(e.Address) < 2 || len(e.Address) > 103 || !path.IsAbs(e.Address) || path.Clean(e.Address) != e.Address || strings.IndexByte(e.Address, 0) >= 0 {
 			return ErrInvalidEndpoint
 		}
-		for i := 0; i < len(e.Address); i++ {
-			c := e.Address[i]
-			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '-' || c == '_' || c == '.') {
+		if !utf8.ValidString(e.Address) {
+			return ErrInvalidEndpoint
+		}
+		for _, r := range e.Address {
+			if unicode.IsControl(r) {
 				return ErrInvalidEndpoint
 			}
 		}

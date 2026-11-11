@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/platform"
-	"github.com/nielsgroen/blur/internal/platform/fake"
+	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/platform/fake"
 )
 
 func unavailable(t *testing.T, err error, calls int) {

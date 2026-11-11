@@ -1,0 +1,45 @@
+name: BlurSafariCapture
+options:
+  bundleIdPrefix: sh.blur
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ENABLE_APP_SANDBOX: YES
+
+targets:
+  BlurSafariCapture:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: SafariExtension/ExtensionHandler.swift
+      - path: SafariExtension/Resources
+        buildPhase: resources
+    entitlements:
+      path: SafariExtension/Extension.entitlements
+    dependencies:
+      - sdk: SafariServices.framework
+      - sdk: Security.framework
+      - sdk: CryptoKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hazcod.blur.safaricapture
+        PRODUCT_NAME: BlurSafariCapture
+        PRODUCT_MODULE_NAME: BlurSafariCapture
+        CODE_SIGN_ENTITLEMENTS: SafariExtension/Extension.entitlements
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: NO
+        INFOPLIST_FILE: SafariExtension/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_EXPAND_BUILD_SETTINGS: YES
+
+schemes:
+  BlurSafariCapture:
+    build:
+      targets:
+        BlurSafariCapture: all

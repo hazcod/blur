@@ -10,13 +10,17 @@ import (
 	"encoding/json"
 	"errors"
 	"hash"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/nielsgroen/blur/internal/platform"
-	"github.com/nielsgroen/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/appidentity"
+	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/privacy"
 )
+
+var errCaptureDomainChanged = errors.New("capture: active browser domain changed")
 
 type Limits struct {
 	MaxBytes    int
@@ -25,13 +29,37 @@ type Limits struct {
 	MaxDuration time.Duration
 }
 
+const (
+	MaxCaptureNodes = 4096
+	MaxCaptureDepth = 64
+)
+
+// DefaultLimits is the production AX budget: bounded enough to cap a single
+// event's CPU and memory cost while covering a typical focused window.
+func DefaultLimits() Limits {
+	return Limits{MaxBytes: 256 << 10, MaxNodes: 2048, MaxDepth: 32, MaxDuration: 750 * time.Millisecond}
+}
+
 func (l Limits) valid() bool {
-	return l.MaxBytes > 0 && l.MaxBytes <= MaxObservationTextBytes && l.MaxNodes > 0 && l.MaxDepth > 0 && l.MaxDuration > 0
+	return l.MaxBytes > 0 && l.MaxBytes <= MaxObservationTextBytes &&
+		l.MaxNodes > 0 && l.MaxNodes <= MaxCaptureNodes &&
+		l.MaxDepth > 0 && l.MaxDepth <= MaxCaptureDepth &&
+		l.MaxDuration > 0 && l.MaxDuration <= time.Minute
 }
 
 type Exclusions struct {
-	Apps    []string
-	Domains []string
+	Apps            []string
+	Domains         []string
+	IncludedApps    []string
+	IncludedDomains []string
+	DefaultDisabled bool
+}
+
+// NormalizeExclusions returns the canonical, case-insensitive form used by
+// the capture boundary. Invalid identifiers fail closed instead of being
+// silently ignored.
+func NormalizeExclusions(exclusions Exclusions) (Exclusions, bool) {
+	return canonicalExclusions(exclusions)
 }
 
 type ErrorCode string
@@ -39,6 +67,7 @@ type ErrorCode string
 const (
 	InvalidLimits      ErrorCode = "invalid_limits"
 	InvalidExclusions  ErrorCode = "invalid_exclusions"
+	InvalidProfiles    ErrorCode = "invalid_profiles"
 	Unavailable        ErrorCode = "unavailable"
 	ProbeFailed        ErrorCode = "probe_failed"
 	Excluded           ErrorCode = "excluded"
@@ -298,9 +327,10 @@ func SanitizeObservation(appID, domain, rawText string, maxBytes int) (Sanitized
 	}
 	o := SanitizedObservation{appID: app, domain: host, text: text, truncated: truncated, redactionVersion: privacy.Version, redactionCounts: copyCounts(counts)}
 	o.contentID = contentID(o)
-	if err := o.Validate(); err != nil {
-		return empty, err
-	}
+	// Every field above is derived from canonical validated input and this
+	// package's redactor. Keep the independent redaction/fixed-point check in
+	// Validate at storage and pipeline boundaries rather than paying for it
+	// again while constructing the value.
 	return o, nil
 }
 
@@ -349,9 +379,20 @@ func validRedactionRule(rule string) bool {
 }
 
 // The frame and node deliberately have no exported representation or JSON tags.
-type rawFrame struct{ roots []*rawNode }
+type rawFrame struct {
+	roots          []*rawNode
+	truncated      bool
+	cleanup        func()
+	nativeRootID   uintptr
+	domain         string
+	domainKnown    bool
+	validateDomain func(context.Context, string) error
+}
 type rawNode struct {
+	role          string
+	sensitive     bool
 	declaredBytes int
+	boundedValue  bool
 	children      []*rawNode
 	value         func(context.Context, int) (string, error)
 }
@@ -362,6 +403,7 @@ type Pipeline struct {
 	Read       readBounded
 	Limits     Limits
 	Exclusions Exclusions
+	Profiles   []AppProfile
 }
 
 func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
@@ -372,6 +414,14 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	exclusions, ok := canonicalExclusions(p.Exclusions)
 	if !ok {
 		return empty, captureError(InvalidExclusions, nil)
+	}
+	profileList, ok := profilesWithBuiltins(p.Profiles)
+	if !ok {
+		return empty, captureError(InvalidProfiles, nil)
+	}
+	profiles, ok := validateProfiles(profileList)
+	if !ok {
+		return empty, captureError(InvalidProfiles, nil)
 	}
 	if err := contextError(ctx.Err()); err != nil {
 		return empty, err
@@ -399,15 +449,36 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	if !ok {
 		return empty, captureError(InvalidProbe, nil)
 	}
-	if probe.Secure || probe.Elevated || probe.Private || excluded(app, domain, exclusions) {
+	browser := appidentity.IsBrowserApp(app)
+	domainPolicy := len(exclusions.Domains)+len(exclusions.IncludedDomains) > 0
+	mayDiscoverBrowserDomain := browser && domain == "" && domainPolicy
+	if probe.Secure || probe.Elevated || probe.Private || excluded(app, domain, exclusions) ||
+		(!included(app, domain, exclusions) && !mayDiscoverBrowserDomain) {
 		return empty, captureError(Excluded, nil)
 	}
 	frame, err := p.Read(ctx, probe, p.Limits)
+	if frame.cleanup != nil {
+		defer frame.cleanup()
+	}
 	if ce := contextError(ctx.Err()); ce != nil {
 		return empty, ce
 	}
 	if err != nil {
+		if ce := contextError(err); ce != nil {
+			return empty, ce
+		}
 		return empty, captureError(ReadFailed, nil)
+	}
+	if frame.domainKnown {
+		domain, ok = normalizeDomain(frame.domain)
+		if !ok || domain == "" {
+			return empty, captureError(Excluded, nil)
+		}
+	} else if domain == "" {
+		domain, _ = normalizeDomain(probe.Domain)
+	}
+	if browser && domainPolicy && domain == "" || excluded(app, domain, exclusions) || !included(app, domain, exclusions) {
+		return empty, captureError(Excluded, nil)
 	}
 	nodes, err := validateFrame(frame, p.Limits)
 	if err != nil {
@@ -419,8 +490,16 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		if ce := contextError(ctx.Err()); ce != nil {
 			return empty, ce
 		}
-		if node.value == nil {
+		if node.sensitive || node.value == nil || ignoredAXRole(app, node.role, profiles) {
 			continue
+		}
+		if domainPolicy && frame.validateDomain != nil {
+			if err := frame.validateDomain(ctx, domain); err != nil {
+				if ce := contextError(err); ce != nil {
+					return empty, ce
+				}
+				return empty, captureError(Excluded, nil)
+			}
 		}
 		separator := 0
 		if b.Len() > 0 {
@@ -434,13 +513,25 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		if ce := contextError(ctx.Err()); ce != nil {
 			return empty, ce
 		}
+		if errors.Is(readErr, errAXValueTruncated) {
+			frame.truncated = true
+			readErr = nil
+		}
 		if readErr != nil {
 			return empty, captureError(ReadFailed, nil)
+		}
+		if domainPolicy && frame.validateDomain != nil {
+			if err := frame.validateDomain(ctx, domain); err != nil {
+				if ce := contextError(err); ce != nil {
+					return empty, ce
+				}
+				return empty, captureError(Excluded, nil)
+			}
 		}
 		if !utf8.ValidString(value) {
 			return empty, captureError(ReadFailed, nil)
 		}
-		if len(value) > remaining || len(value) > node.declaredBytes {
+		if len(value) > remaining || (!node.boundedValue && len(value) > node.declaredBytes) {
 			return empty, captureError(LimitExceeded, nil)
 		}
 		if value == "" {
@@ -452,7 +543,18 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		remaining -= len(value)
 		b.WriteString(value)
 	}
-	return SanitizeObservation(app, domain, b.String(), p.Limits.MaxBytes)
+	observation, err := SanitizeObservation(app, domain, b.String(), p.Limits.MaxBytes)
+	if err != nil {
+		return empty, err
+	}
+	if frame.truncated && !observation.truncated {
+		observation.truncated = true
+		observation.contentID = contentID(observation)
+	}
+	if err := observation.Validate(); err != nil {
+		return empty, err
+	}
+	return observation, nil
 }
 
 // A byte cap may bisect a redaction placeholder or leave a partial labelled
@@ -510,8 +612,31 @@ func normalizeDomain(raw string) (string, bool) {
 	s := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
 	return s, identifier(s) && !strings.Contains(s, "..") && !strings.HasPrefix(s, ".") && !strings.HasSuffix(s, ".")
 }
+
+// domainFromDocumentURL retains only a normalized DNS host. The URL and its
+// path, query, fragment, and credentials remain transient and are never logged
+// or added to an observation.
+func domainFromDocumentURL(raw string) (string, bool) {
+	if raw == "" || len(raw) > 2048 {
+		return "", false
+	}
+	document, err := url.Parse(raw)
+	if err != nil || document.Opaque != "" || document.Host == "" {
+		return "", false
+	}
+	switch strings.ToLower(document.Scheme) {
+	case "http", "https":
+	default:
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSuffix(document.Hostname(), "."))
+	domain, ok := normalizeDomain(host)
+	return domain, ok && domain != ""
+}
+
 func canonicalExclusions(e Exclusions) (Exclusions, bool) {
 	var out Exclusions
+	out.DefaultDisabled = e.DefaultDisabled
 	for _, raw := range e.Apps {
 		app, ok := normalizeAppID(raw)
 		if !ok || app == "" {
@@ -525,6 +650,20 @@ func canonicalExclusions(e Exclusions) (Exclusions, bool) {
 			return Exclusions{}, false
 		}
 		out.Domains = append(out.Domains, domain)
+	}
+	for _, raw := range e.IncludedApps {
+		app, ok := normalizeAppID(raw)
+		if !ok || app == "" {
+			return Exclusions{}, false
+		}
+		out.IncludedApps = append(out.IncludedApps, app)
+	}
+	for _, raw := range e.IncludedDomains {
+		domain, ok := normalizeDomain(raw)
+		if !ok || domain == "" {
+			return Exclusions{}, false
+		}
+		out.IncludedDomains = append(out.IncludedDomains, domain)
 	}
 	return out, true
 }
@@ -550,17 +689,41 @@ func excluded(app, domain string, e Exclusions) bool {
 	return false
 }
 
+// included applies the positive allowlist only in default-disabled mode. A
+// matching app or domain is sufficient; deny rules are checked first.
+func included(app, domain string, e Exclusions) bool {
+	if !e.DefaultDisabled {
+		return true
+	}
+	for _, x := range e.IncludedApps {
+		if app != "" && app == x {
+			return true
+		}
+	}
+	for _, x := range e.IncludedDomains {
+		if x != "" && domain != "" && (domain == x || strings.HasSuffix(domain, "."+x)) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateFrame(f rawFrame, l Limits) ([]*rawNode, error) {
 	var out []*rawNode
 	seen := map[*rawNode]bool{}
 	bytes := 0
 	var walk func(*rawNode, int) error
 	walk = func(n *rawNode, depth int) error {
-		if n == nil || seen[n] || depth > l.MaxDepth || len(out) >= l.MaxNodes || n.declaredBytes < 0 || n.declaredBytes > l.MaxBytes-bytes {
+		if n == nil || seen[n] || depth > l.MaxDepth || len(out) >= l.MaxNodes ||
+			(n.boundedValue && (n.declaredBytes != -1 || n.value == nil && !n.sensitive)) ||
+			(!n.boundedValue && (n.declaredBytes < 0 || n.declaredBytes > l.MaxBytes-bytes)) ||
+			n.role != "" && !validAXRole(n.role) {
 			return platform.ErrReadLimit
 		}
 		seen[n] = true
-		bytes += n.declaredBytes
+		if !n.boundedValue {
+			bytes += n.declaredBytes
+		}
 		out = append(out, n)
 		for _, child := range n.children {
 			if err := walk(child, depth+1); err != nil {

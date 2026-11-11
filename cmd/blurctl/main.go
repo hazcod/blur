@@ -6,8 +6,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/nielsgroen/blur/internal/core"
-	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/hazcod/blur/internal/core"
+	"github.com/hazcod/blur/internal/platform"
 )
 
 type client interface {

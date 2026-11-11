@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/core"
-	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/hazcod/blur/internal/core"
+	"github.com/hazcod/blur/internal/platform"
 )
 
 type countingClient struct{ called int }

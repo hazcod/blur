@@ -5,22 +5,20 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/hazcod/blur/internal/platform"
 )
 
 func assertCaptureConformance(t *testing.T, adapter platform.CaptureSource, evidence string) {
 	t.Helper()
 
-	want := platform.CapabilityReport{
-		ID: "capture", State: platform.UserDisabled,
-		Reason: "adapter_unimplemented", Evidence: evidence,
-	}
 	got, err := adapter.Capability(context.Background())
 	if err != nil {
 		t.Fatalf("Capability() error = %v", err)
 	}
-	if got != want {
-		t.Fatalf("Capability() = %#v, want %#v", got, want)
+	if got.ID != "capture" || got.Evidence != evidence ||
+		!(got.State == platform.UserDisabled && got.Reason == "adapter_unimplemented" ||
+			got.State == platform.PermissionRequired && got.Reason == "permission_required") {
+		t.Fatalf("Capability() = %#v, not a supported unimplemented/permission state", got)
 	}
 	if err := got.Validate(); err != nil {
 		t.Fatalf("Capability() returned invalid report: %v", err)
@@ -39,8 +37,8 @@ func assertCaptureConformance(t *testing.T, adapter platform.CaptureSource, evid
 			if !errors.As(err, &unavailable) {
 				t.Fatalf("operation error = %v, want UnavailableError", err)
 			}
-			if unavailable.Report != want {
-				t.Fatalf("unavailable report = %#v, want %#v", unavailable.Report, want)
+			if unavailable.Report != got {
+				t.Fatalf("unavailable report = %#v, want capability report %#v", unavailable.Report, got)
 			}
 		})
 	}

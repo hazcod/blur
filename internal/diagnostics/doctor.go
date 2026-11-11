@@ -1,7 +1,7 @@
 // Package diagnostics exposes content-free health data for local doctor tools.
 package diagnostics
 
-import "github.com/nielsgroen/blur/internal/memory"
+import "github.com/hazcod/blur/internal/memory"
 
 type IntegrityState string
 type Freshness string

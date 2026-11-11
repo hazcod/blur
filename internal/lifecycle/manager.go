@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/memory"
+	"github.com/hazcod/blur/internal/memory"
 )
 
 var ErrStarted = errors.New("lifecycle: already started")

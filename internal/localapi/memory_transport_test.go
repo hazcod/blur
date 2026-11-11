@@ -11,7 +11,7 @@ import (
 )
 
 func TestEndpointDescriptors(t *testing.T) {
-	valid := []EndpointDescriptor{{Kind: EndpointUnix, Address: "/tmp/blur-user/socket"}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\blur-user-alice-main`}}
+	valid := []EndpointDescriptor{{Kind: EndpointUnix, Address: "/tmp/blur-user/socket"}, {Kind: EndpointUnix, Address: "/Users/alice/Library/Group Containers/ABC.group.sh.blur/b/s"}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\blur-user-alice-main`}}
 	for _, e := range valid {
 		if err := e.Validate(); err != nil {
 			t.Fatalf("%+v: %v", e, err)

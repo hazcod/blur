@@ -9,8 +9,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/storage"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/storage"
 )
 
 func observation(t *testing.T, app, domain, body string) capture.SanitizedObservation {

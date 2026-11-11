@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/nielsgroen/blur/internal/core"
+	"github.com/hazcod/blur/internal/core"
 )
 
 // This foundation check is explicitly ephemeral and exits after one document.

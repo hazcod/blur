@@ -11,12 +11,12 @@ import (
 	"sort"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/buildinfo"
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/localapi"
-	"github.com/nielsgroen/blur/internal/platform"
-	"github.com/nielsgroen/blur/internal/search"
-	"github.com/nielsgroen/blur/internal/storage"
+	"github.com/hazcod/blur/internal/buildinfo"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/localapi"
+	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/storage"
 )
 
 var ErrInvalidService = errors.New("core: invalid service configuration")

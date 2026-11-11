@@ -1,5 +1,7 @@
-// Package localapi defines scoped authorization and message-oriented local
-// transport contracts. Native endpoint access control belongs to later adapters.
+// Package localapi defines scoped authorization and bounded message-oriented
+// local transports. UnixTransport enforces owner-only socket paths and
+// same-user peer credentials on macOS and Linux; Windows named pipes remain a
+// separate native adapter.
 package localapi
 
 import (
@@ -25,6 +27,7 @@ const (
 	NonceBytes                = 24
 	MaxClockSkew              = 30 * time.Second
 	MaxGrants                 = 1024
+	MaxGrantLifetime          = 365 * 24 * time.Hour
 )
 
 var (
@@ -85,7 +88,7 @@ type storedGrant struct {
 	// proof forgery, so it is credential-equivalent secret material.
 	authenticatorKey [32]byte
 	revoked          bool
-	nonces           map[[NonceBytes]byte]struct{}
+	nonces           map[[NonceBytes]byte]time.Time
 }
 
 func (g *storedGrant) String() string   { return "stored grant (authenticator key redacted)" }
@@ -147,6 +150,14 @@ func (s *GrantStore) pruneLocked(now time.Time) {
 	for id, grant := range s.grants {
 		if grant.revoked || !now.Before(grant.expiresAt) {
 			s.removeGrant(id, grant)
+			continue
+		}
+		// Proof timestamps on the exact skew boundary are still accepted, so
+		// retain each replay key until it is strictly outside that window.
+		for nonce, timestamp := range grant.nonces {
+			if timestamp.IsZero() || now.After(timestamp.Add(MaxClockSkew)) {
+				delete(grant.nonces, nonce)
+			}
 		}
 	}
 }
@@ -165,7 +176,7 @@ func validClientID(id string) bool {
 }
 
 func (s *GrantStore) Issue(clientID string, scopes []Scope, ttl time.Duration) (IssuedGrant, error) {
-	if s == nil || !validClientID(clientID) || len(scopes) == 0 || ttl <= 0 {
+	if s == nil || !validClientID(clientID) || len(scopes) == 0 || ttl <= 0 || ttl > MaxGrantLifetime {
 		return IssuedGrant{}, ErrInvalidGrant
 	}
 	selected := make(map[Scope]bool, len(scopes))
@@ -202,9 +213,49 @@ func (s *GrantStore) Issue(clientID string, scopes []Scope, ttl time.Duration) (
 		return IssuedGrant{}, ErrInvalidGrant
 	}
 	authenticatorKey := sha256.Sum256(credential[:])
-	s.grants[id] = &storedGrant{clientID: clientID, scopes: selected, issuedAt: issued, expiresAt: expires, authenticatorKey: authenticatorKey, nonces: make(map[[NonceBytes]byte]struct{})}
+	s.grants[id] = &storedGrant{clientID: clientID, scopes: selected, issuedAt: issued, expiresAt: expires, authenticatorKey: authenticatorKey, nonces: make(map[[NonceBytes]byte]time.Time)}
 	result := IssuedGrant{ID: id, ClientID: clientID, Scopes: append([]Scope(nil), scopes...), IssuedAt: issued, ExpiresAt: expires, Credential: append([]byte(nil), credential[:]...)}
 	return result, nil
+}
+
+// Restore reconstructs a live grant from an owner-protected credential record.
+// The credential itself is never retained; only its derived HMAC key is kept.
+func (s *GrantStore) Restore(grant IssuedGrant) error {
+	if s == nil || !validGrantID(grant.ID) || grant.ClientID != "claude.mcp" || len(grant.Scopes) != 1 || grant.Scopes[0] != ScopeMCPBoundedRead || len(grant.Credential) != 32 || allZero(grant.Credential) || grant.IssuedAt.IsZero() || !grant.ExpiresAt.After(grant.IssuedAt) || grant.ExpiresAt.Sub(grant.IssuedAt) > MaxGrantLifetime {
+		return ErrInvalidGrant
+	}
+	selected := map[Scope]bool{ScopeMCPBoundedRead: true}
+	now := s.now()
+	if now.IsZero() || !now.Before(grant.ExpiresAt) || grant.IssuedAt.After(now.Add(MaxClockSkew)) {
+		return ErrInvalidGrant
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now)
+	if len(s.grants) >= s.maxGrants {
+		return ErrInvalidGrant
+	}
+	if _, exists := s.grants[grant.ID]; exists {
+		return ErrInvalidGrant
+	}
+	s.grants[grant.ID] = &storedGrant{
+		clientID: grant.ClientID, scopes: selected, issuedAt: grant.IssuedAt,
+		expiresAt: grant.ExpiresAt, authenticatorKey: sha256.Sum256(grant.Credential),
+		nonces: make(map[[NonceBytes]byte]time.Time),
+	}
+	return nil
+}
+
+func validGrantID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for i := range id {
+		if !((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // Revoke invalidates and removes a grant after clearing its replay and key data.
@@ -306,6 +357,6 @@ func (s *GrantStore) Authorize(p Proof, requestDigest [32]byte) error {
 	if len(g.nonces) >= s.maxNonces {
 		return ErrReplayLimit
 	}
-	g.nonces[nonce] = struct{}{}
+	g.nonces[nonce] = p.Timestamp
 	return nil
 }

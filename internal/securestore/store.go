@@ -7,7 +7,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/hazcod/blur/internal/platform"
 )
 
 // SecretState and SecretError alias the shared platform types so OS adapters
@@ -22,6 +22,7 @@ const (
 	Corrupt     SecretState = platform.SecretCorrupt
 	Denied      SecretState = platform.SecretDenied
 	Unavailable SecretState = platform.SecretUnavailable
+	Ambiguous   SecretState = platform.SecretAmbiguous
 )
 
 // Key is an opaque DEK. Explicit Bytes access returns a copy for cryptographic
@@ -74,27 +75,21 @@ func ResolveKey(ctx context.Context, store platform.SecretStore, name string, ra
 	if err := ctx.Err(); err != nil {
 		return Key{}, err
 	}
-	value, err := store.Get(ctx, name, len(zero))
-	if contextErr := ctx.Err(); contextErr != nil {
-		return Key{}, contextErr
-	}
+	resolvedKey, err := loadKey(ctx, store, name)
 	if err == nil {
-		if len(value) != len(zero) {
-			return Key{}, &SecretError{State: Corrupt}
-		}
-		var key Key
-		copy(key.bytes[:], value)
-		return key, nil
+		return resolvedKey, nil
 	}
 	state, typed := err.(*SecretError)
-	if !typed || state == nil || state.State != NotFound || len(value) != 0 {
-		if state != nil && typed {
-			switch state.State {
-			case Locked, Corrupt, Denied, Unavailable:
-				return Key{}, &SecretError{State: state.State}
-			}
-		}
+	if !typed || state == nil {
 		return Key{}, &SecretError{State: Unavailable}
+	}
+	if state.State != NotFound {
+		switch state.State {
+		case Locked, Corrupt, Denied, Unavailable, Ambiguous:
+			return Key{}, &SecretError{State: state.State, Operation: "read", BackendCode: state.BackendCode}
+		default:
+			return Key{}, &SecretError{State: Unavailable}
+		}
 	}
 	if random == nil {
 		return Key{}, &SecretError{State: Unavailable}
@@ -120,7 +115,14 @@ func ResolveKey(ctx context.Context, store platform.SecretStore, name string, ra
 	}
 	if putErr != nil {
 		clear(zero[:])
-		return Key{}, &SecretError{State: Unavailable}
+		var putState *SecretError
+		if errors.As(putErr, &putState) && putState != nil {
+			switch putState.State {
+			case Locked, Corrupt, Denied, Unavailable, Ambiguous:
+				return Key{}, &SecretError{State: putState.State, Operation: "create", BackendCode: putState.BackendCode}
+			}
+		}
+		return Key{}, &SecretError{State: Unavailable, Operation: "create"}
 	}
 	if !putUnchanged {
 		clear(zero[:])
@@ -128,25 +130,79 @@ func ResolveKey(ctx context.Context, store platform.SecretStore, name string, ra
 	}
 	stored, readErr := store.Get(ctx, name, len(zero))
 	if err := ctx.Err(); err != nil {
+		clear(stored)
 		clear(zero[:])
 		return Key{}, err
 	}
 	if readErr != nil {
+		clear(stored)
 		clear(zero[:])
 		state, typed := readErr.(*SecretError)
 		if typed && state != nil {
 			switch state.State {
-			case Locked, Corrupt, Denied, Unavailable:
-				return Key{}, &SecretError{State: state.State}
+			case Locked, Corrupt, Denied, Unavailable, Ambiguous:
+				return Key{}, &SecretError{State: state.State, Operation: "verify", BackendCode: state.BackendCode}
 			}
 		}
-		return Key{}, &SecretError{State: Unavailable}
+		return Key{}, &SecretError{State: Unavailable, Operation: "verify"}
 	}
-	if len(stored) != len(zero) || subtle.ConstantTimeCompare(stored, zero[:]) != 1 {
+	valid := len(stored) == len(zero) && subtle.ConstantTimeCompare(stored, zero[:]) == 1
+	clear(stored)
+	if !valid {
 		clear(zero[:])
 		return Key{}, &SecretError{State: Corrupt}
 	}
 	key := Key{bytes: zero}
 	clear(zero[:])
+	return key, nil
+}
+
+// LoadKey retrieves a previously stored DEK and never creates or mutates it.
+// This is required when an encrypted store already exists: a missing key must
+// fail closed rather than being replaced with a new, unusable key.
+func LoadKey(ctx context.Context, store platform.SecretStore, name string) (Key, error) {
+	return loadKey(ctx, store, name)
+}
+
+func loadKey(ctx context.Context, store platform.SecretStore, name string) (Key, error) {
+	if ctx == nil {
+		return Key{}, &SecretError{State: Unavailable}
+	}
+	if err := ctx.Err(); err != nil {
+		return Key{}, err
+	}
+	if store == nil || name == "" {
+		return Key{}, &SecretError{State: Unavailable}
+	}
+	var expected [32]byte
+	value, err := store.Get(ctx, name, len(expected))
+	if contextErr := ctx.Err(); contextErr != nil {
+		clear(value)
+		return Key{}, contextErr
+	}
+	if err != nil {
+		valueLen := len(value)
+		clear(value)
+		state, typed := err.(*SecretError)
+		if typed && state != nil {
+			switch state.State {
+			case NotFound:
+				if valueLen != 0 {
+					return Key{}, &SecretError{State: Unavailable}
+				}
+				return Key{}, &SecretError{State: NotFound}
+			case Locked, Corrupt, Denied, Unavailable, Ambiguous:
+				return Key{}, &SecretError{State: state.State, BackendCode: state.BackendCode}
+			}
+		}
+		return Key{}, &SecretError{State: Unavailable}
+	}
+	if len(value) != len(expected) {
+		clear(value)
+		return Key{}, &SecretError{State: Corrupt}
+	}
+	var key Key
+	copy(key.bytes[:], value)
+	clear(value)
 	return key, nil
 }

@@ -44,6 +44,9 @@ const (
 	maxEventAccounting = int64(7 * 24 * time.Hour)
 )
 
+// MaxReportSegments bounds durable report-window hydration and aggregation.
+const MaxReportSegments = 4096
+
 type Segment struct {
 	ID          string    `json:"id"`
 	WallStart   time.Time `json:"wall_start"`
@@ -132,16 +135,15 @@ func (e *Engine) Apply(event Event) ([]Segment, error) {
 	e.started, e.lastMono, e.lastWall = true, event.Monotonic, event.Wall
 	switch event.Kind {
 	case Seen:
-		if e.active && (e.appID != event.AppID || e.domain != event.Domain) {
-			e.sources = nil
-		}
 		e.active, e.appID, e.domain = true, strings.Clone(event.AppID), strings.Clone(event.Domain)
-		if !contains(e.sources, event.SourceID) {
-			e.sources = append(e.sources, strings.Clone(event.SourceID))
-			if len(e.sources) > 32 {
-				e.sources = append([]string(nil), e.sources[len(e.sources)-32:]...)
-			}
+		// A sighting is the evidence for the interval that starts at that
+		// sighting. Retaining every earlier sighting in the active session
+		// creates quadratic reverse-index fanout and eventually prevents writes.
+		// The segment emitted above remains linked to the prior sighting.
+		for i := range e.sources {
+			e.sources[i] = ""
 		}
+		e.sources = append(e.sources[:0], strings.Clone(event.SourceID))
 	case Idle, Locked, Sleeping:
 		e.active = false
 		e.appID = ""
@@ -185,7 +187,7 @@ func (e *Engine) makeSegments(start time.Time, duration int64, app, domain strin
 func (e *Engine) makeSegment(start time.Time, duration int64, app, domain string, sources []string, rule string, version uint32) Segment {
 	e.seq++
 	end := start.Add(time.Duration(duration))
-	seed := fmt.Sprintf("%d:%d:%s:%s", e.lastMono, e.seq, app, domain)
+	seed := fmt.Sprintf("%d:%d:%d:%s:%s", e.lastMono, e.seq, start.UTC().UnixNano(), app, domain)
 	h := sha256.Sum256([]byte(seed))
 	return Segment{ID: hex.EncodeToString(h[:16]), WallStart: start, WallEnd: end, Duration: duration, AppID: strings.Clone(app), Domain: strings.Clone(domain), SourceIDs: append([]string(nil), sources...), RuleID: rule, RuleVersion: version}
 }
@@ -209,6 +211,62 @@ func (e *Engine) Segments() []Segment {
 	out = append(out, e.ring[e.ringNext:]...)
 	out = append(out, e.ring[:e.ringNext]...)
 	return cloneSegments(out)
+}
+
+// ForgetSource removes every buffered segment attributed to sourceID and
+// prevents the current session from attributing future segments to it.
+// Segment deletion is conservative: a segment citing the source is dropped in
+// full rather than retaining potentially derived app/time metadata.
+func (e *Engine) ForgetSource(sourceID string) (int, error) {
+	if e == nil || !validText(sourceID, 128) {
+		return 0, ErrInvalid
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	wasActiveSource := contains(e.sources, sourceID)
+	remaining := e.sources[:0]
+	for _, id := range e.sources {
+		if id == sourceID {
+			continue
+		}
+		remaining = append(remaining, id)
+	}
+	for i := len(remaining); i < len(e.sources); i++ {
+		e.sources[i] = ""
+	}
+	e.sources = remaining
+	if wasActiveSource && len(e.sources) == 0 {
+		e.active = false
+		e.appID = ""
+		e.domain = ""
+	}
+
+	ordered := make([]Segment, 0, len(e.ring))
+	if len(e.ring) < e.cfg.RingSize || e.ringNext == 0 {
+		ordered = append(ordered, e.ring...)
+	} else {
+		ordered = append(ordered, e.ring[e.ringNext:]...)
+		ordered = append(ordered, e.ring[:e.ringNext]...)
+	}
+	kept := make([]Segment, 0, len(ordered))
+	removed := 0
+	for _, segment := range ordered {
+		if contains(segment.SourceIDs, sourceID) {
+			removed++
+			continue
+		}
+		kept = append(kept, cloneSegment(segment))
+	}
+	for i := range e.ring {
+		e.ring[i] = Segment{}
+	}
+	e.ring = make([]Segment, len(kept), e.cfg.RingSize)
+	copy(e.ring, kept)
+	e.ringNext = 0
+	clear(ordered)
+	clear(kept)
+	return removed, nil
 }
 
 func Classify(segments []Segment, rules []Rule) ([]Segment, error) {

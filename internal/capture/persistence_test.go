@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/privacy"
 )
 
 func TestAuthenticatedObservationRecordRoundTripsDeterministically(t *testing.T) {

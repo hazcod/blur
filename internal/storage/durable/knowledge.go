@@ -10,9 +10,9 @@ import (
 	"sort"
 	"unicode/utf8"
 
-	"github.com/nielsgroen/blur/internal/knowledge"
-	"github.com/nielsgroen/blur/internal/storage"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/knowledge"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 const (
@@ -33,6 +33,32 @@ func (s *Store) knowledgeAliasKey(alias string) string {
 }
 
 func (s *Store) PutKnowledgeEntity(ctx context.Context, entity knowledge.Entity) error {
+	return s.putKnowledgeEntity(ctx, entity, "")
+}
+
+// PutKnowledgeEntityFromSource atomically checks that a single confirmed fact
+// cites a live observation before storing the entity. This is the acceptance
+// path for source-derived model proposals.
+func (s *Store) PutKnowledgeEntityFromSource(ctx context.Context, entity knowledge.Entity, sourceID string) error {
+	if !validKnowledgeSourceID(sourceID) || entity.State != knowledge.Confirmed || len(entity.Facts) != 1 || entity.Facts[0].State != knowledge.Confirmed || len(entity.Facts[0].Sources) != 1 || entity.Facts[0].Sources[0].ID != sourceID {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	return s.putKnowledgeEntity(ctx, entity, sourceID)
+}
+
+func validKnowledgeSourceID(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for i := range value {
+		if !(value[i] >= '0' && value[i] <= '9' || value[i] >= 'a' && value[i] <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) putKnowledgeEntity(ctx context.Context, entity knowledge.Entity, requiredSourceID string) error {
 	if ctx == nil || entity.Validate() != nil {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
@@ -42,7 +68,21 @@ func (s *Store) PutKnowledgeEntity(ctx context.Context, entity knowledge.Entity)
 		return &storage.StoreError{Code: storage.Invalid}
 	}
 	defer clear(encoded)
+	if !s.state.knowledgeMu.TryRLock() {
+		return ErrUnavailable
+	}
+	defer s.state.knowledgeMu.RUnlock()
 	return s.Update(ctx, func(tx *Tx) error {
+		if requiredSourceID != "" {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, found, err := s.getObservationReader(tx.writer, requiredSourceID); err != nil {
+				return err
+			} else if !found {
+				return &storage.StoreError{Code: storage.Invalid}
+			}
+		}
 		ids, err := tx.knowledgeDirectory()
 		if err != nil {
 			return err
@@ -99,6 +139,10 @@ func (s *Store) DeleteKnowledgeEntity(ctx context.Context, id string) error {
 	if ctx == nil || !validOpaqueID(id) {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
+	if !s.state.knowledgeMu.TryRLock() {
+		return ErrUnavailable
+	}
+	defer s.state.knowledgeMu.RUnlock()
 	return s.Update(ctx, func(tx *Tx) error {
 		entity, found, err := tx.knowledgeEntity(id)
 		if err != nil {
@@ -129,6 +173,69 @@ func (s *Store) DeleteKnowledgeEntity(ctx context.Context, id string) error {
 		ids = removeString(ids, id)
 		return tx.PutIndexRecord(knowledgeMetaNS, knowledgeDirectoryID, mustJSON(ids))
 	})
+}
+
+// DeleteAllKnowledge removes every entity, exact-name entry and merge snapshot
+// in bounded transactions. The store-level writer fence waits for existing
+// mutations and rejects new ones until the purge finishes, while allowing reads.
+func (s *Store) DeleteAllKnowledge(ctx context.Context) error {
+	if ctx == nil {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	s.state.knowledgeMu.Lock()
+	defer s.state.knowledgeMu.Unlock()
+	const batchSize = 8
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ids, err := s.readKnowledgeDirectory(ctx)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		for start := 0; start < len(ids); start += batchSize {
+			end := min(start+batchSize, len(ids))
+			batch := append([]string(nil), ids[start:end]...)
+			err := s.Update(ctx, func(tx *Tx) error {
+				directory, err := tx.knowledgeDirectory()
+				if err != nil {
+					return err
+				}
+				for _, id := range batch {
+					entity, found, err := tx.knowledgeEntity(id)
+					if err != nil {
+						return err
+					}
+					if !found {
+						return ErrCorrupt
+					}
+					if err := tx.removeKnowledgeAliases(entity, id); err != nil {
+						return err
+					}
+					if entity.State == knowledge.Merged {
+						if err := tx.deleteKnowledgeRecord(knowledgeMergeNS, id); err != nil {
+							return err
+						}
+					}
+					if err := tx.deleteKnowledgeRecord(knowledgeEntityNS, id); err != nil {
+						return err
+					}
+					directory = removeString(directory, id)
+				}
+				if err := tx.PutIndexRecord(knowledgeMetaNS, knowledgeDirectoryID, mustJSON(directory)); err != nil {
+					return err
+				}
+				return nil
+			})
+			clear(batch)
+			if err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (s *Store) ListKnowledge(ctx context.Context, request knowledge.PageRequest) (knowledge.Page, error) {
@@ -204,61 +311,72 @@ func (s *Store) QuarantineKnowledgeSource(ctx context.Context, sourceID string) 
 	if ctx == nil || !validHash(sourceID) {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
-	return s.Update(ctx, func(tx *Tx) error {
-		ids, err := tx.knowledgeDirectory()
+	if !s.state.knowledgeMu.TryRLock() {
+		return ErrUnavailable
+	}
+	defer s.state.knowledgeMu.RUnlock()
+	return s.Update(ctx, func(tx *Tx) error { return tx.quarantineKnowledgeSource(sourceID) })
+}
+
+// quarantineKnowledgeSource removes claims whose only remaining evidence is
+// the source and updates surviving multi-source claims in the same transaction.
+func (tx *Tx) quarantineKnowledgeSource(sourceID string) error {
+	if tx == nil || !validHash(sourceID) {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	ids, err := tx.knowledgeDirectory()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		e, ok, err := tx.knowledgeEntity(id)
 		if err != nil {
 			return err
 		}
-		for _, id := range ids {
-			e, ok, err := tx.knowledgeEntity(id)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				continue
-			}
-			changed := false
-			facts := e.Facts[:0]
-			for _, f := range e.Facts {
-				f.Sources, changed = withoutSource(f.Sources, sourceID, changed)
-				if len(f.Sources) > 0 {
-					facts = append(facts, f)
-				} else {
-					changed = true
-				}
-			}
-			e.Facts = facts
-			loops := e.OpenLoops[:0]
-			for _, l := range e.OpenLoops {
-				l.Sources, changed = withoutSource(l.Sources, sourceID, changed)
-				if len(l.Sources) > 0 {
-					loops = append(loops, l)
-				} else {
-					changed = true
-				}
-			}
-			e.OpenLoops = loops
-			for _, sid := range e.ActivitySourceIDs {
-				if sid == sourceID {
-					changed = true
-					break
-				}
-			}
-			if changed {
-				filtered := e.ActivitySourceIDs[:0]
-				for _, sid := range e.ActivitySourceIDs {
-					if sid != sourceID {
-						filtered = append(filtered, sid)
-					}
-				}
-				e.ActivitySourceIDs = filtered
-				if err := tx.PutIndexRecord(knowledgeEntityNS, id, mustJSON(e)); err != nil {
-					return err
-				}
+		if !ok {
+			continue
+		}
+		changed := false
+		facts := e.Facts[:0]
+		for _, f := range e.Facts {
+			f.Sources, changed = withoutSource(f.Sources, sourceID, changed)
+			if len(f.Sources) > 0 {
+				facts = append(facts, f)
+			} else {
+				changed = true
 			}
 		}
-		return nil
-	})
+		e.Facts = facts
+		loops := e.OpenLoops[:0]
+		for _, l := range e.OpenLoops {
+			l.Sources, changed = withoutSource(l.Sources, sourceID, changed)
+			if len(l.Sources) > 0 {
+				loops = append(loops, l)
+			} else {
+				changed = true
+			}
+		}
+		e.OpenLoops = loops
+		for _, sid := range e.ActivitySourceIDs {
+			if sid == sourceID {
+				changed = true
+				break
+			}
+		}
+		if changed {
+			filtered := e.ActivitySourceIDs[:0]
+			for _, sid := range e.ActivitySourceIDs {
+				if sid != sourceID {
+					filtered = append(filtered, sid)
+				}
+			}
+			e.ActivitySourceIDs = filtered
+			if err := tx.PutIndexRecord(knowledgeEntityNS, id, mustJSON(e)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func withoutSource(sources []knowledge.Source, id string, changed bool) ([]knowledge.Source, bool) {
@@ -277,6 +395,10 @@ func (s *Store) MergeKnowledge(ctx context.Context, sourceID, targetID string) e
 	if ctx == nil || !validOpaqueID(sourceID) || !validOpaqueID(targetID) || sourceID == targetID {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
+	if !s.state.knowledgeMu.TryRLock() {
+		return ErrUnavailable
+	}
+	defer s.state.knowledgeMu.RUnlock()
 	return s.Update(ctx, func(tx *Tx) error {
 		source, sok, err := tx.knowledgeEntity(sourceID)
 		if err != nil {
@@ -324,6 +446,10 @@ func (s *Store) UnmergeKnowledge(ctx context.Context, sourceID, targetID string)
 	if ctx == nil || !validOpaqueID(sourceID) || !validOpaqueID(targetID) {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
+	if !s.state.knowledgeMu.TryRLock() {
+		return ErrUnavailable
+	}
+	defer s.state.knowledgeMu.RUnlock()
 	return s.Update(ctx, func(tx *Tx) error {
 		stored, found, err := tx.readKnowledgeRecordLocked(knowledgeMergeNS, sourceID)
 		if err != nil {

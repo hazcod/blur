@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/diagnostics"
-	"github.com/nielsgroen/blur/internal/knowledge"
-	"github.com/nielsgroen/blur/internal/memory"
-	"github.com/nielsgroen/blur/internal/securestore"
-	"github.com/nielsgroen/blur/internal/storage"
-	"github.com/nielsgroen/blur/internal/storage/durable"
+	"github.com/hazcod/blur/internal/diagnostics"
+	"github.com/hazcod/blur/internal/knowledge"
+	"github.com/hazcod/blur/internal/memory"
+	"github.com/hazcod/blur/internal/securestore"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/durable"
 )
 
 func parseFixture(args []string) (command, path string, ok bool) {

@@ -1,6 +1,10 @@
 package activity
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -23,6 +27,52 @@ func TestRepeatedSightingsConserveElapsedTime(t *testing.T) {
 	}
 	if len(segments) != 2 || segments[0].SourceIDs[0] != "source-1" || segments[1].SourceIDs[0] != "source-1" {
 		t.Fatalf("segments lost prior evidence: %#v", segments)
+	}
+}
+
+func TestNewSightingsReplacePriorSourceAttribution(t *testing.T) {
+	start := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
+	e := New(Config{MaxGap: time.Minute, RingSize: 128})
+	for i := 0; i < 100; i++ {
+		_, err := e.Apply(Event{
+			Kind: Seen, Monotonic: int64(i) * int64(time.Minute),
+			Wall:     start.Add(time.Duration(i) * time.Minute),
+			SourceID: fmt.Sprintf("source-%03d", i), AppID: "slack",
+		})
+		if err != nil {
+			t.Fatalf("sighting %d: %v", i, err)
+		}
+	}
+	segments := e.Segments()
+	if len(segments) != 99 {
+		t.Fatalf("segments=%d, want 99", len(segments))
+	}
+	for i, segment := range segments {
+		want := fmt.Sprintf("source-%03d", i)
+		if len(segment.SourceIDs) != 1 || segment.SourceIDs[0] != want {
+			t.Fatalf("segment %d sources=%v, want only most recent evidence %q", i, segment.SourceIDs, want)
+		}
+	}
+}
+
+func TestSegmentIDsDifferAcrossFreshProcesses(t *testing.T) {
+	start := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
+	segmentFromFreshEngine := func(wall time.Time, source string) Segment {
+		engine := New(Config{MaxGap: time.Minute, RingSize: 2})
+		if _, err := engine.Apply(Event{Kind: Seen, Monotonic: 0, Wall: wall, SourceID: source, AppID: "editor"}); err != nil {
+			t.Fatal(err)
+		}
+		segments, err := engine.Apply(Event{Kind: Seen, Monotonic: int64(time.Second), Wall: wall.Add(time.Second), SourceID: source, AppID: "editor"})
+		if err != nil || len(segments) != 1 {
+			t.Fatalf("fresh engine emitted segments=%d err=%v", len(segments), err)
+		}
+		return segments[0]
+	}
+
+	first := segmentFromFreshEngine(start, "source-a")
+	second := segmentFromFreshEngine(start.Add(time.Second), "source-b")
+	if first.ID == second.ID {
+		t.Fatalf("different process sessions reused durable segment ID %q", first.ID)
 	}
 }
 
@@ -151,6 +201,76 @@ func TestReportConservesDurationAcrossLocalMidnight(t *testing.T) {
 	}
 }
 
+func TestReportConservesYearAcrossThousandsOfSegments(t *testing.T) {
+	segments := syntheticYearSegments()
+	report, err := Report(segments, time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := int64(len(segments)) * int64(time.Minute)
+	if report.Eligible != want || report.Unclassified != want {
+		t.Fatalf("year totals eligible=%s unclassified=%s, want both %s", time.Duration(report.Eligible), time.Duration(report.Unclassified), time.Duration(want))
+	}
+	if len(report.Days) != 365 {
+		t.Fatalf("report days = %d, want 365", len(report.Days))
+	}
+	var days int64
+	for _, day := range report.Days {
+		days += day.Duration
+	}
+	if days != want || len(report.Apps) != 1 || report.Apps[0].Duration != want {
+		t.Fatalf("report buckets did not conserve year duration: days=%s apps=%+v", time.Duration(days), report.Apps)
+	}
+}
+
+func syntheticYearSegments() []Segment {
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	segments := make([]Segment, 0, 365*11)
+	for day := 0; day < 365; day++ {
+		dayStart := start.AddDate(0, 0, day)
+		for block := 0; block < 11; block++ {
+			segmentStart := dayStart.Add(time.Duration(block*2) * time.Hour)
+			segments = append(segments, Segment{
+				ID:        fmt.Sprintf("year-segment-%04d-%02d", day, block),
+				WallStart: segmentStart,
+				WallEnd:   segmentStart.Add(time.Minute),
+				Duration:  int64(time.Minute),
+				AppID:     "editor",
+			})
+		}
+	}
+	return segments
+}
+
+func TestEngineForgetSourceRemovesRingAndActiveReferences(t *testing.T) {
+	e := New(Config{MaxGap: time.Hour, RingSize: 8})
+	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
+	for i, id := range []string{"source-a", "source-b", "source-c"} {
+		_, err := e.Apply(Event{Kind: Seen, Monotonic: int64(i) * int64(time.Minute), Wall: start.Add(time.Duration(i) * time.Minute), SourceID: id, AppID: "editor"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := e.ForgetSource("source-a")
+	if err != nil || removed != 1 {
+		t.Fatalf("ForgetSource() = (%d, %v), want one segment directly supported by source-a", removed, err)
+	}
+	for _, segment := range e.Segments() {
+		if contains(segment.SourceIDs, "source-a") {
+			t.Fatalf("forgotten source remains in ring: %#v", segment)
+		}
+	}
+	segments, err := e.Apply(Event{Kind: Seen, Monotonic: 3 * int64(time.Minute), Wall: start.Add(3 * time.Minute), SourceID: "source-d", AppID: "editor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, segment := range segments {
+		if contains(segment.SourceIDs, "source-a") {
+			t.Fatalf("forgotten source was re-emitted: %#v", segment)
+		}
+	}
+}
+
 func TestReportUsesLocalDSTCalendarBoundary(t *testing.T) {
 	zone, err := time.LoadLocation("America/New_York")
 	if err != nil {
@@ -174,4 +294,71 @@ func sumDuration(segments []Segment) int64 {
 		n += s.Duration
 	}
 	return n
+}
+
+func TestApplyNeverEmitsInvalidSegmentsForRepeatedAndAlternatingSources(t *testing.T) {
+	engine := New(Config{MaxGap: 10 * time.Minute, RingSize: 16})
+	wall := time.Unix(1700000000, 0).UTC()
+	var mono int64
+	for i := 0; i < 500; i++ {
+		id := "src-" + string(rune('a'+i%3))
+		segments, err := engine.Apply(Event{Kind: Seen, Monotonic: mono, Wall: wall, SourceID: id, AppID: "org.example.app", Domain: "example.com"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, segment := range segments {
+			if err := segment.Validate(); err != nil || len(segment.SourceIDs) > 32 {
+				t.Fatalf("invalid segment %+v: %v", segment, err)
+			}
+		}
+		mono += int64(7 * time.Second)
+		wall = wall.Add(7 * time.Second)
+	}
+}
+
+func TestApplyRejectsOversizedLabelsAtIntakeSoSegmentsStayValid(t *testing.T) {
+	engine := New(Config{})
+	wall := time.Unix(1700000000, 0).UTC()
+	for _, event := range []Event{
+		{Kind: Seen, Wall: wall, SourceID: "s", AppID: strings.Repeat("a", 129)},
+		{Kind: Seen, Wall: wall, SourceID: "s", AppID: "app", Domain: strings.Repeat("d", 254)},
+		{Kind: Seen, Wall: wall, SourceID: strings.Repeat("s", 129), AppID: "app"},
+	} {
+		if _, err := engine.Apply(event); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("Apply(%d-byte fields) error = %v, want ErrInvalid", len(event.AppID)+len(event.Domain), err)
+		}
+	}
+}
+
+func TestTenMinuteSessionOfDistinctSourcesEmitsOnlyValidBoundedSegments(t *testing.T) {
+	engine := New(Config{MaxGap: 10 * time.Minute, RingSize: 256})
+	wall := time.Unix(1700000000, 0).UTC()
+	var all []Segment
+	for i := 0; i < 100; i++ {
+		at := time.Duration(i) * 6 * time.Second
+		segments, err := engine.Apply(Event{Kind: Seen, Monotonic: int64(at), Wall: wall.Add(at), SourceID: fmt.Sprintf("%064x", i), AppID: "org.example.app"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, segments...)
+	}
+	end := 10 * time.Minute
+	segments, err := engine.Apply(Event{Kind: Idle, Monotonic: int64(end), Wall: wall.Add(end)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all = append(all, segments...)
+	var total int64
+	for _, segment := range all {
+		if err := segment.Validate(); err != nil {
+			t.Fatalf("segment invalid: %v", err)
+		}
+		if encoded, _ := json.Marshal(segment); len(encoded) > 16<<10 {
+			t.Fatalf("segment encodes to %d bytes", len(encoded))
+		}
+		total += segment.Duration
+	}
+	if total != int64(end) {
+		t.Fatalf("total duration %d, want %d", total, int64(end))
+	}
 }

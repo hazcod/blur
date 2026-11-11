@@ -12,10 +12,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/search"
-	"github.com/nielsgroen/blur/internal/storage"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 func indexObservation(t *testing.T, app, domain, text string) capture.SanitizedObservation {
@@ -58,6 +58,45 @@ func TestDurableExactIndexSearchesWithoutScanFallbackAndAppliesFilters(t *testin
 	}
 	if response.Results[0].Score != 2 || response.Results[0].ProvenanceKind != "raw_sanitized_observation" {
 		t.Fatalf("rank or source provenance = %+v", response.Results[0])
+	}
+}
+
+func TestDurableSearchSupportsBoundedMinimumTermMatches(t *testing.T) {
+	store, err := OpenDurable(t.TempDir()+"/search.db", durableTestKey(t, 0x7c), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	all := indexObservation(t, "editor.app", "docs.example", "anna q3 budget approved")
+	budgetAnna := indexObservation(t, "editor.app", "docs.example", "anna budget discussion")
+	q3Anna := indexObservation(t, "editor.app", "docs.example", "anna q3 discussion")
+	one := indexObservation(t, "editor.app", "docs.example", "budget discussion")
+	for _, observation := range []capture.SanitizedObservation{all, budgetAnna, q3Anna, one} {
+		if err := store.PutObservation(context.Background(), observation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: []string{"anna", "budget", "q3"}, MinTermMatches: 2,
+		TopK: 4, MaxRows: 32, MaxBytes: search.MaxIndexBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Hits) != 3 || page.Hits[0].SourceID != all.ContentID() || page.HasMore {
+		t.Fatalf("minimum-match page=%+v, want the 3-term result ranked first and all 2-term results, excluding one-term result %s", page, one.ContentID())
+	}
+	for _, hit := range page.Hits {
+		if hit.SourceID == one.ContentID() {
+			t.Fatalf("minimum-match query included one-term candidate %s", hit.SourceID)
+		}
+	}
+	if _, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: []string{"anna", "budget"}, MinTermMatches: 3,
+		TopK: 1, MaxRows: 8, MaxBytes: search.MaxIndexBytes,
+	}); !errors.Is(err, search.ErrInvalidRequest) {
+		t.Fatalf("invalid minimum-term threshold error=%v, want ErrInvalidRequest", err)
 	}
 }
 
@@ -1664,7 +1703,7 @@ func TestDurableIndexDeleteRemovesPostingsAndRollsBackAtomically(t *testing.T) {
 	if _, found, err := store.GetObservation(context.Background(), first.ContentID()); err != nil || !found {
 		t.Fatalf("rolled-back observation missing: found=%t err=%v", found, err)
 	}
-	if err := store.Update(context.Background(), func(tx *Tx) error { return tx.deleteObservation(first.ContentID()) }); err != nil {
+	if err := store.DeleteObservationRecord(context.Background(), first.ContentID()); err != nil {
 		t.Fatal(err)
 	}
 	response, err := search.New(store).Search(context.Background(), search.Request{Query: "alpha beta", ResultLimit: 10, SnippetBytes: 64, ResponseBytes: 4096, ScanLimit: 1})
@@ -1673,6 +1712,9 @@ func TestDurableIndexDeleteRemovesPostingsAndRollsBackAtomically(t *testing.T) {
 	}
 	if len(response.Results) != 1 || response.Results[0].SourceID != second.ContentID() {
 		t.Fatalf("delete left a stale posting or removed a sibling: %+v", response.Results)
+	}
+	if err := store.DeleteObservationRecord(context.Background(), first.ContentID()); err != nil {
+		t.Fatalf("repeated deletion: %v", err)
 	}
 }
 

@@ -10,8 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/privacy"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/chronicle"
+	"github.com/hazcod/blur/internal/privacy"
 )
 
 const MaxObservationTextBytes = capture.MaxObservationTextBytes
@@ -34,8 +35,11 @@ type ObservationPageRequest struct {
 // not fit MaxBytes and therefore was not cloned into Observations.
 type ObservationPage struct {
 	Observations []capture.SanitizedObservation
-	Bytes        int
-	HasMore      bool
+	// CapturedAt aligns with Observations. A zero value marks a legacy record
+	// for which the backend has no trustworthy timestamp.
+	CapturedAt []time.Time
+	Bytes      int
+	HasMore    bool
 }
 
 type ErrorCode string
@@ -50,6 +54,19 @@ const (
 type StoreError struct{ Code ErrorCode }
 
 func (e *StoreError) Error() string { return "storage: " + string(e.Code) }
+
+// SafeFailureClassifier exposes a bounded, non-sensitive category for logs.
+// Implementations must never return data-derived values or error details.
+type SafeFailureClassifier interface {
+	SafeFailureCode() string
+}
+
+func (e *StoreError) SafeFailureCode() string {
+	if e == nil {
+		return ""
+	}
+	return string(e.Code)
+}
 
 // DerivationState is a closed persisted vocabulary. Models provide content,
 // never state transitions; these immutable records are written by core policy.
@@ -93,7 +110,13 @@ type Generation struct {
 // a logical-ID cursor even if the physical order is opaque.
 type EncryptedStore interface {
 	EncryptedAtRest() bool
+	// PutObservation records the store's current UTC insertion time. PutObservationAt
+	// is available when the source has a more precise user-authored creation time.
 	PutObservation(context.Context, capture.SanitizedObservation) error
+	PutObservationAt(context.Context, capture.SanitizedObservation, time.Time) error
+	// DeleteObservationRecord removes one source record; callers must also
+	// invalidate any separately materialized derivatives or projections.
+	DeleteObservationRecord(context.Context, string) error
 	GetObservation(context.Context, string) (capture.SanitizedObservation, bool, error)
 	ListObservationPage(context.Context, ObservationPageRequest) (ObservationPage, error)
 	PutDerivation(context.Context, Derivation) error
@@ -107,6 +130,16 @@ type EncryptedStore interface {
 	Close() error
 }
 
+// ChronicleStore persists generated hourly summaries and their provenance.
+// Implementations must cascade source deletion and bound every list request.
+type ChronicleStore interface {
+	PutChronicle(context.Context, chronicle.Summary) error
+	GetChronicle(context.Context, string) (chronicle.Summary, bool, error)
+	ListChronicles(context.Context, time.Time, time.Time, string, int) ([]chronicle.Summary, string, error)
+	DeleteChronicle(context.Context, string) error
+	DeleteAllChronicles(context.Context) error
+}
+
 // EphemeralMemoryStore is TestOnly. It is never a production default and does
 // not encrypt or persist data. It exercises the EncryptedStore contract.
 type EphemeralMemoryStore struct {
@@ -114,6 +147,7 @@ type EphemeralMemoryStore struct {
 	closed           bool
 	observations     map[string]capture.SanitizedObservation
 	observationBytes map[string]int
+	observationTimes map[string]time.Time
 	observationIDs   []string
 	derivations      map[string]Derivation
 	derivationIDs    []string
@@ -125,7 +159,7 @@ type EphemeralMemoryStore struct {
 var _ EncryptedStore = (*EphemeralMemoryStore)(nil)
 
 func NewEphemeralMemoryStore() *EphemeralMemoryStore {
-	return &EphemeralMemoryStore{observations: make(map[string]capture.SanitizedObservation), observationBytes: make(map[string]int), derivations: make(map[string]Derivation), generations: make(map[string]Generation)}
+	return &EphemeralMemoryStore{observations: make(map[string]capture.SanitizedObservation), observationBytes: make(map[string]int), observationTimes: make(map[string]time.Time), derivations: make(map[string]Derivation), generations: make(map[string]Generation)}
 }
 func (*EphemeralMemoryStore) EncryptedAtRest() bool { return false }
 func (s *EphemeralMemoryStore) Close() error {
@@ -175,6 +209,12 @@ func validHash(s string) bool {
 	}
 	return true
 }
+func validCaptureTime(value time.Time) bool {
+	if value.IsZero() {
+		return false
+	}
+	return time.Unix(0, value.UTC().UnixNano()).UTC().Equal(value.UTC())
+}
 func validID(s string) bool {
 	if s == "" || len(s) > 128 {
 		return false
@@ -191,13 +231,17 @@ func copyObservation(o capture.SanitizedObservation) capture.SanitizedObservatio
 	return o.Clone()
 }
 func (s *EphemeralMemoryStore) PutObservation(ctx context.Context, o capture.SanitizedObservation) error {
+	return s.PutObservationAt(ctx, o, time.Now())
+}
+
+func (s *EphemeralMemoryStore) PutObservationAt(ctx context.Context, o capture.SanitizedObservation, capturedAt time.Time) error {
 	if ctx == nil {
 		return &StoreError{Code: Invalid}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if o.Validate() != nil {
+	if o.Validate() != nil || !validCaptureTime(capturedAt) {
 		return &StoreError{Code: Invalid}
 	}
 	s.mu.Lock()
@@ -214,9 +258,40 @@ func (s *EphemeralMemoryStore) PutObservation(ctx context.Context, o capture.San
 	storedID := stored.ContentID()
 	s.observations[storedID] = stored
 	s.observationBytes[storedID] = searchBytes
+	s.observationTimes[storedID] = capturedAt.UTC()
 	s.observationIDs = insertID(s.observationIDs, storedID)
 	return nil
 }
+
+func (s *EphemeralMemoryStore) DeleteObservationRecord(ctx context.Context, id string) error {
+	if ctx == nil {
+		return &StoreError{Code: Invalid}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !validHash(id) {
+		return &StoreError{Code: Invalid}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ready(ctx, s.closed); err != nil {
+		return err
+	}
+	if _, found := s.observations[id]; !found {
+		return nil
+	}
+	delete(s.observations, id)
+	delete(s.observationBytes, id)
+	delete(s.observationTimes, id)
+	index := sort.SearchStrings(s.observationIDs, id)
+	if index < len(s.observationIDs) && s.observationIDs[index] == id {
+		copy(s.observationIDs[index:], s.observationIDs[index+1:])
+		s.observationIDs = s.observationIDs[:len(s.observationIDs)-1]
+	}
+	return nil
+}
+
 func (s *EphemeralMemoryStore) GetObservation(ctx context.Context, id string) (capture.SanitizedObservation, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -246,6 +321,7 @@ func (s *EphemeralMemoryStore) ListObservationPage(ctx context.Context, request 
 	}
 	start := sort.Search(len(s.observationIDs), func(i int) bool { return s.observationIDs[i] > request.After })
 	out := make([]capture.SanitizedObservation, 0, request.Limit)
+	capturedAt := make([]time.Time, 0, request.Limit)
 	usedBytes, index := 0, start
 	for index < len(s.observationIDs) && len(out) < request.Limit {
 		id := s.observationIDs[index]
@@ -254,10 +330,11 @@ func (s *EphemeralMemoryStore) ListObservationPage(ctx context.Context, request 
 			break
 		}
 		out = append(out, copyObservation(s.observations[id]))
+		capturedAt = append(capturedAt, s.observationTimes[id])
 		usedBytes += observationBytes
 		index++
 	}
-	return ObservationPage{Observations: out, Bytes: usedBytes, HasMore: index < len(s.observationIDs)}, nil
+	return ObservationPage{Observations: out, CapturedAt: capturedAt, Bytes: usedBytes, HasMore: index < len(s.observationIDs)}, nil
 }
 func validDerivation(d Derivation) bool {
 	if !validID(d.ID) || !validID(d.GenerationID) || !validHash(d.ProviderModelDigest) || !validHash(d.OutputHash) || d.ProcessorVersion <= 0 || d.SchemaVersion <= 0 || d.PromptVersion <= 0 || d.RedactionVersion != privacy.Version || len(d.SourceIDs) == 0 || len(d.SourceIDs) > MaxListLimit || len(d.SourceIDs) != len(d.SourceHashes) || d.CoveredSources < 0 || d.OmittedSources < 0 || d.CoveredSources+d.OmittedSources != len(d.SourceIDs) || d.InputTokens < 0 || d.OutputTokens < 0 || d.Latency < 0 {

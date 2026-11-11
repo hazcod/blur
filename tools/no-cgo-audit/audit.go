@@ -127,7 +127,7 @@ func rejectImportC(path string, source []byte) error {
 
 func currentModuleRoot(ctx context.Context, target Target) (string, error) {
 	cmd := exec.CommandContext(ctx, "go", "env", "GOMOD")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS="+target.GOOS, "GOARCH="+target.GOARCH)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+target.GOOS, "GOARCH="+target.GOARCH)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("go env GOMOD for %s/%s: %w", target.GOOS, target.GOARCH, err)
@@ -139,9 +139,10 @@ func currentModuleRoot(ctx context.Context, target Target) (string, error) {
 	return filepath.Dir(modFile), nil
 }
 
-// AuditTarget obtains the dependency list with cgo enabled so go list does not
-// suppress CgoFiles. It scans all repository Go source, then only target-
-// selected GoFiles/CgoFiles in non-standard dependency packages.
+// AuditTarget obtains the dependency list with cgo disabled, matching shipped
+// build policy. It scans all repository Go source, then only target-selected
+// GoFiles in non-standard dependencies. Optional cgo-only fallbacks in unused
+// dependency source are not part of a cgo-disabled product binary.
 func AuditTarget(ctx context.Context, target Target) error {
 	root, err := currentModuleRoot(ctx, target)
 	if err != nil {
@@ -153,7 +154,7 @@ func AuditTarget(ctx context.Context, target Target) error {
 
 	cmd := exec.CommandContext(ctx, "go", "list", "-deps", "-json", "./...")
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS="+target.GOOS, "GOARCH="+target.GOARCH)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+target.GOOS, "GOARCH="+target.GOARCH)
 	var output bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &output

@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nielsgroen/blur/internal/capture"
-	"github.com/nielsgroen/blur/internal/search"
-	"github.com/nielsgroen/blur/internal/securestore"
-	"github.com/nielsgroen/blur/internal/storage/physical/bolt"
+	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/securestore"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 const durableScaleBenchOptIn = "BLUR_RUN_SCALE_BENCH"
@@ -106,6 +106,16 @@ func BenchmarkDurableExactIndexScale(b *testing.B) {
 				b.Fatal(err)
 			}
 			store = nil
+			started := time.Now()
+			store, err = OpenDurable(path, key, OpenExisting)
+			firstOpenDuration := time.Since(started)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				b.Fatal(err)
+			}
+			store = nil
 			reopenDurations := make([]time.Duration, 0, durableScaleReopenSamples)
 			for i := 0; i < durableScaleReopenSamples; i++ {
 				started := time.Now()
@@ -127,6 +137,7 @@ func BenchmarkDurableExactIndexScale(b *testing.B) {
 			b.ReportMetric(float64(heapInuse)/float64(1<<20), "heap-inuse-MiB")
 			b.ReportMetric(float64(p50.Nanoseconds()), "index-p50-ns")
 			b.ReportMetric(float64(durations[p95].Nanoseconds()), "index-p95-ns")
+			b.ReportMetric(float64(firstOpenDuration.Nanoseconds()), "first-open-ns")
 			reportScaleLatency(b, "search", searchDurations)
 			b.ReportMetric(float64(len(durations)), "index-queries")
 			b.ReportMetric(float64(len(searchDurations)), "search-queries")

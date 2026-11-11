@@ -4,7 +4,7 @@ package fake
 import (
 	"context"
 
-	"github.com/nielsgroen/blur/internal/platform"
+	"github.com/hazcod/blur/internal/platform"
 )
 
 func report(r platform.CapabilityReport, id string) (platform.CapabilityReport, bool) {
