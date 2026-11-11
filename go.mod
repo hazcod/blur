@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/Microsoft/go-winio v0.6.4
-	github.com/ebitengine/purego v0.10.0
+	github.com/ebitengine/purego v0.11.3
 	github.com/godbus/dbus/v5 v5.2.4
 	github.com/goexlib/cgo v0.1.1
 	github.com/golang-gui/goui v0.6.0

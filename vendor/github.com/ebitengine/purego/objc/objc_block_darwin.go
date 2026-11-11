@@ -6,11 +6,11 @@ package objc
 import (
 	"fmt"
 	"reflect"
+	"structs"
 	"sync"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
-	"github.com/ebitengine/purego/internal/xreflect"
 )
 
 const (
@@ -35,6 +35,7 @@ const (
 //
 // The layout of this struct matches Block_literal_1 described in https://clang.llvm.org/docs/Block-ABI-Apple.html#high-level
 type blockDescriptor struct {
+	_         structs.HostLayout
 	_         uintptr
 	size      uintptr
 	_         uintptr
@@ -48,6 +49,7 @@ type blockDescriptor struct {
 //
 // The layout of this struct matches __block_literal_1 described in https://clang.llvm.org/docs/Block-ABI-Apple.html#high-level
 type blockLayout struct {
+	_          structs.HostLayout
 	isa        Class
 	flags      uint32
 	_          uint32
@@ -125,7 +127,7 @@ func (*blockCache) encode(typ reflect.Type) *uint8 {
 		encoding = returnType
 	}
 
-	if typ.NumIn() == 0 || typ.In(0) != reflect.TypeOf(Block(0)) {
+	if typ.NumIn() == 0 || typ.In(0) != reflect.TypeFor[Block]() {
 		panic(fmt.Sprintf("objc: A Block implementation must take a Block as its first argument; got %v", typ.String()))
 	}
 
@@ -168,7 +170,7 @@ func (b *blockCache) getLayout(typ reflect.Type) blockLayout {
 		reflect.MakeFunc(
 			typ,
 			func(args []reflect.Value) (results []reflect.Value) {
-				block, ok := xreflect.TypeAssert[Block](args[0])
+				block, ok := reflect.TypeAssert[Block](args[0])
 				if !ok {
 					panic(fmt.Sprintf("objc: block argument is not a block but %s", args[0].Type().String()))
 				}
@@ -263,7 +265,7 @@ func InvokeBlock[T any](block Block, args ...any) (result T, err error) {
 	callResult := fn.Call(reflectedArgs)
 
 	var ok bool
-	result, ok = xreflect.TypeAssert[T](callResult[0])
+	result, ok = reflect.TypeAssert[T](callResult[0])
 	if !ok {
 		return result, fmt.Errorf("objc: the returned value type %s was not %T", callResult[0].Type().String(), result)
 	}
