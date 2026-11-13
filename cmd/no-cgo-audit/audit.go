@@ -37,10 +37,8 @@ type Target struct {
 // SupportedTargets includes the command build matrix maintained by Makefile.
 var SupportedTargets = []Target{
 	{GOOS: "darwin", GOARCH: "arm64"},
-	{GOOS: "darwin", GOARCH: "amd64"},
 	{GOOS: "windows", GOARCH: "amd64"},
 	{GOOS: "linux", GOARCH: "amd64"},
-	{GOOS: "linux", GOARCH: "arm64"},
 }
 
 // AuditPackages rejects cgo files and any import of "C" in selected

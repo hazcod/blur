@@ -1,5 +1,5 @@
 # GoReleaser configuration (GoReleaser v2).
-# Builds the portable Windows and Linux archives. The macOS universal app is
+# Builds the portable x64 Windows and Linux archives. The macOS Apple silicon app is
 # built, signed and notarized separately by the `macos` job in
 # .github/workflows/release.yml and attached to the same GitHub release.
 # Tags must be semantic versions with a leading "v" (vX.Y.Z[-prerelease]).
@@ -22,7 +22,7 @@ builds:
       - -trimpath
       - -buildvcs=false
     goos: [linux]
-    goarch: [amd64, arm64]
+    goarch: [amd64]
     mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w -X main.version={{ .Version }} -X main.commit={{ .Commit }} -X main.date={{ .Date }}
@@ -104,6 +104,7 @@ changelog:
       - "^ci:"
 
 release:
+  replace_existing_artifacts: true
   header: |
     ## Blur {{ .Tag }}
 
@@ -114,9 +115,9 @@ release:
   footer: |
     ---
 
-    **Downloads:** Windows x86-64 (`windows_amd64.zip`), Linux x86-64 (`linux_amd64.tar.gz`) and Linux ARM64 (`linux_arm64.tar.gz`). Windows and Linux builds are experimental.
+    **Downloads:** Windows x64 (`windows_amd64.zip`) and Linux x64 (`linux_amd64.tar.gz`). Windows and Linux builds are experimental.
 
-    **macOS:** when repository signing and notarization secrets are configured, a separate job attaches `Blur_{{ .Version }}_macos_universal.zip` (Developer ID signed, notarized, universal Apple silicon + Intel). If that asset is absent, use the source build instructions in the setup guide.
+    **macOS:** when repository signing and notarization secrets are configured, a separate job attaches `Blur_{{ .Version }}_macos_arm64.zip` (Developer ID signed and notarized, for Apple silicon). If that asset is absent, use the source build instructions in the setup guide.
 
     **Setup:** https://github.com/hazcod/blur/blob/{{ .Tag }}/docs/getting-started.md
 

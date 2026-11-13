@@ -110,7 +110,7 @@ They never accept keys through arguments, environment variables, or config.
 print bounded fixture content. Do not place personal data in a fixture store.
 The macOS desktop bundle is written to the stable, visible path
 `~/Downloads/Blur.app` so it can be selected in macOS Accessibility settings.
-`make macos-app` builds a universal arm64 + x86_64 executable with cgo disabled
+`make macos-app` builds an Apple silicon arm64 executable with cgo disabled
 and packages it into the same bundle.
 Set `MACOS_APP` and `MACOS_BINARY` to choose explicit output paths. Rebuilding
 replaces that generated bundle only after a staged build passes signature
@@ -236,19 +236,16 @@ The committed Xcode project can be regenerated from
 XcodeGen.
 
 `make cross-build` builds `blur`, `blur-core`, `blurctl`, and physical storage
-with cgo disabled for Darwin arm64/amd64, Windows amd64, and Linux amd64/arm64;
-it also compiles the native GoUI package for Linux arm64. The desktop entrypoint
-selects the X11 shell on both Linux architectures. `make cross-test-compile`
-compiles platform conformance tests for Darwin arm64, Windows amd64, and Linux
-amd64/arm64, plus the Linux adapter tests on both Linux architectures. The
+with cgo disabled for macOS Apple silicon (arm64), Windows x64 (amd64), and Linux
+x64 (amd64). `make cross-test-compile` compiles platform conformance tests for
+those three targets and the Linux adapter tests for x64. The
 GoUI compatibility fork is documented in
 [`docs/dependency-forks.md`](dependency-forks.md). `make no-cgo-audit` inspects
 command dependency graphs for Cgo files and `import "C"` across the supported
 target matrix.
 
 `make portable-packages` creates unsigned, version-free portable artifacts in
-`dist/packages/`: `blur-windows-amd64.zip`, `blur-linux-amd64.tar.gz`, and
-`blur-linux-arm64.tar.gz`. The Windows archive contains a GUI-subsystem
+`dist/packages/`: `blur-windows-amd64.zip` and `blur-linux-amd64.tar.gz`. The Windows archive contains a GUI-subsystem
 `Blur.exe`, a separate console-subsystem `blur-mcp.exe` for inherited Claude
 stdio, and the README, license, and security policy. The GUI app writes a
 bounded rotating `blur.log` and runtime crash output under

@@ -4,7 +4,7 @@ Blur is a cross-platform desktop app in development. Windows and Linux have nati
 
 ## Choose a build
 
-Download a build from [GitHub Releases](https://github.com/hazcod/blur/releases). Choose Windows x86-64 (`windows_amd64.zip`), Linux x86-64 (`linux_amd64.tar.gz`) or Linux ARM64 (`linux_arm64.tar.gz`). Windows and Linux archives are unsigned development builds. Signed macOS app archives are included only when the release has macOS signing configured; otherwise use the source build below.
+Download a build from [GitHub Releases](https://github.com/hazcod/blur/releases). Choose Windows x64 (`windows_amd64.zip`) or Linux x64 (`linux_amd64.tar.gz`). Windows and Linux archives are unsigned development builds. Signed Apple silicon macOS app archives are included only when the release has macOS signing configured; otherwise use the source build below.
 
 For an unreleased commit, you can also try a Windows or Linux CI artifact:
 
@@ -12,13 +12,13 @@ For an unreleased commit, you can also try a Windows or Linux CI artifact:
 2. Check that the **Verify** job completed its portable packaging step. Review the platform test results too; Windows tests are currently advisory.
 3. While signed in to GitHub, download the **blur-portable** artifact from that run and extract it. Artifacts expire after 14 days; a failed packaging step will not produce one.
 
-The artifact contains `blur-windows-amd64.zip`, `blur-linux-amd64.tar.gz` and `blur-linux-arm64.tar.gz`. These are unsigned development builds. CI does not upload a macOS app through this artifact.
+The artifact contains `blur-windows-amd64.zip` and `blur-linux-amd64.tar.gz`. These are unsigned x64 development builds. CI does not upload a macOS app through this artifact.
 
 To build from source, install the Go version specified in [go.mod](../go.mod), clone the repository and use `make macos-app` on macOS or `make portable-packages` for Windows and Linux archives. See [Contributing](../CONTRIBUTING.md) for verification commands.
 
 ## macOS
 
-The app bundle is universal: Apple silicon and Intel use the same `Blur.app`. A source build writes it to `~/Downloads/Blur.app`; a published macOS archive contains the app bundle. Move it to Applications when you are ready to use it.
+The app bundle supports Apple silicon Macs. Intel Macs are not supported. A source build writes it to `~/Downloads/Blur.app`; a published macOS archive contains the app bundle. Move it to Applications when you are ready to use it.
 
 Grant Blur access in **System Settings → Privacy & Security → Accessibility**. Blur reads accessible text from the focused app; it does not need Screen Recording permission. Choose the apps and sites it may capture in Settings, then start capture explicitly.
 
@@ -36,11 +36,11 @@ For troubleshooting, the GUI writes rotating logs under `%APPDATA%\Blur\Logs`. R
 
 ## Linux
 
-Choose the archive for your machine: `amd64` for x86-64 or `arm64` for ARM64. Blur currently needs an **X11 desktop session**, a working session **D-Bus**, **AT-SPI2** accessibility services, and an unlocked **Secret Service** keyring such as GNOME Keyring or KWallet with Secret Service support. Wayland capture is not currently supported.
+Use the `amd64` archive for x64 machines. Blur currently needs an **X11 desktop session**, a working session **D-Bus**, **AT-SPI2** accessibility services, and an unlocked **Secret Service** keyring. Wayland capture is not currently supported.
 
 Extract the archive and run `./blur` from its directory. For a user-local installation, put the executable on your `PATH`, such as in `~/.local/bin`. CI portable archives also include a desktop launcher and SVG icon for the standard per-user XDG application and icon directories.
 
-Blur uses AT-SPI2 to read accessible text from the focused app and Secret Service to protect its database key. It does not unlock a locked keyring for you. If capture or startup is unavailable, check the session, accessibility services and keyring first. Live Linux desktop validation is still pending on both architectures.
+Blur uses AT-SPI2 to read accessible text from the focused app and Secret Service to protect its database key. It does not unlock a locked keyring for you. If capture or startup is unavailable, check the session, accessibility services and keyring first. Live Linux desktop validation is still pending.
 
 ## Start with local memory
 

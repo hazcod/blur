@@ -54,8 +54,8 @@ func TestPackagePortableWindowsArchiveContainsAppAndNotices(t *testing.T) {
 
 func TestPackagePortableLinuxArchiveIncludesLauncherAndArtwork(t *testing.T) {
 	root, binary := packageFixture(t)
-	output := filepath.Join(t.TempDir(), "blur-linux-arm64.tar.gz")
-	if err := packagePortable(root, binary, "", output, "linux", "arm64"); err != nil {
+	output := filepath.Join(t.TempDir(), "blur-linux-amd64.tar.gz")
+	if err := packagePortable(root, binary, "", output, "linux", "amd64"); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.Open(output)
@@ -86,7 +86,7 @@ func TestPackagePortableLinuxArchiveIncludesLauncherAndArtwork(t *testing.T) {
 		entries[header.Name] = string(contents)
 		modes[header.Name] = header.Mode
 	}
-	prefix := "blur-linux-arm64/"
+	prefix := "blur-linux-amd64/"
 	if entries[prefix+"blur"] != "binary fixture" || entries[prefix+"blur.svg"] != "icon fixture" {
 		t.Fatalf("Linux archive is missing binary or icon: %v", entries)
 	}
@@ -106,8 +106,15 @@ func TestPackagePortableLinuxArchiveIncludesLauncherAndArtwork(t *testing.T) {
 func TestPackagePortableRejectsUnsupportedTargetsAndSymlinkBinary(t *testing.T) {
 	root, binary := packageFixture(t)
 	output := filepath.Join(t.TempDir(), "blur.zip")
-	if err := packagePortable(root, binary, "", output, "windows", "arm64"); err == nil {
-		t.Fatal("unsupported Windows arm64 package succeeded")
+	for _, target := range [][2]string{{"windows", "arm64"}, {"linux", "arm64"}, {"windows", "386"}, {"linux", "386"}} {
+		suffix := ".zip"
+		if target[0] == "linux" {
+			suffix = ".tar.gz"
+		}
+		unsupportedOutput := filepath.Join(t.TempDir(), "blur"+suffix)
+		if err := packagePortable(root, binary, "", unsupportedOutput, target[0], target[1]); err == nil {
+			t.Fatalf("unsupported %s/%s package succeeded", target[0], target[1])
+		}
 	}
 	link := filepath.Join(t.TempDir(), "blur")
 	if err := os.Symlink(binary, link); err != nil {

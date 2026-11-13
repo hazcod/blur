@@ -1,6 +1,6 @@
 # Releasing Blur
 
-Releases are cut by pushing a semantic-version tag. The `Release` workflow
+Each push to `main` automatically publishes a preview release. The `Release` workflow
 (`.github/workflows/release.yml`) builds and publishes Windows and Linux archives
 and their signed checksums. It also publishes a signed, notarized macOS app
 when all five macOS repository secrets below are configured.
@@ -12,35 +12,28 @@ back to an unsigned or ad-hoc-signed macOS app.
 
 ## Versioning
 
-GoReleaser requires semantic versions with a leading `v`: `vX.Y.Z`, or
-`vX.Y.Z-rc.1` for pre-releases (which are flagged as pre-releases on GitHub).
-Tags such as `release-1` or `1.2.3` are not valid for GoReleaser and `v*` tags
-that are not valid semver will fail the `goreleaser` job.
+GitHub Actions assigns `v0.1.0-alpha.<run number>` to each push on `main`, creates
+the tag at that exact commit, and passes it to GoReleaser. No local tag or
+manual release is needed. Re-running the same workflow reuses its tag and
+refuses to move it to a different commit.
 
-The version is injected at link time through
-`-X main.version=... -X main.commit=... -X main.date=...` and is shown by
-`blur version` (also `blur --version`).
-
-## Cutting a release
-
-```sh
-make version                      # preview the version derived from git
-git tag -a v1.2.3 -m "Blur 1.2.3"
-git push origin v1.2.3
-```
+All automated versions are marked as pre-releases while Blur is in development.
+The version, commit and build time are injected into the binary and shown by
+`blur version` (also `blur --version`). Push a normal commit to `main` to
+publish; the workflow builds, signs checksums and uploads the assets.
 
 After checking platform configuration, the workflow runs these build jobs:
 
-1. `goreleaser` (Ubuntu): builds cgo-free Linux (amd64, arm64) and Windows
-   (amd64 GUI plus the `blur-mcp` console companion) binaries with
+1. `goreleaser` (Ubuntu): builds cgo-free Linux x64 (amd64) and Windows
+   (x64/amd64 GUI plus the `blur-mcp` console companion) binaries with
    `-trimpath`, packages `tar.gz` and `zip` archives, writes
    `checksums.txt`, signs it keylessly with cosign (GitHub OIDC), and creates
    the GitHub release with a changelog.
-2. `macos` (macOS runner, after the first job, only with complete signing configuration): builds the universal app with
+2. `macos` (macOS runner, after the first job, only with complete signing configuration): builds the Apple silicon app with
    `make macos-app`, signs it with a Developer ID Application certificate
    (Hardened Runtime, secure timestamp, `platform/macos/Blur.sandbox.entitlements`),
    notarizes it with `notarytool`, staples the ticket, verifies with `spctl` and
-   `codesign`, and uploads `Blur_<version>_macos_universal.zip` to the release.
+   `codesign`, and uploads `Blur_<version>_macos_arm64.zip` to the release.
 
 Verify a download:
 

@@ -30,23 +30,21 @@ vulncheck:
 build:
 	CGO_ENABLED=0 go build ./...
 
-# Keep shipped target tuples synchronized with tools/no-cgo-audit.SupportedTargets.
+# Keep shipped target tuples synchronized with cmd/no-cgo-audit.SupportedTargets.
 cross-build: physical-cross-build
 	@set -eu; \
-	for target in darwin/arm64 darwin/amd64 windows/amd64 linux/amd64 linux/arm64; do \
+	for target in darwin/arm64 windows/amd64 linux/amd64; do \
 		GOOS=$${target%/*}; GOARCH=$${target#*/}; \
 		for package in ./cmd/blur ./cmd/blur-core ./cmd/blurctl ./cmd/blur-sign; do \
 			echo "Building $$package for $$GOOS/$$GOARCH with cgo disabled"; \
 			CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go build -o /dev/null $$package; \
 		done; \
 	done
-	@echo "Compiling the Linux native UI for arm64 with cgo disabled"; \
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go test -c -o /dev/null github.com/golang-gui/goui/ui
 
 # Keep the physical-package matrix synchronized with the audit and command matrix above.
 physical-cross-build:
 	@set -eu; \
-	for target in darwin/arm64 darwin/amd64 windows/amd64 linux/amd64 linux/arm64; do \
+	for target in darwin/arm64 windows/amd64 linux/amd64; do \
 		GOOS=$${target%/*}; GOARCH=$${target#*/}; \
 		echo "Building ./internal/storage/physical/bolt for $$GOOS/$$GOARCH with cgo disabled"; \
 		CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go build -o /dev/null ./internal/storage/physical/bolt; \
@@ -54,7 +52,7 @@ physical-cross-build:
 
 cross-test-compile:
 	@set -eu; \
-	for target in darwin/arm64 windows/amd64 linux/amd64 linux/arm64; do \
+	for target in darwin/arm64 windows/amd64 linux/amd64; do \
 		GOOS=$${target%/*}; GOARCH=$${target#*/}; \
 		echo "Compiling platform conformance tests for $$GOOS/$$GOARCH with cgo disabled"; \
 		CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH go test -c -o /dev/null ./internal/platform/conformance; \
@@ -82,12 +80,10 @@ portable-packages:
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags '-H=windowsgui' -o "$(PORTABLE_PACKAGE_DIR)/Blur-windows-amd64.exe" ./cmd/blur
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags '-X main.mcpOnlyBinary=true' -o "$(PORTABLE_PACKAGE_DIR)/blur-mcp-windows-amd64.exe" ./cmd/blur
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o "$(PORTABLE_PACKAGE_DIR)/blur-linux-amd64" ./cmd/blur
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -o "$(PORTABLE_PACKAGE_DIR)/blur-linux-arm64" ./cmd/blur
 	go run ./cmd/blur-package -root . -binary "$(PORTABLE_PACKAGE_DIR)/Blur-windows-amd64.exe" -mcp-binary "$(PORTABLE_PACKAGE_DIR)/blur-mcp-windows-amd64.exe" -output "$(PORTABLE_PACKAGE_DIR)/blur-windows-amd64.zip" -os windows -arch amd64
 	go run ./cmd/blur-package -root . -binary "$(PORTABLE_PACKAGE_DIR)/blur-linux-amd64" -output "$(PORTABLE_PACKAGE_DIR)/blur-linux-amd64.tar.gz" -os linux -arch amd64
-	go run ./cmd/blur-package -root . -binary "$(PORTABLE_PACKAGE_DIR)/blur-linux-arm64" -output "$(PORTABLE_PACKAGE_DIR)/blur-linux-arm64.tar.gz" -os linux -arch arm64
 
-# The checked-in Xcode project builds a universal, unsigned Safari .appex.
+# The checked-in Xcode project builds an Apple silicon, unsigned Safari .appex.
 # Signing, App Group provisioning, embedding, and Safari runtime tests remain
 # separate release gates; an unsigned extension is not installable.
 XCODE_DEVELOPER_DIR ?= $(shell xcode-select -p 2>/dev/null)
@@ -101,7 +97,7 @@ SAFARI_EXTENSION_PRODUCT = $(SAFARI_EXTENSION_DERIVED_DATA)/Build/Products/Relea
 SAFARI_EXTENSION_INFO = $(SAFARI_EXTENSION_PRODUCT)/Contents/Info.plist
 
 safari-extension-build:
-	DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" xcodebuild -quiet -project platform/macos/BlurSafariCapture.xcodeproj -scheme BlurSafariCapture -configuration Release -sdk macosx -destination 'generic/platform=macOS' -derivedDataPath "$(SAFARI_EXTENSION_DERIVED_DATA)" CODE_SIGNING_ALLOWED=NO BLUR_APP_GROUP_ID="$(BLUR_APP_GROUP_ID)" BLUR_KEYCHAIN_ACCESS_GROUP="$(BLUR_KEYCHAIN_ACCESS_GROUP)" build
+	DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" xcodebuild -quiet -project platform/macos/BlurSafariCapture.xcodeproj -scheme BlurSafariCapture -configuration Release -sdk macosx -destination 'generic/platform=macOS' -derivedDataPath "$(SAFARI_EXTENSION_DERIVED_DATA)" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO BLUR_APP_GROUP_ID="$(BLUR_APP_GROUP_ID)" BLUR_KEYCHAIN_ACCESS_GROUP="$(BLUR_KEYCHAIN_ACCESS_GROUP)" build
 	test -s "$(SAFARI_EXTENSION_PRODUCT)/Contents/MacOS/BlurSafariCapture"
 	test -f "$(SAFARI_EXTENSION_PRODUCT)/Contents/Resources/Injected.js"
 	test "$$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$(SAFARI_EXTENSION_INFO)")" = "com.apple.Safari.extension"
@@ -132,7 +128,6 @@ MACOS_SAFARI_SIGNED_APP ?= dist/darwin-arm64/Blur-Safari.app
 MACOS_SAFARI_STAGING_APP = $(abspath $(dir $(MACOS_SAFARI_SIGNED_APP)))/.$(basename $(notdir $(MACOS_SAFARI_SIGNED_APP))).staging.app
 MACOS_BINARY ?= $(dir $(MACOS_APP)).blur-build
 MACOS_BINARY_ARM64 ?= $(MACOS_BINARY).arm64
-MACOS_BINARY_AMD64 ?= $(MACOS_BINARY).amd64
 MACOS_BUNDLE_ID ?= com.hazcod.blur
 MACOS_MINIMUM_SYSTEM_VERSION ?= 13.0
 MACOS_CODESIGN_IDENTITY ?= $(shell go run ./cmd/macos-signing-identity -app "$(MACOS_APP)" 2>/dev/null)
@@ -165,10 +160,8 @@ MACOS_ENTITLEMENT_FLAGS = $(if $(filter 1,$(MACOS_SANDBOX)),--entitlements "$(MA
 macos-app:
 	@if test -z "$(MACOS_CODESIGN_IDENTITY)"; then echo "Using ad-hoc signing; macOS may require Accessibility approval again after rebuilds. Set MACOS_CODESIGN_IDENTITY for a stable local identity."; fi
 	CGO_ENABLED=0 go run -mod=mod github.com/golang-gui/goui/cmd/goui build -target darwin/arm64 -ldflags '$(MACOS_LDFLAGS)' -o $(MACOS_BINARY_ARM64)
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags '$(MACOS_LDFLAGS)' -o "$(MACOS_BINARY_AMD64)" ./cmd/blur
-	lipo -create "$(MACOS_BINARY_ARM64)" "$(MACOS_BINARY_AMD64)" -output "$(MACOS_BINARY)"
+	cp "$(MACOS_BINARY_ARM64)" "$(MACOS_BINARY)"
 	lipo "$(MACOS_BINARY)" -verify_arch arm64
-	lipo "$(MACOS_BINARY)" -verify_arch x86_64
 	rm -rf "$(MACOS_APP_STAGING)"
 	CGO_ENABLED=0 go run -mod=mod github.com/golang-gui/goui/cmd/goui package -target darwin/arm64 -format app -binary "$(MACOS_BINARY_ARM64)" -o "$(MACOS_APP_STAGING)"
 	install -m 755 "$(MACOS_BINARY)" "$(MACOS_APP_STAGING)/Contents/MacOS/blur"

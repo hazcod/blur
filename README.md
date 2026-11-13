@@ -12,9 +12,9 @@ Blur is development software. Windows and Linux have native capture implementati
 
 | Platform | Architectures | Native text capture | Status |
 | --- | --- | --- | --- |
-| macOS | Apple silicon, Intel | Accessibility | Native desktop app |
-| Windows | x86-64 | UI Automation | Experimental; live runtime validation pending |
-| Linux | x86-64, ARM64 | AT-SPI2 on X11 | Experimental; live desktop validation pending |
+| macOS | Apple silicon | Accessibility | Native desktop app |
+| Windows | x64 | UI Automation | Experimental; live runtime validation pending |
+| Linux | x64 | AT-SPI2 on X11 | Experimental; live desktop validation pending |
 
 ![Blur's Today page with a recap of the day, next steps and notes](docs/images/today.png)
 

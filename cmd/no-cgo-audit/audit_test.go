@@ -211,8 +211,8 @@ func TestMacOSAppTargetBuildsAndPackagesWithCGODisabled(t *testing.T) {
 			foundPackage = strings.HasPrefix(trimmed, "CGO_ENABLED=0 ")
 		}
 	}
-	if !foundArm64Build || !foundAMD64Build || !foundPackage || !foundUniversalMerge {
-		t.Fatalf("macos-app must build cgo-disabled arm64+amd64 binaries, merge them, and package the universal executable (arm64=%t amd64=%t package=%t merge=%t)", foundArm64Build, foundAMD64Build, foundPackage, foundUniversalMerge)
+	if !foundArm64Build || foundAMD64Build || !foundPackage || foundUniversalMerge {
+		t.Fatalf("macos-app must build and package only cgo-disabled Apple silicon binaries (arm64=%t amd64=%t package=%t universal=%t)", foundArm64Build, foundAMD64Build, foundPackage, foundUniversalMerge)
 	}
 }
 

@@ -35,7 +35,7 @@ func main() {
 	flag.StringVar(&mcpBinaryPath, "mcp-binary", "", "console-subsystem MCP companion binary (Windows only)")
 	flag.StringVar(&outputPath, "output", "", "output .zip or .tar.gz archive")
 	flag.StringVar(&targetOS, "os", "", "target operating system (windows or linux)")
-	flag.StringVar(&targetArch, "arch", "", "target architecture (amd64 or arm64)")
+	flag.StringVar(&targetArch, "arch", "", "target architecture (amd64 / x64)")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		fatal(errInvalidPackage)
@@ -149,7 +149,7 @@ func portableTarget(targetOS, targetArch string) (format, executable string, err
 	switch {
 	case targetOS == "windows" && targetArch == "amd64":
 		return "zip", "Blur.exe", nil
-	case targetOS == "linux" && (targetArch == "amd64" || targetArch == "arm64"):
+	case targetOS == "linux" && targetArch == "amd64":
 		return "tar.gz", "blur", nil
 	default:
 		return "", "", errInvalidPackage
