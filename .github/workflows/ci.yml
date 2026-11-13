@@ -31,6 +31,8 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+      - name: Test release configuration checks
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - run: go vet ./...
       - name: Audit cgo
         run: make no-cgo-audit

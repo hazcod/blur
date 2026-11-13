@@ -1,7 +1,14 @@
 # Releasing Blur
 
 Releases are cut by pushing a semantic-version tag. The `Release` workflow
-(`.github/workflows/release.yml`) then builds, signs and publishes everything.
+(`.github/workflows/release.yml`) builds and publishes Windows and Linux archives
+and their signed checksums. It also publishes a signed, notarized macOS app
+when all five macOS repository secrets below are configured.
+
+With no macOS secrets configured, the workflow publishes Windows and Linux
+assets and skips macOS explicitly. Partial macOS configuration fails before
+publishing, with only the missing secret names in the error. It never falls
+back to an unsigned or ad-hoc-signed macOS app.
 
 ## Versioning
 
@@ -22,14 +29,14 @@ git tag -a v1.2.3 -m "Blur 1.2.3"
 git push origin v1.2.3
 ```
 
-The workflow runs two jobs:
+After checking platform configuration, the workflow runs these build jobs:
 
 1. `goreleaser` (Ubuntu): builds cgo-free Linux (amd64, arm64) and Windows
    (amd64 GUI plus the `blur-mcp` console companion) binaries with
    `-trimpath`, packages `tar.gz` and `zip` archives, writes
    `checksums.txt`, signs it keylessly with cosign (GitHub OIDC), and creates
    the GitHub release with a changelog.
-2. `macos` (macOS runner, after the first job): builds the universal app with
+2. `macos` (macOS runner, after the first job, only with complete signing configuration): builds the universal app with
    `make macos-app`, signs it with a Developer ID Application certificate
    (Hardened Runtime, secure timestamp, `platform/macos/Blur.sandbox.entitlements`),
    notarizes it with `notarytool`, staples the ticket, verifies with `spctl` and

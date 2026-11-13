@@ -1,10 +1,12 @@
 # Getting started with Blur
 
-Blur is a cross-platform desktop app in development. macOS is the primary development platform. Windows and Linux have native capture implementations and portable packages, but still need live desktop validation. Use the [platform status](project-status.md) to check the current limitations before relying on Blur.
+Blur is a cross-platform desktop app in development. Windows and Linux have native capture implementations and portable packages, but still need live desktop validation. See [platform status](project-status.md) for the current limitations.
 
 ## Choose a build
 
-Published versions, when available, are listed on the [releases page](https://github.com/hazcod/blur/releases). If there is no release yet, build from source or try a Windows or Linux CI artifact:
+Download a build from [GitHub Releases](https://github.com/hazcod/blur/releases). Choose Windows x86-64 (`windows_amd64.zip`), Linux x86-64 (`linux_amd64.tar.gz`) or Linux ARM64 (`linux_arm64.tar.gz`). Windows and Linux archives are unsigned development builds. Signed macOS app archives are included only when the release has macOS signing configured; otherwise use the source build below.
+
+For an unreleased commit, you can also try a Windows or Linux CI artifact:
 
 1. Open the [CI workflow](https://github.com/hazcod/blur/actions/workflows/ci.yml) and select a recent run for the commit you want to try.
 2. Check that the **Verify** job completed its portable packaging step. Review the platform test results too; Windows tests are currently advisory.

@@ -1,6 +1,6 @@
 # Blur
 
-Private, local-first memory for macOS, Windows and Linux.
+Private, local-first memory for you.
 
 [![CI](https://github.com/hazcod/blur/actions/workflows/ci.yml/badge.svg)](https://github.com/hazcod/blur/actions/workflows/ci.yml)
 
@@ -8,15 +8,13 @@ Blur is an open-source, cross-platform personal memory app. It keeps a searchabl
 
 [Website](https://blur.hazcod.com) · [Getting started](docs/getting-started.md) · [Contributing](CONTRIBUTING.md) · [Platform status](docs/project-status.md)
 
-Blur is development software. macOS is the most exercised platform; Windows and Linux have native capture implementations and portable builds, with live desktop validation still in progress.
+Blur is development software. Windows and Linux have native capture implementations and portable builds, with live desktop validation still in progress.
 
 | Platform | Architectures | Native text capture | Status |
 | --- | --- | --- | --- |
-| macOS | Apple silicon, Intel | Accessibility | Primary development platform |
+| macOS | Apple silicon, Intel | Accessibility | Native desktop app |
 | Windows | x86-64 | UI Automation | Experimental; live runtime validation pending |
 | Linux | x86-64, ARM64 | AT-SPI2 on X11 | Experimental; live desktop validation pending |
-
-The screenshots below show the macOS interface. The notch panel and Safari extension are macOS-specific integrations.
 
 ![Blur's Today page with a recap of the day, next steps and notes](docs/images/today.png)
 
@@ -28,6 +26,8 @@ Blur reads text from the focused app through your operating system's accessibili
 
 - Today: a recap of your day, next steps and notes.
 - Ask: questions answered from your memory. General questions never send captured data.
+- Correlate: bring related notes, conversations and decisions together in an answer, with sources from across your apps.
+- Reminders and follow-ups: optional AI turns your notes into suggested next steps; you review and confirm the ones you want to keep.
 - Search: find anything you saw or wrote, by exact words.
 - Library: facts about people and projects that you review and keep.
 - Time: where your time went, per app and per range.
@@ -49,7 +49,7 @@ Most memory tools send your history to a model and let it work things out. Blur 
 
 Start with the [getting started guide](docs/getting-started.md) for platform requirements, development builds and first-run setup.
 
-Tagged downloads appear on the [releases page](https://github.com/hazcod/blur/releases) when published. For Windows and Linux, the [CI workflow](https://github.com/hazcod/blur/actions/workflows/ci.yml) uploads portable archives as the `blur-portable` artifact after packaging succeeds. These are unsigned development builds, expire after 14 days and require a GitHub sign-in to download.
+Download builds from [GitHub Releases](https://github.com/hazcod/blur/releases). Windows and Linux archives are unsigned development builds. For a build of a specific commit, the [CI workflow](https://github.com/hazcod/blur/actions/workflows/ci.yml) also uploads portable archives as the `blur-portable` artifact after packaging succeeds; CI artifacts expire after 14 days and require a GitHub sign-in.
 
 ## Using Blur
 
