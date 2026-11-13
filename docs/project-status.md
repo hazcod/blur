@@ -17,14 +17,14 @@ release gates. Linux AT-SPI still needs live-desktop validation.
 Treat this as development software, not a security-reviewed personal-data
 product.
 
-The implementation status is described in [architecture](architecture.md)
-and [threat model](threat-model.md). The product direction is in the
-[design](superpowers/specs/2026-11-04-blur-design.md); it includes proposed
-capabilities that are not shipped here.
+For installation requirements and development builds, start with
+[Getting started](getting-started.md). The implementation and its boundaries
+are described in [architecture](architecture.md) and
+[threat model](threat-model.md).
 
 ## Why not just let an AI read everything?
 
-Blur is designed as the alternative to handing a model all of your data. Nothing leaves your Mac unless you turn on a model, and that model is a local Ollama model or an endpoint you configure. Questions are read by a deterministic local planner, not a model, so time questions and "what did you capture from WhatsApp" are answered with no model at all. When a model is used it receives only a handful of selected, size-limited items with their time and app, and Blur shows how many items were sent for each answer. Recaps are built from short hourly summaries Blur already wrote, and you decide what is captured, how long it is kept, and whether to delete all of it.
+Blur is designed as the alternative to handing a model all of your data. Memory is stored locally and encrypted; AI is optional and off by default. Questions are read by a deterministic local planner, not a model, so time questions and "what did you capture from WhatsApp" are answered with no model at all. When a model is used it receives only a handful of selected, size-limited items with their time and app, and Blur shows how many items were sent for each answer. Remote memory evidence requires a separate opt-in, and a provider may retain requests. Optional folder sync writes encrypted change files to the provider you choose; MCP shares selected results with a client that may use a hosted model. Recaps are built from short hourly summaries Blur already wrote, and you decide what is captured, how long it is kept, and whether to delete all of it.
 
 ## Build and run
 
@@ -241,8 +241,8 @@ it also compiles the native GoUI package for Linux arm64. The desktop entrypoint
 selects the X11 shell on both Linux architectures. `make cross-test-compile`
 compiles platform conformance tests for Darwin arm64, Windows amd64, and Linux
 amd64/arm64, plus the Linux adapter tests on both Linux architectures. The
-small vendored GoUI compatibility patch is documented in
-[`docs/vendor-patches.md`](vendor-patches.md). `make no-cgo-audit` inspects
+GoUI compatibility fork is documented in
+[`docs/dependency-forks.md`](dependency-forks.md). `make no-cgo-audit` inspects
 command dependency graphs for Cgo files and `import "C"` across the supported
 target matrix.
 

@@ -34,8 +34,16 @@ body:
     validations:
       required: true
   - type: textarea
+    id: environment
+    attributes:
+      label: OS version and desktop environment
+      description: Include CPU architecture. On Linux, include desktop, X11 or Wayland session, and keyring provider. On Windows, note whether the affected app is elevated.
+      placeholder: e.g. Windows 11, x86-64; affected app runs without elevation
+    validations:
+      required: true
+  - type: textarea
     id: logs
     attributes:
       label: Diagnostics
-      description: Output of `blurctl doctor`, redacted of personal data.
+      description: Relevant startup or capture errors, redacted of personal data. On Windows, logs are under %APPDATA%\Blur\Logs. Do not attach your memory database, captured text, credentials or keyring data. The fixture-only doctor command is not a diagnostic tool for your personal store.
       render: shell

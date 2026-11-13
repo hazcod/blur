@@ -107,7 +107,10 @@ release:
   header: |
     ## Blur {{ .Tag }}
 
-    Everything runs locally and nothing leaves your device.
+    Private, local-first memory for macOS, Windows and Linux.
+
+    Memory is stored locally and encrypted. AI, folder sync and MCP are optional;
+    configured remote providers and MCP clients may receive selected content.
   footer: |
     ---
 

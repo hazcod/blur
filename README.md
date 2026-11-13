@@ -1,10 +1,22 @@
 # Blur
 
-Private, local-first memory of what you work on.
+Private, local-first memory for macOS, Windows and Linux.
 
 [![CI](https://github.com/hazcod/blur/actions/workflows/ci.yml/badge.svg)](https://github.com/hazcod/blur/actions/workflows/ci.yml)
 
-Blur is an open-source personal memory app for your desktop (macOS now, Windows and Linux in progress). It keeps a searchable record of your day and answers questions about it. The alternative to letting AI read everything: your memory stays encrypted on your Mac, a local planner picks the few items a question needs, and a model only ever sees those.
+Blur is an open-source, cross-platform personal memory app. It keeps a searchable record of your day and answers questions about it. Your memory stays encrypted on your device, and a local planner selects the few items a question needs before a model sees them.
+
+[Website](https://blur.hazcod.com) · [Getting started](docs/getting-started.md) · [Contributing](CONTRIBUTING.md) · [Platform status](docs/project-status.md)
+
+Blur is development software. macOS is the most exercised platform; Windows and Linux have native capture implementations and portable builds, with live desktop validation still in progress.
+
+| Platform | Architectures | Native text capture | Status |
+| --- | --- | --- | --- |
+| macOS | Apple silicon, Intel | Accessibility | Primary development platform |
+| Windows | x86-64 | UI Automation | Experimental; live runtime validation pending |
+| Linux | x86-64, ARM64 | AT-SPI2 on X11 | Experimental; live desktop validation pending |
+
+The screenshots below show the macOS interface. The notch panel and Safari extension are macOS-specific integrations.
 
 ![Blur's Today page with a recap of the day, next steps and notes](docs/images/today.png)
 
@@ -12,36 +24,37 @@ Blur is an open-source personal memory app for your desktop (macOS now, Windows 
 
 ## What Blur does
 
-Blur reads the text of the app you are focused on through macOS Accessibility, stores it in a local encrypted database, and lets you search it or ask questions about it. Answers say where they came from. It never takes screenshots.
+Blur reads text from the focused app through your operating system's accessibility APIs, stores it in a local encrypted database, and lets you search it or ask questions about it. Answers say where they came from. It never takes screenshots.
 
 - Today: a recap of your day, next steps and notes.
 - Ask: questions answered from your memory. General questions never send captured data.
 - Search: find anything you saw or wrote, by exact words.
 - Library: facts about people and projects that you review and keep.
 - Time: where your time went, per app and per range.
-- Quick ask: a panel under the notch for fast questions and notes.
-- Safari capture: optional page capture through a Safari extension.
+- Quick ask: fast questions and notes, with a notch panel on macOS.
+- Safari capture: an optional macOS extension that requires a separately configured build; it is not included in the default app.
 
 ## Why not just let AI read everything?
 
 Most memory tools send your history to a model and let it work things out. Blur works the other way round.
 
-- Nothing leaves your Mac unless you turn on a model. The model is a local Ollama model or an endpoint you configure.
+- AI is optional and off by default. Use a local Ollama model or an endpoint you configure. Sending memory evidence to a remote endpoint requires a separate opt-in; that provider may retain requests.
 - A local planner reads your question, not a model. It is deterministic. Time questions and questions like "what did you capture from WhatsApp" are answered with no model at all.
 - The model only gets a handful of items, selected and size-limited each time, never your whole memory. Blur shows how many items were sent with each answer.
 - Daily recaps are built from the short hourly summaries Blur already wrote, so they are a few kilobytes, not hundreds of captures.
 - You decide what is captured with allowed and blocked apps and sites, and with timed pauses. You decide how long it is kept, and you can delete all of it.
+- Optional folder sync writes encrypted change files to a provider you choose. Enabling MCP lets your client read selected memory results; a hosted client may send those results to its model provider.
 
 ## Install
 
-Download the latest `Blur.app` from the [releases page](https://github.com/hazcod/blur/releases) and move it to Applications. macOS is the supported target today. Windows and Linux are in progress.
+Start with the [getting started guide](docs/getting-started.md) for platform requirements, development builds and first-run setup.
 
-On first launch, grant Blur access in System Settings, Privacy & Security, Accessibility.
+Tagged downloads appear on the [releases page](https://github.com/hazcod/blur/releases) when published. For Windows and Linux, the [CI workflow](https://github.com/hazcod/blur/actions/workflows/ci.yml) uploads portable archives as the `blur-portable` artifact after packaging succeeds. These are unsigned development builds, expire after 14 days and require a GitHub sign-in to download.
 
 ## Using Blur
 
 - Capture: in Settings you choose which apps and sites Blur may capture and which it must never capture.
-- Quick ask: open the panel by hovering the notch, from the link in the window, or with the keyboard shortcut you choose. Enter asks, Command+Enter saves a note, and Esc clears the field and then closes the panel.
+- Quick ask on macOS: open the panel by hovering the notch, from the link in the window, or with the keyboard shortcut you choose. Enter asks, Command+Enter saves a note, and Esc clears the field and then closes the panel.
 - Today page: your recap, next steps and notes in one place.
 - Ask page: ask questions about your memory and see the sources behind each answer.
 - Pause: use the menu bar item to pause capture for 15 minutes, 1 hour or until tomorrow.
@@ -67,7 +80,7 @@ git clone https://github.com/hazcod/blur.git && cd blur
 make macos-app
 ```
 
-The app lands at `~/Downloads/Blur.app`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, [docs/releasing.md](docs/releasing.md) for releases and [docs/architecture.md](docs/architecture.md) for the design.
+The macOS app lands at `~/Downloads/Blur.app`. On Windows and Linux, `make portable-packages` creates the portable archives under `dist/packages/`. Use the Go toolchain version in [go.mod](go.mod). See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, [docs/releasing.md](docs/releasing.md) for releases and [docs/architecture.md](docs/architecture.md) for the design.
 
 ## Status, security and licence
 

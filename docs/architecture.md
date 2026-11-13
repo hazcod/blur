@@ -347,7 +347,7 @@ Secret Service adapter. The Linux adapter uses the session bus and Secret
 Service's encrypted DH/AES transfer, refuses ambiguous/locked matches, and does
 not create collections or invoke unlock prompts. It is wired into the Linux
 X11 application bootstrap on amd64 and arm64. The arm64 UI build uses a narrow
-vendored GoUI compatibility patch: its Linux pipe/poll wrappers call the
+GoUI compatibility fork (see [dependency forks](dependency-forks.md)): its Linux pipe/poll wrappers call the
 already-required `x/sys/unix` APIs, and X11 reads the corresponding `Revents`
 field. This avoids architecture-specific syscall numbers in Blur. The durable
 database uses the resolved key for authenticated encryption.
@@ -463,7 +463,5 @@ emits matching App Group/Keychain entitlements, signs the extension before the
 host, and verifies both signatures. The default app still excludes Safari;
 registered identifiers, release signing/notarization, and live Safari
 verification remain outstanding, so browser capture remains unavailable in
-default builds. The complete
-proposed direction and gates are in the
-[design](superpowers/specs/2026-11-04-blur-design.md) and
-[implementation plan](superpowers/plans/2026-11-04-blur-cross-platform-foundation.md).
+default builds. See [project status](project-status.md) for current platform
+gates and [releasing](releasing.md) for the release workflow.
