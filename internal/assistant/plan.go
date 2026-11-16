@@ -2,6 +2,8 @@ package assistant
 
 import (
 	"context"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -62,6 +64,7 @@ type Plan struct {
 	MatchOnly         bool     // ambiguity probe: require a topic match, never recent-source fallback
 	ReferenceQuestion string   // original retrieval question retained through grounded continuations
 	SubjectFollowup   bool     // factual continuation may retrieve new matches for the inherited named subject
+	Conversation      bool     // recap of the saved conversation with the person named in Entity
 }
 
 // Turn is one earlier exchange, kept so follow-ups can inherit scope.
@@ -197,7 +200,7 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 	if searchMode {
 		scopeWords = searchScopeWords(question, ws)
 	}
-	scope, numeral := detectScope(scopeWords, now)
+	scope, scopeWordsUsed := detectScope(scopeWords, now)
 	ids, names, domains, consumed := matchApps(question, ws, apps)
 	more, consumed := findDomains(question, consumed)
 	for _, d := range more {
@@ -205,18 +208,33 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 			domains = append(domains, d)
 		}
 	}
-	if numeral != "" {
+	if len(scopeWordsUsed) > 0 {
 		if consumed == nil {
 			consumed = make(map[string]struct{})
 		}
-		consumed[numeral] = struct{}{}
+		for _, used := range scopeWordsUsed {
+			consumed[used] = struct{}{}
+		}
 	}
 	entity := detectEntity(question, ws)
 	if entity == "" {
 		entity = detectOutstandingSubject(ws)
 	}
+	var conversation conversationRequest
+	if !searchMode {
+		conversation = detectConversationRecap(question, ws, consumed)
+	}
+	var speaker string
+	if !searchMode && entity == "" && !conversation.ok {
+		var verb string
+		if speaker, verb = detectSpeaker(question, ws, consumed); speaker != "" && slices.Contains(neutralSpeechVerbs, verb) {
+			consumed = withWords(consumed, verb)
+		}
+	}
 	named := len(ids) > 0 || len(domains) > 0
-	plan.WholeDocument = !searchMode && detectWholeDocumentRequest(ws)
+	// A conversation recap names a person, not a document, even though it
+	// uses the words "recap" and "conversation".
+	plan.WholeDocument = !searchMode && !conversation.ok && detectWholeDocumentRequest(ws)
 	memory := plan.WholeDocument || searchMode || QuestionSeeksPersonalMemory(question) || !scope.IsZero() ||
 		entity != "" && IsOutstandingQuestion(question) ||
 		startsWith(ws, "what", "or", "who", "is") ||
@@ -242,6 +260,12 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 	if !memory && (!named || !detectTimeKind(ws) && !detectCaptureKind(ws)) {
 		return plan, nil
 	}
+	if !searchMode && scope.Label == ScopeJustNow {
+		consumed = withWords(consumed, recencyGrammarWords...)
+	}
+	if !searchMode && seeksStoredLocation(ws) {
+		consumed = withWords(consumed, storageGrammarWords...)
+	}
 	if strings.TrimSpace(question) != "" {
 		plan.Terms, err = planTerms(question, consumed, !scope.IsZero())
 	}
@@ -261,6 +285,8 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 		plan.Kind = KindTime
 	case detectCaptureKind(ws):
 		plan.Kind = KindCapture
+	case scope.Label == ScopeJustNow && len(plan.Terms) == 0:
+		plan.Kind = KindCapture
 	case hasSummaryWord(ws) || detectRecapPattern(ws):
 		plan.Kind = KindRecap
 	case entity != "":
@@ -272,6 +298,20 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 		plan.Kind = KindRecap
 	default:
 		plan.Kind = KindLookup
+	}
+	if conversation.ok {
+		plan.Kind, plan.Entity, plan.Conversation, plan.MatchOnly = KindLookup, conversation.name, true, true
+		plan.Terms, err = planTerms(conversation.name, nil, false)
+		if err != nil || len(plan.Terms) == 0 {
+			return Plan{}, ErrContext
+		}
+		if plan.Scope.IsZero() {
+			plan.Scope = Scope{Start: now.AddDate(0, 0, -ConversationDefaultDays), End: now, Label: "last " + strconv.Itoa(ConversationDefaultDays) + " days"}
+		}
+		return plan, nil
+	}
+	if speaker != "" && plan.Kind == KindLookup {
+		plan.Entity = speaker
 	}
 	if IsOutstandingQuestion(question) {
 		plan.Kind = KindEntity

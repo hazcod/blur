@@ -747,7 +747,7 @@ func QuestionSeeksPersonalMemory(question string) bool {
 		}
 		prev = word
 	}
-	return false
+	return seeksStoredLocation(splitWords(question))
 }
 
 func memoryIntentWord(word string) bool {
