@@ -132,6 +132,8 @@ type storeState struct {
 	captureTimeBaseline time.Time
 	closed              bool
 	deletionPending     atomic.Bool
+	// rollupZone names the zone that dates hour recaps into local day rollups.
+	rollupZone atomic.Pointer[func() string]
 }
 
 var _ storage.EncryptedStore = (*Store)(nil)

@@ -85,7 +85,14 @@ func (r testChronicles) DeleteChronicle(_ context.Context, id string) error {
 	delete(r, id)
 	return nil
 }
-func (r testChronicles) DeleteAllChronicles(context.Context) error { clear(r); return nil }
+func (r testChronicles) DeleteAllChronicles(context.Context) error                  { clear(r); return nil }
+func (r testChronicles) PutChronicleRollup(context.Context, chronicle.Rollup) error { return nil }
+func (r testChronicles) GetChronicleRollup(context.Context, string) (chronicle.Rollup, bool, error) {
+	return chronicle.Rollup{}, false, nil
+}
+func (r testChronicles) ListChronicleRollups(context.Context, string, time.Time, time.Time, string, int) ([]chronicle.Rollup, string, error) {
+	return nil, "", nil
+}
 
 type pagedTestChronicles struct{ rows []chronicle.Summary }
 
@@ -108,6 +115,15 @@ func (r pagedTestChronicles) ListChronicles(_ context.Context, start, end time.T
 }
 func (r pagedTestChronicles) DeleteChronicle(context.Context, string) error { return nil }
 func (r pagedTestChronicles) DeleteAllChronicles(context.Context) error     { return nil }
+func (r pagedTestChronicles) PutChronicleRollup(context.Context, chronicle.Rollup) error {
+	return nil
+}
+func (r pagedTestChronicles) GetChronicleRollup(context.Context, string) (chronicle.Rollup, bool, error) {
+	return chronicle.Rollup{}, false, nil
+}
+func (r pagedTestChronicles) ListChronicleRollups(context.Context, string, time.Time, time.Time, string, int) ([]chronicle.Rollup, string, error) {
+	return nil, "", nil
+}
 
 type evidenceBudgetProbe struct{}
 

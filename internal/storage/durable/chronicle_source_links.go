@@ -159,13 +159,17 @@ func (tx *Tx) unlinkChronicleLink(source, id string, root chronicleLinkRoot) err
 // One summary per erasure transaction bounds derivative fanout even when a
 // document has been revisited for years. Journal phase five resumes this head.
 func (tx *Tx) removeChroniclesForSourceBatch(source string) (bool, error) {
+	rollupsDone, err := tx.removeRollupsForSourceBatch(source)
+	if err != nil {
+		return false, err
+	}
 	root, found, err := tx.migrateChronicleLinks(source)
 	if err != nil || !found {
-		return !found, err
+		return !found && rollupsDone, err
 	}
 	if err = tx.deleteChronicle(root.Head); err != nil {
 		return false, err
 	}
 	_, found, err = tx.chronicleLinkRoot(source)
-	return !found, err
+	return !found && rollupsDone, err
 }

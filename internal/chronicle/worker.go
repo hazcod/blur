@@ -46,6 +46,11 @@ type BackgroundPolicy interface {
 type WorkerConfig struct {
 	Enabled  bool
 	Provider power.Provider
+	// Now and Zone drive day and week rollups. Zone returns the IANA name of
+	// the zone whose local days and ISO weeks are summarized; both default to
+	// the process clock and zone.
+	Now  func() time.Time
+	Zone func() string
 }
 
 type workerJob struct{ packed Packed }
@@ -70,11 +75,15 @@ type Worker struct {
 	logger        *slog.Logger
 	deferredLog   sync.Once
 	telemetry     workerTelemetry
+	// rollupMu serializes rollup passes; rollupBackfilled is guarded by it.
+	rollupMu         sync.Mutex
+	rollupBackfilled bool
+	rollupKick       chan struct{}
 }
 
 func NewWorker(repository SummaryRepository, policy BackgroundPolicy, generator SummaryGenerator, config WorkerConfig) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
-	w := &Worker{repository: repository, policy: policy, generator: generator, config: config, queue: make(chan workerJob, MaxQueuedChronicleHours), ctx: ctx, cancel: cancel, done: make(chan struct{}), queued: make(map[string]struct{}), activeChanged: make(chan struct{}), logger: slog.Default()}
+	w := &Worker{repository: repository, policy: policy, generator: generator, config: config, queue: make(chan workerJob, MaxQueuedChronicleHours), ctx: ctx, cancel: cancel, done: make(chan struct{}), queued: make(map[string]struct{}), activeChanged: make(chan struct{}), logger: slog.Default(), rollupKick: make(chan struct{}, 1)}
 	go w.run()
 	return w
 }
@@ -145,6 +154,8 @@ func (w *Worker) run() {
 		workers.Add(1)
 		go func() { defer workers.Done(); w.consume() }()
 	}
+	workers.Add(1)
+	go func() { defer workers.Done(); w.rollupLoop() }()
 	workers.Wait()
 }
 
@@ -330,6 +341,7 @@ func (w *Worker) processAttempt(parent context.Context, packed Packed, receipts 
 		return err
 	}
 	w.logger.Info("chronicle summary stored", "result", "stored", "source_count", len(summary.SourceIDs))
+	w.kickRollups()
 	return nil
 }
 
