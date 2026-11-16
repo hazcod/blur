@@ -43,6 +43,30 @@ func (c *Client) recencyEvidence(ctx context.Context, plan assistant.Plan, start
 	return withoutAuthenticationPages(items), assistant.ScopeJustNowWiden, scoped, nil
 }
 
+// widenedRecencyLookup repeats a topic lookup once over assistant.ScopeJustNowWiden
+// when the "just now" window held no match, mirroring recencyEvidence. It
+// returns the widened span even when that also finds nothing, so the answer
+// can say how far it looked.
+func (c *Client) widenedRecencyLookup(ctx context.Context, plan assistant.Plan, diagnosis *assistant.Diagnosis, alternates *[]string, queries []string) ([]assistant.Evidence, bool, time.Duration, error) {
+	wide := plan
+	wide.Scope.Start = plan.Scope.End.Add(-assistant.ScopeJustNowWiden)
+	start, end, bounded, _ := c.planWindow(wide)
+	var segments, scoped []activity.Segment
+	if _, ok := c.planActivity(); ok {
+		var err error
+		if segments, err = c.windowSegments(ctx, start, end, MaxActivityReportSegments); err != nil {
+			return nil, false, 0, err
+		}
+		scoped = filterSegments(segments, wide)
+	}
+	items, pending, err := c.lookupEvidenceWithExpansion(ctx, wide, bounded, segments, scoped, diagnosis, alternates, queries)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	diagnosis.SourcesInScope = max(diagnosis.SourcesInScope, uniqueSources(scoped))
+	return withoutAuthenticationPages(items), pending, assistant.ScopeJustNowWiden, nil
+}
+
 // conversationEvidence gathers the saved conversation with one person: up to
 // assistant.MaxEvidenceSources captures that are about the named person,
 // messaging and mail apps first, listed oldest first so the recap reads as a

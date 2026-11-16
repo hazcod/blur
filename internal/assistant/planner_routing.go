@@ -43,13 +43,24 @@ func detectRecency(ws []word) bool {
 	if hasSeq(ws, "just", "now") || hasSeq(ws, "moment", "ago") {
 		return true
 	}
-	if len(ws) == 0 || ws[0].s != "what" && ws[0].s != "which" {
-		return false
-	}
-	if hasSeq(ws, "i", "just") || hasSeq(ws, "we", "just") {
-		return true
+	// Anchor the cue to the question's own verb phrase: "what was/did/have I
+	// just working/doing/read", never "what do I just need to install".
+	for _, aux := range []string{"was", "were", "did", "have", "had", "am"} {
+		for _, who := range []string{"i", "we"} {
+			if (startsWith(ws, "what", aux, who, "just") || startsWith(ws, "which", aux, who, "just")) && len(ws) > 4 {
+				if _, activity := recencyVerbs[ws[4].s]; activity {
+					return true
+				}
+			}
+		}
 	}
 	return startsWith(ws, "what", "am", "i", "working", "on") || startsWith(ws, "what", "am", "i", "reading") || startsWith(ws, "what", "am", "i", "doing")
+}
+
+var recencyVerbs = map[string]struct{}{
+	"working": {}, "doing": {}, "reading": {}, "looking": {}, "writing": {}, "editing": {}, "opening": {}, "watching": {}, "viewing": {}, "browsing": {}, "typing": {},
+	"do": {}, "done": {}, "read": {}, "see": {}, "seen": {}, "open": {}, "opened": {}, "write": {}, "wrote": {}, "written": {}, "edit": {}, "edited": {},
+	"watch": {}, "watched": {}, "look": {}, "looked": {}, "work": {}, "worked": {}, "view": {}, "viewed": {}, "visit": {}, "visited": {}, "type": {}, "typed": {},
 }
 
 var dayPartHours = map[string][2]int{
@@ -104,7 +115,13 @@ func dayPartAnchor(ws []word, i int, now time.Time) (day time.Time, label string
 		if back == 0 && lastBefore {
 			back = 7
 		}
-		return dayStart(now, -back), "on " + titled(ws[index].s) + " " + part, nil, true
+		day := dayStart(now, -back)
+		// Memory questions are about the past: a window that has not begun yet
+		// belongs to the previous week's occurrence.
+		if first := time.Date(day.Year(), day.Month(), day.Day(), dayPartHours[part][0], 0, 0, 0, day.Location()); first.After(now) {
+			day = day.AddDate(0, 0, -7)
+		}
+		return day, "on " + titled(ws[index].s) + " " + part, nil, true
 	}
 	date := func(dayWord, monthWord int) (time.Time, string, []string, bool) {
 		month, isMonth := monthWords[ws[monthWord].s]
@@ -333,17 +350,36 @@ func capitalizedName(question string, ws []word, from, to int, consumed map[stri
 	return strings.TrimSpace(question[ws[from].start:ws[to-1].end])
 }
 
-var storageVerbs = []string{"store", "stored", "save", "saved", "keep", "kept", "put", "leave", "left", "stash", "stashed"}
+// storageParticiples say a thing was put somewhere; bare "save" or "left" are
+// ordinary words ("the save button", "the left lung").
+var storageParticiples = []string{"stored", "saved", "kept", "stashed"}
+
+// firstPersonStorageVerbs describe the user's own act of putting something away.
+var firstPersonStorageVerbs = []string{"put", "store", "stored", "save", "saved", "keep", "kept", "leave", "left", "stash", "stashed"}
 
 // storageGrammarWords never narrow the search for the stored thing itself.
 var storageGrammarWords = []string{"store", "stored", "save", "saved", "keep", "kept", "put", "leave", "left", "stash", "stashed", "again"}
 
-// seeksStoredLocation recognises "where is/was X stored/saved/kept/put" and
-// "where is X again?": a question about where the user put something, which
-// only their own memory can answer.
+func startsWithWhere(ws []word) bool {
+	return len(ws) >= 3 && (ws[0].s == "where" || ws[0].s == "where's" || ws[0].s == "where’s")
+}
+
+// seeksStoredLocation recognises "where is X stored/saved/kept" and "where is
+// that/my X again?": a question about where the user put something, which only
+// their own memory can answer. "where is the left lung" and "where is Paris
+// again?" stay general questions.
 func seeksStoredLocation(ws []word) bool {
-	if len(ws) < 3 || ws[0].s != "where" && ws[0].s != "where's" && ws[0].s != "where’s" {
+	if !startsWithWhere(ws) {
 		return false
 	}
-	return hasWord(ws, storageVerbs...) || ws[len(ws)-1].s == "again"
+	if hasWord(ws, storageParticiples...) {
+		return true
+	}
+	return ws[len(ws)-1].s == "again" && (hasWord(ws, "my", "our", "that", "this") || hasSeq(ws, "the", "one"))
+}
+
+// storageQuestion also covers the first-person act ("where did I put the SOW
+// draft"), whose verb must not become a required search term.
+func storageQuestion(ws []word) bool {
+	return seeksStoredLocation(ws) || startsWithWhere(ws) && hasWord(ws, "i", "we") && hasWord(ws, firstPersonStorageVerbs...)
 }

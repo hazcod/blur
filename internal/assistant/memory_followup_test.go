@@ -306,3 +306,16 @@ func TestWhenFollowupWithAGeneratorStillUsesTheModel(t *testing.T) {
 		t.Fatalf("model was skipped: calls=%d err=%v", g.calls, err)
 	}
 }
+
+// Sources the earlier answer cited but the fresh read no longer returns are not
+// replaced by other captures of the same person.
+func TestWhenFollowupNeverFallsBackToUncitedSources(t *testing.T) {
+	loc := brussels(t)
+	cited, other := strings.Repeat("d", 64), strings.Repeat("e", 64)
+	g := &groundedRetriever{fresh: Retrieval{Evidence: []Evidence{capturedEvidence(other, "Slack", time.Date(2026, 11, 15, 13, 47, 0, 0, time.UTC))}}}
+	r := clockedGroundedRetriever{groundedRetriever: g, now: time.Date(2026, 11, 16, 15, 30, 0, 0, loc)}
+	got, err := NewService(r, nil, nil, 8192).AskWithHistory(context.Background(), "when did he say that?", citedOnlyHistory(cited))
+	if err != nil || !got.Answer.InsufficientEvidence || len(got.Answer.SourceIDs) != 0 || len(got.Sources) != 0 || !strings.Contains(got.Answer.Text, "which") {
+		t.Fatalf("uncited sources were presented as the answer: %+v sources=%d err=%v", got.Answer, len(got.Sources), err)
+	}
+}

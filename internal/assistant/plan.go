@@ -264,7 +264,7 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 	if !searchMode && scope.Label == ScopeJustNow {
 		consumed = withWords(consumed, recencyGrammarWords...)
 	}
-	if !searchMode && seeksStoredLocation(ws) {
+	if !searchMode && storageQuestion(ws) {
 		consumed = withWords(consumed, storageGrammarWords...)
 	}
 	if strings.TrimSpace(question) != "" {

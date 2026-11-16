@@ -538,6 +538,11 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 			retrieval.Evidence, retrieval.Diagnosis.RecapSampled, err = c.recapEvidence(ctx, plan, start, end, scoped)
 		case assistant.KindLookup:
 			retrieval.Evidence, searchPending, err = c.lookupEvidenceWithExpansion(ctx, plan, bounded, windowSegs, scoped, &retrieval.Diagnosis, &retrieval.AlternateQueries, expansionQueries)
+			if err == nil && len(retrieval.Evidence) == 0 && plan.Scope.Label == assistant.ScopeJustNow {
+				var widenedPending bool
+				retrieval.Evidence, widenedPending, retrieval.Diagnosis.ScopeWidened, err = c.widenedRecencyLookup(ctx, plan, &retrieval.Diagnosis, &retrieval.AlternateQueries, expansionQueries)
+				searchPending = searchPending || widenedPending
+			}
 		case assistant.KindEntity:
 			if assistant.IsOutstandingQuestion(plan.Question) {
 				retrieval.Evidence, outstandingSources, err = c.outstandingEntityEvidence(ctx, plan)

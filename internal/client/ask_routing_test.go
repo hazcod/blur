@@ -77,3 +77,31 @@ func TestConversationRecapReturnsOnlyThePersonsThreadOldestFirst(t *testing.T) {
 		t.Fatalf("conversation evidence = %v, want %v oldest first", got, want)
 	}
 }
+
+func TestTopicRecencyQuestionWidensOnceToo(t *testing.T) {
+	corpus := newScenarioCorpus(t)
+	ctx := context.Background()
+	later := corpus.now.Add(150 * time.Minute) // the last hour is empty
+	corpus.client.askNow = func() time.Time { return later }
+	plan, err := assistant.PlanQuestion("what did I just read about pentest", later, nil)
+	if err != nil || plan.Kind != assistant.KindLookup || plan.Scope.Label != assistant.ScopeJustNow {
+		t.Fatalf("plan = %+v err=%v", plan, err)
+	}
+	retrieval, err := corpus.client.RetrievePlan(ctx, plan)
+	if err != nil || retrieval.Diagnosis.ScopeWidened != assistant.ScopeJustNowWiden || len(retrieval.Evidence) == 0 {
+		t.Fatalf("topic recency did not widen: %+v err=%v", retrieval, err)
+	}
+	for _, item := range retrieval.Evidence {
+		if corpus.label(item.SourceID) != "notion-pentest-plan" {
+			t.Fatalf("widened lookup returned %s", corpus.label(item.SourceID))
+		}
+	}
+	miss, err := assistant.PlanQuestion("what did I just read about zebras", later, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieval, err = corpus.client.RetrievePlan(ctx, miss)
+	if err != nil || retrieval.Diagnosis.ScopeWidened != assistant.ScopeJustNowWiden {
+		t.Fatalf("a miss must still say how far it looked: %+v err=%v", retrieval.Diagnosis, err)
+	}
+}

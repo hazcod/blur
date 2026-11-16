@@ -46,7 +46,7 @@ func TestRecencyQuestionWithATopicStaysATopicLookupInTheLastHour(t *testing.T) {
 
 func TestRecencyCuesDoNotScopeOrdinaryQuestions(t *testing.T) {
 	now := time.Date(2026, 11, 16, 15, 30, 0, 0, time.UTC)
-	for _, q := range []string{"what is a working set", "what is the justice system", "how do I just in time compile"} {
+	for _, q := range []string{"what is a working set", "what is the justice system", "how do I just in time compile", "what do I just need to install for nginx", "what should I just do about the invoice"} {
 		t.Run(q, func(t *testing.T) {
 			plan, err := PlanQuestion(q, now, nil)
 			if err != nil {
@@ -105,6 +105,25 @@ func TestDayPartsCombineWithDays(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Asked on Friday morning, "Friday evening" has not happened yet: it means last
+// week's.
+func TestWeekdayDayPartThatHasNotStartedMeansLastWeek(t *testing.T) {
+	loc := brussels(t)
+	now := time.Date(2026, 11, 13, 9, 30, 0, 0, loc) // Friday
+	plan, err := PlanQuestion("what did I do Friday evening", now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 11, 6, 18, 0, 0, 0, loc)
+	if !plan.Scope.Start.Equal(want) || !plan.Scope.End.Equal(want.Add(6*time.Hour)) {
+		t.Fatalf("scope = %+v, want the previous Friday evening", plan.Scope)
+	}
+	plan, _ = PlanQuestion("what did I do Friday morning", now, nil)
+	if !plan.Scope.Start.Equal(time.Date(2026, 11, 13, 6, 0, 0, 0, loc)) {
+		t.Fatalf("a morning that has begun stays today's: %+v", plan.Scope)
 	}
 }
 
@@ -208,7 +227,7 @@ func TestStorageQuestionsSeekPersonalMemory(t *testing.T) {
 	for _, q := range []string{
 		"where is the API key for venice stored again?", "where was the invoice saved", "where is my backup kept",
 		"where did I put the licence", "where did we leave the draft", "where is the signing key stored",
-		"where is that file again?",
+		"where is that file again?", "where did I put the SOW draft", "where did I save that invoice",
 	} {
 		if !QuestionSeeksPersonalMemory(q) {
 			t.Errorf("%q should search personal memory", q)
@@ -217,6 +236,16 @@ func TestStorageQuestionsSeekPersonalMemory(t *testing.T) {
 	for _, q := range []string{"where is the Eiffel tower", "where is Paris", "what is the capital of France again?", "where can bears live"} {
 		if QuestionSeeksPersonalMemory(q) {
 			t.Errorf("%q must remain a general question", q)
+		}
+	}
+}
+
+func TestStorageActQuestionsDropTheVerbFromTheSearchTerms(t *testing.T) {
+	now := time.Date(2026, 11, 16, 15, 30, 0, 0, time.UTC)
+	for q, want := range map[string]string{"where did I put the SOW draft": "draft sow", "where did I save that invoice": "invoice"} {
+		plan, err := PlanQuestion(q, now, nil)
+		if err != nil || plan.Kind != KindLookup || sortedTerms(plan) != want {
+			t.Fatalf("%q plan = %+v err=%v, want lookup %q", q, plan, err, want)
 		}
 	}
 }

@@ -89,7 +89,8 @@ func DominantMentions(items []Evidence, name string) []Evidence {
 // capturedWhenAnswer answers "when did he say that?" from capture metadata
 // alone. It lists when the cited sources were saved, in the user's zone, and
 // cites them. A saved screen can be newer than the message it shows, which the
-// answer says. ok is false when no source has a usable capture time.
+// answer says. When none of the cited sources can be dated it asks which
+// message is meant and cites nothing. ok is false only on an invalid answer.
 func capturedWhenAnswer(plan Plan, evidence []Evidence, cited []string, diagnosis Diagnosis, zone *time.Location) (Result, bool) {
 	var timed []Evidence
 	for _, item := range evidence {
@@ -97,24 +98,19 @@ func capturedWhenAnswer(plan Plan, evidence []Evidence, cited []string, diagnosi
 			timed = append(timed, item)
 		}
 	}
-	if plan.Entity != "" {
-		if about := DominantMentions(timed, plan.Entity); len(about) > 0 {
-			timed = about
-		}
-	}
-	// The sources the earlier answer cited are what "that" refers to.
+	// "that" is what the earlier answer cited. Never widen to other captures of
+	// the same person: listing and citing sources nobody pointed at would
+	// present a guess as an answer.
 	var anchored []Evidence
 	for _, item := range timed {
 		if slices.Contains(cited, item.SourceID) {
 			anchored = append(anchored, item)
 		}
 	}
-	if len(anchored) > 0 {
-		timed = anchored
+	if len(anchored) == 0 {
+		return Result{Answer: Answer{Text: "I can’t tell which saved message you mean. Say which message or topic, and I will check when it was captured.", InsufficientEvidence: true}, Direct: true, Plan: plan, IndexingPending: diagnosis.IndexingPending}, true
 	}
-	if len(timed) == 0 {
-		return Result{}, false
-	}
+	timed = anchored
 	sort.SliceStable(timed, func(i, j int) bool { return timed[i].CapturedAt.Before(timed[j].CapturedAt) })
 	if len(timed) > maxWhenCaptures {
 		timed = timed[len(timed)-maxWhenCaptures:]

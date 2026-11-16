@@ -664,6 +664,8 @@ func EmptyAnswerText(plan Plan, d Diagnosis) string {
 		return "Capture has been paused since " + d.PausedSince.Format("15:04") + ", so nothing new has been saved. Resume capture and ask again."
 	case len(plan.AppNames) > 0 && !d.AppKnown:
 		return "I haven't captured anything from " + plan.AppNames[0] + " yet. Check Capture scope in Settings if it should be included."
+	case d.ScopeWidened > 0 && plan.Kind == KindLookup:
+		return "I found nothing matching in the last " + strconv.Itoa(int(d.ScopeWidened/time.Hour)) + " hours."
 	case d.ScopeWidened > 0:
 		return "Nothing captured in the last " + strconv.Itoa(int(d.ScopeWidened/time.Hour)) + " hours."
 	case !plan.Scope.IsZero() && d.SourcesInScope == 0:
