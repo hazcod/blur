@@ -233,8 +233,8 @@ func recallScenarios() []recallScenario {
 		{name: "who-is-dima", question: "who is Dima?", mustCite: []string{"slack-dima-*"}, minCite: 1, mustNotCite: []string{"okta-login"}},
 		{name: "unknown-person", question: "what did I discuss with Marco?", mustNotCite: []string{"any"}, insufficient: true},
 		{name: "followup-when", question: "when did he say that?", historyFrom: "dima-retest", mustCite: []string{"slack-dima-retest"}, knownGap: "the previous Dima answer left plan.Entity empty (the question was planned as a terms lookup), so the pronoun follow-up hits service.go:198-199 and asks \"Who are you referring to?\""},
-		{name: "reminder-create", question: "remind me tomorrow at 9 to send the AG report", custom: reminderCreateScenario, knownGap: "\"tomorrow at 9\" without am/pm is rejected as ambiguous (reminders/parse.go:324 parseClock refuses bare hours 1-12), so the draft stops with Missing=time instead of scheduling 2026-11-17 09:00"},
-		{name: "task-create-list", question: "add a task: follow up with Chloe on the consultant reporting, then: what's on my todo list?", custom: taskCreateListScenario, knownGap: "without a local model \"add a task: follow up with Chloe ...\" is not recognised as a task (classifyQuickInput only knows the \"task:\" prefix, quick_panel.go:270) and is routed to Ask/note instead of creating one; the todo listing step does work once the task exists"},
+		{name: "reminder-create", question: "remind me tomorrow at 9 to send the AG report", custom: reminderCreateScenario},
+		{name: "task-create-list", question: "add a task: follow up with Chloe on the consultant reporting, then: what's on my todo list?", custom: taskCreateListScenario},
 	}
 }
 
