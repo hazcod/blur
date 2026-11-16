@@ -103,14 +103,19 @@ func (c *Client) resolveMCPSessionApps(ctx context.Context, name string) ([]stri
 		if app.Domain || seen[app.ID] || !strings.EqualFold(app.ID, name) && !strings.EqualFold(app.Name, name) {
 			continue
 		}
-		seen[app.ID] = true
-		ids = append(ids, app.ID)
+		// The capture index stores lower-case app identities.
+		id := strings.ToLower(app.ID)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
 		if len(ids) == maxMCPSessionAppMatches {
 			break
 		}
 	}
 	if len(ids) == 0 {
-		ids = append(ids, name)
+		ids = append(ids, strings.ToLower(name))
 	}
 	return ids, nil
 }
