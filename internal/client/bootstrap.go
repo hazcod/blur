@@ -181,6 +181,9 @@ func openLocalAppAt(ctx context.Context, directory string, secrets platform.Secr
 	if err != nil {
 		return nil, storageStartupFailure("database_open", classifyStoreOpenError(err))
 	}
+	// Hour recaps are dated into local day rollups with the same zone Ask and
+	// the background worker use.
+	store.SetChronicleZone(localZoneName)
 	activityEngine := activity.New(activity.Config{})
 	activityEpoch := time.Now()
 	deleteService, err := deletion.NewService(store, activityEngine)

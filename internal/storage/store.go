@@ -174,6 +174,12 @@ type ChronicleStore interface {
 	PutChronicle(context.Context, chronicle.Summary) error
 	GetChronicle(context.Context, string) (chronicle.Summary, bool, error)
 	ListChronicles(context.Context, time.Time, time.Time, string, int) ([]chronicle.Summary, string, error)
+	// Rollups are derived day and ISO-week recaps of the hourly summaries.
+	PutChronicleRollup(context.Context, chronicle.Rollup) error
+	GetChronicleRollup(context.Context, string) (chronicle.Rollup, bool, error)
+	// ListChronicleRollups pages one level ("day" or "week") by period start
+	// in a half-open range, with at most 64 rows per page.
+	ListChronicleRollups(ctx context.Context, level string, start, end time.Time, after string, limit int) ([]chronicle.Rollup, string, error)
 	DeleteChronicle(context.Context, string) error
 	DeleteAllChronicles(context.Context) error
 }

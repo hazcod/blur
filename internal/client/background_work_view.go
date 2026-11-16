@@ -167,6 +167,18 @@ func formatBackgroundWorkGroup(group BackgroundWorkGroup) backgroundWorkRow {
 			row.Detail += fmt.Sprintf(" %d queued.", group.Queued)
 		}
 	}
+	if group.ID == "recaps" {
+		switch {
+		case group.RollupsPending == 1:
+			row.Detail += " 1 day or week recap pending."
+		case group.RollupsPending > 1:
+			row.Detail += fmt.Sprintf(" %d day or week recaps pending.", group.RollupsPending)
+		case group.RollupsDirty == 1:
+			row.Detail += " 1 day or week recap waiting for its period to end."
+		case group.RollupsDirty > 1:
+			row.Detail += fmt.Sprintf(" %d day or week recaps waiting for their period to end.", group.RollupsDirty)
+		}
+	}
 	if group.Completed > 0 {
 		unit := "jobs"
 		if group.ID == "library" {

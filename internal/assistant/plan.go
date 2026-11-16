@@ -83,7 +83,9 @@ type Layer int
 const (
 	LayerSource Layer = iota // a raw captured observation
 	LayerHour                // an hourly chronicle summary
-	LayerDigest              // a daily or weekly digest
+	LayerDay                 // a stored recap of one whole local day
+	LayerWeek                // a stored recap of one whole ISO week
+	LayerDigest              // a Library digest
 )
 
 // Diagnosis explains an empty or thin retrieval so the answer can say why.
@@ -92,6 +94,7 @@ type Diagnosis struct {
 	VoiceAssociationUnverified bool          // a recent transcript does not establish the requested website/video identity
 	VoiceRecallLimited         bool          // bounded transcript selection omitted other saved rows or sessions
 	RecapSampled               bool          // time-distributed retrieval omitted other saved candidates
+	RollupsDirty               int           // day or week recaps in scope that are waiting to be regenerated
 	TaskSearchLimited          bool          // bounded current-task recall omitted candidates
 	LibraryRecallLimited       bool          // bounded subject-name lookup omitted candidate Library entries
 	SemanticIssue              string        // closed retrieval coverage: disabled, loading, unavailable, limited

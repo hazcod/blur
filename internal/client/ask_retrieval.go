@@ -535,7 +535,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 		case assistant.KindCapture:
 			retrieval.Evidence, retrieval.Diagnosis.ScopeWidened, _, err = c.recencyEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
 		case assistant.KindRecap:
-			retrieval.Evidence, retrieval.Diagnosis.RecapSampled, err = c.recapEvidence(ctx, plan, start, end, scoped)
+			retrieval.Evidence, retrieval.Diagnosis.RecapSampled, err = c.recapEvidenceWithDiagnosis(ctx, plan, start, end, scoped, &retrieval.Diagnosis)
 		case assistant.KindLookup:
 			retrieval.Evidence, searchPending, err = c.lookupEvidenceWithExpansion(ctx, plan, bounded, windowSegs, scoped, &retrieval.Diagnosis, &retrieval.AlternateQueries, expansionQueries)
 			if err == nil && len(retrieval.Evidence) == 0 && plan.Scope.Label == assistant.ScopeJustNow {

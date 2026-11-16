@@ -53,9 +53,13 @@ type GetSnapshotsParams struct {
 	MaxBytesPerSource int            `json:"max_bytes_per_source"`
 }
 
-// GetChronicleParams reads one source-linked hourly recap by its stable ID.
+// GetChronicleParams reads one source-linked recap. An hourly recap is read by
+// its stable HourID. A day or week recap is read with Level ("day" or "week")
+// and Period (YYYY-MM-DD or YYYY-Www); HourID is then empty.
 type GetChronicleParams struct {
-	HourID string `json:"hour_id"`
+	HourID string `json:"hour_id,omitempty"`
+	Level  string `json:"level,omitempty"`
+	Period string `json:"period,omitempty"`
 }
 
 // ListChroniclesParams reads a bounded, source-linked page of hourly recaps

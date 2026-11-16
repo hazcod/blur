@@ -14,6 +14,11 @@ type WorkerStatus struct {
 	LastCompletedAt            time.Time
 	LastErrorCode              string
 	LastErrorAt                time.Time
+	// RollupsPending counts dirty day and week rollups that can be generated
+	// now; RollupsDirty counts every dirty one. RollupReason is non-empty when
+	// rollup generation is skipped, for example skipped_no_local_provider.
+	RollupsPending, RollupsDirty int
+	RollupReason                 string
 }
 type workerTelemetry struct {
 	deferred        int
@@ -22,6 +27,9 @@ type workerTelemetry struct {
 	lastCompletedAt time.Time
 	lastErrorCode   string
 	lastErrorAt     time.Time
+	rollupsPending  int
+	rollupsDirty    int
+	rollupReason    string
 }
 
 // Status snapshots existing queue/admission counters only. It never reads
@@ -32,7 +40,7 @@ func (w *Worker) Status() WorkerStatus {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	out := WorkerStatus{State: "idle", Queued: max(0, len(w.queued)-w.activeJobs), Running: w.activeJobs, Completed: w.telemetry.completed, LastCompletedAt: w.telemetry.lastCompletedAt, LastErrorCode: w.telemetry.lastErrorCode, LastErrorAt: w.telemetry.lastErrorAt}
+	out := WorkerStatus{State: "idle", Queued: max(0, len(w.queued)-w.activeJobs), Running: w.activeJobs, Completed: w.telemetry.completed, LastCompletedAt: w.telemetry.lastCompletedAt, LastErrorCode: w.telemetry.lastErrorCode, LastErrorAt: w.telemetry.lastErrorAt, RollupsPending: w.telemetry.rollupsPending, RollupsDirty: w.telemetry.rollupsDirty, RollupReason: w.telemetry.rollupReason}
 	switch {
 	case w.closed || !w.enabled():
 		out.State = "disabled"
