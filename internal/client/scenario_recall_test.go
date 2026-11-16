@@ -60,9 +60,20 @@ type recallScenario struct {
 	// knownGap marks a confirmed, currently failing case. gapModes limits it to
 	// specific modes; empty means every mode.
 	knownGap string
-	gapModes []scenarioMode
+	// gapProblem must appear in the joined problems of a gapped scenario, so a
+	// gap cannot hide a different failure. gapProblemByMode overrides it per mode.
+	gapProblem       string
+	gapProblemByMode map[scenarioMode]string
+	gapModes         []scenarioMode
 	// custom replaces the Ask pipeline (entry flows for reminders and tasks).
 	custom func(context.Context, *scenarioCorpus) scenarioOutcome
+}
+
+func (s recallScenario) expectedGapProblem(mode scenarioMode) string {
+	if p, ok := s.gapProblemByMode[mode]; ok {
+		return p
+	}
+	return s.gapProblem
 }
 
 func globMatch(pattern, label string) bool {
@@ -221,20 +232,20 @@ func (s recallScenario) evaluate(c *scenarioCorpus, out scenarioOutcome) []strin
 func recallScenarios() []recallScenario {
 	return []recallScenario{
 		{name: "today-recap", question: "what did I do today", mustCite: []string{"orion-article", "notion-pentest-plan", "voice-youssef"}, minCite: 2, mustNotCite: []string{"blur-self"}},
-		{name: "just-now", question: "what was I just working on", mustCite: []string{"notion-pentest-plan"}, mustNotCite: []string{"blur-self", "okta-login"}, knownGap: "\"what was I just working on\" is planned as a lookup for the single term \"working\" with no recency scope (planner.go:486-493 only recognises the contiguous \"working on\" recap pattern and planner.go:412 only scopes \"right now\"/\"currently\"), so retrieval finds nothing and the answer is insufficient"},
-		{name: "venice-key", question: "where is the API key for venice stored again?", mustCite: []string{"terminal-venice"}, knownGap: "the question has no recognised personal-memory cue (service.go:729 QuestionSeeksPersonalMemory), so it is planned as KindGeneral: noModel returns ErrAskUnavailable (service.go:302) and fakeGen returns the general-question refusal without ever searching memory"},
-		{name: "samira-recap", question: "recap my convo with Samira", mustCite: []string{"slack-samira-*"}, minCite: 2, mustNotCite: []string{"slack-dima-*", "okta-login"}, knownGap: "\"recap my convo with Samira\" is planned as an unscoped recap with terms convo,samira and no person filter, so planWindow (ask_retrieval.go:306-312) recaps only today and cites orion-article, voice-youssef and notion-pentest-plan instead of the Samira DMs"},
-		{name: "dima-retest", question: "what did Dima say about the pentest retest?", mustCite: []string{"slack-dima-retest"}, mustNotCite: []string{"okta-login", "blur-self"}, knownGap: "exact retrieval requires every term to match (search.go:188-206 termScore), so \"pentest\" excludes the Dima Slack capture that only says \"retest\" and the Notion planning page that has all three terms is cited instead"},
-		{name: "orion-article", question: "summarize that article I read in Orion about local LLMs", mustCite: []string{"orion-article"}, knownGap: "a whole-document summary plan needs a generator (document.go:81 returns ErrAskUnavailable when none is configured), so with no model the question errors instead of answering extractively", gapModes: []scenarioMode{modeNoModel}},
-		{name: "yesterday-afternoon", question: "what did I do yesterday afternoon?", mustCite: []string{"teams-idelux", "preview-programme", "slack-dima-retest"}, minCite: 1, mustNotCite: []string{"finder-downloads", "okta-login"}, knownGap: "the planner scopes \"yesterday afternoon\" to the whole of yesterday (only \"this afternoon\" has a daypart at planner.go:388), so the no-model recap cites the morning captures finder-downloads and okta-login", gapModes: []scenarioMode{modeNoModel}},
-		{name: "last-week", question: "what did I do last week?", mustCite: []string{"sublime-sync-1", "terminal-sync-2", "slack-samira-1"}, minCite: 1, knownGap: "the model-facing context lists the newest hour recaps first and the fake generator cites the first two, which are Sunday's teams-idelux/slack-dima-retest recaps, so none of the earlier-week captures are cited", gapModes: []scenarioMode{modeFakeGen}},
-		{name: "youssef-promise", question: "what did Youssef promise?", mustCite: []string{"voice-youssef"}, knownGap: "all planned terms must match (search.go:188-206), and the voice transcript says \"will send the SOW\" without the word \"promise\", so nothing is retrieved and semantic coverage reports limited"},
+		{name: "just-now", question: "what was I just working on", mustCite: []string{"notion-pentest-plan"}, mustNotCite: []string{"blur-self", "okta-login"}, knownGap: "\"what was I just working on\" is planned as a lookup for the single term \"working\" with no recency scope (planner.go:486-493 only recognises the contiguous \"working on\" recap pattern and planner.go:412 only scopes \"right now\"/\"currently\"), so retrieval finds nothing and the answer is insufficient", gapProblem: "cited 0 of required 1 from notion-pentest-plan"},
+		{name: "venice-key", question: "where is the API key for venice stored again?", mustCite: []string{"terminal-venice"}, knownGap: "the question has no recognised personal-memory cue (service.go:729 QuestionSeeksPersonalMemory), so it is planned as KindGeneral: noModel returns ErrAskUnavailable (service.go:302) and fakeGen returns the general-question refusal without ever searching memory", gapProblem: "cited 0 of required 1 from terminal-venice", gapProblemByMode: map[scenarioMode]string{modeNoModel: "error: assistant: ask unavailable"}},
+		{name: "samira-recap", question: "recap my convo with Samira", mustCite: []string{"slack-samira-*"}, minCite: 2, mustNotCite: []string{"slack-dima-*", "okta-login"}, knownGap: "\"recap my convo with Samira\" is planned as an unscoped recap with terms convo,samira and no person filter, so planWindow (ask_retrieval.go:306-312) recaps only today and cites orion-article, voice-youssef and notion-pentest-plan instead of the Samira DMs", gapProblem: "cited 0 of required 2 from slack-samira-1"},
+		{name: "dima-retest", question: "what did Dima say about the pentest retest?", mustCite: []string{"slack-dima-retest"}, mustNotCite: []string{"okta-login", "blur-self"}, knownGap: "exact retrieval requires every term to match (search.go:188-206 termScore), so \"pentest\" excludes the Dima Slack capture that only says \"retest\" and the Notion planning page that has all three terms is cited instead", gapProblem: "cited 0 of required 1 from slack-dima-retest"},
+		{name: "orion-article", question: "summarize that article I read in Orion about local LLMs", mustCite: []string{"orion-article"}, knownGap: "a whole-document summary plan needs a generator (document.go:81 returns ErrAskUnavailable when none is configured), so with no model the question errors instead of answering extractively", gapProblem: "error: assistant: ask unavailable", gapModes: []scenarioMode{modeNoModel}},
+		{name: "yesterday-afternoon", question: "what did I do yesterday afternoon?", mustCite: []string{"teams-idelux", "preview-programme", "slack-dima-retest"}, minCite: 1, mustNotCite: []string{"finder-downloads", "okta-login"}, knownGap: "the planner scopes \"yesterday afternoon\" to the whole of yesterday (only \"this afternoon\" has a daypart at planner.go:388), so the no-model recap cites the morning captures finder-downloads and okta-login", gapProblem: "cited forbidden finder-downloads", gapModes: []scenarioMode{modeNoModel}},
+		{name: "last-week", question: "what did I do last week?", mustCite: []string{"sublime-sync-1", "terminal-sync-2", "slack-samira-1"}, minCite: 1, knownGap: "the model-facing context lists the newest hour recaps first and the fake generator cites the first two, which are Sunday's teams-idelux/slack-dima-retest recaps, so none of the earlier-week captures are cited", gapProblem: "cited 0 of required 1 from slack-samira-1", gapModes: []scenarioMode{modeFakeGen}},
+		{name: "youssef-promise", question: "what did Youssef promise?", mustCite: []string{"voice-youssef"}, knownGap: "all planned terms must match (search.go:188-206), and the voice transcript says \"will send the SOW\" without the word \"promise\", so nothing is retrieved and semantic coverage reports limited", gapProblem: "cited 0 of required 1 from voice-youssef"},
 		{name: "buildwise-url", question: "what's the buildwise evidence packet url?", mustCite: []string{"note-buildwise"}},
 		{name: "who-is-dima", question: "who is Dima?", mustCite: []string{"slack-dima-*"}, minCite: 1, mustNotCite: []string{"okta-login"}},
 		{name: "unknown-person", question: "what did I discuss with Marco?", mustNotCite: []string{"any"}, insufficient: true},
-		{name: "followup-when", question: "when did he say that?", historyFrom: "dima-retest", mustCite: []string{"slack-dima-retest"}, knownGap: "the previous Dima answer left plan.Entity empty (the question was planned as a terms lookup), so the pronoun follow-up hits service.go:198-199 and asks \"Who are you referring to?\""},
-		{name: "reminder-create", question: "remind me tomorrow at 9 to send the AG report", custom: reminderCreateScenario, knownGap: "\"tomorrow at 9\" without am/pm is rejected as ambiguous (reminders/parse.go:324 parseClock refuses bare hours 1-12), so the draft stops with Missing=time instead of scheduling 2026-11-17 09:00"},
-		{name: "task-create-list", question: "add a task: follow up with Chloe on the consultant reporting, then: what's on my todo list?", custom: taskCreateListScenario, knownGap: "without a local model \"add a task: follow up with Chloe ...\" is not recognised as a task (classifyQuickInput only knows the \"task:\" prefix, quick_panel.go:270) and is routed to Ask/note instead of creating one; the todo listing step does work once the task exists"},
+		{name: "followup-when", question: "when did he say that?", historyFrom: "dima-retest", mustCite: []string{"slack-dima-retest"}, knownGap: "the previous Dima answer left plan.Entity empty (the question was planned as a terms lookup), so the pronoun follow-up hits service.go:198-199 and asks \"Who are you referring to?\"", gapProblem: "cited 0 of required 1 from slack-dima-retest"},
+		{name: "reminder-create", question: "remind me tomorrow at 9 to send the AG report", custom: reminderCreateScenario, knownGap: "\"tomorrow at 9\" without am/pm is rejected as ambiguous (reminders/parse.go:324 parseClock refuses bare hours 1-12), so the draft stops with Missing=time instead of scheduling 2026-11-17 09:00", gapProblem: "entry did not produce a complete reminder draft"},
+		{name: "task-create-list", question: "add a task: follow up with Chloe on the consultant reporting, then: what's on my todo list?", custom: taskCreateListScenario, knownGap: "without a local model \"add a task: follow up with Chloe ...\" is not recognised as a task (classifyQuickInput only knows the \"task:\" prefix, quick_panel.go:270) and is routed to Ask/note instead of creating one; the todo listing step does work once the task exists", gapProblem: "instead of a task"},
 	}
 }
 
@@ -348,8 +359,9 @@ func TestRecallScenario(t *testing.T) {
 				problems := s.evaluate(corpus, out)
 				gap := s.knownGap != "" && (len(s.gapModes) == 0 || slices.Contains(s.gapModes, mode))
 				verdict := "PASS"
+				gapMatches := gap && strings.Contains(strings.Join(problems, "; "), s.expectedGapProblem(mode))
 				switch {
-				case len(problems) > 0 && gap:
+				case len(problems) > 0 && gapMatches:
 					verdict = "KNOWN-GAP"
 				case len(problems) > 0:
 					verdict = "FAIL"
@@ -359,7 +371,10 @@ func TestRecallScenario(t *testing.T) {
 					t.Logf("SCENARIO %s/%s: problems: %s", s.name, mode, strings.Join(problems, "; "))
 				}
 				switch {
-				case len(problems) > 0 && !gap:
+				case len(problems) > 0 && gapMatches:
+				case len(problems) > 0 && gap:
+					t.Errorf("scenario %s/%s is a knownGap but broke differently: expected problem containing %q, observed %q", s.name, mode, s.expectedGapProblem(mode), strings.Join(problems, "; "))
+				case len(problems) > 0:
 					t.Errorf("scenario %s/%s failed: %s", s.name, mode, strings.Join(problems, "; "))
 				case len(problems) == 0 && gap:
 					t.Errorf("scenario %s/%s now passes, remove knownGap (%s)", s.name, mode, s.knownGap)
