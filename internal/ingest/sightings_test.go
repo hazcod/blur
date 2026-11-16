@@ -13,7 +13,7 @@ import (
 func TestUnchangedCapturePersistsCurrentVisitBeforeActivityCloses(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	o, _ := capture.SanitizeObservation("editor.app", "", "Mira is the rollback owner.", 512)
+	o, _ := capture.SanitizeObservation("editor.app", "", "Mira is the rollback owner. plus enough extra visible detail", 512)
 	if err := store.PutObservationAt(ctx, o, time.Now().Add(-48*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
