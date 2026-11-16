@@ -195,13 +195,16 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 		last := &history[len(history)-1]
 		if !last.General && last.Plan.Kind != KindGeneral {
 			grounded = true
-			if followup == followupSubject && (last.Plan.Entity == "" || strings.ContainsAny(last.Plan.Entity, ",;") || hasWord(splitWords(last.Plan.Entity), "and", "or")) {
+			// A pronoun follow-up after an answer that named no subject still
+			// refers to what that answer cited, so it reads those sources again.
+			citedOnly := followup == followupSubject && last.Plan.Entity == "" && len(last.SourceIDs) > 0
+			if followup == followupSubject && !citedOnly && (last.Plan.Entity == "" || strings.ContainsAny(last.Plan.Entity, ",;") || hasWord(splitWords(last.Plan.Entity), "and", "or")) {
 				return Result{Answer: Answer{Text: "Who are you referring to? Name the person or project so I can check the right saved sources.", InsufficientEvidence: true}, Plan: last.Plan}, nil
 			}
 			current := plan
 			plan = last.Plan
 			plan.WholeDocument = false // follow-ups use cited-source retrieval, not a new full scan
-			plan.SubjectFollowup = followup == followupSubject
+			plan.SubjectFollowup = followup == followupSubject && !citedOnly
 			plan.Question = question
 			plan.Scope.Explicit = false
 			if !current.Scope.IsZero() {
@@ -355,6 +358,11 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 			return Result{Answer: Answer{Text: "I can’t verify the saved sources for that earlier answer now. Name the person, project, or text you want me to check.", InsufficientEvidence: true}, Plan: plan, IndexingPending: retrieval.Diagnosis.IndexingPending}, nil
 		}
 		return Result{Answer: Answer{Text: EmptyAnswerText(plan, retrieval.Diagnosis), InsufficientEvidence: true}, Plan: plan, IndexingPending: retrieval.Diagnosis.IndexingPending, CoverageLimited: retrieval.Diagnosis.SemanticIssue != "" || retrieval.Diagnosis.VoiceRecallLimited}, nil
+	}
+	if grounded && (s.memoryGenerationDisabled || s.generator == nil || s.counter == nil) && isWhenQuestion(question) {
+		if result, ok := capturedWhenAnswer(plan, retrieval.Evidence, history[len(history)-1].SourceIDs, retrieval.Diagnosis, now.Location()); ok {
+			return result, nil
+		}
 	}
 	if answer, source, ok := shortenVerifiedSavedQuote(question, previous, evidence); ok {
 		return Result{Answer: answer, Sources: []Evidence{source}, Direct: true, Plan: plan, ConversationTurns: 1, IndexingPending: retrieval.Diagnosis.IndexingPending, CoverageLimited: retrieval.Diagnosis.SemanticIssue != "" || retrieval.Diagnosis.LibraryRecallLimited}, nil
@@ -656,6 +664,10 @@ func EmptyAnswerText(plan Plan, d Diagnosis) string {
 		return "Capture has been paused since " + d.PausedSince.Format("15:04") + ", so nothing new has been saved. Resume capture and ask again."
 	case len(plan.AppNames) > 0 && !d.AppKnown:
 		return "I haven't captured anything from " + plan.AppNames[0] + " yet. Check Capture scope in Settings if it should be included."
+	case d.ScopeWidened > 0 && plan.Kind == KindLookup:
+		return "I found nothing matching in the last " + strconv.Itoa(int(d.ScopeWidened/time.Hour)) + " hours."
+	case d.ScopeWidened > 0:
+		return "Nothing captured in the last " + strconv.Itoa(int(d.ScopeWidened/time.Hour)) + " hours."
 	case !plan.Scope.IsZero() && d.SourcesInScope == 0:
 		return "Nothing captured " + plan.Scope.Label + " yet."
 	}
@@ -747,7 +759,7 @@ func QuestionSeeksPersonalMemory(question string) bool {
 		}
 		prev = word
 	}
-	return false
+	return seeksStoredLocation(splitWords(question))
 }
 
 func memoryIntentWord(word string) bool {

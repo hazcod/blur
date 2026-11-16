@@ -511,7 +511,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 	var topicLibrary []assistant.Evidence
 	var supersededTopicSources []string
 	var topicLibraryLimited bool
-	if plan.Kind == assistant.KindLookup && !voiceRequested && !plan.WholeDocument {
+	if plan.Kind == assistant.KindLookup && !voiceRequested && !plan.WholeDocument && !plan.Conversation {
 		topicLibrary, topicLibraryLimited, supersededTopicSources, err = c.inferredTopicEvidence(ctx, plan)
 		if err != nil {
 			return assistant.Retrieval{}, err
@@ -528,14 +528,21 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 		retrieval.Diagnosis.VoiceRequested = true
 		retrieval.Diagnosis.VoiceRecallLimited = limited
 		retrieval.Diagnosis.VoiceAssociationUnverified = len(voice) > 0 && !asksAboutNamedSession(plan)
+	} else if plan.Conversation {
+		retrieval.Evidence, retrieval.Diagnosis.RecapSampled, err = c.conversationEvidence(ctx, plan, bounded, windowSegs)
 	} else {
 		switch plan.Kind {
 		case assistant.KindCapture:
-			retrieval.Evidence, err = c.recentPlanEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
+			retrieval.Evidence, retrieval.Diagnosis.ScopeWidened, _, err = c.recencyEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
 		case assistant.KindRecap:
 			retrieval.Evidence, retrieval.Diagnosis.RecapSampled, err = c.recapEvidence(ctx, plan, start, end, scoped)
 		case assistant.KindLookup:
 			retrieval.Evidence, searchPending, err = c.lookupEvidenceWithExpansion(ctx, plan, bounded, windowSegs, scoped, &retrieval.Diagnosis, &retrieval.AlternateQueries, expansionQueries)
+			if err == nil && len(retrieval.Evidence) == 0 && plan.Scope.Label == assistant.ScopeJustNow {
+				var widenedPending bool
+				retrieval.Evidence, widenedPending, retrieval.Diagnosis.ScopeWidened, err = c.widenedRecencyLookup(ctx, plan, &retrieval.Diagnosis, &retrieval.AlternateQueries, expansionQueries)
+				searchPending = searchPending || widenedPending
+			}
 		case assistant.KindEntity:
 			if assistant.IsOutstandingQuestion(plan.Question) {
 				retrieval.Evidence, outstandingSources, err = c.outstandingEntityEvidence(ctx, plan)
@@ -563,7 +570,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 	if err != nil {
 		return assistant.Retrieval{}, err
 	}
-	if plan.Kind == assistant.KindLookup && !voiceRequested && !plan.WholeDocument {
+	if plan.Kind == assistant.KindLookup && !voiceRequested && !plan.WholeDocument && !plan.Conversation {
 		if len(supersededTopicSources) > 0 {
 			superseded := make(map[string]bool, len(supersededTopicSources))
 			for _, sourceID := range supersededTopicSources {
@@ -580,7 +587,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 		retrieval.Evidence = uniqueEvidence(append(topicLibrary, retrieval.Evidence...), planEvidenceItems)
 		retrieval.Diagnosis.LibraryRecallLimited = topicLibraryLimited
 	}
-	if (plan.Kind == assistant.KindLookup || plan.Kind == assistant.KindEntity) && !voiceRequested && !plan.WholeDocument {
+	if (plan.Kind == assistant.KindLookup || plan.Kind == assistant.KindEntity) && !voiceRequested && !plan.WholeDocument && !plan.Conversation {
 		taskPage, taskErr := c.searchTasks(ctx, plan.Question, taskTopicTerms(plan.Terms), semantic.Query{AppIDs: plan.AppIDs, Domains: plan.Domains, Start: plan.Scope.Start, End: plan.Scope.End}, planEvidenceItems, plan.MatchOnly, outstandingSources...)
 		if taskErr != nil {
 			return assistant.Retrieval{}, taskErr
@@ -687,39 +694,9 @@ func (c *Client) lookupEvidenceWithExpansion(ctx context.Context, plan assistant
 		if alternateOutput != nil {
 			*alternateOutput = append([]string(nil), page.AlternateQueries...)
 		}
-		page = boundSearchHydration(page)
-		hits, err := c.hydrateSearchPage(ctx, page)
+		evidence, err = c.pageEvidence(ctx, plan, page, windowSegs)
 		if err != nil {
 			return nil, pending, err
-		}
-		locateExactPassages(hits, plan.Terms)
-		starts := map[string]time.Time{}
-		for _, hit := range hits {
-			if !hit.CapturedAt.IsZero() {
-				starts[hit.SourceID] = hit.CapturedAt
-			}
-		}
-		for _, segment := range windowSegs {
-			for _, id := range segment.SourceIDs {
-				if segment.WallStart.After(starts[id]) {
-					starts[id] = segment.WallStart
-				}
-			}
-		}
-		for _, hit := range hits {
-			ev := newEvidence(hit.SourceID, hit.AppID, hit.Domain, hit.Text)
-			ev.Partial = hit.Partial
-			ev.Document = hit.Document
-			ev.CapturedAt, ev.TimeUnknown = hit.CapturedAt, hit.TimeUnknown
-			ev.MatchStart, ev.MatchEnd = hit.MatchStart, hit.MatchEnd
-			if at, ok := starts[hit.SourceID]; ok {
-				ev.CapturedAt = at
-				ev.TimeUnknown = false
-			}
-			if plan.WholeDocument && isAuthenticationPageEvidence(ev) {
-				continue
-			}
-			evidence = append(evidence, ev)
 		}
 	}
 	if plan.WholeDocument && len(evidence) == 0 {
@@ -737,6 +714,47 @@ func (c *Client) lookupEvidenceWithExpansion(ctx context.Context, plan assistant
 		return evidence, pending, err
 	}
 	return evidence, pending, nil
+}
+
+// pageEvidence hydrates an exact-search page into evidence, stamping each item
+// with the newest activity-segment start that mentions its source.
+func (c *Client) pageEvidence(ctx context.Context, plan assistant.Plan, page search.ExactPage, windowSegs []activity.Segment) ([]assistant.Evidence, error) {
+	page = boundSearchHydration(page)
+	hits, err := c.hydrateSearchPage(ctx, page)
+	if err != nil {
+		return nil, err
+	}
+	locateExactPassages(hits, plan.Terms)
+	starts := map[string]time.Time{}
+	for _, hit := range hits {
+		if !hit.CapturedAt.IsZero() {
+			starts[hit.SourceID] = hit.CapturedAt
+		}
+	}
+	for _, segment := range windowSegs {
+		for _, id := range segment.SourceIDs {
+			if segment.WallStart.After(starts[id]) {
+				starts[id] = segment.WallStart
+			}
+		}
+	}
+	var evidence []assistant.Evidence
+	for _, hit := range hits {
+		ev := newEvidence(hit.SourceID, hit.AppID, hit.Domain, hit.Text)
+		ev.Partial = hit.Partial
+		ev.Document = hit.Document
+		ev.CapturedAt, ev.TimeUnknown = hit.CapturedAt, hit.TimeUnknown
+		ev.MatchStart, ev.MatchEnd = hit.MatchStart, hit.MatchEnd
+		if at, ok := starts[hit.SourceID]; ok {
+			ev.CapturedAt = at
+			ev.TimeUnknown = false
+		}
+		if plan.WholeDocument && isAuthenticationPageEvidence(ev) {
+			continue
+		}
+		evidence = append(evidence, ev)
+	}
+	return evidence, nil
 }
 
 // planSearch runs exact search for the plan's terms, one query per app id or
@@ -1267,9 +1285,12 @@ func (c *Client) AnswerDirect(ctx context.Context, plan assistant.Plan) (assista
 		answer, handled, err := directTime(scoped, start, end, zone, label, subject)
 		return assistant.DirectAnswer{Answer: answer}, handled, err
 	}
-	evidence, err := c.recentPlanEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
+	evidence, widened, scoped, err := c.recencyEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
 	if err != nil || len(evidence) == 0 {
 		return assistant.DirectAnswer{}, false, err
+	}
+	if widened > 0 {
+		label = "in the last " + strconv.Itoa(int(widened/time.Hour)) + " hours (nothing in the last hour)"
 	}
 	return directCaptureEvidence(evidence, scoped, zone, label, subject), true, nil
 }

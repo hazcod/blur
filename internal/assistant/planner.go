@@ -346,9 +346,10 @@ func parseUnit(w string) byte {
 }
 
 // detectScope finds the time window a question names, computed in
-// now.Location() with Start inclusive and End exclusive. The returned string
-// is a numeral consumed by the window ("7" in "last 7 days").
-func detectScope(ws []word, now time.Time) (Scope, string) {
+// now.Location() with Start inclusive and End exclusive. The returned words are
+// those consumed by the window ("7" in "last 7 days", "november" in
+// "8 november afternoon") so they do not become search terms.
+func detectScope(ws []word, now time.Time) (Scope, []string) {
 	mk := func(start, end time.Time, label string) Scope {
 		return Scope{Start: start, End: end, Label: label, Explicit: true}
 	}
@@ -358,41 +359,44 @@ func detectScope(ws []word, now time.Time) (Scope, string) {
 		}
 		if unit := parseUnit(ws[i+1].s); unit == 'h' || unit == 'm' {
 			if unit == 'h' {
-				return mk(now.Add(-time.Hour), now, "last hour"), ""
+				return mk(now.Add(-time.Hour), now, "last hour"), nil
 			}
-			return mk(now.Add(-time.Minute), now, "last minute"), ""
+			return mk(now.Add(-time.Minute), now, "last minute"), nil
 		}
 		if i+2 < len(ws) {
 			if n, err := strconv.Atoi(ws[i+1].s); err == nil && n >= 1 {
 				switch unit := parseUnit(ws[i+2].s); {
 				case unit == 'h' && n <= 720:
-					return mk(now.Add(-time.Duration(n)*time.Hour), now, "last "+ws[i+1].s+" hours"), ws[i+1].s
+					return mk(now.Add(-time.Duration(n)*time.Hour), now, "last "+ws[i+1].s+" hours"), []string{ws[i+1].s}
 				case unit == 'm' && n <= 10080:
-					return mk(now.Add(-time.Duration(n)*time.Minute), now, "last "+ws[i+1].s+" minutes"), ws[i+1].s
+					return mk(now.Add(-time.Duration(n)*time.Minute), now, "last "+ws[i+1].s+" minutes"), []string{ws[i+1].s}
 				case unit == 'd' && n <= 366:
-					return mk(now.AddDate(0, 0, -n), now, "last "+ws[i+1].s+" days"), ws[i+1].s
+					return mk(now.AddDate(0, 0, -n), now, "last "+ws[i+1].s+" days"), []string{ws[i+1].s}
 				}
 			}
 		}
 	}
+	if scope, used, ok := dayPartScope(ws, now); ok {
+		return scope, used
+	}
 	sinceMonday := (int(now.Weekday()) + 6) % 7
 	switch {
 	case hasSeq(ws, "last", "week"):
-		return mk(dayStart(now, -sinceMonday-7), dayStart(now, -sinceMonday), "last week"), ""
+		return mk(dayStart(now, -sinceMonday-7), dayStart(now, -sinceMonday), "last week"), nil
 	case hasSeq(ws, "this", "week"):
-		return mk(dayStart(now, -sinceMonday), now, "this week"), ""
+		return mk(dayStart(now, -sinceMonday), now, "this week"), nil
 	case hasSeq(ws, "this", "month"):
-		return mk(time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()), now, "this month"), ""
+		return mk(time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()), now, "this month"), nil
 	case hasSeq(ws, "this", "morning"):
-		return mk(atHour(now, 6), atHour(now, 12), "this morning"), ""
+		return mk(atHour(now, 6), atHour(now, 12), "this morning"), nil
 	case hasSeq(ws, "this", "afternoon"):
-		return mk(atHour(now, 12), atHour(now, 18), "this afternoon"), ""
+		return mk(atHour(now, 12), atHour(now, 18), "this afternoon"), nil
 	case hasSeq(ws, "this", "evening"):
-		return mk(atHour(now, 18), dayStart(now, 1), "this evening"), ""
+		return mk(atHour(now, 18), dayStart(now, 1), "this evening"), nil
 	case hasWord(ws, "tonight"):
-		return mk(atHour(now, 18), dayStart(now, 1), "tonight"), ""
+		return mk(atHour(now, 18), dayStart(now, 1), "tonight"), nil
 	case hasWord(ws, "yesterday"):
-		return mk(dayStart(now, -1), dayStart(now, 0), "yesterday"), ""
+		return mk(dayStart(now, -1), dayStart(now, 0), "yesterday"), nil
 	}
 	for i, w := range ws {
 		wd, ok := weekdayWords[w.s]
@@ -404,19 +408,21 @@ func detectScope(ws []word, now time.Time) (Scope, string) {
 			back = 7
 		}
 		name := strings.ToUpper(w.s[:1]) + w.s[1:]
-		return mk(dayStart(now, -back), dayStart(now, -back+1), "on "+name), ""
+		return mk(dayStart(now, -back), dayStart(now, -back+1), "on "+name), nil
 	}
 	switch {
 	case hasWord(ws, "today"):
-		return mk(dayStart(now, 0), now, "today"), ""
+		return mk(dayStart(now, 0), now, "today"), nil
 	case hasSeq(ws, "right", "now"), hasWord(ws, "currently"), hasSeq(ws, "at", "the", "moment"), hasSeq(ws, "at", "moment"):
-		return mk(now.Add(-30*time.Minute), now, "right now"), ""
+		return mk(now.Add(-30*time.Minute), now, "right now"), nil
 	case hasWord(ws, "earlier"):
-		return mk(dayStart(now, 0), now, "earlier today"), ""
+		return mk(dayStart(now, 0), now, "earlier today"), nil
 	case hasWord(ws, "recently", "lately"):
-		return mk(now.AddDate(0, 0, -3), now, "recently"), ""
+		return mk(now.AddDate(0, 0, -3), now, "recently"), nil
+	case detectRecency(ws):
+		return mk(now.Add(-ScopeJustNowWindow), now, ScopeJustNow), nil
 	}
-	return Scope{}, ""
+	return Scope{}, nil
 }
 
 func detectTimeKind(ws []word) bool {
