@@ -868,6 +868,7 @@ type searchIndexSearchStream struct {
 	current         searchIndexPosting
 	currentScore    int
 	exhausted       bool
+	term            bool // a term stream may exhaust without ending a partial-match query
 	seen            map[string]struct{}
 }
 
@@ -877,6 +878,7 @@ type searchIndexEvaluatedCandidate struct {
 	termMatches  int
 	metadataOkay bool
 	score        int
+	termMask     uint32 // bit i is set when query term i is indexed for the source
 }
 
 func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, query search.ExactQuery, result *search.ExactPage) error {
@@ -935,6 +937,7 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 	streams := make([]searchIndexSearchStream, len(constraints))
 	for i := range constraints {
 		streams[i] = searchIndexSearchStream{
+			term:            constraints[i].kind == searchIndexTerm,
 			constraintIndex: i,
 			iterator:        newSearchIndexTreeIterator(ctx, reader, s, constraints[i].kind, constraints[i].digest),
 			seen:            make(map[string]struct{}),
@@ -1030,6 +1033,7 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 			candidate.fields[i] = ref.fields
 			if constraint.kind == searchIndexTerm {
 				candidate.termMatches++
+				candidate.termMask |= 1 << uint(i)
 				weight := searchIndexWeight(ref.fields)
 				if weight == 0 {
 					clearSearchIndexRefs(refs)
@@ -1114,7 +1118,7 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 		evaluated[posting.sourceID] = candidate
 		if candidate.matches {
 			matchedCount++
-			result.Hits = append(result.Hits, search.IndexHit{SourceID: posting.sourceID, Score: candidate.score, Bytes: sourceBytes, CapturedAt: capturedAt})
+			result.Hits = append(result.Hits, search.IndexHit{SourceID: posting.sourceID, Score: candidate.score, Bytes: sourceBytes, CapturedAt: capturedAt, MatchedTerms: candidate.termMask})
 			sort.Slice(result.Hits, func(i, j int) bool {
 				if result.Hits[i].Score != result.Hits[j].Score {
 					return result.Hits[i].Score > result.Hits[j].Score
@@ -1131,12 +1135,12 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 		if err := advance(i); err != nil {
 			return err
 		}
-		if streams[i].exhausted {
+		if streams[i].exhausted && searchIndexNoMoreMatches(streams, minTermMatches) {
 			return nil
 		}
 	}
 	for {
-		if searchIndexTopKProven(result.Hits, query.TopK, streams) {
+		if searchIndexTopKProven(result.Hits, query.TopK, streams, minTermMatches) {
 			result.HasMore = matchedCount > len(result.Hits)
 			for _, stream := range streams {
 				result.HasMore = result.HasMore || !stream.exhausted
@@ -1152,7 +1156,7 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 				return err
 			}
 			progressed = true
-			if streams[i].exhausted {
+			if streams[i].exhausted && searchIndexNoMoreMatches(streams, minTermMatches) {
 				result.HasMore = matchedCount > len(result.Hits)
 				return nil
 			}
@@ -1188,26 +1192,79 @@ func (s *Store) readSearchCaptureTime(reader bolt.Reader, sourceID string, sourc
 	return at, used, false, nil
 }
 
-func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream) bool {
+// searchIndexNoMoreMatches reports that no unseen source can satisfy the query.
+// Every source in an exhausted stream was already evaluated by random access,
+// so an unseen source can only match through streams that still have postings.
+// An exhausted metadata stream ends the query; an exhausted term stream only
+// does so once fewer than minTermMatches term streams remain.
+func searchIndexNoMoreMatches(streams []searchIndexSearchStream, minTermMatches int) bool {
+	active := 0
+	for _, stream := range streams {
+		if !stream.term {
+			if stream.exhausted {
+				return true
+			}
+			continue
+		}
+		if !stream.exhausted {
+			active++
+		}
+	}
+	return active < minTermMatches
+}
+
+func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream, minTermMatches int) bool {
 	if len(hits) < topK {
 		return false
 	}
-	threshold := 0
-	maxCursorID := ""
+	if searchIndexNoMoreMatches(streams, minTermMatches) {
+		return true
+	}
+	terms := 0
 	for _, stream := range streams {
-		if stream.exhausted {
-			return true
-		}
-		threshold += stream.currentScore
-		if stream.current.sourceID > maxCursorID {
-			maxCursorID = stream.current.sourceID
+		if stream.term {
+			terms++
 		}
 	}
 	kth := hits[topK-1]
+	if minTermMatches >= terms {
+		// All-term query: an unseen source sits at or after every cursor.
+		threshold := 0
+		maxCursorID := ""
+		for _, stream := range streams {
+			threshold += stream.currentScore
+			if stream.current.sourceID > maxCursorID {
+				maxCursorID = stream.current.sourceID
+			}
+		}
+		if kth.Score > threshold {
+			return true
+		}
+		return kth.Score == threshold && kth.SourceID <= maxCursorID
+	}
+	// Partial query: an unseen source appears in at least minTermMatches of the
+	// remaining term streams, so its score cannot exceed their largest cursor
+	// scores, and (on a tie) its ID cannot precede the earliest cursor.
+	var scores []int
+	minCursorID := ""
+	for _, stream := range streams {
+		if !stream.term || stream.exhausted {
+			continue
+		}
+		scores = append(scores, stream.currentScore)
+		if minCursorID == "" || stream.current.sourceID < minCursorID {
+			minCursorID = stream.current.sourceID
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(scores)))
+	threshold := 0
+	for _, score := range scores[:min(minTermMatches, len(scores))] {
+		threshold += score
+	}
 	if kth.Score > threshold {
 		return true
 	}
-	return kth.Score == threshold && kth.SourceID <= maxCursorID
+	return kth.Score == threshold && kth.SourceID <= minCursorID
 }
 
 func clearSearchIndexConstraints(constraints []searchIndexConstraint) {
