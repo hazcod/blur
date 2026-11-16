@@ -88,20 +88,21 @@ const (
 
 // Diagnosis explains an empty or thin retrieval so the answer can say why.
 type Diagnosis struct {
-	VoiceRequested             bool      // the question asks for spoken content, not browser playback controls
-	VoiceAssociationUnverified bool      // a recent transcript does not establish the requested website/video identity
-	VoiceRecallLimited         bool      // bounded transcript selection omitted other saved rows or sessions
-	RecapSampled               bool      // time-distributed retrieval omitted other saved candidates
-	TaskSearchLimited          bool      // bounded current-task recall omitted candidates
-	LibraryRecallLimited       bool      // bounded subject-name lookup omitted candidate Library entries
-	SemanticIssue              string    // closed retrieval coverage: disabled, loading, unavailable, limited
-	IndexingPending            bool      // saved sources still have exact-search work queued
-	CapturePaused              bool      // capture is off or paused right now
-	PausedSince                time.Time // when it was paused, if known
-	AppKnown                   bool      // the named app has been captured before
-	SourcesInScope             int       // captured sources inside the time scope
-	ModelFree                  bool      // the answer was produced without a model
-	CaptureIssue               string    // closed capture-health category; never source/error text
+	VoiceRequested             bool          // the question asks for spoken content, not browser playback controls
+	VoiceAssociationUnverified bool          // a recent transcript does not establish the requested website/video identity
+	VoiceRecallLimited         bool          // bounded transcript selection omitted other saved rows or sessions
+	RecapSampled               bool          // time-distributed retrieval omitted other saved candidates
+	TaskSearchLimited          bool          // bounded current-task recall omitted candidates
+	LibraryRecallLimited       bool          // bounded subject-name lookup omitted candidate Library entries
+	SemanticIssue              string        // closed retrieval coverage: disabled, loading, unavailable, limited
+	IndexingPending            bool          // saved sources still have exact-search work queued
+	CapturePaused              bool          // capture is off or paused right now
+	PausedSince                time.Time     // when it was paused, if known
+	AppKnown                   bool          // the named app has been captured before
+	SourcesInScope             int           // captured sources inside the time scope
+	ModelFree                  bool          // the answer was produced without a model
+	CaptureIssue               string        // closed capture-health category; never source/error text
+	ScopeWidened               time.Duration // a recency question found nothing in its window and looked this far back instead
 }
 
 // Retrieval is what a planned retrieval returns.
