@@ -90,7 +90,7 @@ func receiverFixture(t *testing.T, now time.Time, enabled bool, sink *receiverSi
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test/a?secret=hide","title":"Plan","text":"Owner: Sam","active":true,"privacy_known":true,"private":false,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
+	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test/a?secret=hide","title":"Plan","text":"Owner: Sam owns the rollback and schedule","active":true,"privacy_known":true,"private":false,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
 	digest := sha256.Sum256(payload)
 	proof, err := localapi.NewProof(grant, localapi.ScopeCaptureIngest, digest, now, nil)
 	if err != nil {
@@ -136,10 +136,10 @@ func TestReceiverRejectsInvalidOrDisabledRequestsWithoutWriting(t *testing.T) {
 	}{
 		{"disabled", true, nil}, {"bad mac", false, func(b []byte) []byte { return []byte(strings.Replace(string(b), `"mac":"`, `"mac":"0`, 1)) }},
 		{"malformed payload", false, func(b []byte) []byte {
-			return []byte(strings.Replace(string(b), `"text":"Owner: Sam"`, `"text":"Owner: Sam","extra":true`, 1))
+			return []byte(strings.Replace(string(b), `"text":"Owner: Sam owns the rollback and schedule"`, `"text":"Owner: Sam owns the rollback and schedule","extra":true`, 1))
 		}},
 		{"duplicate payload key", false, func(b []byte) []byte {
-			return []byte(strings.Replace(string(b), `"text":"Owner: Sam"`, `"text":"one","text":"two"`, 1))
+			return []byte(strings.Replace(string(b), `"text":"Owner: Sam owns the rollback and schedule"`, `"text":"one","text":"two"`, 1))
 		}},
 		{"invalid UTF-8", false, func(b []byte) []byte { return append(b, 0xff) }},
 	}
@@ -159,7 +159,7 @@ func TestReceiverRejectsInvalidOrDisabledRequestsWithoutWriting(t *testing.T) {
 		})
 	}
 	for _, mutate := range []func(*Snapshot){func(p *Snapshot) { p.Private = true }, func(p *Snapshot) { p.Active = false }, func(p *Snapshot) { p.PrivacyKnown = false }} {
-		p := Snapshot{Browser: SafariBundleID, URL: "https://example.test", Text: "body", Active: true, PrivacyKnown: true, CapturedAt: now}
+		p := Snapshot{Browser: SafariBundleID, URL: "https://example.test", Text: "body text that is comfortably long enough to keep", Active: true, PrivacyKnown: true, CapturedAt: now}
 		mutate(&p)
 		if _, err := Sanitize(p, true, now); err == nil {
 			t.Fatal("accepted disallowed privacy state")
@@ -305,4 +305,37 @@ func TestReceiverPolicyCoversDuplicateSightingAndCanceledCommit(t *testing.T) {
 	if err := r.Accept(context.Background(), wire); !errors.Is(err, context.Canceled) || sink.writes != 1 || sink.sightings != 1 {
 		t.Fatal("canceled prewrite check persisted content or a sighting")
 	}
+}
+
+func TestReceiverDropsShortSnapshotsButKeepsExemptAndLongOnes(t *testing.T) {
+	ctx := context.Background()
+	long := strings.Repeat("x", 32)
+	short := strings.Repeat("x", 31)
+	for _, c := range []struct {
+		text, app string
+		stored    bool
+	}{{short, "", false}, {long, "", true}, {"hi", "sh.blur.notes", true}, {"hi", "sh.blur.meetings", true}} {
+		sink := &receiverSink{encrypted: true}
+		r, _, _ := receiverFixture(t, time.Now(), true, sink)
+		o, err := capture.SanitizeObservation(firstNonEmpty(c.app, SafariBundleID), "example.test", c.text, 256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.persist(ctx, o, time.Now()); err != nil {
+			t.Fatalf("persist %q: %v", c.text, err)
+		}
+		sink.mu.Lock()
+		rows := len(sink.rows)
+		sink.mu.Unlock()
+		if (rows == 1) != c.stored || (!c.stored && r.DroppedShort() != 1) || (c.stored && r.DroppedShort() != 0) {
+			t.Fatalf("text %q app %q: rows=%d dropped=%d", c.text, c.app, rows, r.DroppedShort())
+		}
+	}
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }

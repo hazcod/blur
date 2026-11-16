@@ -31,7 +31,7 @@ type Capturer interface {
 	Capture(context.Context) (capture.SanitizedObservation, error)
 }
 
-type Stats struct{ Persisted, Duplicates, Skipped uint64 }
+type Stats struct{ Persisted, Duplicates, Skipped, DroppedShort uint64 }
 
 const maxPendingActivitySegments = 256
 
@@ -71,6 +71,7 @@ type Service struct {
 	persisted       atomic.Uint64
 	duplicates      atomic.Uint64
 	skipped         atomic.Uint64
+	droppedShort    atomic.Uint64
 }
 
 // SetCaptureCycleNotify registers a non-blocking callback after each
@@ -379,6 +380,14 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 		s.pauseActivity(ctx)
 		return nil
 	}
+	if !capture.MeetsMinimumContent(observation.AppID(), observation.Text()) {
+		// Too little content to store, but the foreground visit still counts
+		// toward activity timing (without evidence links).
+		state = HealthEmpty
+		s.droppedShort.Add(1)
+		s.recordShortVisit(ctx, observation)
+		return nil
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -520,7 +529,7 @@ func (s *Service) Stats() Stats {
 	if s == nil {
 		return Stats{}
 	}
-	return Stats{Persisted: s.persisted.Load(), Duplicates: s.duplicates.Load(), Skipped: s.skipped.Load()}
+	return Stats{Persisted: s.persisted.Load(), Duplicates: s.duplicates.Load(), Skipped: s.skipped.Load(), DroppedShort: s.droppedShort.Load()}
 }
 
 // A preference change may reject the frame between capture and its encrypted
@@ -534,4 +543,18 @@ func (s *Service) rejectPolicyCommit(ctx context.Context, err error, state *Heal
 	s.skipped.Add(1)
 	s.pauseActivity(ctx)
 	return true
+}
+
+func (s *Service) recordShortVisit(ctx context.Context, observation capture.SanitizedObservation) {
+	if s.activity == nil || ctx.Err() != nil {
+		return
+	}
+	now := time.Now().UTC()
+	segments, err := s.activity.Apply(activity.Event{Kind: activity.Seen, Monotonic: now.Sub(s.activityEpoch).Nanoseconds(), Wall: now, AppID: observation.AppID(), Domain: observation.Domain()})
+	if err != nil {
+		s.logger.Error("activity event rejected", "operation", "activity", "result", "invalid")
+		return
+	}
+	s.enqueueActivity(segments)
+	_ = s.flushPendingActivity(ctx)
 }

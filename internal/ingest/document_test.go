@@ -208,7 +208,7 @@ func TestDocumentIngestionFreshFallbackPreservesVisualRouteAndBlocksPolicyFailur
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := openTestStore(t)
-			observation, err := capture.SanitizeObservation("org.example.editor", "", "Visible OCR fallback evidence", 4096)
+			observation, err := capture.SanitizeObservation("org.example.editor", "", "Visible OCR fallback evidence plus enough extra visible detail", 4096)
 			if err != nil {
 				t.Fatal(err)
 			}

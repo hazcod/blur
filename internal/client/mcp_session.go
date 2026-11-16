@@ -44,6 +44,9 @@ type mcpSessionCapture struct {
 	NextOffsetBytes int    `json:"next_offset_bytes"`
 	Complete        bool   `json:"complete"`
 	PartialCapture  bool   `json:"partial_capture,omitempty"`
+
+	// Sighting count: how often identical content was seen (last_seen_at above).
+	SightingCount int64 `json:"sighting_count,omitempty"`
 }
 
 type mcpSessionResponse struct {
@@ -55,6 +58,10 @@ type mcpSessionResponse struct {
 	Next            string              `json:"next,omitempty"`
 	IndexingPending bool                `json:"indexing_pending,omitempty"`
 	CoverageLimited bool                `json:"coverage_limited,omitempty"`
+
+	// SightingUnavailable counts captures whose sighting_count was omitted
+	// because their sighting metadata is damaged.
+	SightingUnavailable int `json:"sighting_unavailable,omitempty"`
 }
 
 func decodeMCPSessionParams(raw []byte) (mcpSessionParams, error) {
@@ -278,7 +285,7 @@ func (c *Client) readMCPSession(ctx context.Context, epoch uint64, params mcpSes
 		if err != nil {
 			return nil, err
 		}
-		cost := len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.LastSeenAt) + len(item.Content) + mcpSessionItemOverheadEst
+		cost := len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.LastSeenAt) + len(item.Content) + mcpSessionItemOverheadEst + mcpSightingFieldsBytes
 		if len(response.Captures) > 0 && used+cost > localapi.MaxRPCSnapshotResponseBytes-1024 {
 			response.HasMore = true
 			break
@@ -306,6 +313,12 @@ func (c *Client) readMCPSession(ctx context.Context, epoch uint64, params mcpSes
 		response.HasMore = true
 		response.Next = response.Captures[len(response.Captures)-1].SourceID
 	}
+	for _, item := range response.Captures {
+		if item.SightingCount == 0 {
+			response.SightingUnavailable++
+		}
+	}
+	noteSightingUnavailable(response.SightingUnavailable)
 	return c.publishMCPParity(ctx, epoch, response, localapi.MaxRPCSnapshotResponseBytes)
 }
 
@@ -346,6 +359,10 @@ func (c *Client) sessionCapture(ctx context.Context, entry mcpSessionEntry, chun
 	item := mcpSessionCapture{SourceID: entry.id, AppID: appID, Domain: domain, LastSeenAt: entry.seen.UTC().Format(time.RFC3339Nano), Content: text[:end], NextOffsetBytes: end, Complete: end == len(text), PartialCapture: partial}
 	if !captured.IsZero() {
 		item.CapturedAt = captured.UTC().Format(time.RFC3339Nano)
+	}
+	var err error
+	if item.SightingCount, _, err = c.mcpSighting(ctx, entry.id, captured); err != nil {
+		return mcpSessionCapture{}, err
 	}
 	return item, nil
 }
