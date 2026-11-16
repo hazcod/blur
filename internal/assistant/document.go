@@ -77,15 +77,16 @@ type documentReducer struct {
 }
 
 func (s *Service) answerWholeDocument(ctx context.Context, question string, plan Plan, retrieval Retrieval, _ []string, progress func(DocumentProgress)) (Result, error) {
-	if s.memoryGenerationDisabled || s.generator == nil || s.counter == nil {
-		return Result{}, ErrAskUnavailable
-	}
+	extractive := s.memoryGenerationDisabled || s.generator == nil || s.counter == nil
 	selected, ambiguous, found := chooseWholeDocumentSource(retrieval.Evidence)
 	if ambiguous {
 		return Result{Answer: Answer{Text: "I found a few matching pages. Which app or website did you capture it from, or roughly when?", InsufficientEvidence: true}, Direct: true, Plan: plan}, nil
 	}
 	if !found {
 		return Result{Answer: Answer{Text: "I couldn’t find a captured page that matches. Name its app, website, or topic and I’ll look again.", InsufficientEvidence: true}, Direct: true, Plan: plan}, nil
+	}
+	if extractive {
+		return s.extractiveWholeDocument(ctx, plan, selected)
 	}
 	total := selected.Document.PartCount
 	if total < 1 {
