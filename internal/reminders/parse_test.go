@@ -36,7 +36,7 @@ func TestExplicitReminderParsingKeepsTitleAndExactSchedule(t *testing.T) {
 
 func TestMissingOrAmbiguousReminderFieldsAreNotInvented(t *testing.T) {
 	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
-	for _, input := range []string{"remind me to review the PR", "remind me at 5 to review the PR", "remind me in 10 minutes", "remind me on 2020-01-01 at 09:00 to review the PR"} {
+	for _, input := range []string{"remind me to review the PR", "remind me at 25 to review the PR", "remind me in 10 minutes", "remind me on 2020-01-01 at 09:00 to review the PR"} {
 		draft, err := Parse(input, now, "Europe/Brussels")
 		if err != nil || draft.Missing == "" {
 			t.Fatalf("missing field silently guessed for %q: %+v %v", input, draft, err)

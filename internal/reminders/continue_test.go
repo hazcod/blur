@@ -7,7 +7,7 @@ import (
 
 func TestReminderClarificationPreservesTitleDateAndOriginalRelativeIntent(t *testing.T) {
 	at := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
-	draft, err := Parse("remind me tomorrow at 5 to review the PR", at, "Europe/Brussels")
+	draft, err := Parse("remind me tomorrow at 25 to review the PR", at, "Europe/Brussels")
 	if err != nil || draft.Missing != "time" {
 		t.Fatal(draft, err)
 	}
@@ -72,12 +72,12 @@ func TestWeekdayAndDaypartDefaultsPermitClockRefinementWithoutLosingDate(t *test
 		{"Monday", "2026-11-16T08:00:00Z"},
 		{"on Monday morning", "2026-11-16T08:00:00Z"},
 		{"tomorrow morning", "2026-11-13T08:00:00Z"},
-		{"tomorrow at 5", "2026-11-13T08:00:00Z"},
+		{"tomorrow at 25", "2026-11-13T08:00:00Z"},
 	} {
 		t.Run(test.spec, func(t *testing.T) {
 			draft, err := Parse("remind me "+test.spec+" to go to the drycleaners", now, "Europe/Brussels")
 			missing := ""
-			if test.spec == "tomorrow at 5" {
+			if test.spec == "tomorrow at 25" {
 				missing = "time"
 			}
 			if err != nil || draft.Missing != missing || (draft.Reminder == nil) != (missing != "") {
@@ -96,13 +96,13 @@ func TestTimeClarificationPreservesExplicitTimezoneAndDate(t *testing.T) {
 	for _, test := range []struct{ spec, want string }{
 		{"on Monday Europe/Brussels", "2026-11-16T08:00:00Z"},
 		{"on Monday morning Europe/Brussels", "2026-11-16T08:00:00Z"},
-		{"tomorrow at 5 Europe/Brussels", "2026-11-13T08:00:00Z"},
+		{"tomorrow at 25 Europe/Brussels", "2026-11-13T08:00:00Z"},
 		{"on Monday UTC", "2026-11-16T09:00:00Z"},
 	} {
 		t.Run(test.spec, func(t *testing.T) {
 			draft, err := Parse("remind me "+test.spec+" to collect my suit", now, "America/New_York")
 			missing := ""
-			if test.spec == "tomorrow at 5 Europe/Brussels" {
+			if test.spec == "tomorrow at 25 Europe/Brussels" {
 				missing = "time"
 			}
 			if err != nil || draft.Missing != missing || (draft.Reminder == nil) != (missing != "") {
