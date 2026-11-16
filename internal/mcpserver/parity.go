@@ -52,7 +52,7 @@ func registerParityTools(server *mcp.Server, reader RPCReader, openWorld *bool) 
 	server.AddTool(&mcp.Tool{
 		Name:         "read_session",
 		Title:        "Read one app's recent session",
-		Description:  "Read the saved captures of one app (for example Slack or a terminal) inside a window of at most 24 hours, oldest first, with each capture's text. Use it after get_chronicle or get_recent_activity point at an app and time and you need the actual conversation or session; pass the app's display name or ID plus from/to Unix seconds. Page with next, and open long captures further with get_snapshots using next_offset_bytes. Blur's own interface is never included. Results returned to the MCP host may be sent to its configured model provider.",
+		Description:  "Read the saved captures of one app (for example Slack or a terminal) inside a window of at most 24 hours, oldest first by when each capture was first saved (last_seen_at shows the latest revisit), with each capture's text. A very busy window returns the earliest 512 captures and sets coverage_limited. Use it after get_chronicle or get_recent_activity point at an app and time and you need the actual conversation or session; pass the app's display name or ID plus from/to Unix seconds. Page with next, and open long captures further with get_snapshots using next_offset_bytes. Blur's own interface is never included. Results returned to the MCP host may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(readSessionInputSchema),
 		OutputSchema: json.RawMessage(readSessionOutputSchema),
 		Annotations:  annotations,

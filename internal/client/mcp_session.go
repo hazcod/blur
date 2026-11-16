@@ -21,6 +21,7 @@ const (
 	maxMCPSessionScan         = 512
 	maxMCPSessionAppMatches   = 4
 	mcpSessionItemOverheadEst = 256
+	mcpSessionSlice           = time.Hour
 )
 
 type mcpSessionParams struct {
@@ -121,9 +122,87 @@ func (c *Client) resolveMCPSessionApps(ctx context.Context, name string) ([]stri
 }
 
 type mcpSessionEntry struct {
-	id   string
-	app  string
-	seen time.Time
+	id       string
+	app      string
+	seen     time.Time
+	captured time.Time
+}
+
+// scanMCPSessionApp collects up to maxMCPSessionScan captures of one app from
+// the start of the window forward, one slice at a time. Anything beyond the cap
+// is the newest tail and is reported through the limited result.
+func (c *Client) scanMCPSessionApp(ctx context.Context, reader ObservationWindowReader, app string, start, end time.Time) ([]mcpSessionEntry, bool, bool, error) {
+	var entries []mcpSessionEntry
+	limited, pending := false, false
+	indexByID := map[string]int{}
+	for sliceStart := start; sliceStart.Before(end); sliceStart = sliceStart.Add(mcpSessionSlice) {
+		sliceEnd := sliceStart.Add(mcpSessionSlice)
+		if sliceEnd.After(end) {
+			sliceEnd = end
+		}
+		if len(entries) >= maxMCPSessionScan {
+			// Probe the rest of the window for any remaining capture.
+			page, err := readSourceWindow(ctx, reader, storage.ObservationWindowRequest{Start: sliceStart, End: end, AppID: app, ExcludeAppIDs: []string{appidentity.BundleID}, Limit: 1, MaxBytes: storage.MaxObservationPageBytes})
+			if err != nil {
+				return nil, false, false, err
+			}
+			pending = pending || page.Pending
+			limited = len(page.Sources) > 0
+			break
+		}
+		var slice []mcpSessionEntry
+		before, beforeID := time.Time{}, ""
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil, false, false, err
+			}
+			page, err := readSourceWindow(ctx, reader, storage.ObservationWindowRequest{
+				Start: sliceStart, End: sliceEnd, AppID: app, ExcludeAppIDs: []string{appidentity.BundleID},
+				BeforeCapturedAt: before, BeforeSourceID: beforeID,
+				Limit: storage.MaxObservationPageRows, MaxBytes: storage.MaxObservationPageBytes,
+			})
+			if err != nil {
+				return nil, false, false, err
+			}
+			pending = pending || page.Pending
+			for i, source := range page.Sources {
+				slice = append(slice, mcpSessionEntry{id: source.SourceID(), app: source.AppID(), seen: page.CapturedAt[i]})
+			}
+			if !page.HasMore {
+				break
+			}
+			if page.NextSourceID == "" || page.NextCapturedAt.IsZero() || len(page.Sources) == 0 {
+				return nil, false, false, ErrInvalidRequest
+			}
+			if len(slice) >= 4*maxMCPSessionScan {
+				limited = true
+				break
+			}
+			before, beforeID = page.NextCapturedAt, page.NextSourceID
+		}
+		sort.SliceStable(slice, func(i, j int) bool {
+			if !slice[i].seen.Equal(slice[j].seen) {
+				return slice[i].seen.Before(slice[j].seen)
+			}
+			return slice[i].id < slice[j].id
+		})
+		// A capture revisited across slices appears once per slice; keep one
+		// row with its latest visit inside the window.
+		for _, item := range slice {
+			if index, duplicate := indexByID[item.id]; duplicate {
+				if item.seen.After(entries[index].seen) {
+					entries[index].seen = item.seen
+				}
+				continue
+			}
+			indexByID[item.id] = len(entries)
+			entries = append(entries, item)
+		}
+	}
+	if len(entries) > maxMCPSessionScan {
+		entries, limited = entries[:maxMCPSessionScan], true
+	}
+	return entries, limited, pending, nil
 }
 
 func (c *Client) readMCPSession(ctx context.Context, epoch uint64, params mcpSessionParams) (json.RawMessage, error) {
@@ -143,38 +222,34 @@ func (c *Client) readMCPSession(ctx context.Context, epoch uint64, params mcpSes
 			continue
 		}
 		response.AppIDs = append(response.AppIDs, app)
-		before, beforeID := time.Time{}, ""
-		for scanned := 0; ; {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			page, err := readSourceWindow(ctx, reader, storage.ObservationWindowRequest{
-				Start: start, End: end, AppID: app, ExcludeAppIDs: []string{appidentity.BundleID},
-				BeforeCapturedAt: before, BeforeSourceID: beforeID,
-				Limit: storage.MaxObservationPageRows, MaxBytes: storage.MaxObservationPageBytes,
-			})
-			if err != nil {
-				return nil, err
-			}
-			response.IndexingPending = response.IndexingPending || page.Pending
-			for i, source := range page.Sources {
-				entries = append(entries, mcpSessionEntry{id: source.SourceID(), app: source.AppID(), seen: page.CapturedAt[i]})
-			}
-			scanned += len(page.Sources)
-			if !page.HasMore {
-				break
-			}
-			if page.NextSourceID == "" || page.NextCapturedAt.IsZero() || len(page.Sources) == 0 {
-				return nil, ErrInvalidRequest
-			}
-			if scanned >= maxMCPSessionScan {
-				response.CoverageLimited = true
-				break
-			}
-			before, beforeID = page.NextCapturedAt, page.NextSourceID
+		found, limited, pending, err := c.scanMCPSessionApp(ctx, reader, app, start, end)
+		if err != nil {
+			return nil, err
 		}
+		entries = append(entries, found...)
+		response.CoverageLimited = response.CoverageLimited || limited
+		response.IndexingPending = response.IndexingPending || pending
+	}
+	// The store lists newest-first, so the scan walks the window forward in
+	// slices and the cap drops the newest tail. Order the kept captures by when
+	// each was first captured, then last seen, then source ID.
+	for i := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		at, unknown, err := c.sourceCaptureTime(ctx, entries[i].id, time.Time{})
+		if err != nil {
+			return nil, err
+		}
+		if unknown || at.IsZero() {
+			at = entries[i].seen
+		}
+		entries[i].captured = at
 	}
 	sort.SliceStable(entries, func(i, j int) bool {
+		if !entries[i].captured.Equal(entries[j].captured) {
+			return entries[i].captured.Before(entries[j].captured)
+		}
 		if !entries[i].seen.Equal(entries[j].seen) {
 			return entries[i].seen.Before(entries[j].seen)
 		}
