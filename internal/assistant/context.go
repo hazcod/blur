@@ -61,6 +61,7 @@ type Evidence struct {
 	AssociationUnverified bool // selected by time; not proof of the requested website, video, or meeting identity
 	TimeUnknown           bool // original capture time was lost; a retention baseline is not a sighting
 	Partial               bool // the source capture omitted original content, independently of model excerpting
+	TermsRelaxed          bool // a lookup match that contains some, not all, of the question's terms
 	SourceID              string
 	AppID                 string
 	AppName               string // display name of the app, optional
@@ -117,6 +118,7 @@ type packedEvidence struct {
 	AssociationUnverified bool           `json:"association_unverified,omitempty"`
 	TimeUnknown           bool           `json:"capture_time_unknown,omitempty"`
 	Partial               bool           `json:"partial_capture,omitempty"`
+	TermsRelaxed          bool           `json:"some_terms_match,omitempty"`
 	AppID                 string         `json:"app_id,omitempty"`
 	App                   string         `json:"app,omitempty"`
 	Domain                string         `json:"domain,omitempty"`
@@ -141,14 +143,18 @@ func packContextWithBudget(question string, evidence []Evidence, rules []string,
 	return packContextWithOptions(question, evidence, rules, inputLimit, contextOptions{})
 }
 
-type contextOptions struct{ balanced, sampled, transcript, repair bool }
+type contextOptions struct{ balanced, sampled, transcript, repair, chronological bool }
 
 func packContextWithOptions(question string, evidence []Evidence, rules []string, inputLimit int, options contextOptions) (PackedContext, error) {
 	question, err := normalizeQuestion(question)
 	if err != nil || len(evidence) == 0 {
 		return PackedContext{}, ErrContext
 	}
-	evidence = layerOrder(evidence)
+	if options.chronological {
+		evidence = chronologicalOrder(evidence)
+	} else {
+		evidence = layerOrder(evidence)
+	}
 	ruleBytes, err := validateWritingRules(rules)
 	if err != nil {
 		return PackedContext{}, err
@@ -201,7 +207,7 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 			payload.Omitted++
 			continue
 		}
-		packed := packedEvidence{AssociationUnverified: item.AssociationUnverified, TimeUnknown: item.TimeUnknown, AppID: item.AppID, App: item.AppName, Domain: item.Domain, Layer: layerName(item.Layer), Origin: item.Origin, Time: evidenceTime(item), Text: text, Partial: item.Partial, Truncated: item.Partial || len(text) != len(item.Text)}
+		packed := packedEvidence{AssociationUnverified: item.AssociationUnverified, TimeUnknown: item.TimeUnknown, AppID: item.AppID, App: item.AppName, Domain: item.Domain, Layer: layerName(item.Layer), Origin: item.Origin, Time: evidenceTime(item), Text: text, Partial: item.Partial, TermsRelaxed: item.TermsRelaxed, Truncated: item.Partial || len(text) != len(item.Text)}
 		packed.Label = "S" + strconv.Itoa(len(payload.Evidence)+1)
 		if options.transcript {
 			// Track changes retain authorship. Repeating immutable app/domain
@@ -243,6 +249,12 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 			if item.AssociationUnverified {
 				associationUnverified = true
 				system += " A voice transcript with association_unverified is only a recent recording candidate. Summarize its recorded words coherently, but explicitly say its link to the requested website or video is not verified. Do not claim it is that video or infer that the user performed activities merely mentioned in the recording. Keep separate recordings distinct."
+				break
+			}
+		}
+		for _, item := range payload.Evidence {
+			if item.TermsRelaxed {
+				system += " An item with some_terms_match contains only some of the question's words. Treat it as a closest match, not proof of the full question, and say so when you rely on it."
 				break
 			}
 		}

@@ -119,6 +119,9 @@ func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.
 		}
 	}
 	candidates = append(candidates, raw...)
+	// Sign-in screens are chrome; hour recaps and other captures in the same
+	// window are the substance when any exist.
+	candidates = demoteAuthenticationPages(candidates)
 	var leading []assistant.Evidence
 	rollupLimited := false
 	if len(rollups) > 0 {
@@ -137,7 +140,22 @@ func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.
 		leading = append(leading, chosen...)
 		rollupLimited = weekLimited || dayLimited
 	}
-	selected, limited := assistant.TimeDistributedEvidence(candidates, assistant.MaxEvidenceItems-len(leading))
+	var selected []assistant.Evidence
+	var limited bool
+	if end.Sub(start) > 24*time.Hour {
+		// A long period reads as a timeline: every day with saved items is
+		// represented before any day is represented twice, oldest first.
+		zone, zoneErr := loadZone(localZoneName())
+		if zoneErr != nil {
+			zone = time.UTC
+		}
+		selected, limited = assistant.DayBalancedEvidence(candidates, assistant.MaxEvidenceItems-len(leading), zone)
+		if diagnosis != nil {
+			diagnosis.Chronological = true
+		}
+	} else {
+		selected, limited = assistant.TimeDistributedEvidence(candidates, assistant.MaxEvidenceItems-len(leading))
+	}
 	return append(leading, selected...), sampled || limited || rollupLimited, nil
 }
 

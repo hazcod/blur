@@ -395,7 +395,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	byteBudget := inputBudget
 	for attempt := 0; ; attempt++ {
 		var memory memoryContext
-		memory, err = packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled})
+		memory, err = packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological})
 		packed = memory.PackedContext
 		conversationTurns, conversationTruncated = memory.Turns, memory.ConversationTruncated
 		if err != nil {
@@ -477,7 +477,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 				evidence = append(evidence, expanded.Evidence...)
 				byteBudget = inputBudget
 				for attempt := 0; ; attempt++ {
-					memory, packErr := packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled})
+					memory, packErr := packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological})
 					if packErr != nil {
 						return Result{}, packErr
 					}
