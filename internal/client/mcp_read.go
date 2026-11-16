@@ -80,7 +80,7 @@ type mcpSnapshotItem struct {
 	DocumentTotalBytes *int64 `json:"document_total_bytes,omitempty"`
 
 	// Sighting fields: how often identical content was seen.
-	SightingCount int64  `json:"sighting_count"`
+	SightingCount int64  `json:"sighting_count,omitempty"`
 	LastSeenAt    string `json:"last_seen_at,omitempty"`
 }
 
@@ -158,7 +158,7 @@ type mcpWorkingMemoryItem struct {
 	Truncated  bool      `json:"truncated"`
 
 	// Sighting fields: how often identical content was seen.
-	SightingCount int64  `json:"sighting_count"`
+	SightingCount int64  `json:"sighting_count,omitempty"`
 	LastSeenAt    string `json:"last_seen_at,omitempty"`
 }
 

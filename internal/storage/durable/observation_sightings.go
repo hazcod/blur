@@ -29,9 +29,12 @@ type observationSightingHour struct {
 	Times    []int64 `json:"times"`
 }
 
-// observationSightingCount is the additive per-source tally. Sources written
-// before it existed have no record and read as count 0 until their next
-// sighting. It is erased with the source's sighting chain.
+// observationSightingCount is the additive per-source tally. It is absent for
+// sources whose sightings were recorded before it existed (they decode as
+// count 0, meaning "not tallied"); readers then derive the count and newest
+// time from the source's sighting chain, and the next sighting persists the
+// derived count so the tally continues from the true number. It is erased
+// with the source's sighting chain.
 type observationSightingCount struct {
 	Count    int64 `json:"count"`
 	LastSeen int64 `json:"last_seen"`
@@ -47,25 +50,76 @@ func decodeSightingCount(encoded []byte) (observationSightingCount, error) {
 	return rec, nil
 }
 
-// bumpSightingCountLocked raises the per-source count by one and keeps the
-// newest last-seen time. A legacy source (no record) counts its original
-// capture plus this sighting.
-func (tx *Tx) bumpSightingCountLocked(id string, at time.Time) error {
+// maxSightingChainHops bounds the legacy chain walk (one hop per source/hour).
+const maxSightingChainHops = 4096
+
+// deriveSightingChain counts the distinct recorded sighting instants of a
+// source across its hour chain (the original capture always counts, at least
+// once) and returns the newest instant. It is the source of truth for sources
+// that have no count record.
+func deriveSightingChain(read sightingReader, id string, first time.Time) (int64, time.Time, error) {
+	count, last := int64(1), first
+	head, ok, err := read(observationSightingNS, id, 64)
+	if err != nil || !ok {
+		return count, last, err
+	}
+	hour := string(head)
+	clear(head)
+	for hops := 0; hour != "" && hops < maxSightingChainHops; hops++ {
+		if !validChronicleHourID(hour) {
+			return 0, time.Time{}, ErrCorrupt
+		}
+		encoded, found, err := read(observationSightingNS, sightingHourKey(id, hour), maxSightingHourBytes)
+		if err != nil {
+			return 0, time.Time{}, err
+		}
+		if !found {
+			return 0, time.Time{}, ErrCorrupt
+		}
+		node, err := decodeSightingHour(encoded, hour)
+		clear(encoded)
+		if err != nil {
+			return 0, time.Time{}, err
+		}
+		for _, n := range node.Times {
+			if n != first.UnixNano() { // the capture itself is already counted
+				count++
+			}
+			if at := time.Unix(0, n).UTC(); at.After(last) {
+				last = at
+			}
+		}
+		hour = node.Previous
+	}
+	return count, last, nil
+}
+
+// bumpSightingCountLocked records one more sighting, which the caller has
+// already written into the hour chain. Without a count record (legacy source)
+// the tally is derived from the chain, which already includes this sighting.
+func (tx *Tx) bumpSightingCountLocked(id string, at time.Time, first time.Time) error {
+	read := func(ns, key string, max int) ([]byte, bool, error) { return tx.readIndexValueLocked(ns, key, max) }
 	encoded, found, err := tx.readIndexValueLocked(observationSightingNS, sightingCountKey(id), 256)
 	if err != nil {
 		return err
 	}
-	rec := observationSightingCount{Count: 1}
+	var rec observationSightingCount
 	if found {
 		rec, err = decodeSightingCount(encoded)
 		clear(encoded)
-		if err != nil {
-			return err
-		}
 	}
-	rec.Count++
-	if n := at.UnixNano(); n > rec.LastSeen {
-		rec.LastSeen = n
+	if !found || err != nil {
+		// Legacy or damaged record: rebuild from the authoritative chain.
+		n, last, derr := deriveSightingChain(read, id, first)
+		if derr != nil {
+			return derr
+		}
+		rec = observationSightingCount{Count: n, LastSeen: last.UnixNano()}
+	} else {
+		rec.Count++
+		if n := at.UnixNano(); n > rec.LastSeen {
+			rec.LastSeen = n
+		}
 	}
 	out, err := json.Marshal(rec)
 	if err != nil {
@@ -76,8 +130,9 @@ func (tx *Tx) bumpSightingCountLocked(id string, at time.Time) error {
 }
 
 // ObservationSightingStats returns the monotonic sighting count (the original
-// capture counts as one) and the newest sighting time. Sources recorded before
-// counts existed report count 1 and their capture time until sighted again.
+// capture counts as one) and the newest sighting time. A source with no count
+// record (recorded before counts existed, or with a damaged record) reports
+// values derived from its sighting chain.
 func (s *Store) ObservationSightingStats(ctx context.Context, id string) (int64, time.Time, bool, error) {
 	if ctx == nil || !validHash(id) {
 		return 0, time.Time{}, false, &storage.StoreError{Code: storage.Invalid}
@@ -99,21 +154,25 @@ func (s *Store) ObservationSightingStats(ctx context.Context, id string) (int64,
 		if err != nil {
 			return err
 		}
-		found, count, last = true, 1, first
-		encoded, ok, err := s.readIndexValueReader(reader, observationSightingNS, sightingCountKey(id), 256)
-		if err != nil || !ok {
+		found = true
+		read := func(ns, key string, max int) ([]byte, bool, error) {
+			return s.readIndexValueReader(reader, ns, key, max)
+		}
+		if encoded, ok, err := read(observationSightingNS, sightingCountKey(id), 256); err != nil {
 			return err
+		} else if ok {
+			rec, derr := decodeSightingCount(encoded)
+			clear(encoded)
+			if derr == nil {
+				count, last = rec.Count, time.Unix(0, rec.LastSeen).UTC()
+				if first.After(last) {
+					last = first
+				}
+				return nil
+			}
 		}
-		rec, err := decodeSightingCount(encoded)
-		clear(encoded)
-		if err != nil {
-			return err
-		}
-		count = rec.Count
-		if at := time.Unix(0, rec.LastSeen).UTC(); at.After(last) {
-			last = at
-		}
-		return nil
+		count, last, err = deriveSightingChain(read, id, first)
+		return err
 	})
 	if err != nil {
 		return 0, time.Time{}, false, err
@@ -274,13 +333,13 @@ func (tx *Tx) recordObservationSighting(observation capture.SanitizedObservation
 	if err := tx.changeSightingMonthLocked(id, latest, false); err != nil {
 		return err
 	}
-	if err := tx.bumpSightingCountLocked(id, at); err != nil {
-		return err
-	}
 	if newHour {
-		return tx.putIndexValueLocked(observationSightingNS, id, []byte(hour))
+		if err := tx.putIndexValueLocked(observationSightingNS, id, []byte(hour)); err != nil {
+			return err
+		}
 	}
-	return nil
+	// Last: a legacy derivation walks the chain, which must include this hour.
+	return tx.bumpSightingCountLocked(id, at, first)
 }
 
 func (tx *Tx) changeSightingMonthLocked(id string, at time.Time, remove bool) error {

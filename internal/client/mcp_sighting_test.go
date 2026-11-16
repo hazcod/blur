@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -71,4 +72,69 @@ func TestMCPReadsReturnSightingCountAndLastSeenForEachCapture(t *testing.T) {
 	check("get_working_memory", sightingRead(t, corpus, localapi.RPCGetWorkingMemory, `{"hours":2,"limit":8}`, "items"))
 	check("read_session", sightingRead(t, corpus, localapi.RPCReadSession,
 		fmt.Sprintf(`{"app":%q,"from":%d,"to":%d}`, app, first.Add(-time.Hour).Unix(), corpus.now.Add(time.Hour).Unix()), "captures"))
+}
+
+// The durable layer's legacy derivation (no count record, 3 chain sightings)
+// is covered in storage/durable; this checks the MCP surface of a source with
+// 3 sightings reports 3 and the newest time, then 4 after one more.
+func TestMCPReadsReportThreeThenFourSightings(t *testing.T) {
+	corpus := newScenarioCorpus(t)
+	app := "com.example.chainsightings"
+	first := corpus.now.Add(-90 * time.Minute)
+	o := sessionTestCapture(t, corpus, app, "chain capture text that is longer than the minimum", first)
+	ctx := context.Background()
+	newest := first.Add(60 * time.Minute)
+	for _, at := range []time.Time{first.Add(10 * time.Minute), newest} {
+		if err := corpus.store.RecordObservationSighting(ctx, o, at.UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := fmt.Sprintf(`{"source_ids":[%q]}`, o.ContentID())
+	expect := func(want int64, last time.Time) {
+		t.Helper()
+		for name, items := range map[string][]sightingFields{
+			"get_snapshots":      sightingRead(t, corpus, localapi.RPCGetSnapshots, ids, "snapshots"),
+			"get_working_memory": sightingRead(t, corpus, localapi.RPCGetWorkingMemory, `{"hours":3,"limit":8}`, "items"),
+		} {
+			var mine []sightingFields
+			for _, item := range items {
+				if item.SourceID == o.ContentID() {
+					mine = append(mine, item)
+				}
+			}
+			if len(mine) != 1 {
+				t.Fatalf("%s: %d matching items", name, len(mine))
+			}
+			items = mine
+			at, err := time.Parse(time.RFC3339Nano, items[0].LastSeenAt)
+			if items[0].SightingCount == nil || *items[0].SightingCount != want || err != nil || !at.Equal(last.UTC()) {
+				t.Fatalf("%s: %+v want %d %s", name, items[0], want, last)
+			}
+		}
+	}
+	expect(3, newest)
+	later := first.Add(80 * time.Minute)
+	if err := corpus.store.RecordObservationSighting(ctx, o, later.UTC()); err != nil {
+		t.Fatal(err)
+	}
+	expect(4, later)
+}
+
+type failingSightingData struct{ Data }
+
+func (failingSightingData) ObservationSightingStats(context.Context, string) (int64, time.Time, bool, error) {
+	return 0, time.Time{}, false, errors.New("corrupt")
+}
+
+func TestMCPSightingUnreadableMetadataOmitsFieldsKeepsCapture(t *testing.T) {
+	c := &Client{data: failingSightingData{}}
+	count, last, err := c.mcpSighting(context.Background(), "id", time.Now())
+	if err != nil || count != 0 || last != "" {
+		t.Fatalf("got %d %q %v", count, last, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := c.mcpSighting(ctx, "id", time.Now()); err == nil {
+		t.Fatal("cancellation must still propagate")
+	}
 }

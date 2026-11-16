@@ -29,3 +29,20 @@ func TestMeetsMinimumContentCountsNonWhitespaceCharacters(t *testing.T) {
 		}
 	}
 }
+
+// Counting is per rune: combining marks and ZWJ sequences count as several
+// characters. This is accepted behavior, documented here.
+func TestMinimumContentCountsRunesNotGraphemes(t *testing.T) {
+	const app = "org.example.editor"
+	combining := strings.Repeat("e\u0301", 16) // 16 graphemes, 32 runes
+	if !MeetsMinimumContent(app, combining) {
+		t.Fatal("16 combining-mark graphemes (32 runes) should meet the minimum")
+	}
+	family := strings.Repeat("\U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466", 4) // 4 emoji, 28 runes
+	if MeetsMinimumContent(app, family) {
+		t.Fatal("4 ZWJ families are 28 runes and must not meet the minimum")
+	}
+	if !MeetsMinimumContent(app, family+"abcd") {
+		t.Fatal("28 runes plus 4 more should meet the minimum")
+	}
+}

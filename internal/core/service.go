@@ -9,6 +9,7 @@ import (
 	"hash"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/hazcod/blur/internal/buildinfo"
@@ -30,7 +31,13 @@ type Service struct {
 	searchSlots chan struct{}
 	reports     []platform.CapabilityReport
 	mode        string
+
+	droppedShort atomic.Uint64
 }
+
+// DroppedShort counts ingested observations discarded for carrying fewer than
+// capture.MinObservationChars non-whitespace characters.
+func (s *Service) DroppedShort() uint64 { return s.droppedShort.Load() }
 
 type StatusReport struct {
 	Version          string `json:"version"`
@@ -285,6 +292,10 @@ func (s *Service) Ingest(ctx context.Context, o capture.SanitizedObservation, pr
 	// cancellation arrives immediately afterward.
 	if err := checkContext(ctx); err != nil {
 		return err
+	}
+	if !capture.MeetsMinimumContent(o.AppID(), o.Text()) {
+		s.droppedShort.Add(1)
+		return nil
 	}
 	err := s.store.PutObservation(ctx, o)
 	var storeErr *storage.StoreError

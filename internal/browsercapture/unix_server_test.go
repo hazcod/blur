@@ -42,7 +42,7 @@ func TestUnixServerAcceptsAuthenticatedBoundedFrameAndStopsCleanly(t *testing.T)
 	if err != nil || info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("socket not private: %v %v", info, err)
 	}
-	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test","text":"body","active":true,"privacy_known":true,"private":false,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
+	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test","text":"body text that is comfortably long enough to keep","active":true,"privacy_known":true,"private":false,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
 	digest := sha256.Sum256(payload)
 	proof, _ := localapi.NewProof(grant, localapi.ScopeCaptureIngest, digest, now, nil)
 	frame, _ := json.Marshal(struct {

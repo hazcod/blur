@@ -46,7 +46,7 @@ type mcpSessionCapture struct {
 	PartialCapture  bool   `json:"partial_capture,omitempty"`
 
 	// Sighting count: how often identical content was seen (last_seen_at above).
-	SightingCount int64 `json:"sighting_count"`
+	SightingCount int64 `json:"sighting_count,omitempty"`
 }
 
 type mcpSessionResponse struct {
