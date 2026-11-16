@@ -108,7 +108,7 @@ func New(reader RPCReader) *mcp.Server {
 		Title:        "Read saved capture text",
 		Description:  "Read full saved capture text for source IDs returned by search_memory. Large captures are paginated by UTF-8 byte offsets; pass next_offset_bytes in offsets to continue. Each result may contain full text from a source part of a larger document. Results are returned to the MCP host and may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(snapshotInputSchema),
-		OutputSchema: json.RawMessage(snapshotOutputSchema),
+		OutputSchema: withFocusProperties(snapshotOutputSchema, "snapshots"),
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld},
 	}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return getSnapshots(ctx, reader, request)
@@ -148,7 +148,7 @@ func New(reader RPCReader) *mcp.Server {
 		Title:        "Read recent context",
 		Description:  "Read the newest saved captures from the last few hours, excluding Blur's own interface. Use this for vague/current questions; each excerpt has a source ID and may be shortened, so call get_snapshots before exact claims. Results are returned to the MCP host and may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(workingMemoryInputSchema),
-		OutputSchema: json.RawMessage(workingMemoryOutputSchema),
+		OutputSchema: withFocusProperties(workingMemoryOutputSchema, "items"),
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld},
 	}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return getWorkingMemory(ctx, reader, request)
@@ -281,6 +281,8 @@ type workingMemoryItem struct {
 	CapturedAt string `json:"captured_at"`
 	Content    string `json:"content"`
 	Truncated  bool   `json:"truncated"`
+
+	focusFields // focused-element breadcrumb (focus.go)
 }
 
 type workingMemoryOutput struct {
@@ -830,6 +832,9 @@ func boundWorkingMemoryOutput(output workingMemoryOutput, input workingMemoryInp
 	seen := make(map[string]bool, len(output.Items))
 	previous := end
 	for _, item := range output.Items {
+		if !item.focusFields.valid() {
+			return false
+		}
 		if len(item.SourceID) != 64 || strings.ToLower(item.SourceID) != item.SourceID || seen[item.SourceID] || !validOutputText(item.AppID, 128) || strings.EqualFold(item.AppID, appidentity.BundleID) || item.Domain != "" && !validOutputText(item.Domain, 253) || !validOutputText(item.Content, 1600) {
 			return false
 		}
@@ -1157,6 +1162,8 @@ type snapshotItem struct {
 	PartCount          *int64 `json:"part_count,omitempty"`
 	DocumentOffset     *int64 `json:"document_offset_bytes,omitempty"`
 	DocumentTotalBytes *int64 `json:"document_total_bytes,omitempty"`
+
+	focusFields // focused-element breadcrumb (focus.go)
 }
 
 type snapshotOutput struct {
@@ -1241,6 +1248,9 @@ func boundSnapshotOutput(input snapshotOutput, request snapshotInput) (snapshotO
 	seen := map[string]bool{}
 	used := 0
 	for _, item := range input.Snapshots {
+		if !item.focusFields.valid() {
+			return snapshotOutput{}, false
+		}
 		_, sourceIDErr := hex.DecodeString(item.SourceID)
 		if sourceIDErr != nil || !allowed[item.SourceID] || seen[item.SourceID] || !validOutputText(item.AppID, 128) || item.Domain != "" && !validOutputText(item.Domain, 253) || !utf8.ValidString(item.Content) || strings.IndexByte(item.Content, 0) >= 0 || len(item.Content) > request.MaxBytesPerSource || len(item.Content) > 4096 || item.OffsetBytes != request.Offsets[item.SourceID] || item.NextOffsetBytes != item.OffsetBytes+len(item.Content) || item.NextOffsetBytes < item.OffsetBytes || item.CapturedAt != "" && len(item.CapturedAt) > 40 {
 			return snapshotOutput{}, false

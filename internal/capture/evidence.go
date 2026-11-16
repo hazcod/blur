@@ -98,6 +98,27 @@ func (e Evidence) Truncated() bool {
 	}
 	return e.summary.Coverage() != CaptureComplete
 }
+
+// FocusedRole, FocusedName and FocusedPath expose the focused-element
+// breadcrumb of a single-observation source. Multipart captures carry none.
+func (e Evidence) FocusedRole() string {
+	if e.kind == 1 {
+		return e.observation.FocusedRole()
+	}
+	return ""
+}
+func (e Evidence) FocusedName() string {
+	if e.kind == 1 {
+		return e.observation.FocusedName()
+	}
+	return ""
+}
+func (e Evidence) FocusedPath() string {
+	if e.kind == 1 {
+		return e.observation.FocusedPath()
+	}
+	return ""
+}
 func (e Evidence) RedactionVersion() int {
 	if e.kind == 1 {
 		return e.observation.RedactionVersion()

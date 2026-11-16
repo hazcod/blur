@@ -78,6 +78,8 @@ type mcpSnapshotItem struct {
 	PartCount          *int64 `json:"part_count,omitempty"`
 	DocumentOffset     *int64 `json:"document_offset_bytes,omitempty"`
 	DocumentTotalBytes *int64 `json:"document_total_bytes,omitempty"`
+
+	mcpFocusFields // focused-element breadcrumb (mcp_focus.go)
 }
 
 type mcpSnapshotResponse struct {
@@ -152,6 +154,8 @@ type mcpWorkingMemoryItem struct {
 	CapturedAt time.Time `json:"captured_at"`
 	Content    string    `json:"content"`
 	Truncated  bool      `json:"truncated"`
+
+	mcpFocusFields // focused-element breadcrumb (mcp_focus.go)
 }
 
 type mcpWorkingMemoryResponse struct {
@@ -710,8 +714,10 @@ func (c *Client) readMCPWorkingMemory(ctx context.Context, epoch uint64, params 
 		response.Items = append(response.Items, mcpWorkingMemoryItem{
 			SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(),
 			CapturedAt: at.UTC(), Content: content, Truncated: clipped || source.Truncated(),
+			mcpFocusFields: focusFieldsOf(source), // focused-element breadcrumb
 		})
 	}
+	trimWorkingMemoryFocus(&response) // breadcrumb yields to the byte budget
 	encoded, err := json.Marshal(response)
 	if err != nil || len(encoded) > maxMCPReadOutputBytes {
 		clear(encoded)
@@ -1309,6 +1315,7 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 		if !at.IsZero() {
 			item.CapturedAt = at.UTC().Format(time.RFC3339Nano)
 		}
+		item.mcpFocusFields = focusFieldsOf(evidence) // focused-element breadcrumb
 		if provenance, multipart := evidence.Provenance(); multipart {
 			item.DocumentID = provenance.EditionID
 			item.PartIndex = &provenance.PartIndex

@@ -44,6 +44,8 @@ type mcpSessionCapture struct {
 	NextOffsetBytes int    `json:"next_offset_bytes"`
 	Complete        bool   `json:"complete"`
 	PartialCapture  bool   `json:"partial_capture,omitempty"`
+
+	mcpFocusFields // focused-element breadcrumb (mcp_focus.go)
 }
 
 type mcpSessionResponse struct {
@@ -320,6 +322,7 @@ func (c *Client) sessionCapture(ctx context.Context, entry mcpSessionEntry, chun
 	var found bool
 	var text, appID, domain string
 	var partial bool
+	var focus mcpFocusFields // focused-element breadcrumb
 	if timed, ok := c.data.(storage.ObservationTimeReader); ok {
 		evidence, at, ok, err := storage.ReadSourceEvidenceWithCaptureTime(ctx, timed, entry.id)
 		if err != nil {
@@ -327,6 +330,7 @@ func (c *Client) sessionCapture(ctx context.Context, entry mcpSessionEntry, chun
 		}
 		found, captured = ok, at
 		text, appID, domain, partial = evidence.Text(), evidence.AppID(), evidence.Domain(), evidence.Truncated()
+		focus = focusFieldsOf(evidence)
 	} else {
 		evidence, ok, err := storage.ReadSourceEvidence(ctx, reader, entry.id)
 		if err != nil {
@@ -334,6 +338,7 @@ func (c *Client) sessionCapture(ctx context.Context, entry mcpSessionEntry, chun
 		}
 		found = ok
 		text, appID, domain, partial = evidence.Text(), evidence.AppID(), evidence.Domain(), evidence.Truncated()
+		focus = focusFieldsOf(evidence)
 	}
 	// A capture deleted between listing and reading means memory is changing.
 	if !found || strings.EqualFold(appID, appidentity.BundleID) || !utf8.ValidString(text) || strings.IndexByte(text, 0) >= 0 {
@@ -343,7 +348,7 @@ func (c *Client) sessionCapture(ctx context.Context, entry mcpSessionEntry, chun
 	for end > 0 && end < len(text) && !utf8.RuneStart(text[end]) {
 		end--
 	}
-	item := mcpSessionCapture{SourceID: entry.id, AppID: appID, Domain: domain, LastSeenAt: entry.seen.UTC().Format(time.RFC3339Nano), Content: text[:end], NextOffsetBytes: end, Complete: end == len(text), PartialCapture: partial}
+	item := mcpSessionCapture{SourceID: entry.id, AppID: appID, Domain: domain, LastSeenAt: entry.seen.UTC().Format(time.RFC3339Nano), Content: text[:end], NextOffsetBytes: end, Complete: end == len(text), PartialCapture: partial, mcpFocusFields: focus}
 	if !captured.IsZero() {
 		item.CapturedAt = captured.UTC().Format(time.RFC3339Nano)
 	}

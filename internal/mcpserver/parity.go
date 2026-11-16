@@ -54,7 +54,7 @@ func registerParityTools(server *mcp.Server, reader RPCReader, openWorld *bool) 
 		Title:        "Read one app's recent session",
 		Description:  "Read the saved captures of one app (for example Slack or a terminal) inside a window of at most 24 hours, oldest first by when each capture was first saved (last_seen_at shows the latest revisit), with each capture's text. A very busy window returns the earliest 512 captures and sets coverage_limited. Use it after get_chronicle or get_recent_activity point at an app and time and you need the actual conversation or session; pass the app's display name or ID plus from/to Unix seconds. Page with next, and open long captures further with get_snapshots using next_offset_bytes. Blur's own interface is never included. Results returned to the MCP host may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(readSessionInputSchema),
-		OutputSchema: json.RawMessage(readSessionOutputSchema),
+		OutputSchema: withFocusProperties(readSessionOutputSchema, "captures"),
 		Annotations:  annotations,
 	}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return readSession(ctx, reader, request)
@@ -158,6 +158,8 @@ type sessionCapture struct {
 	NextOffsetBytes int    `json:"next_offset_bytes"`
 	Complete        bool   `json:"complete"`
 	PartialCapture  bool   `json:"partial_capture,omitempty"`
+
+	focusFields // focused-element breadcrumb (focus.go)
 }
 
 type readSessionOutput struct {
@@ -197,6 +199,9 @@ func boundReadSessionOutput(output readSessionOutput, input readSessionInput, li
 	}
 	seen := map[string]bool{}
 	for _, item := range output.Captures {
+		if !item.focusFields.valid() {
+			return false
+		}
 		if !validSourceIDText(item.SourceID) || seen[item.SourceID] || !validOutputText(item.AppID, 128) || strings.EqualFold(item.AppID, appidentity.BundleID) || item.Domain != "" && !validOutputText(item.Domain, 253) || !validOptionalTimestamp(item.CapturedAt) || item.LastSeenAt == "" || !validOptionalTimestamp(item.LastSeenAt) || !utf8.ValidString(item.Content) || strings.IndexByte(item.Content, 0) >= 0 || len(item.Content) > chunk || item.OffsetBytes != 0 || item.NextOffsetBytes != len(item.Content) {
 			return false
 		}
