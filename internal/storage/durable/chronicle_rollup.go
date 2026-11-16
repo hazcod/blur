@@ -107,7 +107,20 @@ func (s *Store) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup)
 			return err
 		}
 		if !found {
+			rollup.Revision = 0
 			return tx.writeRollup(rollup, nil)
+		}
+		// Compare-and-set: the caller generated this rollup from the revision
+		// it read. If an hour recap changed since, the rollup is stored but
+		// stays dirty so the next pass regenerates it.
+		if !rollup.Dirty && rollup.Revision != old.Revision {
+			rollup.Dirty = true
+		}
+		rollup.Revision = old.Revision
+		if rollup.Dirty {
+			// Marking dirty (for example a week after its day regenerated)
+			// also makes any in-flight generation of this rollup stale.
+			rollup.Revision++
 		}
 		return tx.writeRollup(rollup, &old)
 	})
@@ -276,12 +289,55 @@ func (tx *Tx) markChronicleDayDirty(hourStart time.Time) error {
 		}
 		return tx.writeRollup(placeholder, nil)
 	}
-	if rollup.Dirty {
-		return nil
-	}
 	old := rollup
 	rollup.Dirty = true
+	rollup.Revision++ // even when already dirty: an in-flight generation is now stale
 	return tx.writeRollup(rollup, &old)
+}
+
+// invalidateRollupsCoveringHour discards the generated text of every day and
+// week rollup that covers an hour whose recap was deleted. A deleted recap may
+// have been derived from a source that the rollup never cited (an input-only
+// source), so the rollup text cannot be trusted to be free of it. The rollup
+// stays dirty and regenerates from the hour recaps that remain.
+func (tx *Tx) invalidateRollupsCoveringHour(hourStart time.Time) error {
+	loc, _ := tx.store.rollupLocation()
+	var ids []string
+	add := func(date string) {
+		ids = append(ids, chronicle.DayRollupID(date))
+		if week, ok := chronicle.WeekKeyForDate(date); ok {
+			ids = append(ids, chronicle.WeekRollupID(week))
+		}
+	}
+	// A rollup is dated in its own zone, so look around the UTC date as well
+	// as at the current local date; coverage is checked against its bounds.
+	for _, offset := range []int{-1, 0, 1} {
+		add(hourStart.UTC().AddDate(0, 0, offset).Format("2006-01-02"))
+	}
+	add(chronicle.DayKeyAt(hourStart, loc))
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		rollup, found, err := tx.readRollup(id)
+		if err != nil {
+			return err
+		}
+		if !found || hourStart.Before(rollup.Start) || !hourStart.Before(rollup.End) {
+			continue
+		}
+		old := rollup
+		rollup.Text, rollup.InputHash, rollup.Model, rollup.GeneratedAt = "", "", "", time.Time{}
+		rollup.ChildIDs, rollup.SourceIDs = nil, nil
+		rollup.Dirty = true
+		rollup.Revision++
+		if err := tx.writeRollup(rollup, &old); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (tx *Tx) readRollupShards() ([]string, error) {

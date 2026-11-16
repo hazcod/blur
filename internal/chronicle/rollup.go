@@ -49,6 +49,10 @@ type Rollup struct {
 	Model       string    `json:"model,omitempty"`
 	InputHash   string    `json:"input_hash"` // hex SHA-256 of the ordered child texts
 	Dirty       bool      `json:"dirty"`
+	// Revision is owned by the store. It advances whenever an input of the
+	// rollup changes. A write of a clean rollup that was generated from an
+	// older revision is kept dirty, so late inputs are never lost.
+	Revision uint64 `json:"revision,omitempty"`
 }
 
 // RollupRepository is the optional storage capability that enables rollups.

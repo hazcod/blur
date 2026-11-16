@@ -409,6 +409,9 @@ func (tx *Tx) deleteChronicle(id string) error {
 	if err := tx.deleteKnowledgeRecord(chronicleNS, id); err != nil {
 		return err
 	}
+	if err := tx.invalidateRollupsCoveringHour(summary.Start); err != nil {
+		return err
+	}
 	return tx.markChronicleDayDirty(summary.Start)
 }
 
