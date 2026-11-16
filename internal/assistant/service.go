@@ -70,6 +70,7 @@ type Result struct {
 	GenerationIssue       string
 	CoverageLimited       bool // recap retrieval or model context omitted/excerpted saved evidence
 	IndexingPending       bool
+	TermsRelaxed          bool // a packed item matches only some of the question's words
 	Answer                Answer
 	Sources               []Evidence
 	InputTokens           int
@@ -395,7 +396,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	byteBudget := inputBudget
 	for attempt := 0; ; attempt++ {
 		var memory memoryContext
-		memory, err = packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled})
+		memory, err = packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological})
 		packed = memory.PackedContext
 		conversationTurns, conversationTruncated = memory.Turns, memory.ConversationTruncated
 		if err != nil {
@@ -477,7 +478,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 				evidence = append(evidence, expanded.Evidence...)
 				byteBudget = inputBudget
 				for attempt := 0; ; attempt++ {
-					memory, packErr := packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled})
+					memory, packErr := packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological})
 					if packErr != nil {
 						return Result{}, packErr
 					}
@@ -544,7 +545,9 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 		sources = append(sources, source)
 	}
 	targets := citedTargets(answer.SourceIDs, append(append([]TargetRef(nil), personal.Targets...), retrieval.Targets...))
+	retrieval.Diagnosis.TermsRelaxed = packedTermsRelaxed(evidence, packed.SourceIDs)
 	return Result{
+		TermsRelaxed:      retrieval.Diagnosis.TermsRelaxed,
 		CoverageLimited:   memoryCoverageLimited(plan, retrieval.Diagnosis, packed),
 		ConversationTurns: conversationTurns, ConversationTruncated: conversationTruncated,
 		IndexingPending: retrieval.Diagnosis.IndexingPending,

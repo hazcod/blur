@@ -533,7 +533,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 	} else {
 		switch plan.Kind {
 		case assistant.KindCapture:
-			retrieval.Evidence, retrieval.Diagnosis.ScopeWidened, _, err = c.recencyEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
+			retrieval.Evidence, retrieval.Diagnosis.ScopeWidened, _, err = c.captureEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
 		case assistant.KindRecap:
 			retrieval.Evidence, retrieval.Diagnosis.RecapSampled, err = c.recapEvidenceWithDiagnosis(ctx, plan, start, end, scoped, &retrieval.Diagnosis)
 		case assistant.KindLookup:
@@ -661,6 +661,23 @@ func syntheticID(parts ...string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// captureEvidence is recencyEvidence for capture questions, with sign-in screens
+// demoted whenever the window holds a substantive capture. Both the model path
+// and the direct answer path read it, so neither lists login chrome as activity.
+// Demotion runs on a wider candidate list and the cut to limit comes after it,
+// so sign-in screens cannot crowd substantive captures out of the answer.
+func (c *Client) captureEvidence(ctx context.Context, plan assistant.Plan, start, end time.Time, scoped []activity.Segment, limit int) ([]assistant.Evidence, time.Duration, []activity.Segment, error) {
+	if questionHasLoginCue(plan.Question) {
+		return c.recencyEvidence(ctx, plan, start, end, scoped, limit)
+	}
+	items, widened, segments, err := c.recencyEvidence(ctx, plan, start, end, scoped, min(limit*captureDemotionFactor, maxRecentCandidates))
+	if err != nil {
+		return nil, widened, segments, err
+	}
+	items = demoteAuthenticationPages(plan.Question, items)
+	return items[:min(len(items), limit)], widened, segments, nil
+}
+
 func (c *Client) lookupEvidence(ctx context.Context, plan assistant.Plan, bounded bool, windowSegs, scoped []activity.Segment, diagnosis ...*assistant.Diagnosis) ([]assistant.Evidence, bool, error) {
 	return c.lookupEvidenceWithExpansion(ctx, plan, bounded, windowSegs, scoped, firstDiagnosis(diagnosis), nil, nil)
 }
@@ -725,6 +742,10 @@ func (c *Client) pageEvidence(ctx context.Context, plan assistant.Plan, page sea
 		return nil, err
 	}
 	locateExactPassages(hits, plan.Terms)
+	matched := make(map[string]uint32, len(page.Hits))
+	for _, hit := range page.Hits {
+		matched[hit.SourceID] = hit.MatchedTerms
+	}
 	starts := map[string]time.Time{}
 	for _, hit := range hits {
 		if !hit.CapturedAt.IsZero() {
@@ -742,6 +763,7 @@ func (c *Client) pageEvidence(ctx context.Context, plan assistant.Plan, page sea
 	for _, hit := range hits {
 		ev := newEvidence(hit.SourceID, hit.AppID, hit.Domain, hit.Text)
 		ev.Partial = hit.Partial
+		ev.TermsRelaxed = termsRelaxed(matched[hit.SourceID], len(plan.Terms))
 		ev.Document = hit.Document
 		ev.CapturedAt, ev.TimeUnknown = hit.CapturedAt, hit.TimeUnknown
 		ev.MatchStart, ev.MatchEnd = hit.MatchStart, hit.MatchEnd
@@ -761,7 +783,7 @@ func (c *Client) pageEvidence(ctx context.Context, plan assistant.Plan, page sea
 // domain filter, merged by score and restricted to sources inside the window.
 func (c *Client) planSearch(ctx context.Context, plan assistant.Plan, bounded bool, windowSegs []activity.Segment) (search.ExactPage, error) {
 	pool := planEvidenceItems
-	if bounded {
+	if bounded || plan.Kind == assistant.KindLookup {
 		pool = planLookupPool
 	}
 	return c.planSearchCandidatesWithExactRanking(ctx, plan, bounded, windowSegs, planEvidenceItems, pool, min(search.MaxIndexRows, pool*16), false)
@@ -826,6 +848,10 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 	best := map[string]search.IndexHit{}
 	partialBest := map[string]search.IndexHit{}
 	var merged search.ExactPage
+	// Ask lookups always add majority-term matches to the all-terms hits, so a
+	// capture that words one topic differently ("retest" for "pentest retest")
+	// is still found and then ranked by lookupRank.
+	relaxed := !rankExactQuestions && plan.Kind == assistant.KindLookup && !plan.Conversation && !plan.Literal && len(terms) >= 2
 	for _, f := range filters {
 		minMatches := 0
 		for pass := 0; pass < 2; pass++ {
@@ -833,6 +859,14 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 				return search.ExactPage{}, err
 			}
 			page, err := c.data.SearchExact(ctx, search.ExactQuery{Terms: terms, AppID: f.app, Domain: f.domain, ExcludeAppIDs: []string{appidentity.BundleID}, CapturedStart: start, CapturedEnd: end, ScopeSourceIDs: scopeSources, MinTermMatches: minMatches, PartialOnly: pass == 1, TopK: pool, MaxRows: maxRows, MaxBytes: search.MaxIndexBytes})
+			if pass == 1 && errors.Is(err, search.ErrIndexBudget) {
+				// The majority-term pass is an optional widening. When it cannot
+				// prove its top results inside the row budget, keep the all-terms
+				// hits and report the coverage gap instead of failing the question.
+				merged.CoverageLimited = true
+				merged.HasMore = true
+				break
+			}
 			if err != nil {
 				return search.ExactPage{}, err
 			}
@@ -852,7 +886,7 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 					}
 				}
 			}
-			if pass == 1 || plan.Literal || len(terms) < 2 || len(page.Hits) > 0 && len(page.Hits) < min(pool, recallCandidates) {
+			if pass == 1 || plan.Literal || len(terms) < 2 || !relaxed && len(page.Hits) > 0 && len(page.Hits) < min(pool, recallCandidates) {
 				break
 			}
 			// If strict AND results are absent or already fill the relevance
@@ -860,7 +894,7 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 			// exact list can otherwise crowd out semantically relevant captures;
 			// the selected model relevance-checks every added candidate before it
 			// can become Ask evidence.
-			minMatches = max(1, (len(terms)+1)/2)
+			minMatches = lookupMajorityTerms(len(terms))
 		}
 	}
 	partial := make([]search.IndexHit, 0, len(partialBest))
@@ -882,7 +916,14 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 		}
 		return merged.Hits[i].SourceID < merged.Hits[j].SourceID
 	})
-	merged.Hits = reservePartialTermCandidates(merged.Hits, partial, pool, limit)
+	if relaxed {
+		merged.Hits, err = c.rankLookupPool(ctx, plan, terms, merged.Hits, partial, pool)
+		if err != nil {
+			return search.ExactPage{}, err
+		}
+	} else {
+		merged.Hits = reservePartialTermCandidates(merged.Hits, partial, pool, limit)
+	}
 	question := plan.Question
 	if question == "" {
 		question = plan.SearchQuery()
@@ -1285,7 +1326,7 @@ func (c *Client) AnswerDirect(ctx context.Context, plan assistant.Plan) (assista
 		answer, handled, err := directTime(scoped, start, end, zone, label, subject)
 		return assistant.DirectAnswer{Answer: answer}, handled, err
 	}
-	evidence, widened, scoped, err := c.recencyEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
+	evidence, widened, scoped, err := c.captureEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
 	if err != nil || len(evidence) == 0 {
 		return assistant.DirectAnswer{}, false, err
 	}

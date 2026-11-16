@@ -12,7 +12,7 @@ import (
 // generated a synthesis. It shares the validated, bounded passage selection
 // with model answers and keeps complete originals available for inspection.
 func quotedEvidenceAnswer(question string, plan Plan, evidence []Evidence, diagnosis Diagnosis, contextLimit int) (Result, error) {
-	packed, err := packContextWithOptions(question, evidence, nil, contextLimit-MaxAnswerTokens-PromptTemplateReserve, contextOptions{balanced: plan.Kind == KindRecap, sampled: diagnosis.RecapSampled})
+	packed, err := packContextWithOptions(question, evidence, nil, contextLimit-MaxAnswerTokens-PromptTemplateReserve, contextOptions{balanced: plan.Kind == KindRecap, sampled: diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && diagnosis.Chronological})
 	if err != nil {
 		return Result{}, err
 	}
@@ -34,7 +34,13 @@ func quotedEvidenceAnswer(question string, plan Plan, evidence []Evidence, diagn
 	if voice {
 		text.WriteString("Voice transcript:\n\n“")
 	} else {
-		text.WriteString("Saved passages:\n\n")
+		// Passages that only share some of the question's words are shown as
+		// the closest matches, never as if they matched everything asked.
+		if packedTermsRelaxed(evidence, packed.SourceIDs) {
+			text.WriteString("Saved passages (the closest matches; not every word of your question appears in each):\n\n")
+		} else {
+			text.WriteString("Saved passages:\n\n")
+		}
 	}
 	sources := make([]Evidence, 0, len(packed.SourceIDs))
 	partial := false
@@ -70,7 +76,8 @@ func quotedEvidenceAnswer(question string, plan Plan, evidence []Evidence, diagn
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Answer: answer, Sources: sources, Direct: true, Plan: plan, IndexingPending: diagnosis.IndexingPending, Omitted: packed.Omitted, Truncated: packed.Truncated, CoverageLimited: memoryCoverageLimited(plan, diagnosis, packed)}, nil
+	diagnosis.TermsRelaxed = packedTermsRelaxed(evidence, packed.SourceIDs)
+	return Result{TermsRelaxed: diagnosis.TermsRelaxed, Answer: answer, Sources: sources, Direct: true, Plan: plan, IndexingPending: diagnosis.IndexingPending, Omitted: packed.Omitted, Truncated: packed.Truncated, CoverageLimited: memoryCoverageLimited(plan, diagnosis, packed)}, nil
 }
 
 func memoryCoverageLimited(plan Plan, diagnosis Diagnosis, packed PackedContext) bool {
@@ -115,4 +122,19 @@ func invalidGroundedResponse(err error) bool {
 	default:
 		return false
 	}
+}
+
+// packedTermsRelaxed reports whether any evidence item actually sent in the
+// packed context matches only some of the question's words.
+func packedTermsRelaxed(evidence []Evidence, packedIDs []string) bool {
+	packed := make(map[string]bool, len(packedIDs))
+	for _, id := range packedIDs {
+		packed[id] = true
+	}
+	for _, item := range evidence {
+		if item.TermsRelaxed && packed[item.SourceID] {
+			return true
+		}
+	}
+	return false
 }
