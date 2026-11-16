@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/hazcod/blur/internal/acceptance"
 	"github.com/hazcod/blur/internal/localapi"
 )
 
@@ -25,6 +26,19 @@ const (
 // private to the user. Elsewhere, or if that directory is unknown, it falls
 // back to the data directory.
 func MCPSocketAddress(dataDir string) string {
+	if acceptance.Enabled {
+		config, err := acceptance.Load()
+		if err != nil || dataDir != config.DataDirectory() {
+			return ""
+		}
+		// The production per-user socket is intentionally stable across launches.
+		// A fixture must never bind or remove that owner's endpoint.
+		address := filepath.Join(dataDir, mcpSocketFileName)
+		if (localapi.EndpointDescriptor{Kind: localapi.EndpointUnix, Address: address}).Validate() != nil {
+			return ""
+		}
+		return address
+	}
 	if base := userTempDir(); base != "" {
 		address := mcpSocketPathIn(base)
 		endpoint := localapi.EndpointDescriptor{Kind: localapi.EndpointUnix, Address: address}

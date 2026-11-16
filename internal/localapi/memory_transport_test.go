@@ -20,7 +20,7 @@ func TestEndpointDescriptors(t *testing.T) {
 			t.Fatal("security requirements absent")
 		}
 	}
-	invalid := []EndpointDescriptor{{}, {Kind: "tcp", Address: "127.0.0.1:1"}, {Kind: EndpointUnix, Address: "relative"}, {Kind: EndpointUnix, Address: "/tmp/../socket"}, {Kind: EndpointUnix, Address: "/tmp/blur\n/socket"}, {Kind: EndpointUnix, Address: "/"}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\other`}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\blur-user-alice-..`}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\blur-user-alice/name`}}
+	invalid := []EndpointDescriptor{{}, {Kind: "tcp", Address: "127.0.0.1:1"}, {Kind: EndpointUnix, Address: "relative"}, {Kind: EndpointUnix, Address: "/tmp/../socket"}, {Kind: EndpointUnix, Address: "/tmp/blur\n/socket"}, {Kind: EndpointUnix, Address: "/"}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\othere`}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\blur-user-alice-..`}, {Kind: EndpointNamedPipe, Address: `\\.\pipe\blur-user-alice/name`}}
 	for _, e := range invalid {
 		if err := e.Validate(); !errors.Is(err, ErrInvalidEndpoint) {
 			t.Fatalf("accepted %+v: %v", e, err)
@@ -36,17 +36,17 @@ func TestMemoryTransportRoundTripCopiesAndBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func(close func() error) { _ = close() }(l.Close)
 	client, err := m.Dial(ctx, e)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func(close func() error) { _ = close() }(client.Close)
 	server, err := l.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer func(close func() error) { _ = close() }(server.Close)
 	message := []byte("ping")
 	if err := client.Send(ctx, message); err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func TestMemoryTransportConcurrentClientsNoLeak(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			defer c.Close()
+			defer func(close func() error) { _ = close() }(c.Close)
 			if err := c.Send(ctx, []byte("x")); err != nil {
 				t.Error(err)
 			}
@@ -183,18 +183,18 @@ func TestMemoryTransportConcurrentClientsNoLeak(t *testing.T) {
 func TestMemoryTransportNilContextIsRejected(t *testing.T) {
 	m := NewMemoryTransport(1, 4)
 	e := EndpointDescriptor{Kind: EndpointUnix, Address: "/tmp/blur-user/socket"}
-	if _, err := m.Listen(nil, e); !errors.Is(err, ErrCanceled) {
+	if _, err := m.Listen(nil, e); !errors.Is(err, ErrCanceled) { //nolint:staticcheck // Verify that the API rejects a nil context.
 		t.Fatalf("nil listen: %v", err)
 	}
-	if _, err := m.Dial(nil, e); !errors.Is(err, ErrCanceled) {
+	if _, err := m.Dial(nil, e); !errors.Is(err, ErrCanceled) { //nolint:staticcheck // Verify that the API rejects a nil context.
 		t.Fatalf("nil dial: %v", err)
 	}
 	l, err := m.Listen(context.Background(), e)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	if _, err := l.Accept(nil); !errors.Is(err, ErrCanceled) {
+	defer func(close func() error) { _ = close() }(l.Close)
+	if _, err := l.Accept(nil); !errors.Is(err, ErrCanceled) { //nolint:staticcheck // Verify that the API rejects a nil context.
 		t.Fatalf("nil accept: %v", err)
 	}
 }
@@ -207,7 +207,7 @@ func TestMemoryTransportReleasesClosedConnections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func(close func() error) { _ = close() }(listener.Close)
 	l := listener.(*memoryListener)
 	for i := 0; i < 20; i++ {
 		client, err := m.Dial(ctx, e)
@@ -292,7 +292,7 @@ func TestMemoryTransportClosedPendingClientsReleaseQueueCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func(close func() error) { _ = close() }(l.Close)
 	for i := 0; i < 4; i++ {
 		bounded, cancel := context.WithTimeout(ctx, time.Second)
 		client, err := m.Dial(bounded, e)
@@ -308,12 +308,12 @@ func TestMemoryTransportClosedPendingClientsReleaseQueueCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("live dial: %v", err)
 	}
-	defer client.Close()
+	defer func(close func() error) { _ = close() }(client.Close)
 	server, err := l.Accept(bounded)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer func(close func() error) { _ = close() }(server.Close)
 	if err := client.Send(bounded, []byte("live")); err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +330,7 @@ func TestMemoryTransportAcceptSkipsClosedPendingClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func(close func() error) { _ = close() }(l.Close)
 	dead, err := m.Dial(ctx, e)
 	if err != nil {
 		t.Fatal(err)
@@ -340,12 +340,12 @@ func TestMemoryTransportAcceptSkipsClosedPendingClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer live.Close()
+	defer func(close func() error) { _ = close() }(live.Close)
 	server, err := l.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer func(close func() error) { _ = close() }(server.Close)
 	if err := live.Send(ctx, []byte("ping")); err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestMemoryTransportCancelAndCloseRaceLeavesNoStalePending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func(close func() error) { _ = close() }(l.Close)
 	for i := 0; i < 64; i++ {
 		first, err := m.Dial(ctx, e)
 		if err != nil {

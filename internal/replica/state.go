@@ -23,6 +23,7 @@ type State struct {
 	KeySet        bool              `json:"key_set,omitempty"`
 	ObsWatermark  int64             `json:"obs_watermark,omitempty"`  // unix nanos of last exported capture time
 	TombWatermark int64             `json:"tomb_watermark,omitempty"` // unix nanos of last exported tombstone
+	TombSequence  uint64            `json:"tomb_sequence,omitempty"`  // committed local cutoff change cursor
 	LastSeq       uint64            `json:"last_seq,omitempty"`
 	LastBackupAt  time.Time         `json:"last_backup_at,omitempty"`
 	OtherDevices  int               `json:"other_devices,omitempty"`
@@ -95,7 +96,7 @@ func writeStateFile(path string, s State) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil { // #nosec G703 -- path is the application-owned replica state location, not remote input.
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".state-*")
@@ -103,7 +104,7 @@ func writeStateFile(path string, s State) error {
 		return err
 	}
 	name := tmp.Name()
-	if err := tmp.Chmod(0o600); err == nil {
+	if err = tmp.Chmod(0o600); err == nil {
 		_, err = tmp.Write(data)
 	}
 	if err == nil {
@@ -113,10 +114,10 @@ func writeStateFile(path string, s State) error {
 		err = cerr
 	}
 	if err == nil {
-		err = os.Rename(name, path)
+		err = os.Rename(name, path) // #nosec G703 -- Publish the app-owned temporary state file within its private parent directory.
 	}
 	if err != nil {
-		_ = os.Remove(name)
+		_ = os.Remove(name) // #nosec G703 -- name comes directly from os.CreateTemp in the private state directory.
 	}
 	return err
 }

@@ -37,7 +37,7 @@ var ErrDisabled = errors.New("replica: sync is off")
 // Exporter is the store surface the writer needs.
 type Exporter interface {
 	ExportObservations(ctx context.Context, after time.Time, maxCount, maxBytes int) ([]durable.ExportedObservation, bool, error)
-	Tombstones(ctx context.Context) ([]durable.Tombstone, error)
+	DeletionChanges(context.Context, uint64, int) (durable.DeletionChangePage, error)
 }
 
 // Writer exports one segment per Flush into <folder>/<device>/<seq>.seg.
@@ -103,12 +103,14 @@ func (w *Writer) Flush(ctx context.Context) (more bool, err error) {
 			clear(item.Record)
 		}
 	}()
-	tombs, err := w.Store.Tombstones(ctx)
+	deletions, err := w.Store.DeletionChanges(ctx, st.TombSequence, durable.MaxDeletionChangePage)
 	if err != nil {
 		return false, err
 	}
 	var records []Record
 	obsMark, tombMark := st.ObsWatermark, st.TombWatermark
+	tombSequence := deletions.Next
+	more = more || deletions.HasMore
 	imported, err := w.importedIDs(ctx, items)
 	if err != nil {
 		return false, err
@@ -120,19 +122,18 @@ func (w *Writer) Flush(ctx context.Context) (more bool, err error) {
 		}
 		records = append(records, Record{Kind: KindObservation, At: item.CapturedAt, Observation: item.Record})
 	}
-	for _, t := range tombs {
-		if t.At.UnixNano() <= st.TombWatermark {
-			continue
-		}
+	for _, change := range deletions.Changes {
+		t := change.Tombstone
 		records = append(records, Record{Kind: KindTombstone, At: t.At, SourceID: t.SourceID})
 		tombMark = max(tombMark, t.At.UnixNano())
 	}
 	if len(records) == 0 {
-		if obsMark != st.ObsWatermark || tombMark != st.TombWatermark {
+		if obsMark != st.ObsWatermark || tombSequence != st.TombSequence {
 			// Only imported content was scanned: advance so it is not rescanned.
 			err = w.State.Update(func(s *State) {
 				s.ObsWatermark = max(s.ObsWatermark, obsMark)
 				s.TombWatermark = max(s.TombWatermark, tombMark)
+				s.TombSequence = max(s.TombSequence, tombSequence)
 			})
 		}
 		return more && err == nil, err
@@ -168,6 +169,7 @@ func (w *Writer) Flush(ctx context.Context) (more bool, err error) {
 		s.LastSeq = seq
 		s.ObsWatermark = obsMark
 		s.TombWatermark = tombMark
+		s.TombSequence = tombSequence
 		s.LastBackupAt = now().UTC()
 	}); err != nil {
 		return false, err

@@ -54,7 +54,7 @@ func TestDeleteKnowledgeRemovesOnlyTheSelectedLibraryEntity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	client := NewClient(store)
 	entity, err := client.AddKnowledge(ctx, knowledge.Project, "Project Aurora", "user-authored detail")
 	if err != nil {
@@ -94,7 +94,7 @@ func TestUnmergeKnowledgeRestoresBothLibraryEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	client := NewClient(store)
 	source, err := client.AddKnowledge(ctx, knowledge.Person, "Ada Lovelace", "works on analysis")
 	if err != nil {

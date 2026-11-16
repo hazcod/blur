@@ -108,7 +108,7 @@ func packagePortable(repoRoot, binaryPath, mcpBinaryPath, outputPath, targetOS, 
 		return fmt.Errorf("blur-package: create temporary archive: %w", err)
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	defer func() { _ = os.Remove(temporaryPath) }()
 	if archiveFormat == "zip" {
 		err = writeZip(temporary, entries, targetOS, targetArch)
 	} else {
@@ -200,7 +200,7 @@ func writeEntry(output io.Writer, entry archiveEntry) error {
 	if err != nil {
 		return errInvalidPackage
 	}
-	defer file.Close()
+	defer func(close func() error) { _ = close() }(file.Close)
 	info, err := file.Stat()
 	pathInfo, pathErr := os.Lstat(entry.source)
 	if err != nil || pathErr != nil || !info.Mode().IsRegular() || !pathInfo.Mode().IsRegular() || !os.SameFile(info, pathInfo) || info.Size() != entry.size {
@@ -218,7 +218,7 @@ func writeZip(output io.Writer, entries []archiveEntry, targetOS, targetArch str
 	prefix := "blur-" + targetOS + "-" + targetArch + "/"
 	for _, entry := range entries {
 		header := &zip.FileHeader{Name: prefix + filepath.ToSlash(entry.name), Method: zip.Deflate}
-		header.SetModTime(time.Unix(0, 0).UTC())
+		header.Modified = time.Unix(0, 0).UTC()
 		header.SetMode(entry.mode)
 		file, err := writer.CreateHeader(header)
 		if err != nil {
@@ -238,8 +238,8 @@ func writeZip(output io.Writer, entries []archiveEntry, targetOS, targetArch str
 
 func writeTarGzip(output io.Writer, entries []archiveEntry, targetOS, targetArch string) error {
 	gz := gzip.NewWriter(output)
-	gz.Header.ModTime = time.Unix(0, 0).UTC()
-	gz.Header.OS = 255
+	gz.ModTime = time.Unix(0, 0).UTC()
+	gz.OS = 255
 	writer := tar.NewWriter(gz)
 	prefix := "blur-" + targetOS + "-" + targetArch + "/"
 	for _, entry := range entries {

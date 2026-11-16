@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"github.com/hazcod/blur/internal/model/modeltest"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/activity"
+	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/platform"
 )
 
@@ -46,7 +48,7 @@ func TestOpenLocalAppCreatesPrivateStoreAndReopensIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer app.Close()
+	defer func(close func() error) { _ = close() }(app.Close)
 }
 
 func TestOpenLocalAppEnforcesSingleInstanceUntilClose(t *testing.T) {
@@ -86,6 +88,46 @@ func TestOpenLocalAppPreservesSafeKeychainFailureState(t *testing.T) {
 	}
 }
 
+func TestStartupDiagnosticIdentifiesTheFailingStorageBoundary(t *testing.T) {
+	for _, stage := range []string{"storage_directory", "database_probe", "encryption_key"} {
+		t.Run(stage, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "Blur")
+			secrets := &bootstrapSecrets{values: make(map[string][]byte)}
+			switch stage {
+			case "storage_directory":
+				if err := os.WriteFile(dir, []byte("private fixture"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "database_probe":
+				if err := os.MkdirAll(filepath.Join(dir, "memory.db"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "encryption_key":
+				secrets.getErr = &platform.SecretStoreError{State: platform.SecretDenied, BackendCode: -25293}
+			}
+			app, err := openLocalAppAt(context.Background(), dir, secrets, rand.Reader)
+			if app != nil {
+				_ = app.Close()
+				t.Fatal("invalid startup boundary was admitted")
+			}
+			if err == nil {
+				t.Fatal("missing startup error")
+			}
+			d := &desktop{}
+			d.setStartupIssue(err)
+			if !strings.Contains(d.startupDiagnostic, "Startup stage: "+stage) {
+				t.Fatalf("startup discarded the failing boundary: %q", d.startupDiagnostic)
+			}
+			if stage == "encryption_key" && !strings.Contains(d.startupDiagnostic, "-25293") {
+				t.Fatal("stage diagnostic lost the underlying safe Keychain classification")
+			}
+			if strings.Contains(d.startupDiagnostic, "private fixture") || strings.Contains(d.startupDiagnostic, dir) {
+				t.Fatal("startup diagnostic exposed raw content or path")
+			}
+		})
+	}
+}
+
 func TestOpenLocalAppReportsCorruptStoreWithoutRewritingIt(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "Blur")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -109,7 +151,7 @@ func TestOpenLocalAppReportsCorruptStoreWithoutRewritingIt(t *testing.T) {
 
 func TestLocalAIIsOptInAndPersistsAcrossAppRestart(t *testing.T) {
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(modeltest.LocalOllama("test-model", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		var request struct {
 			Prompt string `json:"prompt"`
@@ -125,7 +167,7 @@ func TestLocalAIIsOptInAndPersistsAcrossAppRestart(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"response":"{\"proposals\":[{\"kind\":\"task\",\"text\":\"Send the revised plan\"}]}"}`))
-	}))
+	})))
 	defer server.Close()
 
 	dir := filepath.Join(t.TempDir(), "Blur")
@@ -147,8 +189,17 @@ func TestLocalAIIsOptInAndPersistsAcrossAppRestart(t *testing.T) {
 		t.Fatalf("enable local model: %v", err)
 	}
 	result, err = app.Client.AddNote(note)
-	if err != nil || requests.Load() != 1 || result.Processing != "model_processed" {
-		t.Fatalf("enabled model flow: result=%+v requests=%d err=%v", result, requests.Load(), err)
+	if err != nil || result.Processing != "model_queued" {
+		t.Fatalf("desktop receipt did not queue optional suggestions: result=%+v requests=%d err=%v", result, requests.Load(), err)
+	}
+	waitNoteProcessing(t, app.Client, func(s NoteProcessingStatus) bool { return s.State == "ready" && s.Pending == 0 })
+	if requests.Load() != 1 {
+		t.Fatal("saved note did not reach selected model exactly once", requests.Load())
+	}
+	// Explicit extraction remains synchronous and uses only sanitized evidence.
+	result, err = app.localAI.service.Add(context.Background(), note)
+	if err != nil || requests.Load() != 2 || result.Processing != "model_processed" {
+		t.Fatalf("explicit model flow: result=%+v requests=%d err=%v", result, requests.Load(), err)
 	}
 	if len(result.Proposals) == 0 || result.Proposals[0].Text != "Send the revised plan" {
 		t.Fatalf("model proposal missing from result: %+v", result.Proposals)
@@ -160,11 +211,11 @@ func TestLocalAIIsOptInAndPersistsAcrossAppRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen app: %v", err)
 	}
-	defer app.Close()
+	defer func(close func() error) { _ = close() }(app.Close)
 	if !app.Client.LocalAIEnabled() || app.Client.LocalAISettings() != settings {
 		t.Fatal("explicit local model setting did not survive restart")
 	}
-	if requests.Load() != 1 {
+	if requests.Load() != 2 {
 		t.Fatal("reopening app contacted model without a new note")
 	}
 }
@@ -217,8 +268,11 @@ func TestOpenAICompatibleProviderStoresCredentialOnlyInOSSecretStore(t *testing.
 		t.Fatal("provider credential was not stored in the OS secret store")
 	}
 	note := "Meeting with Sam; password: ultrasecret-provider-test"
-	if _, err := app.Client.AddNote(note); err != nil || requests.Load() != 1 {
-		t.Fatalf("configured provider call: requests=%d err=%v", requests.Load(), err)
+	if _, err := app.Client.AddNote(note); err != nil || requests.Load() != 0 {
+		t.Fatalf("receipt unexpectedly called configured provider: requests=%d err=%v", requests.Load(), err)
+	}
+	if _, err := app.localAI.service.Add(context.Background(), note); err != nil || requests.Load() != 1 {
+		t.Fatalf("explicit configured provider call: requests=%d err=%v", requests.Load(), err)
 	}
 	if err := app.Close(); err != nil {
 		t.Fatal(err)
@@ -227,12 +281,15 @@ func TestOpenAICompatibleProviderStoresCredentialOnlyInOSSecretStore(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer app.Close()
+	defer func(close func() error) { _ = close() }(app.Close)
 	if !app.Client.LocalAIEnabled() || requests.Load() != 1 {
 		t.Fatal("provider setting was not restored without an unsolicited request")
 	}
-	if _, err := app.Client.AddNote(note); err != nil || requests.Load() != 2 {
-		t.Fatalf("restored provider call: requests=%d err=%v", requests.Load(), err)
+	if _, err := app.Client.AddNote(note); err != nil || requests.Load() != 1 {
+		t.Fatalf("receipt unexpectedly called restored provider: requests=%d err=%v", requests.Load(), err)
+	}
+	if _, err := app.localAI.service.Add(context.Background(), note); err != nil || requests.Load() != 2 {
+		t.Fatalf("explicit restored provider call: requests=%d err=%v", requests.Load(), err)
 	}
 	if err := app.Client.ConfigureAI(context.Background(), LocalAISettings{}, ""); err != nil {
 		t.Fatalf("disable provider: %v", err)
@@ -254,12 +311,16 @@ func TestBootstrappedTodayBuildsAndPersistsActivityRecap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer app.Close()
+	defer func(close func() error) { _ = close() }(app.Close)
 	current := time.Now().In(time.Local)
 	now := time.Date(current.Year(), current.Month(), current.Day(), 12, 0, 0, 0, time.Local)
+	source, _ := capture.SanitizeObservation("com.example.editor", "local", "Persisted activity recap source", 512)
+	if err := app.store.PutObservationAt(context.Background(), source, now.Add(-20*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	segment := activity.Segment{
 		ID: "today-recap-test-segment", WallStart: now.Add(-20 * time.Minute), WallEnd: now,
-		Duration: int64(20 * time.Minute), AppID: "com.example.editor", SourceIDs: []string{"capture-source"},
+		Duration: int64(20 * time.Minute), AppID: "com.example.editor", SourceIDs: []string{source.ContentID()},
 	}
 	if err := app.store.PutActivitySegment(context.Background(), segment); err != nil {
 		t.Fatal(err)

@@ -176,6 +176,7 @@ func (s *replicaService) setFolder(path string, bookmark []byte) error {
 		if changed {
 			st.KeySet = false
 			st.ObsWatermark, st.TombWatermark, st.LastSeq = 0, 0, 0
+			st.TombSequence = 0
 			st.Imported, st.OtherDevices, st.LastBackupAt = nil, 0, time.Time{}
 		}
 	}); err != nil {
@@ -304,6 +305,7 @@ func (d *desktop) syncSettingsView() ui.View {
 	rows := []ui.View{
 		wrapLabel("Sync across Macs").Style(styleSectionTitle),
 		wrapLabel("Blur writes sealed, encrypted change files to a folder that iCloud Drive or another sync service carries, and imports the files your other Macs write. Activity and time recaps stay on each Mac.").Style(styleMeta),
+		wrapLabel("Full app captures are not included in sync yet. They remain encrypted on this Mac.").Style(styleMeta),
 		wrapLabel(syncStatusLine(st)).Style(modern.MutedText),
 	}
 	toggle := primaryButton("Turn on")

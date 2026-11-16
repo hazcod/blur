@@ -23,7 +23,6 @@ var (
 	notchClassErr  error
 	notchPanel     objc.ID
 	notchView      objc.ID
-	notchTracking  objc.ID
 	notchInteract  func()
 	notchHover     func(bool)
 	notchIsHovered bool
@@ -97,7 +96,7 @@ func InstallNotchTrigger(onHover func(bool), openInteract func()) error {
 	objc.Send[objc.ID](panel, objc.RegisterName("setCollectionBehavior:"), int64(337)) // all spaces, stationary, ignore cycle, fullscreen auxiliary
 	objc.Send[objc.ID](view, objc.RegisterName("setAlphaValue:"), notchIdleAlpha)
 	objc.Send[objc.ID](panel, objc.RegisterName("orderFrontRegardless"))
-	notchPanel, notchView, notchTracking, notchInteract, notchHover = panel, view, area, openInteract, onHover
+	notchPanel, notchView, notchInteract, notchHover = panel, view, openInteract, onHover
 	return nil
 }
 

@@ -4,7 +4,8 @@ package macospackage
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- Apple provisioning profiles identify signing certificates by SHA-1 fingerprint.
+	"debug/macho"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -74,6 +76,18 @@ func Sign(ctx context.Context, cfg Config, runner CommandRunner) error {
 	if err != nil {
 		return err
 	}
+	helper, err := foundationHelper(app)
+	if err != nil {
+		return err
+	}
+	library, err := meetingAudioLibrary(app)
+	if err != nil {
+		return err
+	}
+	screenText, err := nativeLibrary(app, "libBlurScreenText.dylib")
+	if err != nil {
+		return err
+	}
 	if err := installProfile(cfg.HostProfile, filepath.Join(app, "Contents", "embedded.provisionprofile")); err != nil {
 		return fmt.Errorf("install host provisioning profile: %w", err)
 	}
@@ -114,11 +128,35 @@ func Sign(ctx context.Context, cfg Config, runner CommandRunner) error {
 		return fmt.Errorf("write extension entitlements: %w", err)
 	}
 
-	if err := runCodesign(ctx, runner, cfg.Identity, extensionEntitlements, extension); err != nil {
+	if helper != "" {
+		// This signing path gives the host no App Sandbox entitlement. A
+		// helper must therefore also be unsandboxed, without inherit flags.
+		if err := runner.Run(ctx, "codesign", "--force", "--timestamp", "--options", "runtime", "--sign", identityHash, helper); err != nil {
+			return fmt.Errorf("sign on-device model helper: %w", err)
+		}
+	}
+	if err := runner.Run(ctx, "codesign", "--force", "--timestamp", "--options", "runtime", "--sign", identityHash, library); err != nil {
+		return fmt.Errorf("sign meeting audio library: %w", err)
+	}
+	if err := runner.Run(ctx, "codesign", "--force", "--timestamp", "--options", "runtime", "--sign", identityHash, "--identifier", hostBundleID+".screen-text", screenText); err != nil {
+		return fmt.Errorf("sign screen text library: %w", err)
+	}
+	if err := runCodesign(ctx, runner, identityHash, extensionEntitlements, extension); err != nil {
 		return fmt.Errorf("sign Safari extension: %w", err)
 	}
-	if err := runCodesign(ctx, runner, cfg.Identity, hostEntitlements, app); err != nil {
+	if err := runCodesign(ctx, runner, identityHash, hostEntitlements, app); err != nil {
 		return fmt.Errorf("sign host app: %w", err)
+	}
+	if err := runner.Run(ctx, "codesign", "--verify", "--strict", "--verbose=2", library); err != nil {
+		return fmt.Errorf("verify meeting audio library signature: %w", err)
+	}
+	if err := runner.Run(ctx, "codesign", "--verify", "--strict", "--verbose=2", screenText); err != nil {
+		return fmt.Errorf("verify screen text library signature: %w", err)
+	}
+	if helper != "" {
+		if err := runner.Run(ctx, "codesign", "--verify", "--strict", "--verbose=2", helper); err != nil {
+			return fmt.Errorf("verify on-device model helper signature: %w", err)
+		}
 	}
 	if err := runner.Run(ctx, "codesign", "--verify", "--strict", "--verbose=2", extension); err != nil {
 		return fmt.Errorf("verify Safari extension signature: %w", err)
@@ -127,6 +165,71 @@ func Sign(ctx context.Context, cfg Config, runner CommandRunner) error {
 		return fmt.Errorf("verify host app signature: %w", err)
 	}
 	return nil
+}
+
+// MeetingAudio must be universal and loadable by the macOS 13 host. Speech's
+// newer symbols are weak-linked and guarded by the native source at runtime;
+// signing must not accidentally ship a library with a higher deployment target.
+func meetingAudioLibrary(app string) (string, error) {
+	return nativeLibrary(app, "libBlurMeetingAudio.dylib")
+}
+
+// Native libraries must use both supported architectures and remain loadable by
+// the macOS 13 host. Missing, symlinked or incompatible artifacts cannot be signed.
+func nativeLibrary(app, name string) (string, error) {
+	directory := filepath.Join(app, "Contents", "Frameworks")
+	if _, err := existingDirectory(directory); err != nil {
+		return "", ErrInvalidBundle
+	}
+	library := filepath.Join(directory, name)
+	if err := existingRegularFile(library); err != nil {
+		return "", ErrInvalidBundle
+	}
+	fat, err := macho.OpenFat(library)
+	if err != nil {
+		return "", ErrInvalidBundle
+	}
+	defer func() { _ = fat.Close() }()
+	if len(fat.Arches) != 2 {
+		return "", ErrInvalidBundle
+	}
+	seen := make(map[macho.Cpu]bool, 2)
+	for _, arch := range fat.Arches {
+		if seen[arch.Cpu] || (arch.Cpu != macho.CpuArm64 && arch.Cpu != macho.CpuAmd64) || arch.Type != macho.TypeDylib {
+			return "", ErrInvalidBundle
+		}
+		seen[arch.Cpu] = true
+		validMinimum := false
+		for _, command := range arch.Loads {
+			raw := command.Raw()
+			if len(raw) >= 24 && arch.ByteOrder.Uint32(raw) == 0x32 {
+				validMinimum = arch.ByteOrder.Uint32(raw[8:]) == 1 && arch.ByteOrder.Uint32(raw[12:]) <= 13<<16
+			}
+		}
+		if !validMinimum {
+			return "", ErrInvalidBundle
+		}
+	}
+	return library, nil
+}
+
+// Older bundles have no helper; new Makefile bundles always include it.
+func foundationHelper(app string) (string, error) {
+	directory := filepath.Join(app, "Contents", "Helpers")
+	if _, err := os.Lstat(directory); errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if _, err := existingDirectory(directory); err != nil {
+		return "", ErrInvalidBundle
+	}
+	helper := filepath.Join(directory, "blur-foundation-models")
+	if _, err := os.Lstat(helper); errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err := existingRegularFile(helper); err != nil {
+		return "", ErrInvalidBundle
+	}
+	return helper, nil
 }
 
 func validConfig(cfg Config) bool {
@@ -167,7 +270,7 @@ func validDottedIdentifier(value string, minSegments int) bool {
 			continue
 		}
 		c := value[i]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
 			return false
 		}
 		segmentLength++
@@ -228,6 +331,13 @@ func validateBundle(path, appGroup, keychainGroup string) (string, string, error
 		if expected == extensionBundleID && (values["BlurAppGroupIdentifier"] != appGroup || values["BlurKeychainAccessGroup"] != keychainGroup) {
 			return "", "", ErrInvalidBundle
 		}
+		if expected == hostBundleID {
+			microphone, microphoneOK := values["NSMicrophoneUsageDescription"].(string)
+			audio, audioOK := values["NSAudioCaptureUsageDescription"].(string)
+			if values["LSMinimumSystemVersion"] != "13.0" || !microphoneOK || !audioOK || strings.TrimSpace(microphone) == "" || strings.TrimSpace(audio) == "" {
+				return "", "", ErrInvalidBundle
+			}
+		}
 	}
 	return app, extension, nil
 }
@@ -242,7 +352,7 @@ func existingDirectory(path string) (string, error) {
 
 func existingRegularFile(path string) error {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+	if err != nil || !info.Mode().IsRegular() || runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
 		return ErrInvalidBundle
 	}
 	return nil
@@ -318,7 +428,7 @@ func decodeAndValidateProfile(ctx context.Context, runner CommandRunner, path, b
 			clear(certificate)
 			return "", nil, ErrInvalidProfile
 		}
-		fingerprint := sha1.Sum(certificate)
+		fingerprint := sha1.Sum(certificate) // #nosec G401 -- Match Apple codesign certificate identifiers; this is not a signature or content-integrity hash.
 		clear(certificate)
 		fingerprints = append(fingerprints, fmt.Sprintf("%X", fingerprint))
 	}
@@ -421,6 +531,8 @@ func entitlementPlist(appGroup, keychainGroup string, sandbox bool) []byte {
 	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>")
 	if sandbox {
 		b.WriteString("<key>com.apple.security.app-sandbox</key><true/>")
+	} else {
+		b.WriteString("<key>com.apple.security.device.audio-input</key><true/>")
 	}
 	b.WriteString("<key>com.apple.security.application-groups</key><array><string>")
 	b.WriteString(xmlValue(appGroup))

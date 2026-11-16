@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/golang-gui/goui/core/geometry"
@@ -16,67 +17,19 @@ import (
 
 const (
 	quickPanelEnterDebounce = 150 * time.Millisecond
-	quickPanelDoublePress   = 600 * time.Millisecond
 	quickPanelSavedHold     = 1200 * time.Millisecond
-	quickPanelNotchDelay    = 150 * time.Millisecond
+	quickPanelNotchDelay    = 80 * time.Millisecond
 	quickPanelProgressSeg   = 120
 	quickPanelQuestionRune  = 72
 )
-
-// quickEscape is what one Escape press does.
-type quickEscape int
-
-const (
-	quickEscapeClear quickEscape = iota // cancel any ask, empty the panel
-	quickEscapeClose                    // close the panel
-)
-
-// quickPanelEscapeAction decides one Escape press. The first press clears the
-// panel (cancelling an ask in flight); a second press within 600 ms, or any
-// press on an already empty panel, closes it. since is the time since the
-// previous press; a zero or negative value means there was none.
-func quickPanelEscapeAction(hasContent, asking bool, since time.Duration) quickEscape {
-	if since > 0 && since < quickPanelDoublePress {
-		return quickEscapeClose
-	}
-	if hasContent || asking {
-		return quickEscapeClear
-	}
-	return quickEscapeClose
-}
 
 func (d *desktop) handleQuickPanelEscape() {
 	if d == nil {
 		return
 	}
-	x := d.quickExtras()
-	now := time.Now()
-	since := time.Duration(0)
-	if !x.lastEscape.IsZero() {
-		since = now.Sub(x.lastEscape)
-	}
-	if quickPanelEscapeAction(d.quickPanelHasContent(), d.askLoading, since) == quickEscapeClose {
-		x.lastEscape = time.Time{}
-		d.dismissQuickPanel()
-		return
-	}
-	x.lastEscape = now
-	d.clearQuickPanel()
-}
-
-// clearQuickPanel returns the panel to its empty compact state.
-func (d *desktop) clearQuickPanel() {
-	if d.askLoading {
-		d.cancelAsk()
-	}
-	d.invalidateAsk()
-	d.quickInput, d.status = "", ""
-	d.quickConversation, d.quickAskPending = nil, false
-	d.quickUI.savedFlash, d.quickUI.expandedTurns = false, nil
-	d.quickHistory.resetBrowsing()
-	d.resizeQuickPanel(false)
+	d.cancelEntryInterpretation()
 	if d.app != nil {
-		d.app.RequestUpdate()
+		d.app.Post(d.hideQuickPanel)
 	}
 }
 
@@ -93,19 +46,10 @@ func spacer(height float32) ui.View {
 // optional progress line, then a transcript or the day recap. Plain text on
 // the graphite surface; no bubbles.
 func (d *desktop) quickPanel() ui.View {
-	input := ui.TextInput().ID("quick-input").Text(d.quickInput).Placeholder("Ask or add a note").
+	input := ui.TextInput().ID("quick-input").Text(d.quickInput).Placeholder("Ask, remember, or add a task").
 		Style(styleQuickInput).
 		OnText(func(value string) {
-			hadStatus := quickPanelShowsDraftStatus(d.quickInput, d.status) || d.quickUI.savedFlash
-			d.quickInput = value
-			d.quickHistory.resetBrowsing()
-			d.expandedAnswer = false
-			d.status = ""
-			d.quickUI.savedFlash = false
-			if hadStatus {
-				d.resizeQuickPanel(false)
-			}
-			d.app.RequestUpdate()
+			d.setQuickTypedInput(value)
 		}).OnSubmit(d.quickEnterFromField).MainWeight(1)
 
 	composer := []ui.View{
@@ -124,17 +68,28 @@ func (d *desktop) quickPanel() ui.View {
 		if d.quickPanelHairline() {
 			rows = append(rows, quickHairline())
 		}
-		rows = append(rows, pageScroll(body).MainWeight(1))
+		rows = append(rows, pageScroll(body).ID("quick-scroll").MainWeight(1))
 	}
 	return ui.VBox(rows...).Paddings(quickPanelInsets()).Spacing(quickPanelBodyGap).CrossAlign(layout.CrossStretch).
 		Style(styleQuickBackground).ID("quick-panel-root").MinWidth(quickPanelWidth)
 }
 
 func quickPanelModeLabel(input string) string {
-	if quickPanelWantsAnswer(input) {
+	kind, _ := classifyQuickInput(input)
+	switch kind {
+	case quickInputAsk:
 		return "Ask"
+	case quickInputReminder:
+		return "Reminder"
+	case quickInputTask:
+		return "Task"
+	case quickInputFact:
+		return "Remember"
+	case quickInputRule:
+		return "Writing rule"
+	default:
+		return "Note"
 	}
-	return "Note"
 }
 
 // quickProgressBar is the 2 px indeterminate amber line under the composer:
@@ -166,6 +121,9 @@ func (d *desktop) quickProgressBar() ui.View {
 // quickPanelBody is the transcript, status line or day recap; nil when the
 // panel is only a composer.
 func (d *desktop) quickPanelBody() ui.View {
+	if d.startupIssue != "" {
+		return ui.VBox(wrapLabel(d.startupIssue).Style(styleQuickMeta), flatButton("Copy diagnostic details").OnClick(d.copyStartupDiagnostic)).Spacing(8).ID("quick-body")
+	}
 	var rows []ui.View
 	switch {
 	case d.quickPanelShowsPreview():
@@ -185,7 +143,7 @@ func (d *desktop) quickPreviewRows() []ui.View {
 	}
 	var rows []ui.View
 	remaining := quickPanelPreviewRows
-	for _, group := range quickPreviewGroups(d.today.Snapshot, d.hourlySummaries) {
+	for _, group := range d.currentQuickPreviewGroups() {
 		if len(group.items) == 0 || remaining == 0 {
 			continue
 		}
@@ -203,12 +161,18 @@ func (d *desktop) quickPreviewRows() []ui.View {
 
 func (d *desktop) quickTranscriptRows() []ui.View {
 	var rows []ui.View
+	if strings.TrimSpace(d.quickInput) == "" {
+		if hint := d.noteProcessingHint(); hint != "" {
+			rows = append(rows, wrapLabel(hint).Style(styleQuickMeta))
+		}
+	}
 	last := len(d.quickConversation) - 1
-	for i, turn := range d.quickConversation {
-		if i > 0 {
+	for position, i := range d.quickVisibleTurns() {
+		turn := d.quickConversation[i]
+		if position > 0 {
 			rows = append(rows, spacer(10), quickHairline(), spacer(10))
 		}
-		open := i == last || d.quickUI.expandedTurns[i]
+		open := i == last || i == d.quickSelectedTurnIndex() || d.quickUI.expandedTurns[i]
 		rows = append(rows, d.quickQuestionLine(i, turn, open, i != last))
 		if !open {
 			continue
@@ -217,18 +181,19 @@ func (d *desktop) quickTranscriptRows() []ui.View {
 		if meta := quickTurnMeta(turn); meta != "" {
 			rows = append(rows, spacer(10), wrapLabel(meta).Style(styleQuickMeta))
 		}
-		if i == last {
-			rows = append(rows, spacer(12), quickHairline(), d.quickActionRow(turn))
-		}
 	}
 	switch {
 	case d.quickAskPending && d.askLoading:
 		if len(rows) > 0 {
 			rows = append(rows, spacer(10))
 		}
-		rows = append(rows, wrapLabel(quickPanelPendingLabel(d.askQuestion)).Style(styleQuickMeta))
+		pending := quickPanelPendingLabel(d.askQuestion)
+		if d.askHasDocumentProgress {
+			pending = documentProgressCopy(d.askDocumentProgress)
+		}
+		rows = append(rows, wrapLabel(pending).Style(styleQuickMeta))
 	case d.quickUI.savedFlash:
-		rows = append(rows, wrapLabel("Saved to Today").Style(styleQuickAccent))
+		rows = append(rows, wrapLabel("Note saved").Style(styleQuickAccent))
 	case d.quickUI.copied:
 		rows = append(rows, spacer(8), wrapLabel("Answer copied").Style(styleQuickAccent))
 	case quickPanelShowsDraftStatus(d.quickInput, d.status):
@@ -240,13 +205,14 @@ func (d *desktop) quickTranscriptRows() []ui.View {
 	return rows
 }
 
-// answerSentLine is the one-line statement of what went to a model.
+// answerSentLine describes the final answer's evidence. Optional recall may
+// already have used the selected model before this answer was assembled.
 func answerSentLine(general, direct bool, sent, sources int) string {
 	switch {
 	case general:
-		return "General answer, no memory used"
+		return "General answer, no saved evidence used"
 	case direct:
-		return "Answered without a model"
+		return "Saved evidence shown directly"
 	}
 	items := sent
 	if items == 0 {
@@ -254,21 +220,74 @@ func answerSentLine(general, direct bool, sent, sources int) string {
 	}
 	switch {
 	case items == 1:
-		return "Answered from 1 item sent to the local model"
+		return "Answered from 1 item sent to the answer model"
 	case items > 1:
-		return fmt.Sprintf("Answered from %d items sent to the local model", items)
+		return fmt.Sprintf("Answered from %d items sent to the answer model", items)
 	}
 	return ""
 }
 
+const recapCoverageNotice = "Some evidence was sampled or excerpted; this recap may miss work."
+const partialCaptureCoverageNotice = "Only part of this page was captured, so the answer may miss relevant details."
+
+func answerCoverageNotice(coverageLimited, recap, partialCapture bool) string {
+	if !coverageLimited {
+		return ""
+	}
+	if partialCapture {
+		return partialCaptureCoverageNotice
+	}
+	if recap {
+		return recapCoverageNotice
+	}
+	return selectedPassageCoverageNotice
+}
+
 func quickTurnMeta(turn quickConversationTurn) string {
-	return answerSentLine(turn.general, turn.direct, turn.sent, turn.sources)
+	if turn.action {
+		return ""
+	}
+	line := answerSentLine(turn.general, turn.direct, turn.sent, turn.sources)
+	if turn.generationIssue == assistant.GenerationInvalidResponse {
+		line = "Model answer unverified; saved passages shown"
+	}
+	if turn.general && (turn.rules > 0 || turn.conversation > 0) {
+		line = "General answer"
+	}
+	if turn.rules > 0 {
+		line += fmt.Sprintf("; %d writing rules applied", turn.rules)
+	}
+	if turn.indexingPending {
+		line += "; some saved content is still indexing"
+	}
+	if turn.preferencesOmitted > 0 {
+		line += fmt.Sprintf("; %d preferences omitted", turn.preferencesOmitted)
+	}
+	if turn.coverageLimited {
+		line += "; " + answerCoverageNotice(true, turn.plan.Kind == assistant.KindRecap, turn.partialCapture)
+	}
+	if turn.general && turn.conversation > 0 {
+		line += fmt.Sprintf("; %d earlier exchange", turn.conversation)
+		if turn.conversation != 1 {
+			line += "s"
+		}
+	}
+	if turn.conversationTruncated > 0 {
+		line += "; earlier conversation excerpted"
+	}
+	if turn.conversationOmitted > 0 {
+		line += fmt.Sprintf("; %d earlier exchanges omitted", turn.conversationOmitted)
+	}
+	return line
 }
 
 // quickQuestionLine is the muted one-line question above an answer. Earlier
 // turns are collapsed to this line; clicking one expands it.
 func (d *desktop) quickQuestionLine(index int, turn quickConversationTurn, open, clickable bool) ui.View {
-	label := ui.Label(compactPreviewText(turn.question, quickPanelQuestionRune)).Style(styleQuickQuestion)
+	label := ui.Label(compactPreviewText(turn.question, quickPanelQuestionRune)).ID(fmt.Sprintf("quick-question-%d", index)).Style(styleQuickQuestion)
+	if index == d.quickSelectedTurnIndex() {
+		label.Style(styleQuickAccent)
+	}
 	if !clickable {
 		return label
 	}
@@ -283,11 +302,6 @@ func (d *desktop) quickQuestionLine(index int, turn quickConversationTurn, open,
 	})
 }
 
-func (d *desktop) quickActionRow(turn quickConversationTurn) ui.View {
-	open := flatButton("Open in Blur").MinHeight(28).OnClick(d.openDashboard)
-	return ui.HBox(open).Spacing(4).MainAlign(layout.MainStart)
-}
-
 func (d *desktop) copyQuickAnswer(text string) {
 	if err := copyToPasteboard(text); err != nil {
 		slog.Warn("quick ask copy failed", "result", "failed")
@@ -297,6 +311,9 @@ func (d *desktop) copyQuickAnswer(text string) {
 	x.copied = true
 	x.copyEpoch++
 	epoch := x.copyEpoch
+	if d.app == nil {
+		return
+	}
 	d.app.RequestUpdate()
 	d.app.TimeoutFunc(quickPanelSavedHold, func() {
 		if epoch == x.copyEpoch {
@@ -340,8 +357,16 @@ func (d *desktop) quickEnterFromField()   { d.quickEnter(commandKeyHeld()) }
 func (d *desktop) quickEnterPlain()       { d.quickEnter(false) }
 func (d *desktop) quickEnterWithCommand() { d.quickEnter(true) }
 
-func (d *desktop) submitQuickPanelInput() {
+func (d *desktop) dispatchLegacyQuickPanelInput() {
 	if d == nil || trimmed(d.quickInput) == "" {
+		return
+	}
+	if kind, text := classifyQuickInput(d.quickInput); kind == quickInputFact || kind == quickInputRule {
+		d.submitQuickProfile(kind, text)
+		return
+	}
+	if kind, text := classifyQuickInput(d.quickInput); kind == quickInputReminder || kind == quickInputTask {
+		d.submitQuickTask(kind, text)
 		return
 	}
 	if quickPanelWantsAnswer(d.quickInput) {
@@ -380,7 +405,7 @@ func (d *desktop) saveQuickPanelNote() {
 	case d.loading:
 		d.status = "Blur is busy. Press Return again in a moment. Your text is still here."
 	default:
-		d.note = trimmed(d.quickInput)
+		d.note = quickPanelNoteText(d.quickInput)
 		d.quickNotePending = true
 		d.addNote()
 		if !d.loading { // addNote declined without starting a save
@@ -394,15 +419,19 @@ func (d *desktop) saveQuickPanelNote() {
 	}
 }
 
-// quickPanelNoteSaved runs when a quick note saved: the input is emptied and
-// the panel confirms for a moment (see dismissQuickPanel).
-func (d *desktop) quickPanelNoteSaved() {
+// quickPanelNoteSaved clears only the draft that was actually saved. A new
+// draft typed during persistence must remain visible and keep the panel open.
+func (d *desktop) quickPanelNoteSaved(savedText string, revision uint64) bool {
 	if !d.quickNotePending {
-		return
+		return false
 	}
 	d.quickNotePending = false
+	if d.quickUI.draftRevision != revision || quickPanelNoteText(d.quickInput) != savedText {
+		return false
+	}
 	d.quickInput = ""
 	d.quickUI.savedFlash = true
+	return true
 }
 
 func quickPanelPendingLabel(question string) string {
@@ -413,7 +442,7 @@ func quickPanelPendingLabel(question string) string {
 }
 
 // dismissQuickPanel hides the panel. After a saved note it first holds the
-// "Saved to Today" confirmation for 1.2 s.
+// "Note saved" confirmation for 1.2 s.
 func (d *desktop) dismissQuickPanel() {
 	if d == nil || d.app == nil || d.quickUI.snapshotRun {
 		return
@@ -465,7 +494,7 @@ func (d *desktop) toggleQuickPanel() {
 			d.hideQuickPanel()
 			return
 		}
-		activateDesktopApp()
+		d.quickUI.preferQuick = true
 		d.openQuickPanel()
 	})
 }
@@ -524,26 +553,29 @@ func (d *desktop) showQuickPanelWindow(quick quickPanelPresentWindow) {
 // revealQuickPanel waits for layout while the panel is transparent, sets the
 // measured frame instantly, then fades in.
 func (d *desktop) revealQuickPanel(epoch uint64, attempt int) {
-	d.app.TimeoutFunc(quickPanelRevealTick, func() {
-		if epoch != d.quickUI.revealEpoch {
-			return
-		}
-		if !d.quickPreview && !d.quickPanelPinned {
-			return // dismissed while hidden: stay transparent, nothing to show
-		}
-		_, measured := d.measureQuickPanelBody()
-		if !quickPanelRevealStep(d.quickPanelBodyEstimate() > 0, measured, attempt) {
+	if epoch != d.quickUI.revealEpoch || !d.quickPreview && !d.quickPanelPinned {
+		return
+	}
+	_, measured := d.measureQuickPanelBody()
+	if !quickPanelRevealStep(d.quickPanelBodyEstimate() > 0, measured, attempt) {
+		d.app.TimeoutFunc(quickPanelRevealTick, func() {
 			d.revealQuickPanel(epoch, attempt+1)
-			return
-		}
-		_ = resizeDesktopQuickPanel(d.app, float64(d.quickPanelDesiredHeight()))
+		})
+		return
+	}
+	_ = resizeDesktopQuickPanel(d.app, float64(d.quickPanelDesiredHeight()))
+	if d.quickPanelPinned {
+		// Explicit clicks and shortcuts should be ready to type into immediately.
+		_ = setDesktopQuickPanelAlpha(d.app, 1)
+	} else {
 		_ = fadeInDesktopQuickPanel(d.app)
-	})
+	}
 }
 
 func (d *desktop) finishShowingQuickPanel() {
 	d.watchQuickPanelFocus()
 	d.watchQuickPanelPointer()
+	d.watchQuickPanelKeyboard()
 	if !d.quickUI.snapshotRun && quickPanelShouldFocusInput(d.quickPreview, d.quickPanelPinned) {
 		d.focusQuickPanelComposerWhenReady(0)
 	}
@@ -562,11 +594,18 @@ func (d *desktop) onNotchHover(hovered bool) {
 		d.quickHoverEpoch++
 		epoch := d.quickHoverEpoch
 		if hovered {
-			if d.quickPanelPinned {
+			if d.quickPanelPinned && (d.client == nil || !voiceRecordingActive(d.client.MeetingLive().State)) {
 				return
 			}
 			d.app.TimeoutFunc(quickPanelNotchDelay, func() {
-				if epoch != d.quickHoverEpoch || d.quickPanelPinned {
+				if epoch != d.quickHoverEpoch {
+					return
+				}
+				if d.client != nil && voiceRecordingActive(d.client.MeetingLive().State) {
+					d.revealActiveVoiceOverlay()
+					return
+				}
+				if d.quickPanelPinned {
 					return
 				}
 				d.quickPreview = true
@@ -621,6 +660,9 @@ func (d *desktop) showQuickWindowForRun(quick quickPanelPresentWindow) error {
 				return nil
 			}
 		}
+	}
+	if err := prepareDesktopTransient(d.app, "quick"); err != nil {
+		return err
 	}
 	return quick.Show()
 }

@@ -1,23 +1,68 @@
 name: Release
 
-# Pushing a semantic-version tag (vX.Y.Z, optionally -rc.1 etc.) publishes a release.
+# Every push to main publishes a numbered preview automatically.
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
 
 permissions:
   contents: write
   id-token: write # keyless cosign signing via GitHub OIDC
 
 jobs:
+  platforms:
+    name: Prepare automatic release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      macos_mode: ${{ steps.platforms.outputs.macos_mode }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test release configuration checks
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Select explicit macOS signing policy
+        id: platforms
+        env:
+          BLUR_REQUIRE_TRUSTED_MACOS: ${{ vars.BLUR_REQUIRE_TRUSTED_MACOS || 'false' }}
+          MACOS_DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: bash .github/scripts/release-platforms.sh
+      - name: Assign preview version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          release_tag="v0.1.0-alpha.${GITHUB_RUN_NUMBER}"
+          if existing_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" --jq '.object.sha' 2>/dev/null); then
+            test "$existing_sha" = "$GITHUB_SHA" || { echo "Release tag already points to a different commit" >&2; exit 1; }
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              --raw-field ref="refs/tags/$release_tag" --raw-field sha="$GITHUB_SHA" > /dev/null
+          fi
+          printf 'tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+
   goreleaser:
     name: Windows and Linux archives
+    needs: [platforms, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ needs.platforms.outputs.tag }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -26,95 +71,66 @@ jobs:
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
-          version: '~> v2'
+          version: v2.20.2
           args: release --clean --config .github/goreleaser.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ needs.platforms.outputs.tag }}
 
   macos:
-    name: macOS universal app (signed, notarized)
-    runs-on: macos-latest
-    needs: goreleaser # the GitHub release must exist before assets are attached
+    name: macOS universal app (${{ needs.platforms.outputs.macos_mode }})
+    runs-on: ${{ vars.MACOS_RELEASE_RUNNER || 'xcode-27' }}
+    needs: platforms
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.platforms.outputs.tag }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
-
-      - name: Import Developer ID certificate into a temporary keychain
+      - name: Test macOS archive contents and signing policy
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Build, sign, verify, and archive the complete app
         env:
-          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
-          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
-        run: |
-          set -euo pipefail
-          KEYCHAIN="$RUNNER_TEMP/blur-release.keychain-db"
-          KEYCHAIN_PASSWORD="$(uuidgen)"
-          echo "::add-mask::$KEYCHAIN_PASSWORD"
-          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/developer-id.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
-          rm -f "$RUNNER_TEMP/developer-id.p12"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-          # Put the temporary keychain first in the search list so codesign finds it.
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -n 1)"
-          if [ -z "$IDENTITY" ]; then
-            echo "No Developer ID Application identity found in the imported certificate" >&2
-            exit 1
-          fi
-          echo "MACOS_CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
-          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          RELEASE_TAG: ${{ needs.platforms.outputs.tag }}
+          MACOS_RELEASE_MODE: ${{ needs.platforms.outputs.macos_mode }}
+          BLUR_REQUIRE_TRUSTED_MACOS: ${{ vars.BLUR_REQUIRE_TRUSTED_MACOS || 'false' }}
+          BLUR_MACOS_DEVELOPER_DIR: ${{ vars.MACOS_RELEASE_DEVELOPER_DIR }}
+          MACOS_DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: bash .github/scripts/macos-release.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-release
+          path: ${{ runner.temp }}/macos-release-assets/*
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Build and sign universal app (Hardened Runtime, sandbox entitlements)
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          make macos-app \
-            MACOS_APP="$RUNNER_TEMP/Blur.app" \
-            MACOS_CODESIGN_IDENTITY="$MACOS_CODESIGN_IDENTITY" \
-            MACOS_CODESIGN_EXTRA_FLAGS="--options runtime --timestamp" \
-            VERSION="$VERSION"
-          make macos-app-sandbox-check MACOS_APP="$RUNNER_TEMP/Blur.app"
-
-      - name: Notarize and staple
-        env:
-          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
-          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
-          API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
-        run: |
-          set -euo pipefail
-          echo "$API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
-          ditto -c -k --keepParent "$RUNNER_TEMP/Blur.app" "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
-            --wait
-          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/notarize.zip"
-          xcrun stapler staple "$RUNNER_TEMP/Blur.app"
-          xcrun stapler validate "$RUNNER_TEMP/Blur.app"
-
-      - name: Verify Gatekeeper acceptance
-        run: |
-          set -euo pipefail
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Blur.app"
-          spctl -a -vv -t install "$RUNNER_TEMP/Blur.app"
-
-      - name: Package and upload to the release
+  publish-macos:
+    name: Attach verified macOS app to release
+    needs: [platforms, macos, goreleaser]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: macos-release
+          path: macos-release-assets
+      - name: Attach app, checksum, and signing metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.platforms.outputs.tag }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          ZIP="$RUNNER_TEMP/Blur_${VERSION}_macos_universal.zip"
-          ditto -c -k --keepParent "$RUNNER_TEMP/Blur.app" "$ZIP"
-          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
-          gh release upload "$GITHUB_REF_NAME" "$ZIP" "$ZIP.sha256" --clobber --repo "$GITHUB_REPOSITORY"
-
-      - name: Remove temporary keychain
-        if: always()
-        run: |
-          if [ -n "${KEYCHAIN:-}" ]; then security delete-keychain "$KEYCHAIN" || true; fi
+          cd macos-release-assets
+          sha256sum -c ./*.zip.sha256
+          gh release upload "$RELEASE_TAG" ./*.zip ./*.zip.sha256 ./*.json --clobber --repo "$GITHUB_REPOSITORY"

@@ -14,6 +14,29 @@ const (
 	captureTimeMigrationID        = "capture-time-baseline-v1"
 )
 
+// IsObservationTimeKnown distinguishes observed times from the conservative
+// retention baseline assigned by old migrations. Exact collisions are
+// indistinguishable and conservatively remain unknown. Original metadata is
+// retained for retention/index compatibility; later visits remain observed.
+func (s *Store) IsObservationTimeKnown(at time.Time) bool {
+	return s != nil && s.state != nil && !at.IsZero() && !at.Equal(s.state.captureTimeBaseline)
+}
+
+// ObservationCaptureTime reads only authenticated order metadata. It avoids
+// decrypting the original text twice when a caller already hydrated it.
+func (s *Store) ObservationCaptureTime(ctx context.Context, id string) (time.Time, error) {
+	if ctx == nil || !validHash(id) {
+		return time.Time{}, &storage.StoreError{Code: storage.Invalid}
+	}
+	var at time.Time
+	err := s.view(ctx, func(reader bolt.Reader) error {
+		var err error
+		at, err = s.observationCapturedAtReader(reader, id)
+		return err
+	})
+	return at, err
+}
+
 func (s *Store) ensureCaptureTimeMetadata(ctx context.Context) error {
 	baseline, complete, found, err := s.readCaptureTimeMigration(ctx)
 	if err != nil {

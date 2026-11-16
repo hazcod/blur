@@ -79,14 +79,14 @@ func desktopQuickPanelPointerInside(app ui.App) bool {
 	return darwin.PointerInsideWindow(window.PlatformWindow().NativeHandle())
 }
 
-func setDesktopMenuBarCapture(scheduler *pauseScheduler, running, activeAppCapturing bool) {
+func setDesktopMenuBarCapture(scheduler *pauseScheduler, running, activeAppCapturing bool, detail ...string) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			slog.Error("native capture menu update panicked", "panic_type", fmt.Sprintf("%T", recovered), "stack", string(debug.Stack()))
 		}
 	}()
 	scheduler.observeCapture(running)
-	darwin.UpdateMenuBarCaptureState(running, activeAppCapturing, scheduler.pausedUntil())
+	darwin.UpdateMenuBarCaptureState(running, activeAppCapturing, scheduler.pausedUntil(), detail...)
 }
 
 // menuPauseCallback returns the timed-pause handler, or nil when no scheduler
@@ -141,7 +141,7 @@ func keepDesktopRunningOnWindowClose(allow *bool, hide func() error) error {
 	return hide()
 }
 
-func addDesktopQuitShortcut(window ui.WindowView, app ui.App) ui.WindowView {
+func addDesktopQuitShortcut(window ui.WindowView, app ui.App, extra ...*ui.ShortcutView) ui.WindowView {
 	if app == nil {
 		return window
 	}
@@ -155,7 +155,7 @@ func addDesktopQuitShortcut(window ui.WindowView, app ui.App) ui.WindowView {
 			_ = main.PlatformWindow().RequestClose()
 		}
 	})
-	return window.Shortcuts(quit, close)
+	return window.Shortcuts(append(extra, quit, close)...)
 }
 
 func addDesktopQuickShortcut(window ui.WindowView, app ui.App, onEscape func(), extra ...*ui.ShortcutView) ui.WindowView {

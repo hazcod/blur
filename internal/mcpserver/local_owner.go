@@ -13,7 +13,7 @@ import (
 
 const GrantSecretName = "claude-mcp-grant"
 
-var ErrOwnerUnavailable = errors.New("Blur Claude bridge unavailable")
+var ErrOwnerUnavailable = errors.New("blur Claude bridge unavailable")
 
 // LocalOwner couples the owner-side RPC listener to an OS-protected grant.
 // Stopping Blur closes the listener but preserves the credential so the same

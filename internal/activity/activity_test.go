@@ -9,6 +9,20 @@ import (
 	"time"
 )
 
+func TestMonotonicIntervalsAbsorbSubMillisecondWallClockDrift(t *testing.T) {
+	engine := New(Config{MaxGap: time.Hour})
+	start := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		if _, err := engine.Apply(Event{Kind: Seen, Monotonic: int64(time.Duration(i) * time.Second), Wall: start.Add(time.Duration(i)*time.Second + time.Duration(i)*100*time.Nanosecond), SourceID: "source", AppID: "editor"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	segments := engine.Segments()
+	if len(segments) != 2 || !segments[0].WallEnd.Equal(segments[1].WallStart) || segments[0].Duration+segments[1].Duration != int64(2*time.Second) {
+		t.Fatalf("monotonic intervals lost continuity: %+v", segments)
+	}
+}
+
 func TestRepeatedSightingsConserveElapsedTime(t *testing.T) {
 	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	engine := New(Config{MaxGap: 10 * time.Minute, RingSize: 8})

@@ -14,7 +14,6 @@ import (
 
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/search"
-	"github.com/hazcod/blur/internal/storage"
 	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
@@ -92,11 +91,24 @@ func TestDurableSearchSupportsBoundedMinimumTermMatches(t *testing.T) {
 			t.Fatalf("minimum-match query included one-term candidate %s", hit.SourceID)
 		}
 	}
+	partial, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: []string{"anna", "budget", "q3"}, MinTermMatches: 2, PartialOnly: true,
+		TopK: 4, MaxRows: 32, MaxBytes: search.MaxIndexBytes,
+	})
+	if err != nil || len(partial.Hits) != 2 || partial.Hits[0].SourceID == all.ContentID() || partial.Hits[1].SourceID == all.ContentID() {
+		t.Fatalf("partial-only page=%+v err=%v; want two partial matches and no full-term match", partial, err)
+	}
 	if _, err := store.SearchExact(context.Background(), search.ExactQuery{
 		Terms: []string{"anna", "budget"}, MinTermMatches: 3,
 		TopK: 1, MaxRows: 8, MaxBytes: search.MaxIndexBytes,
 	}); !errors.Is(err, search.ErrInvalidRequest) {
 		t.Fatalf("invalid minimum-term threshold error=%v, want ErrInvalidRequest", err)
+	}
+	if _, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: []string{"anna", "budget"}, PartialOnly: true,
+		TopK: 1, MaxRows: 8, MaxBytes: search.MaxIndexBytes,
+	}); !errors.Is(err, search.ErrInvalidRequest) {
+		t.Fatalf("partial-only query without an explicit threshold error=%v, want ErrInvalidRequest", err)
 	}
 }
 
@@ -272,7 +284,7 @@ func TestDurableDeferredSiblingSearchSurvivesReopenAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen with an unrepaired sibling link: %v", err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	query := search.ExactQuery{Terms: []string{"alpha"}, TopK: 3, MaxRows: 16, MaxBytes: search.MaxIndexBytes}
 	page, err := store.SearchExact(context.Background(), query)
 	if err != nil {
@@ -407,9 +419,9 @@ func TestDurableIndexCommonTermLeafSplitStaysBelowTransactionOperationCap(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 
-	const commonTermCount = search.MaxIndexedObservationTerms - 2 // app and domain tokens fill the remaining two terms
+	const commonTermCount = search.InlineObservationTerms - 2 // app and domain tokens fill the remaining two terms
 	common := make([]string, commonTermCount)
 	for i := range common {
 		common[i] = fmt.Sprintf("common%03d", i)
@@ -450,7 +462,7 @@ func TestDurableIndexMaxTermSynchronizedNonRootSplitStaysBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 
 	common := make([]string, 126)
 	for i := range common {
@@ -484,8 +496,8 @@ func TestDurableIndexMaxTermSynchronizedNonRootSplitStaysBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(terms) != search.MaxIndexedObservationTerms {
-		t.Fatalf("normalized observation has %d unique text+app+domain terms, want exact max %d", len(terms), search.MaxIndexedObservationTerms)
+	if len(terms) != search.InlineObservationTerms {
+		t.Fatalf("normalized observation has %d unique text+app+domain terms, want exact max %d", len(terms), search.InlineObservationTerms)
 	}
 	if treeCount := len(terms) + 2; treeCount != 130 {
 		t.Fatalf("max-term observation touches %d posting trees, want %d including exact app and domain", treeCount, 130)
@@ -543,7 +555,7 @@ func TestDurableIndexMaxTermSynchronizedNonRootSplitStaysBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen with pending max-130 sibling links: %v", err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	// Before repairing the pending parent links, prove that a reopened reader
 	// can cross each encrypted B-link and still report truncation accurately.
 	linkedResponse, err := search.New(store).Search(context.Background(), search.Request{
@@ -826,7 +838,7 @@ func TestSearchIndexPendingSiblingIsRepairedBeforeLaterSplit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 
 	const kind = searchIndexTerm
 	digest := store.searchLookupDigest(kind, "bounded-sibling-chain")
@@ -1456,7 +1468,7 @@ func TestDurableIndexPackedBranchSplitAndDeleteRemainOrdered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 
 	const leafCount = searchIndexTreeMaxChildren
 	const rowsPerLeaf = searchIndexPageRows
@@ -1591,7 +1603,7 @@ func TestDurableIndexBoundsRowsAndEncryptedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	for i := 0; i < 4; i++ {
 		if err := store.PutObservation(context.Background(), indexObservation(t, "editor.app", "docs.example", fmt.Sprintf("alpha item%02d", i))); err != nil {
 			t.Fatal(err)
@@ -1615,7 +1627,7 @@ func TestDurableExactIndexHonorsCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	if err := store.PutObservation(context.Background(), indexObservation(t, "editor.app", "docs.example", "alpha")); err != nil {
 		t.Fatal(err)
 	}
@@ -1656,7 +1668,7 @@ func TestDurableObservationAndIndexMutationRollBackTogether(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	observation := indexObservation(t, "editor.app", "docs.example", "rollback-marker alpha")
 	err = store.Update(context.Background(), func(tx *Tx) error {
 		if err := tx.PutObservation(observation); err != nil {
@@ -1684,7 +1696,7 @@ func TestDurableIndexDeleteRemovesPostingsAndRollsBackAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	first := indexObservation(t, "editor.app", "docs.example", "alpha beta first")
 	second := indexObservation(t, "editor.app", "docs.example", "alpha beta second")
 	for _, observation := range []capture.SanitizedObservation{first, second} {
@@ -1764,7 +1776,7 @@ func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rebuild old observation set: %v", err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	response, err := search.New(store).Search(context.Background(), search.Request{Query: "alpha beta", ResultLimit: 100, SnippetBytes: 32, ResponseBytes: 64 << 10, ScanLimit: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -1806,7 +1818,7 @@ func TestDurableIndexRebuildsLegacyFormatBeforeReturning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rebuild index from legacy format: %v", err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	response, err := search.New(store).Search(context.Background(), search.Request{
 		Query: "alpha beta", ResultLimit: 2, SnippetBytes: 64,
 		ResponseBytes: 4096, ScanLimit: 1,
@@ -1823,7 +1835,7 @@ func TestDurableIndexMaxTermRebuildFitsBoundedBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	common := make([]string, search.MaxIndexedObservationTerms-2)
+	common := make([]string, search.InlineObservationTerms-2)
 	for i := range common {
 		common[i] = fmt.Sprintf("maxrebuild%03d", i)
 	}
@@ -1832,7 +1844,7 @@ func TestDurableIndexMaxTermRebuildFitsBoundedBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(terms) != search.MaxIndexedObservationTerms || len(terms)+2 != 130 {
+	if len(terms) != search.InlineObservationTerms || len(terms)+2 != 130 {
 		t.Fatalf("max observation has %d term trees plus app/domain, want 130", len(terms)+2)
 	}
 	cost, err := estimatedSearchIndexOperations(want)
@@ -1866,7 +1878,7 @@ func TestDurableIndexMaxTermRebuildFitsBoundedBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rebuild a max-term observation in the bounded batch: %v", err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	response, err := search.New(store).Search(context.Background(), search.Request{
 		Query: common[0], ResultLimit: 2, SnippetBytes: 64,
 		ResponseBytes: 4096, ScanLimit: 1,
@@ -1877,25 +1889,30 @@ func TestDurableIndexMaxTermRebuildFitsBoundedBatch(t *testing.T) {
 	t.Logf("max-term rebuild: term_trees=%d app_domain_trees=2 estimate=%d batch_fixed_ops=2 declared_ops=%d hard_cap=%d", len(terms), cost, cost+2, bolt.MaxTransactionOps)
 }
 
-func TestDurableIndexRejectsObservationWithUnboundedTermSet(t *testing.T) {
+func TestDurableIndexQueuesObservationBeyondInlineTermThreshold(t *testing.T) {
 	store, err := OpenDurable(t.TempDir()+"/search.db", durableTestKey(t, 0x78), CreateNew)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	var text strings.Builder
-	for i := 0; i <= search.MaxIndexedObservationTerms; i++ {
+	for i := 0; i <= search.InlineObservationTerms; i++ {
 		fmt.Fprintf(&text, "term%03d ", i)
 	}
 	observation := indexObservation(t, "editor.app", "docs.example", text.String())
-	err = store.PutObservation(context.Background(), observation)
-	var storeError *storage.StoreError
-	if !errors.As(err, &storeError) || storeError.Code != storage.Invalid {
-		t.Fatalf("over-limit observation error = %v, want storage.Invalid", err)
+	if err := store.PutObservation(context.Background(), observation); err != nil {
+		t.Fatal(err)
 	}
-	if _, found, err := store.GetObservation(context.Background(), observation.ContentID()); err != nil || found {
-		t.Fatalf("over-limit observation partially stored: found=%t err=%v", found, err)
+	if saved, found, err := store.GetObservation(context.Background(), observation.ContentID()); err != nil || !found || saved.Text() != observation.Text() {
+		t.Fatal("source rejected by inline threshold", found, err)
 	}
+	if pending, err := store.ExactIndexPending(context.Background()); err != nil || !pending {
+		t.Fatal("source was not queued", pending, err)
+	}
+	if pending, err := store.IndexPendingExact(context.Background(), 10); err != nil || pending {
+		t.Fatal("queued source did not finish", pending, err)
+	}
+
 }
 
 func TestDecodeSearchIndexTreeRejectsZeroPendingSiblingPivot(t *testing.T) {

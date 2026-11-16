@@ -115,6 +115,7 @@ func (e *Engine) Apply(event Event) ([]Segment, error) {
 		return nil, ErrInvalid
 	}
 	var emitted []Segment
+	wallAnchor := event.Wall
 	if e.started && e.active && event.Monotonic > e.lastMono {
 		delta := event.Monotonic - e.lastMono
 		accounted := delta
@@ -131,8 +132,18 @@ func (e *Engine) Apply(event Event) ([]Segment, error) {
 		emitted = append(emitted, attributed...)
 		unknown, _ := e.makeSegments(wallCursor, accounted-known, "", "", nil)
 		emitted = append(emitted, unknown...)
+		// Reading wall and monotonic clocks can differ by a few nanoseconds.
+		// Keep adjacent measured intervals contiguous under that tiny skew;
+		// real clock adjustments still establish a fresh wall-time anchor.
+		if accounted == delta {
+			expected := e.lastWall.Add(time.Duration(delta))
+			skew := event.Wall.Sub(expected)
+			if skew >= -time.Millisecond && skew <= time.Millisecond {
+				wallAnchor = expected
+			}
+		}
 	}
-	e.started, e.lastMono, e.lastWall = true, event.Monotonic, event.Wall
+	e.started, e.lastMono, e.lastWall = true, event.Monotonic, wallAnchor
 	switch event.Kind {
 	case Seen:
 		e.active, e.appID, e.domain = true, strings.Clone(event.AppID), strings.Clone(event.Domain)
@@ -409,7 +420,7 @@ func validText(s string, max int) bool {
 	}
 	for i := range s {
 		c := s[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == ':') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' && c != '.' && c != ':' {
 			return false
 		}
 	}

@@ -32,7 +32,7 @@ func TestLocalAppDefaultsCaptureOnAndPersistsExplicitPause(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := app.Client.ApplicationPreferences(context.Background())
-	if err != nil || !reflect.DeepEqual(got, (preferences.Config{CaptureEnabled: true, MenuBarItemEnabled: true})) {
+	if err != nil || !reflect.DeepEqual(got, preferences.DefaultConfig()) {
 		t.Fatalf("first-run preferences = %+v, %v", got, err)
 	}
 	got.CaptureEnabled = false
@@ -47,7 +47,7 @@ func TestLocalAppDefaultsCaptureOnAndPersistsExplicitPause(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer app.Close()
+	defer func(close func() error) { _ = close() }(app.Close)
 	got, err = app.Client.ApplicationPreferences(context.Background())
 	if err != nil || got.CaptureEnabled {
 		t.Fatalf("explicit pause was not persisted: %+v, %v", got, err)

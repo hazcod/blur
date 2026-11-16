@@ -162,7 +162,7 @@ func BenchmarkDurableExactIndexRankedOverCap(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 
 	ids := make([]string, 0, rankedCount)
 	observations := make([]capture.SanitizedObservation, 0, 4)
@@ -248,7 +248,7 @@ func BenchmarkDurableIndexPackedBranchSplitCascade(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 
 	const kind = searchIndexTerm
 	digest := store.searchLookupDigest(kind, "branch-cascade-benchmark")

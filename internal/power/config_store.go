@@ -94,7 +94,7 @@ func readConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, ErrSettingsUnavailable
 	}
-	defer file.Close()
+	defer func(close func() error) { _ = close() }(file.Close)
 	opened, err := file.Stat()
 	if err != nil || !privateConfigFile(opened) || !os.SameFile(info, opened) || opened.Size() > maxConfigBytes {
 		return Config{}, ErrSettingsUnavailable
@@ -139,7 +139,7 @@ func writeConfig(ctx context.Context, path string, config Config) error {
 		return ErrSettingsUnavailable
 	}
 	tempPath := temp.Name()
-	defer os.Remove(tempPath)
+	defer func() { _ = os.Remove(tempPath) }()
 	if err := temp.Chmod(0o600); err != nil {
 		_ = temp.Close()
 		return ErrSettingsUnavailable

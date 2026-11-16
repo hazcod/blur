@@ -168,7 +168,7 @@ func validClientID(id string) bool {
 	}
 	for i := 0; i < len(id); i++ {
 		c := id[i]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '.' && c != '_' && c != ':' && c != '-' {
 			return false
 		}
 	}
@@ -251,7 +251,7 @@ func validGrantID(id string) bool {
 		return false
 	}
 	for i := range id {
-		if !((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f')) {
+		if (id[i] < '0' || id[i] > '9') && (id[i] < 'a' || id[i] > 'f') {
 			return false
 		}
 	}

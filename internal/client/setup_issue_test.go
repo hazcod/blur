@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/storage/durable"
 )
 
 func TestSetupIssueExplainsSafeRecoveryWithoutLeakingUnderlyingError(t *testing.T) {
@@ -16,6 +17,7 @@ func TestSetupIssueExplainsSafeRecoveryWithoutLeakingUnderlyingError(t *testing.
 	}{
 		{"missing key", ErrMissingDataKey, "key for existing memory is missing"},
 		{"corrupt database", ErrEncryptedStoreCorrupt, "database"},
+		{"newer database", classifyStoreOpenError(durable.ErrUnsupportedSchema), "newer version of Blur"},
 		{"locked keychain", &platform.SecretStoreError{State: platform.SecretLocked}, "Keychain is locked"},
 		{"denied keychain", &platform.SecretStoreError{State: platform.SecretDenied}, "encryption key was denied"},
 		{"unavailable keychain", &platform.SecretStoreError{State: platform.SecretUnavailable}, "Keychain is unavailable"},
@@ -32,5 +34,20 @@ func TestSetupIssueExplainsSafeRecoveryWithoutLeakingUnderlyingError(t *testing.
 				t.Fatalf("SetupIssueMessage() leaked underlying error: %q", got)
 			}
 		})
+	}
+}
+
+func TestStartupErrorIsVisibleWithCopyableSanitizedDiagnostics(t *testing.T) {
+	err := errors.Join(errors.New("secret captured text /Users/alice/private"), &platform.SecretStoreError{State: platform.SecretDenied, Operation: "get", BackendCode: -25293})
+	d := &desktop{}
+	d.setStartupIssue(err)
+	if !strings.Contains(d.startupIssue, "encryption key was denied") || !strings.Contains(d.startupDiagnostic, "-25293") {
+		t.Fatalf("startup recovery lost its reason or diagnostics: %q %q", d.startupIssue, d.startupDiagnostic)
+	}
+	if strings.Contains(d.startupDiagnostic, "secret captured") || strings.Contains(d.startupDiagnostic, "/Users/") {
+		t.Fatal("copyable startup diagnostic contains private underlying error")
+	}
+	if !strings.Contains(d.status, "encryption key was denied") {
+		t.Fatal("status still hides the startup error")
 	}
 }

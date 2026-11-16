@@ -18,6 +18,7 @@ import (
 	"github.com/golang-gui/goui/style"
 	"github.com/golang-gui/goui/theme/modern"
 	"github.com/golang-gui/goui/ui"
+	"github.com/hazcod/blur/internal/acceptance"
 	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/appidentity"
 	"github.com/hazcod/blur/internal/assistant"
@@ -25,11 +26,14 @@ import (
 	"github.com/hazcod/blur/internal/ingest"
 	"github.com/hazcod/blur/internal/knowledge"
 	"github.com/hazcod/blur/internal/knowledge/derive"
+	"github.com/hazcod/blur/internal/knowledge/enrich"
 	"github.com/hazcod/blur/internal/model"
 	"github.com/hazcod/blur/internal/notes"
 	"github.com/hazcod/blur/internal/platform"
 	"github.com/hazcod/blur/internal/power"
 	"github.com/hazcod/blur/internal/preferences"
+	"github.com/hazcod/blur/internal/reminders"
+	"github.com/hazcod/blur/internal/tasks"
 	"github.com/hazcod/blur/internal/today"
 )
 
@@ -51,9 +55,10 @@ func RunDesktopWithSetupIssue(client *Client, setupIssue error, captureControlle
 	done := make(chan struct{})
 	defer close(done)
 	var d *desktop
-	defer func() { d.cancelPauseTimer() }()
+	defer func() { d.cancelPauseTimer(); d.cancelCloudOperation() }()
 	var menuOnce sync.Once
 	defer unregisterQuickAskHotkey()
+	defer uninstallMeetingShortcut()
 	return ui.Run(appidentity.BundleID, func(app ui.App) ui.RootView {
 		menuOnce.Do(func() {
 			if err := installDesktopMainMenu(); err != nil {
@@ -71,7 +76,7 @@ func RunDesktopWithSetupIssue(client *Client, setupIssue error, captureControlle
 			d.captureSetupDone = done
 			d.watchQuickPanelFocus()
 			if client == nil && setupIssue != nil {
-				d.startupIssue = SetupIssueMessage(setupIssue)
+				d.setStartupIssue(setupIssue)
 			}
 			if client != nil {
 				client.SetMemoryInvalidator(func() {
@@ -83,10 +88,13 @@ func RunDesktopWithSetupIssue(client *Client, setupIssue error, captureControlle
 			}
 			d.watchCaptureChanges(done)
 			d.watchDesktopReactivation(done)
+			d.app.Post(d.refreshDetectedModels)
 			d.startUISnapshotIfRequested()
 			d.updateMenuBarCaptureState()
 			d.applyQuickAskHotkey()
 			installDesktopStatusItem(app, d.ensurePauseScheduler(), d.preferences.MenuBarItemEnabled, d.openQuickPanel, d.openSettingsFromMenu, d.toggleCaptureFromMenu, d.onNotchHover)
+			d.initializeMeetings(done)
+			d.initializeSetupChecks(done)
 			if d.preferences.CaptureEnabled {
 				d.startCaptureOnLaunch()
 			}
@@ -102,6 +110,10 @@ func (d *desktop) watchCaptureChanges(done <-chan struct{}) {
 	changes := d.client.CaptureChanges()
 	captureStateChanges := d.client.CaptureStateChanges()
 	memoryChanges := d.client.MemoryChanges()
+	indexChanges := d.client.MemoryIndexChanges()
+	taskChanges := d.client.TaskChanges()
+	noteProcessingChanges := d.client.NoteProcessingChanges()
+	taskOpened := d.client.TaskOpened()
 	safariChanges := d.client.SafariCaptureChanges()
 	controllerChanges := (<-chan struct{})(nil)
 	if d.capture != nil {
@@ -115,6 +127,64 @@ func (d *desktop) watchCaptureChanges(done <-chan struct{}) {
 			select {
 			case <-done:
 				return
+			case <-taskChanges:
+				d.app.Post(func() {
+					d.tasksLoaded = false
+					// A saved task edit or delivery receipt invalidates cached task
+					// rows even when Search is not currently visible.
+					for _, hit := range d.searchHits {
+						if hit.Task != nil {
+							d.searchHits, d.searchComplete = nil, false
+							if d.page == "Ask" && !d.loading {
+								d.runSearch()
+							}
+							break
+						}
+					}
+					if d.page == "Tasks" {
+						if d.tasksLoading {
+							d.taskRefreshPending = true
+						} else {
+							d.loadTaskPage(d.taskAfter)
+						}
+					}
+					if d.page == "Today" || d.quickPreview {
+						if d.todayLoading {
+							d.todayRefreshPending = true
+						} else {
+							d.loadToday()
+						}
+					}
+					d.app.RequestUpdate()
+				})
+			case <-noteProcessingChanges:
+				d.app.Post(func() {
+					if d.page == "Today" {
+						if d.todayLoading {
+							d.todayRefreshPending = true
+						} else {
+							d.loadToday()
+						}
+					}
+					d.app.RequestUpdate()
+				})
+			case id := <-taskOpened:
+				d.app.Post(func() { d.openTaskFromNotice(id) })
+			case <-indexChanges:
+				d.app.Post(func() {
+					d.memoryUI.loaded = false
+					if d.page == "Ask" && d.askQuestion == "" && d.askResult == nil && !d.memoryUI.loading {
+						d.loadMemoryBrowse(memoryBrowseCursor{})
+					}
+					if d.page == "Library" {
+						// Re-read the current filter and page in the background. The
+						// browser publishes only changed rows or status, so index progress
+						// never resets the query or redraws an unchanged directory.
+						d.refreshLibrary()
+					} else {
+						d.app.RequestUpdate()
+					}
+				})
 			case _, ok := <-safariChanges:
 				if !ok {
 					safariChanges = nil
@@ -141,13 +211,17 @@ func (d *desktop) watchCaptureChanges(done <-chan struct{}) {
 					captureStateChanges = nil
 					continue
 				}
-				d.app.Post(d.updateMenuBarCaptureState)
+				d.app.Post(func() { d.updateMenuBarCaptureState(); d.app.RequestUpdate() })
 			case _, ok := <-changes:
 				if !ok {
 					changes = nil
 					continue
 				}
 				d.app.Post(func() {
+					d.memoryUI.loaded = false
+					if d.page == "Ask" && d.askQuestion == "" && d.askResult == nil && !d.memoryUI.loading {
+						d.loadMemoryBrowse(memoryBrowseCursor{})
+					}
 					todayDate := time.Now().In(time.Local).Format("2006-01-02")
 					running := d.capture != nil && d.capture.Running()
 					if shouldRefreshLiveToday(d.page, d.date, todayDate, running) && queueLiveTodayRefresh(d.todayLoading, &d.todayRefreshPending) {
@@ -161,9 +235,11 @@ func (d *desktop) watchCaptureChanges(done <-chan struct{}) {
 					continue
 				}
 				d.app.Post(func() {
-					d.invalidateMemoryViews()
+					// Mutations invalidate synchronously before they return. This
+					// queued notification refreshes that view; clearing it again can
+					// erase a draft restored by a completed explicit-memory action.
 					if !d.client.MemoryIsChanging() {
-						d.refreshAfterMemoryChange()
+						d.refreshInvalidatedMemoryViews()
 					}
 					d.app.RequestUpdate()
 				})
@@ -199,6 +275,9 @@ func captureAppAllowed(appID string, known bool, includedApps []string) bool {
 }
 
 func captureIndicatorPolicyActive(running, appKnown bool, appID string, excludedApps, includedApps []string, defaultDisabled bool) bool {
+	if strings.EqualFold(strings.TrimSpace(appID), appidentity.BundleID) {
+		return false
+	}
 	if !captureMenuIconActive(running, appKnown, appID, excludedApps) {
 		return false
 	}
@@ -212,7 +291,13 @@ func (d *desktop) updateMenuBarCaptureState() {
 	appID, known := d.capture.ActiveApplicationID()
 	running := d.capture != nil && d.capture.Running()
 	active := captureIndicatorPolicyActive(running, known, appID, d.preferences.ExcludedApps, d.preferences.IncludedApps, d.preferences.CaptureDefaultDisabled)
-	setDesktopMenuBarCapture(d.pause, running, active)
+	var health ingest.Health
+	if d.client != nil {
+		health = d.client.CaptureHealth()
+		active = active && captureHealthActive(health)
+	}
+	detail := captureMenuDetail(running, known, appID, d.preferences.ExcludedApps, d.preferences.IncludedApps, d.preferences.CaptureDefaultDisabled, health)
+	setDesktopMenuBarCapture(d.pause, running, active, detail)
 }
 
 func shouldRefreshLiveToday(page, selectedDate, todayDate string, captureRunning bool) bool {
@@ -238,6 +323,9 @@ func consumeLiveTodayRefresh(pending *bool) bool {
 }
 
 type desktop struct {
+	noteUI                        noteDocumentViewState
+	memoryUI                      memoryViewState
+	meetingUI                     meetingViewState
 	pause                         *pauseScheduler
 	sync                          *syncSettingsState
 	app                           ui.App
@@ -260,6 +348,14 @@ type desktop struct {
 	reportReady                   bool
 	note                          string
 	quickInput                    string
+	quickTaskSubmission           *taskSubmission
+	quickProfileSubmission        *profileSubmission
+	quickEntry                    EntryState
+	quickEntryRequest             uint64
+	quickEntryCancel              context.CancelFunc
+	quickEntryLoading             bool
+	quickAskMode                  string
+	profileUI                     profileViewState
 	quickHistory                  quickEntryHistory
 	quickNotePending              bool
 	quickAskPending               bool
@@ -277,13 +373,47 @@ type desktop struct {
 	modelEndpoint                 string
 	modelName                     string
 	modelProvider                 string
+	appleAvailability             string
+	appleChecking                 bool
+	appleCheckRequest             uint64
 	modelCredential               string
 	remoteAskEnabled              bool
+	remoteNotesEnabled            bool
+	modelAccountID                string
+	modelWorkspaceID              string
+	cloudAI                       cloudAIState
 	status                        string
 	loading                       bool
 	libraryLoading                bool
 	libraryLoaded                 bool
 	library                       knowledge.Page
+	libraryGroups                 [][]knowledge.Entity
+	libraryBrowser                libraryBrowserState
+	taskPage                      tasks.Page
+	taskFilter                    tasks.State
+	taskAfter                     string
+	taskBefore                    []string
+	tasksLoading                  bool
+	tasksLoaded                   bool
+	taskRefreshPending            bool
+	taskRequest                   uint64
+	taskEditing                   bool
+	taskEditor                    *tasks.Item
+	taskTitle                     string
+	taskWhen                      string
+	taskOriginalWhen              string
+	taskTimezone                  string
+	pendingDeleteTask             string
+	libraryRefreshPending         bool
+	libraryInspect                *knowledge.Entity
+	libraryInspectLoading         bool
+	libraryInspectRequest         uint64
+	libraryRelated                []knowledge.Entity
+	libraryRelatedOffset          int
+	librarySource                 *SearchHit
+	librarySourceExpanded         bool
+	libraryEditFact               string
+	libraryEditText               string
 	addingKnowledge               bool
 	knowledgeSaving               bool
 	knowledgeDeletingID           string
@@ -317,10 +447,17 @@ type desktop struct {
 	expandedSourceID              string
 	expandedAnswer                bool
 	searchComplete                bool
+	searchIndexingPending         bool
+	searchCoverageLimited         bool
 	searchFailed                  bool
 	askQuestion                   string
 	askResult                     *assistant.Result
+	askConversation               []quickConversationTurn
 	askLoading                    bool
+	askReadingSources             bool
+	askDocumentProgress           assistant.DocumentProgress
+	askHasDocumentProgress        bool
+	askSourcesExpanded            bool
 	askRequestID                  uint64
 	askCancel                     context.CancelFunc
 	answers                       map[string]string
@@ -342,8 +479,16 @@ type desktop struct {
 	powerSecondsDraft             string
 	capture                       *ingest.Controller
 	captureState                  string
+	capturePauseUnsaved           bool
 	localAIEnabled                bool
+	memoryEndpoint                string
+	memoryModel                   string
+	modelDiscovery                modelDiscoveryState
 	backgroundSummaries           bool
+	backgroundWorkUI              backgroundWorkViewState
+	voiceSettings                 voiceSettingsState
+	logSettingsUI                 logSettingsViewState
+	setupChecks                   setupChecksState
 	aiNeedsRepair                 bool
 	preferences                   preferences.Config
 	captureDefaultDisabledDraft   bool
@@ -364,6 +509,7 @@ type desktop struct {
 	permissionActivationAvailable bool
 	captureSetupDone              <-chan struct{}
 	startupIssue                  string
+	startupDiagnostic             string
 }
 
 func newDesktop(app ui.App, client *Client, captureController *ingest.Controller) *desktop {
@@ -372,12 +518,12 @@ func newDesktop(app ui.App, client *Client, captureController *ingest.Controller
 	if client == nil {
 		prefs.CaptureEnabled = false
 	}
-	d := &desktop{app: app, client: client, capture: captureController, preferences: prefs, page: "Today", settingsGroup: settingsGroupCapture, date: localDate, dateDraft: localDate, reportStart: localDate, reportEnd: localDate, reportZone: localZoneName(), answers: make(map[string]string), knowledgeKind: knowledge.Project}
+	d := &desktop{app: app, client: client, capture: captureController, preferences: prefs, page: "Today", settingsGroup: settingsGroupCapture, date: localDate, dateDraft: localDate, reportStart: localDate, reportEnd: localDate, reportZone: localZoneName(), answers: make(map[string]string), knowledgeKind: knowledge.Project, dashboardOpen: acceptance.Enabled}
 	if client != nil && captureController != nil {
 		client.SetCaptureStateReader(func() (bool, time.Time) { return captureController.Running(), time.Time{} })
 	}
 	if client == nil || client.data == nil {
-		d.status = "Encrypted local storage is unavailable. Blur has not started capture or saved anything."
+		d.setStartupIssue(nil)
 		return d
 	}
 	if saved, err := client.ApplicationPreferences(context.Background()); err != nil {
@@ -390,7 +536,7 @@ func newDesktop(app ui.App, client *Client, captureController *ingest.Controller
 		if err := client.RestoreClaudeMCP(context.Background(), true); err != nil {
 			d.mcpStatus = "Claude integration is enabled, but the local bridge could not start. Check Keychain access and try again."
 		} else {
-			d.mcpStatus = "Claude can search Blur memory through the read-only local bridge."
+			d.mcpStatus = "Local bridge ready. Add Blur to Claude’s MCP configuration to connect it."
 		}
 	}
 	d.excludedAppsDraft = strings.Join(d.preferences.ExcludedApps, "\n")
@@ -402,14 +548,19 @@ func newDesktop(app ui.App, client *Client, captureController *ingest.Controller
 	d.modelEndpoint, d.modelName = settings.Endpoint, settings.Model
 	d.modelProvider = effectiveProvider(settings)
 	d.remoteAskEnabled = settings.RemoteAskEnabled
-	if d.modelEndpoint == "" {
+	d.remoteNotesEnabled = settings.RemoteNotesEnabled
+	d.modelAccountID, d.modelWorkspaceID = settings.AccountID, settings.WorkspaceID
+	if d.modelEndpoint == "" && d.modelProvider == ProviderOllama {
 		d.modelEndpoint = "http://127.0.0.1:11434"
 	}
 	if d.modelProvider == ProviderOpenAICompatible && settings.Endpoint == "" {
 		d.modelEndpoint = "https://api.openai.com/v1"
 	}
 	d.localAIEnabled, d.aiNeedsRepair = client.LocalAIEnabled(), client.LocalAISettingsNeedRepair()
+	d.taskFilter = tasks.Open
 	d.backgroundSummaries = settings.BackgroundSummaries
+	memorySettings := client.MemoryIndexSettings()
+	d.memoryEndpoint, d.memoryModel = memorySettings.Endpoint, memorySettings.Model
 	d.powerConfig = power.DefaultConfig()
 	if client.CanConfigurePower() {
 		if config, err := client.PowerConfig(context.Background()); err == nil {
@@ -429,6 +580,9 @@ func newDesktop(app ui.App, client *Client, captureController *ingest.Controller
 			d.retentionDays, d.retentionDraft = policy.Days, policy.Days
 		}
 	}
+	if d.modelProvider == ProviderApple {
+		d.refreshAppleAvailability()
+	}
 	d.status = "Loading your local day…"
 	d.loadToday()
 	return d
@@ -439,18 +593,20 @@ func (d *desktop) view() ui.RootView {
 	options := modern.Options{Dark: settings.ColorScheme() == ui.ColorSchemeDark, AccentColor: settings.AccentColor(), FontFamily: settings.FontFamily(), FontSize: settings.FontSize()}
 	d.tokens = themePalette(options.Dark)
 	rules := themeRules(options)
-	mainWindow := ui.Window("main").Title("Blur").Size(1040, 740).MinSize(800, 560).Center(true).Chrome(ui.WindowChromeNative).Content(
-		ui.HBox(d.sidebar(), d.contentColumn()).CrossAlign(layout.CrossStretch),
-	)
-	mainWindow = addDesktopBackgroundClose(mainWindow, d.app, "main", func() { d.collapseTransientContent("main") })
-	mainWindow = addDesktopQuitShortcut(mainWindow, d.app)
-	quickWindow := d.quickWindowView()
 	var windows []ui.WindowView
+	if d.meetingUI.overlayMounted {
+		windows = append(windows, d.meetingOverlayWindow())
+	}
 	for _, id := range quickPanelWindowIDs(d.dashboardOpen, d.quickPanelMounted) {
 		switch id {
 		case "quick":
-			windows = append(windows, quickWindow)
+			windows = append(windows, d.quickWindowView())
 		case "main":
+			mainWindow := ui.Window("main").Title(appidentity.DisplayName).Size(1040, 740).MinSize(800, 560).Center(true).Chrome(ui.WindowChromeNative).Content(
+				ui.HBox(d.sidebar(), d.contentColumn()).CrossAlign(layout.CrossStretch),
+			)
+			mainWindow = addDesktopBackgroundClose(mainWindow, d.app, "main", d.closeDashboard)
+			mainWindow = addDesktopQuitShortcut(mainWindow, d.app, d.memoryShortcuts()...)
 			windows = append(windows, mainWindow)
 		}
 	}
@@ -467,17 +623,57 @@ func (d *desktop) contentColumn() ui.View {
 }
 
 func desktopPages() []string {
-	return []string{"Today", "Ask", "Search", "Library", "Time", "Settings"}
+	return []string{"Today", "Ask", "Library", "Tasks", "Preferences", "Time", "Settings"}
 }
 
 func (d *desktop) captureLightState() captureLightState {
 	switch {
 	case d.capture != nil && d.capture.Running():
 		return captureLightOn
+	case d.capturePauseUnsaved:
+		return captureLightPaused
 	case d.captureStarting || d.preferences.CaptureEnabled:
 		return captureLightPending
 	}
 	return captureLightPaused
+}
+
+func (d *desktop) navigatePage(page string) {
+	if page == "Search" || page == "Voice notes" {
+		if page == "Search" && d.askQuestion == "" {
+			d.askQuestion = d.query
+		}
+		page = "Ask"
+	}
+	d.page, d.status = page, ""
+	if page == "Ask" && !d.memoryUI.loaded && !d.memoryUI.loading {
+		d.loadMemoryBrowse(memoryBrowseCursor{})
+	}
+	if page == "Today" {
+		if d.todayLoading {
+			d.todayRefreshPending = true
+		} else {
+			d.loadToday()
+		}
+	}
+	if page == "Settings" && d.powerStatus == "" && !d.powerChecking {
+		d.refreshPowerState()
+	}
+	if page == "Settings" && normalSettingsGroup(d.settingsGroup) == settingsGroupCapture {
+		d.refreshSetupChecks()
+	}
+	if page == "Library" && !d.libraryLoaded && !d.libraryLoading {
+		d.loadLibrary()
+	} else if page == "Library" && d.libraryBrowser.updatesAvailable && !d.libraryLoading {
+		d.refreshLibrary()
+	}
+	if page == "Tasks" && !d.tasksLoaded && !d.tasksLoading {
+		d.loadTaskPage("")
+	}
+	if page == "Preferences" && !d.profileUI.loaded && !d.profileUI.loading {
+		d.loadProfilePage("")
+	}
+	d.app.RequestUpdate()
 }
 
 func (d *desktop) sidebar() ui.View {
@@ -494,16 +690,7 @@ func (d *desktop) sidebar() ui.View {
 			Style(buttonStyle).
 			Paddings(geometry.Insets{Left: navTextInset, Right: navTextTrailing}).
 			MinHeight(navRowHeight).MainWeight(1).
-			OnClick(func() {
-				d.page, d.status = page, ""
-				if page == "Settings" && d.powerStatus == "" && !d.powerChecking {
-					d.refreshPowerState()
-				}
-				if page == "Library" && !d.libraryLoaded && !d.libraryLoading {
-					d.loadLibrary()
-				}
-				d.app.RequestUpdate()
-			})
+			OnClick(func() { d.activateSidebarPage(page) })
 		rows = append(rows, ui.HBox(ui.VBox().Style(marker).MinSize(navMarkerWidth, navRowHeight).MaxSize(navMarkerWidth, navRowHeight), button).CrossAlign(layout.CrossStretch))
 	}
 	rows = append(rows, wrapLabel("").MainWeight(1))
@@ -521,6 +708,22 @@ func (d *desktop) sidebar() ui.View {
 	}
 	return ui.VBox(rows...).Spacing(2).Paddings(geometry.Insets{Top: 28, Bottom: 22}).CrossAlign(layout.CrossStretch).
 		Style(styleRail).MinWidth(railWidth).MaxWidth(railWidth)
+}
+
+func (d *desktop) activateSidebarPage(page string) {
+	d.cancelVoiceRecapForNavigation()
+	if page == "Ask" {
+		if d.memoryUI.meetingDetail {
+			d.memoryUI.meetingDetail = false
+			if d.memoryUI.recap.resumeEditor {
+				d.noteUI.open = true
+				d.memoryUI.recap.resumeEditor = false
+			}
+		} else if d.noteUI.open {
+			d.closeNoteDocument()
+		}
+	}
+	d.navigatePage(page)
 }
 
 func captureActionLabel(running bool) string {
@@ -544,7 +747,9 @@ func (d *desktop) header() ui.View {
 			title = ui.HBox(title, flatButton("Today").Enabled(browse).OnClick(d.goToToday)).Spacing(6).CrossAlign(layout.CrossCenter)
 		}
 	}
-	actions = append(actions, flatButton("Quick ask").OnClick(d.openQuickPanel))
+	if d.page != "Ask" {
+		actions = append(actions, flatButton("Quick ask").OnClick(d.openQuickPanel))
+	}
 	return ui.HBox(
 		ui.VBox(title, wrapLabel(d.subtitle()).Style(styleMeta)).Spacing(6).CrossAlign(layout.CrossStart).MainWeight(1),
 		ui.HBox(actions...).Spacing(4).CrossAlign(layout.CrossCenter),
@@ -555,12 +760,14 @@ func (d *desktop) subtitle() string {
 	switch d.page {
 	case "Today":
 		return "A private recap, with next steps you can review."
-	case "Search":
-		return "Find an exact match in your local memory."
-	case "Ask":
-		return "Ask a question about what you have chosen to remember."
+	case "Ask", "Search", "Voice notes":
+		return "Ask a question or find saved notes, voice notes, and captures."
 	case "Library":
 		return "People, projects, and the evidence behind them."
+	case "Tasks":
+		return "Private tasks and reminders scheduled with macOS."
+	case "Preferences":
+		return "What you want Blur to remember, and how you want it to write."
 	case "Time":
 		return reportZoneLine(d.reportZone)
 	case "Settings":
@@ -571,6 +778,9 @@ func (d *desktop) subtitle() string {
 }
 
 func (d *desktop) content() ui.View {
+	if d.client == nil || d.client.data == nil {
+		return d.storageRecoveryView()
+	}
 	switch d.page {
 	case "Today":
 		return d.todayView()
@@ -578,8 +788,14 @@ func (d *desktop) content() ui.View {
 		return d.askView()
 	case "Search":
 		return d.searchView()
+	case "Voice notes":
+		return d.meetingsView()
 	case "Library":
 		return d.libraryView()
+	case "Tasks":
+		return d.tasksView()
+	case "Preferences":
+		return d.profileView()
 	case "Time":
 		return d.timeReportView()
 	default:
@@ -588,93 +804,165 @@ func (d *desktop) content() ui.View {
 }
 
 func askProcessingDisclosure(settings LocalAISettings) string {
+	if settings.Enabled && cloudAccountProvider(effectiveProvider(settings)) {
+		return cloudProcessingDisclosure(settings)
+	}
+	if !settings.Enabled {
+		return "AI is off. Ask can find saved sources and show matching passages without a model. Enable an answer model in Settings for generated answers."
+	}
 	if effectiveProvider(settings) == ProviderOpenAICompatible {
 		if settings.RemoteAskEnabled {
-			return "When you ask, Blur searches matching local sources and sends your question plus up to eight bounded matches to the configured OpenAI-compatible endpoint. Blur sends only your question when no sources match. The provider may retain requests."
+			return "When you search or ask, the selected model can interpret your question and rank bounded saved passages at the configured OpenAI-compatible endpoint. Answers use up to eight matching sources. The provider may retain requests."
 		}
 		return "Ask searches matching local sources. Your question and any matches stay on this device unless you separately allow sending them to the configured remote endpoint."
 	}
-	return "When you ask, Blur searches matching local sources and sends your question plus any bounded matches to Ollama on this device. Blur sends only your question when no sources match. Captured text is not sent to remote providers."
+	if effectiveProvider(settings) == ProviderApple {
+		return "When you ask, Blur searches matching local sources and gives your question, relevant explicit preferences, applicable writing rules, and bounded matches to Apple’s on-device system model. General answers use your question and applicable writing rules. No model server or account login is used."
+	}
+	return "When you ask, Blur searches matching local sources and sends your question, relevant explicit preferences, applicable writing rules, and bounded matches to Ollama on this device. General answers use your question and applicable writing rules. Captured text and preferences are not sent to remote providers."
 }
 
-// askModelLastCopy states the retrieval principle: local first, model last.
-const askModelLastCopy = "Blur reads your memory locally first. Only the few items it picks for a question go to the model you configured, never your whole memory."
+func generalAnswerDisclosure(rules int) string {
+	if rules > 0 {
+		return fmt.Sprintf("General answer. Applied %d saved writing rules; no captured sources or personal facts were used as answer evidence.", rules)
+	}
+	return "General answer. No saved memory was used as answer evidence."
+}
+
+const selectedPassageCoverageNotice = "This answer used selected saved passages; some source text or saved memory may not be included."
+
+func askUnavailableCopy(settings LocalAISettings, needsRepair bool) string {
+	if needsRepair {
+		return "Saved AI settings need attention. Review AI settings to repair them."
+	}
+	if !settings.Enabled {
+		return "Enable Apple on-device or another model in AI settings to ask questions."
+	}
+	provider := effectiveProvider(settings)
+	if provider == ProviderApple {
+		return "Apple’s on-device model is not ready. Review Apple Intelligence availability in AI settings. You can still search saved sources without AI."
+	}
+	if cloudAccountProvider(provider) {
+		if !settings.RemoteAskEnabled {
+			return "Saved-memory sharing is off. Enable it in AI settings, or choose Apple on-device to keep processing on this Mac."
+		}
+		return "The selected provider is not ready for Ask. Review its account and model in AI settings."
+	}
+	if provider == ProviderOpenAICompatible {
+		if !settings.RemoteAskEnabled {
+			return "Remote Ask is off. Enable it in AI settings, or choose Apple on-device to keep processing on this Mac."
+		}
+		return "The configured provider is not ready for Ask. Review its endpoint and credentials in AI settings."
+	}
+	return "Ollama is not ready. Review its connection and selected model in AI settings."
+}
 
 func (d *desktop) askView() ui.View {
+	if d.noteUI.open {
+		return d.noteDocumentView()
+	}
 	settings := LocalAISettings{}
 	if d.client != nil {
 		settings = d.client.LocalAISettings()
 	}
-	rows := []ui.View{wrapLabel(askProcessingDisclosure(settings)).Style(modern.MutedText), wrapLabel(askModelLastCopy).Style(modern.MutedText)}
-	if d.client == nil || !d.client.CanAskMemory() {
-		rows = append(rows, surfaceBox(12, 0, ui.HBox(
-			ui.TextInput().Placeholder("Configure Ollama in Settings to ask").MainWeight(1).Enabled(false),
-			primaryButton("Ask").Enabled(false),
-		).Spacing(10).CrossAlign(layout.CrossCenter)))
-		message := "To ask about local memory, configure Ollama on this device in Settings."
-		if settings.Enabled && effectiveProvider(settings) == ProviderOpenAICompatible {
-			if settings.RemoteAskEnabled {
-				message = "The configured provider is not ready for Ask. Review its endpoint and credentials in Settings."
-			} else {
-				message = "Remote Ask is off. Allow it in Settings to send matching captured sources to the configured endpoint, or switch to local Ollama."
-			}
-		} else if d.client != nil && d.client.LocalAISettingsNeedRepair() {
-			message = "The local model settings need attention. Review AI settings to reconnect Ollama."
-		}
-		rows = append(rows,
-			wrapLabel(message).Style(modern.MutedText),
-			flatButton("Open AI settings").OnClick(func() { d.openSettings(settingsGroupAI) }),
-		)
-		return pageScroll(ui.VBox(hugButtons(rows)...).Spacing(16).CrossAlign(layout.CrossStretch))
+	rows := []ui.View{}
+	memoryChanging := d.client != nil && d.client.MemoryIsChanging()
+	label := "Send"
+	if strings.TrimSpace(d.askQuestion) == "" {
+		label = "Browse"
 	}
-	memoryChanging := d.client.MemoryIsChanging()
 	rows = append(rows, surfaceBox(12, 0, ui.HBox(
-		ui.TextInput().Text(d.askQuestion).MainWeight(1).Placeholder("What did we decide about the launch?").Enabled(askInputEnabled(d.askLoading || d.loading, memoryChanging)).OnText(func(value string) {
-			d.askQuestion = value
+		ui.TextInput().Text(d.askQuestion).MainWeight(1).Placeholder("Ask, write a note, or set a reminder").Enabled(d.client != nil && askInputEnabled(d.askLoading || d.loading, memoryChanging)).OnText(func(value string) {
+			d.cancelVoiceRecapForNavigation()
+			d.askQuestion, d.query = value, value
 			d.askResult = nil
-			d.expandedAnswer = false
-			d.status = ""
+			d.searchHits, d.searchComplete, d.searchFailed = nil, false, false
+			d.searchIndexingPending, d.searchCoverageLimited = false, false
+			d.expandedAnswer, d.memoryUI.meetingDetail = false, false
+			d.expandedSourceID, d.status = "", ""
+			d.askSourcesExpanded = false
+			if strings.TrimSpace(value) == "" && !d.memoryUI.loaded && !d.memoryUI.loading {
+				d.loadMemoryBrowse(memoryBrowseCursor{})
+			}
 			d.app.RequestUpdate()
-		}).OnSubmit(d.askMemory),
-		primaryButton("Ask").Enabled(askSubmitEnabled(d.askLoading || d.loading, memoryChanging, d.askQuestion)).OnClick(d.askMemory),
+		}).OnSubmit(d.submitMemoryQuery),
+		primaryButton(label).Enabled(d.client != nil && askInputEnabled(d.askLoading || d.loading, memoryChanging)).OnClick(d.submitMemoryQuery),
 	).Spacing(10).CrossAlign(layout.CrossCenter)))
 	if memoryChanging {
 		rows = append(rows, wrapLabel("Memory pruning… Ask will return when it’s done.").Style(modern.MutedText))
 	}
 	if d.askLoading {
 		rows = append(rows,
-			wrapLabel(askProgressLabel(d.client.LocalAISettings(), d.askQuestion)).Style(modern.MutedText),
+			wrapLabel(d.askProgressCopy(settings)).Style(modern.MutedText),
 			flatButton("Cancel Ask").OnClick(d.cancelAsk),
 		)
 	}
-	if d.status != "" {
+	if d.status != "" && !strings.HasPrefix(d.status, "Capture is on for the currently focused app.") {
 		rows = append(rows, wrapLabel(d.status).Style(modern.MutedText))
 	}
-	if result := d.askResult; result != nil {
+	if result := d.askResult; result != nil && !d.memoryUI.meetingDetail {
+		if d.memoryUI.answerInput != "" {
+			rows = append(rows, wrapLabel(d.memoryUI.answerInput).Style(styleSectionTitle))
+		}
 		if result.Answer.InsufficientEvidence {
-			rows = append(rows, wrapLabel("There isn’t enough matching evidence to answer that.").Style(modern.MutedText))
+			rows = append(rows, wrapLabel(insufficientEvidenceMessage(result.Answer)).Style(modern.MutedText))
 		} else {
 			if result.General {
-				rows = append(rows, wrapLabel("General answer. No saved memory was sent.").Style(modern.MutedText))
+				rows = append(rows, wrapLabel(generalAnswerDisclosure(result.AppliedRules)).Style(modern.MutedText))
 			}
 			rows = append(rows, surfaceBox(16, 10, answerViews(result.Answer.Text, d.expandedAnswer, func() {
 				d.expandedAnswer = !d.expandedAnswer
 				d.app.RequestUpdate()
 			}, "")...))
-			if line := answerSentLine(result.General, result.Direct, result.SentItems, len(result.Sources)); line != "" && !result.General {
+			if line := answerSentLine(result.General, result.Direct, result.SentItems, len(result.Sources)); line != "" && !result.General && result.GenerationIssue != assistant.GenerationInvalidResponse {
+				if result.AppliedRules > 0 {
+					line += fmt.Sprintf("; %d writing rules applied", result.AppliedRules)
+				}
 				rows = append(rows, wrapLabel(line).Style(modern.MutedText))
 			}
+			if result.IndexingPending {
+				rows = append(rows, wrapLabel(pendingExactIndexCopy).Style(styleMeta))
+			}
+			if result.PreferencesOmitted > 0 {
+				rows = append(rows, wrapLabel(fmt.Sprintf("%d saved preferences did not fit this answer. Review them in Preferences.", result.PreferencesOmitted)).Style(styleMeta))
+			}
 		}
-		var sourceBlocks []ui.View
+		if result.CoverageLimited {
+			notice := answerCoverageNotice(true, result.Plan.Kind == assistant.KindRecap, hasPartialCapture(result.Sources))
+			rows = append(rows, wrapLabel(notice).Style(styleMeta))
+		}
+		var sourceBlocks, recapBlocks, capturedBlocks []ui.View
 		for _, source := range result.Sources {
-			preview, truncated := searchPreview(source.Text)
+			sourceText := source.Text
+			sourceLabel := sourceKind(SearchHit{AppID: source.AppID, Domain: source.Domain})
+			if source.AppName == "Library" {
+				sourceLabel = "Library"
+			}
+			if source.AppID == "sh.blur.notes" {
+				if title, body, found := markdownNoteHeading(source.Text); found {
+					sourceLabel = "Note: " + title
+					sourceText = body
+					if strings.TrimSpace(sourceText) == "" {
+						sourceText = title
+					}
+				}
+			}
+			preview, truncated := searchPreview(sourceText)
 			content := preview
 			if d.expandedSourceID == source.SourceID {
 				content = source.Text
 			}
 			sourceRows := []ui.View{
+				d.memorySourceHeading(SearchHit{AppID: source.AppID, Domain: source.Domain}, sourceLabel),
 				wrapLabel(content),
-				wrapLabel(strings.Trim(strings.Join([]string{source.AppID, source.Domain}, ", "), ", ")).Style(styleMeta),
+				wrapLabel(askEvidenceCaption(source)).Style(styleMeta),
+			}
+			if action := d.memoryVoiceSourceAction(source.SourceID, source.AppID); action != nil {
+				sourceRows = append(sourceRows, action)
+			}
+			if source.AppID == "sh.blur.notes" {
+				id := source.SourceID
+				sourceRows = append(sourceRows, flatButton("Edit note").Enabled(!d.loading).OnClick(func() { d.openNoteDocument(id) }))
 			}
 			if truncated {
 				label := "Show full source"
@@ -691,27 +979,99 @@ func (d *desktop) askView() ui.View {
 					d.app.RequestUpdate()
 				}))
 			}
-			sourceBlocks = append(sourceBlocks, ui.VBox(sourceRows...).Spacing(6).CrossAlign(layout.CrossStretch))
+			if source.Origin == assistant.OriginUserFact {
+				sourceRows = append(sourceRows, flatButton("Review preferences").Enabled(!d.loading).OnClick(func() { d.page = "Preferences"; d.loadProfilePage(""); d.app.RequestUpdate() }))
+			}
+			if source.Origin == assistant.OriginTask {
+				sourceRows = append(sourceRows, flatButton("Review tasks").Enabled(!d.loading).OnClick(func() { d.page = "Tasks"; d.loadTaskPage(""); d.app.RequestUpdate() }))
+			}
+			block := ui.VBox(sourceRows...).Spacing(6).CrossAlign(layout.CrossStretch)
+			if source.Layer == assistant.LayerSource {
+				capturedBlocks = append(capturedBlocks, block)
+			} else {
+				recapBlocks = append(recapBlocks, block)
+			}
+			sourceBlocks = append(sourceBlocks, block)
 		}
-		if len(sourceBlocks) > 0 {
-			rows = append(rows, hairline(), section("Sources", sourceBlocks...))
+		if result.Plan.Kind == assistant.KindRecap {
+			if len(recapBlocks) > 0 {
+				rows = append(rows, hairline(), section("Recaps", recapBlocks...))
+			}
+			if len(capturedBlocks) > 0 {
+				noun := "source"
+				if len(capturedBlocks) != 1 {
+					noun += "s"
+				}
+				label := fmt.Sprintf("Show %d captured %s", len(capturedBlocks), noun)
+				if d.askSourcesExpanded {
+					rows = append(rows, hairline(), section("Captured sources", capturedBlocks...), flatButton("Hide captured sources").OnClick(func() { d.askSourcesExpanded = false; d.app.RequestUpdate() }))
+				} else {
+					rows = append(rows, flatButton(label).OnClick(func() { d.askSourcesExpanded = true; d.app.RequestUpdate() }))
+				}
+			}
+		} else if len(sourceBlocks) > 0 {
+			heading := "Sources"
+			if result.Answer.InsufficientEvidence {
+				heading = "Related sources"
+			}
+			rows = append(rows, hairline(), section(heading, sourceBlocks...))
 		}
 	}
-	if d.askResult == nil && !d.askLoading && d.status == "" {
-		rows = append(rows, wrapLabel("Questions are processed only after you ask. Answers include the local sources they used.").Style(modern.MutedText))
-		rows = append(rows, wrapLabel("Questions about your day, meetings, pages, or notes search your memory. Other questions get a general answer.").Style(modern.MutedText))
+	rows = append(rows, d.memoryResultViews()...)
+	rows = append(rows, wrapLabel(askProcessingDisclosure(settings)).Style(styleMeta))
+	return memoryKeyboardMount(d, pageScroll(ui.VBox(hugButtons(rows)...).Spacing(14).CrossAlign(layout.CrossStretch).ID("memory-composer-root")))
+}
+
+func (d *desktop) askProgressCopy(settings LocalAISettings) string {
+	if d.askReadingSources {
+		return "Loading saved task sources…"
 	}
-	return pageScroll(ui.VBox(hugButtons(rows)...).Spacing(14).CrossAlign(layout.CrossStretch))
+	if d.askHasDocumentProgress {
+		return documentProgressCopy(d.askDocumentProgress)
+	}
+	return askProgressLabel(settings, d.askQuestion)
+}
+
+func documentProgressCopy(progress assistant.DocumentProgress) string {
+	if progress.PartsTotal < 1 {
+		return "Reading the full page…"
+	}
+	parts := fmt.Sprintf("%d of %d parts", min(progress.PartsRead, progress.PartsTotal), progress.PartsTotal)
+	if progress.BytesTotal > 0 {
+		parts += fmt.Sprintf(" (%s of %s)", formatDocumentBytes(progress.BytesRead), formatDocumentBytes(progress.BytesTotal))
+	}
+	switch progress.Phase {
+	case "reducing":
+		return "Combining the full page: " + parts
+	case "complete":
+		return "Finishing the full-page answer: " + parts
+	default:
+		return "Reading and understanding the full page: " + parts
+	}
+}
+
+func formatDocumentBytes(value int64) string {
+	if value < 1024 {
+		return fmt.Sprintf("%d bytes", value)
+	}
+	if value < 1<<20 {
+		return fmt.Sprintf("%d KB", value/1024)
+	}
+	return fmt.Sprintf("%.1f MB", float64(value)/(1<<20))
 }
 
 func askProgressLabel(settings LocalAISettings, question string) string {
-	remote := effectiveProvider(settings) == ProviderOpenAICompatible && settings.RemoteAskEnabled
+	remote := isRemoteCompletionProvider(effectiveProvider(settings)) && (settings.RemoteAskEnabled || cloudAccountProvider(effectiveProvider(settings)))
 	searches := assistant.QuestionSeeksPersonalMemory(question)
 	switch {
 	case remote && searches:
 		return "Searching local memory and asking the configured provider…"
 	case remote:
 		return "Asking the configured provider…"
+	case effectiveProvider(settings) == ProviderApple && searches:
+		return "Searching local memory and asking Apple’s on-device model…"
+	case effectiveProvider(settings) == ProviderApple:
+		return "Asking Apple’s on-device model…"
 	case searches:
 		return "Searching local memory and asking Ollama…"
 	}
@@ -727,36 +1087,79 @@ func askSubmitEnabled(loading, memoryChanging bool, question string) bool {
 }
 
 func (d *desktop) askMemory() {
+	if d == nil {
+		return
+	}
+	d.askMemoryWithDraftRevision(d.quickUI.draftRevision)
+}
+
+// Intent inference may finish after the user starts another draft. Carry the
+// submitted revision through both async stages rather than adopting that draft.
+func (d *desktop) askMemoryWithDraftRevision(quickDraftRevision uint64) {
 	if d == nil || d.loading || d.askLoading || d.client == nil || d.client.MemoryIsChanging() || !d.client.CanAskMemory() {
 		return
 	}
 	d.askRequestID++
 	requestID := d.askRequestID
+	epoch, stable := d.client.BeginMemoryRead()
+	if !stable {
+		return
+	}
 	question := d.askQuestion
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	started := time.Now()
+	surface := "dashboard"
+	if d.quickAskPending {
+		surface = "quick"
+	}
+	mode := d.memoryUI.askMode
+	var history []assistant.Turn
+	if d.quickAskPending {
+		history = quickHistoryTurns(d.quickConversation)
+		mode = d.quickAskMode
+	} else {
+		history = quickHistoryTurns(d.askConversation)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), askOperationTimeout(question))
 	d.askCancel = cancel
 	d.askLoading, d.status, d.askResult = true, "", nil
+	d.askHasDocumentProgress = false
+	d.askDocumentProgress = assistant.DocumentProgress{}
 	d.expandedSourceID = ""
 	d.expandedAnswer = false
 	d.resizeQuickPanel(false)
 	d.app.RequestUpdate()
 	go func() {
-		var history []assistant.Turn
-		if d.quickAskPending {
-			history = quickHistoryTurns(d.quickConversation)
+		var lastProgress time.Time
+		progress := func(value assistant.DocumentProgress) {
+			now := time.Now()
+			if value.Phase != "complete" && now.Sub(lastProgress) < 100*time.Millisecond {
+				return
+			}
+			lastProgress = now
+			d.app.Post(func() {
+				if !askRequestCurrent(requestID, d.askRequestID) {
+					return
+				}
+				d.askDocumentProgress = value
+				d.askHasDocumentProgress = true
+				d.app.RequestUpdate()
+			})
 		}
-		result, err := d.client.AskMemoryWithHistory(ctx, question, history)
+		result, err := d.client.askMemoryWithModeProgress(ctx, question, history, mode, progress)
 		cancel()
 		d.app.Post(func() {
-			if !askRequestCurrent(requestID, d.askRequestID) {
+			if !askRequestCurrent(requestID, d.askRequestID) || !d.client.MemoryReadCurrent(epoch) {
 				return
 			}
 			d.askCancel = nil
 			d.askLoading = false
+			d.askHasDocumentProgress = false
 			if err != nil {
 				d.status = askErrorMessage(err, effectiveProvider(d.client.LocalAISettings()))
 				if d.quickAskPending {
-					d.quickInput = d.askQuestion
+					if d.quickUI.draftRevision == quickDraftRevision {
+						d.quickInput = question
+					}
 					d.quickAskPending = false
 				}
 				d.resizeQuickPanel(d.quickPanelExpanded())
@@ -764,11 +1167,26 @@ func (d *desktop) askMemory() {
 				d.askResult = &result
 				if d.quickAskPending {
 					d.quickConversation = appendQuickConversation(d.quickConversation, d.askQuestion, result)
+					if d.quickUI.draftRevision == quickDraftRevision {
+						d.quickInput = ""
+					}
+					d.showQuickCurrentAnswer()
+					d.quickEntry = EntryState{Epoch: epoch, Targets: result.Targets}
 					d.quickAskPending = false
-					d.quickInput = ""
+				} else {
+					d.askConversation = appendQuickConversation(d.askConversation, question, result)
+					d.memoryUI.entry = EntryState{Epoch: epoch, Targets: result.Targets, HasAnswer: true, AnswerGeneral: result.General}
+					if d.memoryUI.submittedInput != "" {
+						d.memoryUI.answerInput = question
+						if d.askQuestion == question {
+							d.askQuestion, d.query = "", ""
+						}
+						d.memoryUI.submittedInput = ""
+					}
 				}
 				d.resizeQuickPanel(d.quickPanelExpanded())
 			}
+			slog.Debug("assistant request completed", "surface", surface, "elapsed_ms", time.Since(started).Milliseconds(), "ok", err == nil, "source_count", len(result.Sources), "direct", result.Direct, "plan_kind", result.Plan.Kind, "generation_issue", result.GenerationIssue)
 			d.app.RequestUpdate()
 		})
 	}()
@@ -788,10 +1206,15 @@ func (d *desktop) invalidateAsk() {
 		d.askCancel = nil
 	}
 	if d.quickAskPending {
-		d.quickInput = d.askQuestion
+		if d.quickInput == "" {
+			d.quickInput = d.askQuestion
+		}
 		d.quickAskPending = false
 	}
 	d.askLoading = false
+	d.askReadingSources = false
+	d.askHasDocumentProgress = false
+	d.askDocumentProgress = assistant.DocumentProgress{}
 	d.askResult = nil
 	d.expandedSourceID = ""
 	d.expandedAnswer = false
@@ -808,19 +1231,40 @@ func (d *desktop) cancelAsk() {
 }
 
 func askErrorMessage(err error, configuredProvider ...string) string {
-	remote := len(configuredProvider) > 0 && configuredProvider[0] == ProviderOpenAICompatible
+	if message := cloudRequestErrorCopy(err); message != "" {
+		return message
+	}
+	remote := len(configuredProvider) > 0 && isRemoteCompletionProvider(configuredProvider[0])
+	apple := len(configuredProvider) > 0 && configuredProvider[0] == ProviderApple
 	switch {
 	case errors.Is(err, ErrMemoryChanging):
 		return "Memory is being pruned. Try your question again in a moment."
+	case errors.Is(err, assistant.ErrAskUnavailable):
+		if remote {
+			return "AI is not ready for this question. Review the provider and Remote Ask permissions in Settings. You can still search saved sources without AI."
+		}
+		if apple {
+			return "Apple’s on-device model is not ready for this question. Check Apple Intelligence availability in AI settings. You can still search saved sources without AI."
+		}
+		return "This question needs an answer model. Enable local AI in Settings, then try again. You can still search saved sources without AI."
+	case errors.Is(err, model.ErrAppleUnavailable):
+		return "Apple’s on-device model is unavailable. Check Apple Intelligence availability in AI settings."
+	case errors.Is(err, model.ErrAppleRefused):
+		return "Apple’s on-device model declined this request. Try rephrasing your question or search the saved sources."
+	case errors.Is(err, model.ErrAppleBudget):
+		return "That question exceeds Apple’s on-device model context. Try a shorter question or fewer matching sources."
 	case errors.Is(err, assistant.ErrContext):
-		return "No matching local sources were found. Try a different question."
+		return "Blur couldn't safely prepare this question and its local context. Try a shorter question or run it again."
 	case errors.Is(err, assistant.ErrTokenBudget):
 		return "That question and its matching evidence are too large. Try a shorter question."
 	case errors.Is(err, model.ErrOllamaUnavailable):
 		return "Ollama is unavailable. Make sure it’s running and the selected model is installed in Settings."
-	case errors.Is(err, model.ErrOllamaResponse), errors.Is(err, model.ErrCompatibleResponse), errors.Is(err, assistant.ErrGeneratorResponse), errors.Is(err, assistant.ErrAnswer):
+	case errors.Is(err, model.ErrOllamaResponse), errors.Is(err, model.ErrAppleResponse), errors.Is(err, model.ErrCompatibleResponse), errors.Is(err, assistant.ErrGeneratorResponse), errors.Is(err, assistant.ErrAnswer):
 		if remote {
 			return "The configured provider returned an answer Blur couldn’t verify. Try again or choose another model."
+		}
+		if apple {
+			return "Apple’s on-device model returned an answer Blur couldn’t verify. Try again or choose another model."
 		}
 		return "Ollama returned an answer Blur couldn’t verify. Try a different local model or update it."
 	case errors.Is(err, model.ErrCompatibleUnavailable):
@@ -829,10 +1273,16 @@ func askErrorMessage(err error, configuredProvider ...string) string {
 		if remote {
 			return "The configured provider took too long to answer. Check the endpoint in Settings, then try again."
 		}
+		if apple {
+			return "Apple’s on-device model took too long to answer. Try again or check Apple Intelligence in Settings."
+		}
 		return "Ollama took too long to answer. Check that the selected model is loaded, then try again."
 	default:
 		if remote {
 			return "Could not answer from local memory. Check the configured provider in Settings or try a shorter question."
+		}
+		if apple {
+			return "Could not answer with Apple’s on-device model. Try a shorter question or check Apple Intelligence in Settings."
 		}
 		return "Could not answer from local memory. Try a shorter question or check Ollama in Settings."
 	}
@@ -992,25 +1442,36 @@ func formatReportDuration(nanoseconds int64) string {
 }
 
 func (d *desktop) todayView() ui.View {
-	showQuickNote := d.client != nil && d.client.CanAddNote()
-	var quickNote ui.View
-	if showQuickNote {
-		quickNote = d.quickNoteCard()
-	}
-	children := todayContentViews(nil, quickNote, nil, showQuickNote)
-	if hourView := d.hourSoFarView(); hourSoFarHasLines(d) {
-		children = append(children, hourView)
-	}
 	var blocks []ui.View
+	hasCurrentRecap := false
+	if d.showingToday() {
+		hourView := d.hourSoFarView()
+		hasCurrentRecap = hourSoFarHasLines(d)
+		if hasCurrentRecap {
+			blocks = append(blocks, hourView)
+		}
+	}
+	showHourlyRecaps := d.client != nil && d.client.CanViewChronicles()
+	if showHourlyRecaps && (len(d.hourlySummaries) > 0 || d.hourlyLoading || d.hourlyError) {
+		blocks = append(blocks, d.hourlyChroniclesView())
+	}
 	if d.todayLoading {
-		blocks = append(blocks, wrapLabel("Loading this day…").Style(modern.MutedText))
-	} else if d.today.State == "ready" {
-		if todos := d.today.Snapshot.ConfirmedTodos; len(todos) > 0 {
-			rows := make([]ui.View, 0, len(todos))
-			for _, task := range todos {
-				rows = append(rows, wrapLabel(task.Text))
+		blocks = append(blocks, wrapLabel("Loading recaps and tasks…").Style(modern.MutedText))
+	} else {
+		if len(d.today.Tasks) > 0 {
+			rows := make([]ui.View, 0, len(d.today.Tasks))
+			for _, task := range d.today.Tasks {
+				rows = append(rows, d.taskCard(task))
 			}
-			blocks = append(blocks, section("On your list", rows...))
+			blocks = append(blocks, section("Saved tasks", rows...))
+		}
+		if d.today.TaskIssues > 0 {
+			rows := []ui.View{wrapLabel("Some saved tasks need review before they can be added.").Style(modern.MutedText)}
+			for _, todo := range d.today.UnimportedTasks {
+				id := todo.ID
+				rows = append(rows, ui.HBox(wrapLabel(todo.Text).MainWeight(1), flatButton("Add task").Enabled(!d.loading).OnClick(func() { d.confirm(id) })).Spacing(10))
+			}
+			blocks = append(blocks, section("Tasks to review", rows...))
 		}
 		if candidates := d.today.Snapshot.TodoCandidates; len(candidates) > 0 {
 			rows := make([]ui.View, 0, len(candidates))
@@ -1018,96 +1479,29 @@ func (d *desktop) todayView() ui.View {
 				candidate := task
 				rows = append(rows, ui.HBox(
 					wrapLabel(candidate.Text).MainWeight(1),
-					flatButton("Add to Today").Enabled(!d.loading).OnClick(func() { d.confirm(candidate.ID) }),
+					flatButton("Add task").Enabled(!d.loading).OnClick(func() { d.confirm(candidate.ID) }),
+					flatButton("Dismiss").Enabled(!d.loading).OnClick(func() { d.dismissTodayTask(candidate.ID) }),
 				).Spacing(10).CrossAlign(layout.CrossCenter))
 			}
 			blocks = append(blocks, section("Suggested tasks", rows...))
 		}
-		if loopLines := openLoopLines(d.today.Snapshot.OpenLoops); len(loopLines) > 0 {
-			rows := make([]ui.View, 0, len(loopLines))
-			for _, line := range loopLines {
-				rows = append(rows, wrapLabel(line))
+		hasRecaps := hasCurrentRecap || (showHourlyRecaps && len(d.hourlySummaries) > 0)
+		if !todayHasUsefulItems(d.today, hasRecaps) {
+			if d.client == nil || d.client.data == nil {
+				blocks = append(blocks, wrapLabel("Encrypted local storage is unavailable. Recaps and tasks will appear when storage is ready.").Style(modern.MutedText))
+			} else if !showHourlyRecaps || (!d.hourlyLoading && !d.hourlyError) {
+				blocks = append(blocks, wrapLabel("No recaps or tasks for this day yet.").Style(modern.MutedText))
 			}
-			blocks = append(blocks, section("Open loops", rows...))
-		}
-		for _, question := range d.today.Snapshot.Questions {
-			if question.Resolved {
-				continue
-			}
-			blocks = append(blocks, d.questionBlock(question))
-		}
-		if !todayHasUsefulItems(d.today.Snapshot) && len(d.hourlySummaries) == 0 {
-			blocks = append(blocks, wrapLabel("No open items or useful recap for this day yet.").Style(modern.MutedText))
-		}
-	} else if d.client == nil || d.client.data == nil {
-		blocks = append(blocks, wrapLabel("Encrypted local storage is unavailable. Capture and notes stay disabled until storage is ready.").Style(modern.MutedText))
-	} else {
-		captureRunning := d.capture != nil && d.capture.Running()
-		if shouldOfferCaptureSetup(d.today.State, d.capture != nil, captureRunning) {
-			blocks = append(blocks, section("Your recap starts here",
-				wrapLabel("Start capture when you’re ready. Blur only reads the focused app, and you can pause anytime.").Style(modern.MutedText),
-				hug(primaryButton("Set up capture").OnClick(func() { d.openSettings(settingsGroupCapture) })),
-			))
-		} else {
-			blocks = append(blocks, wrapLabel("No recap for "+selectedDayLabel(d.date)+" yet. It appears as approved activity is captured.").Style(modern.MutedText))
 		}
 	}
-	if d.client != nil && d.client.CanViewChronicles() {
-		blocks = append(blocks, d.hourlyChroniclesView())
-	}
-	if d.loading || d.status != "" {
+	if d.status != "" {
 		blocks = append(blocks, wrapLabel(d.status).Style(modern.MutedText))
 	}
-	children = append(children, blocks...)
-	return pageScroll(sections(children...))
+	return pageScroll(sections(blocks...))
 }
 
-func todayHasUsefulItems(snapshot today.Snapshot) bool {
-	for _, question := range snapshot.Questions {
-		if !question.Resolved {
-			return true
-		}
-	}
-	return len(snapshot.ConfirmedTodos)+len(snapshot.TodoCandidates)+len(snapshot.OpenLoops) > 0
-}
-
-func todayContentViews(dateControls, quickNote ui.View, recap []ui.View, showQuickNote bool) []ui.View {
-	children := make([]ui.View, 0, 2+len(recap))
-	if dateControls != nil {
-		children = append(children, dateControls)
-	}
-	if showQuickNote {
-		children = append(children, quickNote)
-	}
-	return append(children, recap...)
-}
-
-func (d *desktop) quickNoteCard() ui.View {
-	hasDraft := strings.TrimSpace(d.note) != ""
-	if !d.quickNoteExpanded {
-		label := "Quick note"
-		if hasDraft {
-			label = "Unsaved note"
-		}
-		return ui.HBox(wrapLabel(label).Style(styleSectionTitle).MainWeight(1), flatButton(quickNoteDisclosureLabel(false, hasDraft)).OnClick(func() {
-			d.quickNoteExpanded = true
-			d.app.RequestUpdate()
-		})).CrossAlign(layout.CrossCenter)
-	}
-	return surfaceBox(16, 10,
-		ui.HBox(
-			wrapLabel("Quick note").Style(styleSectionTitle).MainWeight(1),
-			flatButton(quickNoteDisclosureLabel(true, hasDraft)).OnClick(func() {
-				d.quickNoteExpanded = false
-				d.app.RequestUpdate()
-			}),
-		).CrossAlign(layout.CrossCenter),
-		quickNoteInput(d.note, func(value string) { d.note = value; d.app.RequestUpdate() }),
-		ui.HBox(
-			wrapLabel(quickNotePrivacyHint(d.localAIEnabled, d.modelProvider)).Style(styleMeta).MainWeight(1),
-			primaryButton("Save note").Enabled(d.client != nil && d.client.CanAddNote() && !d.loading && hasDraft).OnClick(d.addNote),
-		).Spacing(10).CrossAlign(layout.CrossCenter),
-	)
+func todayHasUsefulItems(view TodayView, hasRecaps bool) bool {
+	return hasRecaps || len(view.Tasks) > 0 || view.TaskIssues > 0 || len(view.Snapshot.TodoCandidates) > 0
 }
 
 func quickNoteDisclosureLabel(expanded, hasDraft bool) string {
@@ -1120,8 +1514,29 @@ func quickNoteDisclosureLabel(expanded, hasDraft bool) string {
 	return "Add a note"
 }
 
-func quickNotePrivacyHint(modelEnabled bool, provider string) string {
+func quickNotePrivacyHint(modelEnabled bool, provider string, semanticEnabled ...bool) string {
+	if provider == ProviderOpenAICompatible && !modelEnabled {
+		return "Saved locally. Cloud note suggestions are off."
+	}
+	if cloudAccountProvider(provider) {
+		if !modelEnabled {
+			return "Saved locally. Cloud note processing is off."
+		}
+		if provider == ProviderChatGPT {
+			return "Saved locally. Sent to your selected ChatGPT plan for suggestions."
+		}
+		return "Saved locally. Sent to your selected Claude API workspace for suggestions."
+	}
+	if len(semanticEnabled) > 1 && semanticEnabled[1] {
+		if provider == ProviderApple {
+			return "Saved locally. Automatic Library processes this note with Apple’s on-device model."
+		}
+		return "Saved locally. Automatic Library processes this note with local Ollama."
+	}
 	if !modelEnabled {
+		if len(semanticEnabled) > 0 && semanticEnabled[0] {
+			return "Saved locally. Memory search indexes this note using local Ollama."
+		}
 		return "Private note. AI is off."
 	}
 	if provider == ProviderOpenAICompatible {
@@ -1135,16 +1550,6 @@ func recapSectionTitle(text string) ui.View { return wrapLabel(text).Style(style
 func quickNoteInput(text string, onText func(string)) ui.View {
 	return ui.TextView().Text(text).Placeholder("Add a thought, task, or meeting note…").OnText(onText).
 		WrapMode(ui.WrapWordChar).MinHeight(76).MaxHeight(128)
-}
-
-func openLoopLines(loops []today.OpenLoop) []string {
-	lines := make([]string, 0, len(loops))
-	for _, loop := range loops {
-		if strings.TrimSpace(loop.Text) != "" {
-			lines = append(lines, loop.Text)
-		}
-	}
-	return lines
 }
 
 func validSelectedDay(value string) bool { return validDate(value) }
@@ -1220,21 +1625,20 @@ func noteAfterSave(current, saved string) string {
 	return current
 }
 
-func (d *desktop) questionBlock(question today.Question) ui.View {
-	return section("Possible follow-up",
-		wrapLabel(question.Text),
-		wrapLabel(question.Reason).Style(modern.MutedText),
-		ui.HBox(
-			ui.TextInput().Text(d.answers[question.ID]).Placeholder("Add your answer").OnText(func(value string) { d.answers[question.ID] = value; d.app.RequestUpdate() }).MainWeight(1),
-			primaryButton("Answer").Enabled(!d.loading && strings.TrimSpace(d.answers[question.ID]) != "").OnClick(func() { d.answerQuestion(question.ID) }),
-			flatButton("Dismiss").Enabled(!d.loading).OnClick(func() { d.dismissQuestion(question.ID) }),
-		).Spacing(8).CrossAlign(layout.CrossCenter),
-	)
+func (d *desktop) addNote() {
+	if d == nil {
+		return
+	}
+	d.addNoteWithDraftRevision(d.quickUI.draftRevision)
 }
 
-func (d *desktop) addNote() {
-	text := strings.TrimSpace(d.note)
-	if text == "" || d.loading || d.client == nil || !d.client.CanAddNote() {
+func (d *desktop) addNoteWithDraftRevision(quickDraftRevision uint64) {
+	text := d.note
+	if strings.TrimSpace(text) == "" || d.loading || d.client == nil || !d.client.CanAddNote() {
+		return
+	}
+	epoch, stable := d.client.BeginMemoryRead()
+	if !stable {
 		return
 	}
 	isQuickNote := d.quickNotePending
@@ -1244,36 +1648,52 @@ func (d *desktop) addNote() {
 	}
 	d.app.RequestUpdate()
 	go func() {
-		result, err := d.client.AddNote(text)
+		result, err := d.client.addNoteAtEpoch(context.Background(), text, epoch)
 		d.app.Post(func() {
+			if !d.client.MemoryReadCurrent(epoch) {
+				return
+			}
 			d.loading = false
+			savedQuickNote := false
 			if err != nil {
 				d.quickNotePending = false
 				d.status = friendlyError(err)
 			} else {
 				d.note = noteAfterSave(d.note, text)
+				d.revealSavedMemorySource(result.SourceID)
 				if isQuickNote {
 					d.quickHistory.Record(text)
 				}
-				d.quickPanelNoteSaved()
+				savedQuickNote = d.quickPanelNoteSaved(text, quickDraftRevision)
 				switch result.Processing {
 				case notes.ProcessingUnavailable:
 					d.status = "Saved. The local model is unavailable; explicit TODOs still work."
 				case notes.ProcessingBudget:
 					d.status = "Saved. This note was too large for the local model budget and was not sent."
 				case notes.ProcessingInvalidOutput:
-					d.status = "Saved. Blur ignored an invalid model suggestion."
+					d.status = "Saved. Blur could not create task suggestions from this note."
+				case notes.ProcessingSuggestionsUnavailable:
+					d.status = "Saved. Task suggestions could not be updated."
+				case notes.ProcessingQueued:
+					d.status = "Saved. Preparing suggestions…"
 				case notes.ProcessingModel:
-					d.status = "Saved. Review the task and follow-up suggestions below."
+					d.status = "Note saved. Review suggested tasks in Today."
 				default:
-					d.status = "Saved. Add a local model to process ordinary prose."
+					d.status = "Saved."
 				}
 				d.loadToday()
+			}
+			if isQuickNote && d.quickUI.draftRevision != quickDraftRevision {
+				if err == nil {
+					d.status = ""
+				} else {
+					d.status = "Earlier note: " + d.status
+				}
 			}
 			if isQuickNote {
 				if quickNoteShouldReopenAfterFailure(isQuickNote, err != nil) {
 					d.openQuickPanel()
-				} else {
+				} else if savedQuickNote {
 					d.dismissQuickPanel()
 				}
 			}
@@ -1286,17 +1706,39 @@ func (d *desktop) confirm(id string) {
 	if d.loading || d.client == nil {
 		return
 	}
-	d.loading, d.status = true, "Adding to Today…"
-	d.app.RequestUpdate()
 	date := d.today.Date
+	var accepted tasks.TodayCandidate
+	for _, set := range [][]today.Todo{d.today.Snapshot.TodoCandidates, d.today.UnimportedTasks} {
+		for _, todo := range set {
+			if todo.ID == id {
+				accepted = todayTaskCandidate(date, todo)
+			}
+		}
+	}
+	if accepted.ID == "" {
+		return
+	}
+	epoch, stable := d.client.BeginMemoryRead()
+	if !stable {
+		return
+	}
+	d.loading, d.status = true, "Saving task…"
+	d.app.RequestUpdate()
 	go func() {
-		err := d.client.ConfirmProposal(date, id)
+		item, err := d.client.confirmTodayTaskAtEpoch(context.Background(), accepted, epoch)
 		d.app.Post(func() {
-			d.loading = false
-			if err != nil {
-				d.status = friendlyError(err)
-			} else {
-				d.status = "Added to Today. No notification was created."
+			if !d.client.PublishMemoryRead(epoch, func() {
+				d.loading = false
+				if err != nil {
+					d.status = "The task could not be saved. Refresh Today and review the suggestion before trying again."
+				} else {
+					d.status = taskResultCopy(reminders.Result{Item: item})
+					d.tasksLoaded = false
+				}
+			}) {
+				return
+			}
+			if err == nil && d.date == date {
 				d.loadToday()
 			}
 			d.app.RequestUpdate()
@@ -1312,40 +1754,44 @@ func (d *desktop) answerQuestion(id string) {
 	if answer == "" {
 		return
 	}
-	d.loading, d.status = true, "Saving your answer…"
-	d.app.RequestUpdate()
-	date := d.today.Date
-	go func() {
-		err := d.client.AnswerQuestion(date, id, answer)
-		d.app.Post(func() {
-			d.loading = false
-			if err != nil {
-				d.status = friendlyError(err)
-			} else {
-				delete(d.answers, id)
-				d.status = "Answer saved as a private note."
-				d.loadToday()
-			}
-			d.app.RequestUpdate()
-		})
-	}()
+	d.resolveTodayQuestion(id, answer, false)
 }
 
 func (d *desktop) dismissQuestion(id string) {
 	if d.loading || d.client == nil {
 		return
 	}
-	d.loading, d.status = true, "Dismissing question…"
-	d.app.RequestUpdate()
+	d.resolveTodayQuestion(id, "", true)
+}
+
+func (d *desktop) resolveTodayQuestion(id, answer string, dismiss bool) {
+	epoch, stable := d.client.BeginMemoryRead()
+	if !stable {
+		return
+	}
 	date := d.today.Date
+	d.loading, d.status = true, "Saving your answer…"
+	if dismiss {
+		d.status = "Dismissing question…"
+	}
+	d.app.RequestUpdate()
 	go func() {
-		err := d.client.DismissQuestion(date, id)
+		err := d.client.resolveTodayQuestion(date, id, answer, dismiss, &epoch)
 		d.app.Post(func() {
-			d.loading = false
-			if err != nil {
-				d.status = friendlyError(err)
-			} else {
-				d.status = "Question dismissed."
+			if !d.client.PublishMemoryRead(epoch, func() {
+				d.loading = false
+				if err != nil {
+					d.status = friendlyError(err)
+				} else if dismiss {
+					d.status = "Question dismissed."
+				} else {
+					delete(d.answers, id)
+					d.status = "Answer saved as a private note."
+				}
+			}) {
+				return
+			}
+			if err == nil && d.date == date {
 				d.loadToday()
 			}
 			d.app.RequestUpdate()
@@ -1385,8 +1831,7 @@ func (d *desktop) loadToday() bool {
 				return
 			}
 			if consumeLiveTodayRefresh(&d.todayRefreshPending) {
-				todayDate := time.Now().In(time.Local).Format("2006-01-02")
-				if shouldRefreshLiveToday(d.page, d.date, todayDate, d.capture != nil && d.capture.Running()) {
+				if d.page == "Today" || d.quickPreview {
 					d.loadToday()
 				}
 			}
@@ -1498,13 +1943,13 @@ func (d *desktop) chronicleKnowledgeSuggestionsView(hourID string) ui.View {
 			hug(flatButton("Suggest Library facts").Enabled(knowledgeSuggestionActionEnabled(d.client.CanSuggestKnowledge(), d.client.MemoryIsChanging(), d.knowledgeSuggesting || d.knowledgeAccepting)).OnClick(func() { d.suggestKnowledgeFromChronicle(hourID) })),
 		)
 	} else {
-		rows = append(rows, wrapLabel("Library suggestions require local Ollama; recap content is never sent to a remote model.").Style(modern.MutedText))
+		rows = append(rows, wrapLabel("Library suggestions require Apple’s on-device model or local Ollama; recap content stays on this device.").Style(modern.MutedText))
 	}
 	if d.knowledgeSuggestStatus != "" {
 		rows = append(rows, wrapLabel(d.knowledgeSuggestStatus).Style(modern.MutedText))
 	}
 	if d.knowledgeSuggesting {
-		rows = append(rows, wrapLabel("Reviewing this recap with local Ollama…").Style(modern.MutedText))
+		rows = append(rows, wrapLabel("Reviewing this recap with the selected local model…").Style(modern.MutedText))
 	}
 	if d.knowledgeProposalHourID == hourID {
 		for i, proposal := range d.knowledgeProposals {
@@ -1579,7 +2024,7 @@ func (d *desktop) suggestKnowledgeFromChronicle(hourID string) {
 				d.knowledgeSuggestCancel = nil
 				d.knowledgeSuggesting = false
 				if err != nil {
-					d.knowledgeSuggestStatus = "No suggestions were saved. Check local Ollama and try again."
+					d.knowledgeSuggestStatus = "No suggestions were saved. Check the selected local model in AI settings and try again."
 				} else if len(proposals) == 0 {
 					d.knowledgeSuggestStatus = "No durable Library facts stood out in this recap."
 				} else {
@@ -1795,68 +2240,15 @@ func currentMemoryRead(requestGeneration, currentGeneration uint64) bool {
 	return requestGeneration == currentGeneration
 }
 
-func (d *desktop) searchView() ui.View {
-	children := []ui.View{
-		surfaceBox(12, 0, ui.HBox(ui.TextInput().Text(d.query).Placeholder("Search your local memory").MainWeight(1).OnText(func(value string) {
-			d.query, d.status = value, ""
-			d.searchHits, d.searchComplete, d.searchFailed = nil, false, false
-			d.expandedSourceID = ""
-			d.app.RequestUpdate()
-		}).OnSubmit(d.runSearch), primaryButton("Search").Enabled(!d.loading).OnClick(d.runSearch)).Spacing(10).CrossAlign(layout.CrossCenter)),
-	}
-	if d.status != "" {
-		children = append(children, wrapLabel(d.status).Style(modern.MutedText))
-	}
-	for _, hit := range d.searchHits {
-		preview, truncated := searchPreview(hit.Text)
-		content := preview
-		if d.expandedSourceID == hit.SourceID {
-			content = hit.Text
-		}
-		row := []ui.View{wrapLabel(content), wrapLabel(strings.Trim(strings.Join([]string{hit.AppID, hit.Domain}, ", "), ", ")).Style(styleMeta)}
-		if truncated {
-			label := "Show full source"
-			if d.expandedSourceID == hit.SourceID {
-				label = "Show preview"
-			}
-			id := hit.SourceID
-			row = append(row, hug(flatButton(label).OnClick(func() {
-				if d.expandedSourceID == id {
-					d.expandedSourceID = ""
-				} else {
-					d.expandedSourceID = id
-				}
-				d.app.RequestUpdate()
-			})))
-		}
-		if d.client != nil && d.client.CanDeleteSource() {
-			id := hit.SourceID
-			if d.pendingDelete == id {
-				row = append(row,
-					wrapLabel("Delete this source and its derived recap items? This cannot be undone.").Style(modern.MutedText),
-					ui.HBox(
-						flatButton("Cancel").Enabled(!d.loading).OnClick(func() { d.pendingDelete = ""; d.app.RequestUpdate() }),
-						dangerButton("Delete permanently").Enabled(!d.loading).OnClick(func() { d.deleteSource(id) }),
-					).Spacing(8),
-				)
-			} else {
-				row = append(row, hug(flatButton("Delete from memory").Enabled(!d.loading).OnClick(func() { d.pendingDelete = id; d.app.RequestUpdate() })))
-			}
-		}
-		children = append(children, hairline(), ui.VBox(row...).Spacing(6).CrossAlign(layout.CrossStretch))
-	}
-	if message := searchEmptyMessage(d.loading, d.searchComplete, d.searchFailed, len(d.searchHits)); message != "" {
-		children = append(children, recapSectionTitle(message))
-	}
-	return pageScroll(ui.VBox(hugButtons(children)...).Spacing(16).CrossAlign(layout.CrossStretch))
-}
+// Retain the old route as an alias for callers from older saved UI state.
+func (d *desktop) searchView() ui.View { return d.askView() }
 
 func searchEmptyMessage(loading, completed, failed bool, resultCount int) string {
 	if loading || failed || resultCount > 0 {
 		return ""
 	}
 	if completed {
-		return "No matches. Try a shorter phrase or an exact word."
+		return "No matching saved memory found."
 	}
 	return "Search uses exact local terms and does not need AI."
 }
@@ -1916,10 +2308,6 @@ func answerViews(text string, expanded bool, onToggle func(), textStyle string) 
 	return views
 }
 
-func appendAnswerViews(rows []ui.View, text string, expanded bool, onToggle func(), textStyle string) []ui.View {
-	return append(rows, answerViews(text, expanded, onToggle, textStyle)...)
-}
-
 // deleteSourceFailureStatus is the failure text once capture was successfully
 // paused for a deletion that then could not be confirmed.
 func deleteSourceFailureStatus(capturePaused bool) string {
@@ -1946,11 +2334,13 @@ func (d *desktop) deleteSource(id string) {
 	}
 	d.invalidateAsk()
 	d.loading, d.status = true, "Deleting this source and its derived items…"
-	wasCapturing := d.capture != nil && d.capture.Running()
 	d.app.RequestUpdate()
 	go func() {
-		var err error
-		if wasCapturing {
+		// Authored notes cannot be recreated by passive capture. Read the
+		// authenticated source before applying the capture-erasure pause policy.
+		source, err := d.client.ChronicleSource(context.Background(), id)
+		pauseCapture := err == nil && source.AppID != "sh.blur.notes" && d.capture != nil && d.capture.Running()
+		if pauseCapture {
 			err = d.capture.Pause(context.Background())
 		}
 		if err == nil {
@@ -1960,16 +2350,16 @@ func (d *desktop) deleteSource(id string) {
 			d.loading = false
 			d.pendingDelete = ""
 			if err != nil {
-				if wasCapturing && d.capture.Running() {
+				if pauseCapture && d.capture.Running() {
 					d.status = "Capture could not be paused; nothing was deleted. Pause capture, then retry."
 				} else {
-					d.status = deleteSourceFailureStatus(wasCapturing)
-					d.markCapturePaused(wasCapturing)
+					d.status = deleteSourceFailureStatus(pauseCapture)
+					d.markCapturePaused(pauseCapture)
 				}
 			} else {
-				d.markCapturePaused(wasCapturing)
+				d.markCapturePaused(pauseCapture)
 				d.status = "Source and its durable derived items were deleted."
-				if wasCapturing {
+				if pauseCapture {
 					d.status += " Capture remains paused; restart it when ready."
 				}
 				filtered := d.searchHits[:0]
@@ -1982,6 +2372,12 @@ func (d *desktop) deleteSource(id string) {
 					d.searchHits[i] = SearchHit{}
 				}
 				d.searchHits = filtered
+				d.memoryUI.request++
+				d.memoryUI.page, d.memoryUI.loaded, d.memoryUI.loading = memoryBrowsePage{}, false, false
+				d.memoryUI.previous = nil
+				if d.page == "Ask" && strings.TrimSpace(d.askQuestion) == "" {
+					d.loadMemoryBrowse(memoryBrowseCursor{})
+				}
 				if askResultUsesSource(d.askResult, id) {
 					d.askResult = nil
 					d.expandedAnswer = false
@@ -2024,7 +2420,8 @@ func (d *desktop) runSearch() {
 		return
 	}
 	go func() {
-		hits, err := d.client.SearchMemory(query)
+		page, err := d.client.SearchMemoryPageContext(context.Background(), query)
+		hits := page.Hits
 		d.app.Post(func() {
 			if !currentMemoryRead(memoryGeneration, d.memoryGeneration) {
 				d.loading = false
@@ -2039,11 +2436,16 @@ func (d *desktop) runSearch() {
 			if !d.client.PublishMemoryRead(memoryEpoch, func() {
 				d.loading = false
 				d.searchHits = hits
+				d.searchIndexingPending = page.IndexingPending
+				d.searchCoverageLimited = page.CoverageLimited
 				d.searchComplete, d.searchFailed = true, err != nil
 				if err != nil {
 					d.status = friendlyError(err)
 				} else {
 					d.status = fmt.Sprintf("%d result(s)", len(hits))
+					if page.HasMore {
+						d.status += "; more matches are available. Narrow the search to see them."
+					}
 				}
 			}) {
 				d.loading = false
@@ -2059,52 +2461,73 @@ func (d *desktop) libraryView() ui.View {
 	if d.client == nil || d.client.data == nil {
 		return wrapLabel("Encrypted local storage is not set up.").Style(modern.MutedText)
 	}
+	if d.libraryInspect != nil {
+		return pageScroll(ui.VBox(d.inspectedLibraryView(), d.librarySettingsView()).Spacing(14))
+	}
+	controls := d.libraryBrowserControls()
 	if d.libraryLoading && !d.libraryLoaded {
-		return pageScroll(ui.VBox(d.knowledgeControls(), wrapLabel("Loading your local library…").Style(modern.MutedText)).Spacing(14).CrossAlign(layout.CrossStretch))
+		return pageScroll(ui.VBox(controls, d.knowledgeControls(), wrapLabel("Loading your local library…").Style(modern.MutedText)).Spacing(14).CrossAlign(layout.CrossStretch))
 	}
 	if !d.libraryLoaded {
 		if canRetryLibraryLoad(d.libraryLoading, d.libraryLoaded, d.status) {
 			return ui.VBox(
+				controls,
 				d.knowledgeControls(),
 				wrapLabel(d.status).Style(modern.MutedText),
 				hug(flatButton("Retry").Enabled(!d.loading).OnClick(d.loadLibrary)),
 			).Spacing(8).CrossAlign(layout.CrossStart)
 		}
-		return ui.VBox(d.knowledgeControls(), wrapLabel(d.status).Style(modern.MutedText)).Spacing(12).CrossAlign(layout.CrossStretch)
+		return ui.VBox(controls, d.knowledgeControls(), wrapLabel(d.status).Style(modern.MutedText)).Spacing(12).CrossAlign(layout.CrossStretch)
 	}
 	rows := make([]ui.View, 0, len(d.library.Entities))
-	rows = append(rows, d.knowledgeControls())
+	rows = append(rows, controls)
 	if d.status != "" {
 		rows = append(rows, wrapLabel(d.status).Style(modern.MutedText))
 	}
-	if d.justAdded != nil {
+	showAdded := d.justAdded != nil && (!d.libraryBrowser.active || d.libraryBrowser.page == 0 && matchesLibraryEntity(*d.justAdded, d.libraryBrowser.appliedQuery, d.libraryBrowser.kind))
+	if showAdded {
+		for _, entity := range d.library.Entities {
+			if librarySubjectKey(entity) == librarySubjectKey(*d.justAdded) {
+				showAdded = false
+				break
+			}
+		}
+	}
+	if showAdded {
 		rows = append(rows, recapSectionTitle("Just added"), d.knowledgeEntityCard(*d.justAdded))
 	}
-	if len(d.library.Entities) == 0 && !d.library.HasMore && d.justAdded == nil {
-		rows = append(rows, recapSectionTitle("Your library is empty. Add someone or something you want to remember."))
+	if len(d.library.Entities) == 0 && !d.library.HasMore && !showAdded {
+		message := "Your library is empty. Enable automatic Library below, or add something you want to remember."
+		if d.libraryBrowser.appliedQuery != "" || d.libraryBrowser.kind != "" {
+			message = "No entries match this search and filter. Try another name or memory, or choose All."
+		}
+		rows = append(rows, wrapLabel(message).Style(modern.MutedText))
 	}
-	for _, entity := range d.library.Entities {
-		if d.justAdded != nil && entity.ID == d.justAdded.ID {
+	for index, entity := range d.library.Entities {
+		if showAdded && entity.ID == d.justAdded.ID {
 			continue
 		}
-		rows = append(rows, d.knowledgeEntityCard(entity))
+		if index < len(d.libraryGroups) && len(d.libraryGroups[index]) > 1 {
+			rows = append(rows, d.librarySubjectGroupCard(d.libraryGroups[index]))
+		} else {
+			rows = append(rows, d.knowledgeEntityCard(entity))
+		}
 	}
-	if d.library.HasMore {
+	if d.libraryBrowser.active {
+		rows = append(rows, d.libraryBrowserPagination())
+	} else if d.library.HasMore {
 		rows = append(rows, hug(flatButton("Load more").Enabled(!d.libraryLoading && !d.loading).OnClick(func() { d.loadLibraryAfter(d.library.Next) })))
-	} else if d.libraryLoading {
-		rows = append(rows, wrapLabel("Loading more…").Style(modern.MutedText))
 	}
+	rows = append(rows, d.knowledgeControls(), d.librarySettingsView())
 	return pageScroll(ui.VBox(hugButtons(rows)...).Spacing(12).CrossAlign(layout.CrossStretch))
 }
 
 func (d *desktop) knowledgeEntityCard(entity knowledge.Entity) ui.View {
+	if enrich.IsEntityID(entity.ID) {
+		return d.inferredEntityCard(entity)
+	}
 	parts := []ui.View{wrapLabel(entity.Name).Style(styleSectionTitle), wrapLabel(string(entity.Kind) + ", " + string(entity.State)).Style(styleMeta)}
-	for _, fact := range entity.Facts {
-		parts = append(parts, wrapLabel(fact.Text))
-	}
-	for _, loop := range entity.OpenLoops {
-		parts = append(parts, wrapLabel("Open: "+loop.Text).Style(modern.MutedText))
-	}
+	parts = append(parts, d.librarySubjectAccount(entity, false)...)
 	if d != nil && d.client != nil && d.client.CanDeleteKnowledge() {
 		if canUnmergeKnowledgeEntry(entity) {
 			parts = append(parts, wrapLabel("Merged entry. Unmerge it to restore both library entries.").Style(modern.MutedText))
@@ -2265,6 +2688,8 @@ func (d *desktop) addKnowledge() {
 				d.status = "Added to your library."
 				if !d.libraryLoaded {
 					d.loadLibrary()
+				} else {
+					d.refreshLibrary()
 				}
 			}
 			d.app.RequestUpdate()
@@ -2309,6 +2734,17 @@ func (d *desktop) deleteKnowledge(id string) {
 					d.justAdded = nil
 				}
 				d.status = "Removed from your library. Captured sources remain saved."
+				if d.libraryBrowser.active {
+					// Manual entry deletion has no source-mutation fence. Discard
+					// any read queued before it so it cannot restore the old row.
+					if d.libraryBrowser.cancel != nil {
+						d.libraryBrowser.cancel()
+						d.libraryBrowser.cancel = nil
+					}
+					d.libraryBrowser.request++
+					d.libraryLoading = false
+					d.refreshLibrary()
+				}
 			}
 			d.app.RequestUpdate()
 		})
@@ -2352,7 +2788,7 @@ func (d *desktop) loadLibrary() {
 	if d.libraryLoaded {
 		return
 	}
-	d.loadLibraryAfter("")
+	d.loadLibraryBrowserPage(d.libraryBrowser.page, false)
 }
 
 func (d *desktop) loadLibraryAfter(after string) {
@@ -2362,8 +2798,11 @@ func (d *desktop) loadLibraryAfter(after string) {
 	if after != "" && (!d.libraryLoaded || !d.library.HasMore || d.library.Next != after) {
 		return
 	}
+	refreshing := after == "" && d.libraryLoaded
 	d.libraryLoading = true
-	d.app.RequestUpdate()
+	if !refreshing {
+		d.app.RequestUpdate()
+	}
 	current := d.library
 	memoryGeneration := d.memoryGeneration
 	memoryEpoch, stable := d.client.BeginMemoryRead()
@@ -2371,31 +2810,55 @@ func (d *desktop) loadLibraryAfter(after string) {
 		d.libraryLoading = false
 		return
 	}
-	if after == "" {
+	if after == "" && !refreshing {
 		current = knowledge.Page{}
+		d.libraryGroups = nil
 	}
 	go func() {
-		page, err := d.client.Knowledge(after)
-		if err == nil {
-			page, err = appendKnowledgePage(current, page, after)
+		var page knowledge.Page
+		var err error
+		if refreshing {
+			page, err = refreshedKnowledgePage(d.client, current)
+		} else {
+			page, err = d.client.Knowledge(after)
+			if err == nil {
+				page, err = appendKnowledgePage(current, page, after)
+			}
 		}
 		d.app.Post(func() {
 			if !currentMemoryRead(memoryGeneration, d.memoryGeneration) {
 				return
 			}
+			updated := !refreshing
 			if !d.client.PublishMemoryRead(memoryEpoch, func() {
 				d.libraryLoading = false
+				if refreshing && (d.libraryInspect != nil || d.libraryInspectLoading || d.libraryEditFact != "") {
+					d.libraryRefreshPending = true
+					return
+				}
 				if err != nil {
-					d.status = friendlyError(err)
+					status := friendlyError(err)
+					updated = updated || d.status != status
+					d.status = status
 				} else {
-					d.library = page
+					if !refreshing || !sameKnowledgePage(d.library, page) {
+						d.library = page
+						updated = true
+					}
 					d.libraryLoaded = true
-					d.status = ""
+					if !refreshing {
+						d.status = ""
+					}
 				}
 			}) {
 				return
 			}
-			d.app.RequestUpdate()
+			if d.libraryRefreshPending && d.libraryInspect == nil && d.libraryEditFact == "" {
+				d.refreshLibrary()
+			}
+			if updated {
+				d.app.RequestUpdate()
+			}
 		})
 	}()
 }
@@ -2434,6 +2897,12 @@ func (d *desktop) openSettings(group string) {
 	if d.app == nil {
 		return
 	}
+	if d.settingsGroup == settingsGroupAI {
+		d.ensureAIModelStatus()
+	}
+	if d.settingsGroup == settingsGroupCapture && d.dashboardOpen {
+		d.refreshSetupChecks()
+	}
 	if d.powerStatus == "" && !d.powerChecking {
 		d.refreshPowerState()
 	}
@@ -2447,6 +2916,12 @@ func (d *desktop) settingsChips() ui.View {
 		group := name
 		buttons = append(buttons, choiceButton(group, selected == group).OnClick(func() {
 			d.settingsGroup, d.status = group, ""
+			if group == settingsGroupAI {
+				d.ensureAIModelStatus()
+			}
+			if group == settingsGroupCapture {
+				d.refreshSetupChecks()
+			}
 			d.app.RequestUpdate()
 		}))
 	}
@@ -2467,7 +2942,7 @@ func (d *desktop) settingsGroupViews(group string) []ui.View {
 	var views []ui.View
 	switch group {
 	case settingsGroupAI:
-		views = append(views, d.localAISettingsView(), d.chronicleSettingsView())
+		views = append(views, d.backgroundWorkView(), d.localAISettingsView(), d.librarySettingsView(), d.chronicleSettingsView())
 		if d.client != nil && d.client.CanConfigurePower() {
 			views = append(views, d.powerSettingsView())
 		}
@@ -2491,11 +2966,9 @@ func (d *desktop) settingsGroupViews(group string) []ui.View {
 			views = append(views, d.deleteAllView())
 		}
 	case settingsGroupPrivacy:
-		views = append(views, d.privacyOverviewView())
+		views = append(views, d.privacyOverviewView(), d.logSettingsView())
 	default:
-		if capture := d.captureSettingsView(); capture != nil {
-			views = append(views, capture)
-		}
+		views = append(views, d.captureSettingsView(), d.setupChecksView(), d.voiceSettingsView())
 		views = append(views, d.captureExclusionsSettingsView())
 	}
 	return views
@@ -2542,7 +3015,7 @@ func (d *desktop) claudeMCPSettingsView() ui.View {
 	if d.preferences.ClaudeMCPEnabled {
 		label = "Disable Claude access"
 		if d.client != nil && d.client.ClaudeMCPRunning() {
-			state = "On. Claude has read-only access to bounded local search results."
+			state = "Local bridge ready. Add Blur to Claude’s MCP configuration to connect it."
 		} else {
 			state = "Enabled, but the bridge is not running. Check Keychain access and try again."
 		}
@@ -2556,6 +3029,9 @@ func (d *desktop) claudeMCPSettingsView() ui.View {
 		rows = append(rows, wrapLabel("The local Claude bridge is unavailable on this build.").Style(modern.MutedText))
 	} else {
 		rows = append(rows, flatButton(label).Enabled(!d.loading && !d.preferencesNeedsRepair).OnClick(d.toggleClaudeMCP))
+		if d.preferences.ClaudeMCPEnabled && d.client.ClaudeMCPRunning() {
+			rows = append(rows, flatButton("Copy Claude connection configuration").OnClick(d.copyClaudeSetup), wrapLabel("Add this server in Claude’s MCP configuration. Blur must remain running; the bridge does not register itself with Claude.").Style(styleMeta))
+		}
 	}
 	return surfaceBox(14, 8, hugButtons(rows)...)
 }
@@ -2580,7 +3056,7 @@ func (d *desktop) toggleClaudeMCP() {
 			} else {
 				d.preferences = next
 				if next.ClaudeMCPEnabled {
-					d.mcpStatus = "Claude can search Blur memory through the read-only local bridge."
+					d.mcpStatus = "Local bridge ready. Add Blur to Claude’s MCP configuration to connect it."
 				} else {
 					d.mcpStatus = "Claude access is off; the local grant was revoked and removed."
 				}
@@ -2591,7 +3067,7 @@ func (d *desktop) toggleClaudeMCP() {
 }
 
 func privacyOverviewCopy() string {
-	return "Notes and captured evidence are encrypted locally before they enter the durable store. Tasks need confirmation, and follow-up questions can be answered or dismissed without sending messages or scheduling notifications. Library entries are created only from details you enter."
+	return "Notes, explicit preferences, writing rules, and captured evidence are encrypted locally before they enter the durable store; Blur never captures its own interface. Tasks and reminders need an explicit request or confirmation; scheduled notifications include the reminder text, with preview visibility controlled by macOS. Automatic Library uses a separate local-only setting; inferred memories include sources and can be corrected or dismissed."
 }
 
 func (d *desktop) captureSettingsView() ui.View {
@@ -2603,10 +3079,16 @@ func (d *desktop) captureSettingsView() ui.View {
 		).Spacing(5).Padding(14).Style(modern.Card).CrossAlign(layout.CrossStretch)
 	}
 	label := captureActionLabel(d.capture.Running())
-	captureFirst, captureRest := splitFirstSentence(captureDescription(d.capture.Running(), d.preferences.CaptureEnabled))
+	captureFirst, captureRest := splitFirstSentence(captureDescription(d.capture.Running(), d.preferences.CaptureEnabled && !d.capturePauseUnsaved))
 	rows := []ui.View{wrapLabel("Capture").Style(styleSectionTitle)}
 	rows = append(rows, d.groupCopy("Capture", captureFirst, captureRest, browserCaptureDisclosure())...)
+	if health := d.captureHealthView(); health != nil {
+		rows = append(rows, health)
+	}
 	rows = append(rows, primaryButton(label).Enabled(!d.loading).OnClick(d.toggleCapture))
+	if d.capturePauseUnsaved {
+		rows = append(rows, wrapLabel(capturePauseUnsavedCopy).Style(modern.MutedText), secondaryButton("Save pause").Enabled(!d.loading).OnClick(d.saveCapturePause))
+	}
 	if supportsSafariPageCaptureSetting() {
 		safariStatus := "Safari page capture is not configured in this build. It requires a signed build with Safari App Group and Keychain entitlements."
 		if safariPageCaptureBuildConfigured() {
@@ -2650,7 +3132,7 @@ func (d *desktop) captureSettingsView() ui.View {
 }
 
 func (d *desktop) captureExclusionsSettingsView() ui.View {
-	scopeFirst, scopeRest := splitFirstSentence("Choose what Blur captures. Never-capture rules always win; existing saved history is unchanged.")
+	scopeFirst, scopeRest := splitFirstSentence("Choose what Blur captures. Capture includes visible text you're editing. Password fields, private browser windows, and Blur's own interface are excluded. Never-capture rules always win; existing saved history is unchanged.")
 	rows := []ui.View{wrapLabel("Capture scope").Style(styleSectionTitle)}
 	rows = append(rows, d.groupCopy("Capture scope", scopeFirst, scopeRest)...)
 	rows = append(rows,
@@ -2705,6 +3187,9 @@ func (d *desktop) saveCaptureExclusions() {
 	next.IncludedApps = append([]string(nil), allowed.Apps...)
 	next.IncludedDomains = append([]string(nil), allowed.Domains...)
 	next.CaptureDefaultDisabled = d.captureDefaultDisabledDraft
+	if d.capturePauseUnsaved {
+		next.CaptureEnabled = false
+	}
 	wasRunning := d.capture.Running()
 	d.loading = true
 	d.exclusionValidation = ""
@@ -2732,7 +3217,7 @@ func (d *desktop) saveCaptureExclusions() {
 			return
 		}
 		var resumeErr error
-		if previous.CaptureEnabled && !d.capture.Running() {
+		if next.CaptureEnabled && !d.capture.Running() {
 			resumeErr = d.capture.Start(ctx)
 		}
 		d.app.Post(func() {
@@ -2741,6 +3226,9 @@ func (d *desktop) saveCaptureExclusions() {
 			}
 			d.loading = false
 			d.preferences = next
+			if !next.CaptureEnabled {
+				d.capturePauseUnsaved = false
+			}
 			d.excludedAppsDraft = strings.Join(next.ExcludedApps, "\n")
 			d.excludedDomainsDraft = strings.Join(next.ExcludedDomains, "\n")
 			d.includedAppsDraft = strings.Join(next.IncludedApps, "\n")
@@ -2783,9 +3271,9 @@ func (d *desktop) powerSettingsView() ui.View {
 			second = append(second, button)
 		}
 	}
-	powerFirst, powerRest := splitFirstSentence("This policy controls optional local hourly recaps when you enable them in Settings. Follow System uses the OS battery-saver signal and falls back to Balanced when unavailable. Battery power alone never pauses Blur; capture, retention, and AI you start remain available.")
-	rows := []ui.View{wrapLabel("Background work").Style(styleSectionTitle)}
-	rows = append(rows, d.groupCopy("Background work", powerFirst, powerRest)...)
+	powerFirst, powerRest := splitFirstSentence("This policy controls optional local memory indexing and hourly recaps when you enable them in Settings. Follow System uses the OS battery-saver signal and falls back to Balanced when unavailable. Battery power alone never pauses Blur; capture, retention, and AI you start remain available.")
+	rows := []ui.View{wrapLabel("Background limits").Style(styleSectionTitle)}
+	rows = append(rows, d.groupCopy("Background limits", powerFirst, powerRest)...)
 	rows = append(rows,
 		ui.HBox(first...).Spacing(8),
 		ui.HBox(second...).Spacing(8),
@@ -2956,7 +3444,7 @@ func (d *desktop) savePowerMode() {
 				d.powerConfig, d.powerNeedsRepair = config, false
 				d.powerStatus = "Power mode saved."
 			}
-			if d.quickNotePending == false && d.status != "" {
+			if !d.quickNotePending && d.status != "" {
 				d.resizeQuickPanel(d.askResult != nil)
 			}
 			d.app.RequestUpdate()
@@ -2991,7 +3479,7 @@ func deleteAllActionLabel(confirmed bool) string {
 }
 
 func deleteAllConfirmationCopy() string {
-	return "Permanently deletes saved notes, knowledge library entries, captured sources, and derived recap items. Your encryption key and AI settings remain. This cannot be undone."
+	return "Permanently deletes saved notes, tasks, reminders, preferences, writing rules, Library entries, captured sources, and derived items, and cancels Blur notifications. Your encryption key and AI settings remain. This cannot be undone."
 }
 
 var retentionOptions = []int{0, 30, 90, 180, 365}
@@ -3023,7 +3511,7 @@ func retentionCurrentLabel(days int, unknown bool) string {
 // retentionChangeEnabled blocks changes while the policy could not be read and
 // the draft would still be the zero value ("Off").
 func retentionChangeEnabled(loading, unknown bool, draftDays int) bool {
-	return !loading && !(unknown && draftDays == 0)
+	return !loading && (!unknown || draftDays != 0)
 }
 
 func retentionApplyLabel(days int) string {
@@ -3037,7 +3525,7 @@ func retentionConfirmationCopy(days int) string {
 	if days == 0 {
 		return "Automatic pruning will stop. Existing memory will remain until you delete it yourself."
 	}
-	return fmt.Sprintf("Blur will permanently delete captured sources and derived recap items older than %d days now. Records from before this version use the upgrade date as their age baseline. This cannot be undone.", days)
+	return fmt.Sprintf("Blur will permanently delete captured sources, typed notes, voice notes and their transcripts, and derived recap items older than %d days now. Records from before this version use the upgrade date as their age baseline. This cannot be undone.", days)
 }
 
 func (d *desktop) retentionView() ui.View {
@@ -3128,16 +3616,27 @@ func (d *desktop) applyRetention() {
 
 func (d *desktop) refreshAfterMemoryChange() {
 	d.invalidateMemoryViews()
+	d.refreshInvalidatedMemoryViews()
+}
+
+func (d *desktop) refreshInvalidatedMemoryViews() {
 	d.answers = make(map[string]string)
 	switch d.page {
 	case "Today":
 		d.loadToday()
-	case "Search":
-		if strings.TrimSpace(d.query) != "" && !d.loading {
+	case "Ask", "Search", "Voice notes":
+		if strings.TrimSpace(d.askQuestion) == "" {
+			d.loadMemoryBrowse(memoryBrowseCursor{})
+		} else if d.askQuestion == d.memoryUI.searchInput && !d.loading {
+			d.query = d.askQuestion
 			d.runSearch()
 		}
 	case "Library":
 		d.loadLibrary()
+	case "Tasks":
+		d.loadTaskPage("")
+	case "Preferences":
+		d.loadProfilePage("")
 	case "Time":
 		if !d.loading {
 			d.loadActivityReport()
@@ -3150,6 +3649,25 @@ func (d *desktop) invalidateMemoryViews() {
 		return
 	}
 	d.memoryGeneration++
+	d.invalidateNoteDocumentView()
+	d.invalidateVoiceRecap()
+	d.cancelMemoryEntry()
+	d.memoryUI.entry = EntryState{}
+	d.memoryUI.revealedSource = nil
+	d.memoryUI.taskSubmission = nil
+	d.memoryUI.answerInput, d.memoryUI.submittedInput, d.memoryUI.askMode = "", "", ""
+	d.memoryUI.request++
+	if d.memoryUI.notesExportCancel != nil {
+		d.memoryUI.notesExportCancel()
+		d.memoryUI.notesExportCancel = nil
+	}
+	d.memoryUI.notesExportRequest++
+	d.memoryUI.notesExporting = false
+	d.memoryUI.page = memoryBrowsePage{}
+	d.memoryUI.loaded, d.memoryUI.loading, d.memoryUI.meetingDetail = false, false, false
+	d.memoryUI.previous = nil
+	d.memoryUI.after, d.memoryUI.status = memoryBrowseCursor{}, ""
+	d.invalidateMeetingViews()
 	d.todayRequestID++
 	d.hourlyRequestID++
 	d.todayLoading = false
@@ -3161,11 +3679,46 @@ func (d *desktop) invalidateMemoryViews() {
 	d.chronicleSourcesLoading = false
 	d.clearKnowledgeSuggestions()
 	d.searchHits = nil
-	d.searchComplete, d.searchFailed = false, false
+	d.searchComplete, d.searchFailed, d.searchCoverageLimited = false, false, false
 	d.expandedSourceID = ""
 	d.library = knowledge.Page{}
 	d.libraryLoaded = false
 	d.libraryLoading = false
+	d.libraryInspect = nil
+	d.librarySource = nil
+	d.libraryRelated = nil
+	d.libraryInspectLoading = false
+	d.libraryInspectRequest++
+	d.libraryEditFact = ""
+	d.libraryEditText = ""
+	d.libraryRefreshPending = false
+	if d.libraryBrowser.cancel != nil {
+		d.libraryBrowser.cancel()
+		d.libraryBrowser.cancel = nil
+	}
+	d.libraryBrowser.request++
+	d.libraryBrowser.refreshing = false
+	d.taskPage = tasks.Page{}
+	d.tasksLoaded = false
+	d.tasksLoading = false
+	d.taskRefreshPending = false
+	d.taskRequest++
+	d.taskEditor = nil
+	d.taskEditing = false
+	d.taskTitle = ""
+	d.taskWhen = ""
+	d.pendingDeleteTask = ""
+	d.cancelEntryInterpretation()
+	d.quickEntry = EntryState{}
+	d.quickTaskSubmission = nil
+	d.quickConversation = nil
+	d.askConversation = nil
+	d.quickHistory = quickEntryHistory{}
+	d.quickUI.expandedTurns = nil
+	d.quickUI.copied, d.quickUI.savedFlash = false, false
+	d.quickAskMode = ""
+	d.profileUI = profileViewState{request: d.profileUI.request + 1}
+	d.quickProfileSubmission = nil
 	d.report = activity.ReportResult{}
 	d.reportReady = false
 	d.invalidateAsk()
@@ -3180,6 +3733,7 @@ func (d *desktop) deleteAllMemory() {
 		return
 	}
 	d.invalidateAsk()
+	d.clearLibraryBrowserSearch()
 	wasCapturing := d.capture != nil && d.capture.Running()
 	d.loading = true
 	d.status = "Deleting all stored memory…"
@@ -3199,6 +3753,9 @@ func (d *desktop) deleteAllMemory() {
 			cancel()
 		}
 		d.app.Post(func() {
+			if !pauseFailed {
+				d.clearLibraryBrowserSearch()
+			}
 			d.loading = false
 			if err != nil {
 				if pauseFailed {
@@ -3268,66 +3825,91 @@ func (d *desktop) localAISettingsView() ui.View {
 	if d.client != nil {
 		savedSettings = d.client.LocalAISettings()
 	}
-	state := "Off. No model requests are made."
+	state := "AI model off."
 	if d.localAIEnabled {
-		if effectiveProvider(savedSettings) == ProviderOpenAICompatible {
+		if cloudAccountProvider(effectiveProvider(savedSettings)) {
+			state = "On. Questions use the selected cloud model."
+			if savedSettings.RemoteAskEnabled {
+				state += " Saved memory may be sent for Ask."
+			} else {
+				state += " Saved-memory sharing is off."
+			}
+			if savedSettings.RemoteNotesEnabled {
+				state += " Cloud note processing is on."
+			} else {
+				state += " Cloud note processing is off."
+			}
+		} else if effectiveProvider(savedSettings) == ProviderOpenAICompatible {
 			state = "On. Sanitized quick notes are processed when you save them."
 			if savedSettings.RemoteAskEnabled {
 				state += " Remote Ask is on for the saved endpoint."
 			} else {
 				state += " Remote Ask is off."
 			}
+		} else if effectiveProvider(savedSettings) == ProviderApple {
+			state = "On. Notes and questions use Apple’s on-device system model."
 		} else {
 			state = "On. Notes and explicit memory questions use this local Ollama server."
 		}
 	}
 	if d.aiNeedsRepair {
-		state = "Saved model settings could not be read. AI is off; save valid local settings to repair them."
+		state = "Saved AI settings need attention. Review the provider and save valid settings to repair them."
 	}
 	if d.client == nil || d.client.localAI == nil {
-		return ui.VBox(wrapLabel("Local note model").Style(styleSectionTitle), wrapLabel("Model settings are unavailable on this build."), wrapLabel(state).Style(modern.MutedText)).Spacing(8).Padding(14).Style(modern.Card)
+		return ui.VBox(wrapLabel("AI model").Style(styleSectionTitle), wrapLabel("Model settings need access to your encrypted local storage."), wrapLabel(d.startupIssue).Style(modern.MutedText)).Spacing(8).Padding(14).Style(modern.Card)
 	}
 	rows := []ui.View{
-		wrapLabel("Note processing model").Style(styleSectionTitle),
+		wrapLabel("AI model").Style(styleSectionTitle),
 		wrapLabel(state).Style(modern.MutedText),
-		wrapLabel(localAIDataFlowCopy(d.localAIEnabled && !d.aiNeedsRepair, effectiveProvider(savedSettings), savedSettings.RemoteAskEnabled)).Style(modern.MutedText),
+		wrapLabel(localAIDataFlowCopy(d.localAIEnabled && !d.aiNeedsRepair, effectiveProvider(savedSettings), savedSettings.RemoteAskEnabled, savedSettings.RemoteNotesEnabled)).Style(modern.MutedText),
 		ui.HBox(
-			choiceButton("Local Ollama", d.modelProvider == ProviderOllama).OnClick(func() {
-				if !providerSelectionChanges(d.modelProvider, ProviderOllama) {
-					return
-				}
-				d.modelProvider = ProviderOllama
-				d.remoteAskEnabled = false
-				d.modelEndpoint = "http://127.0.0.1:11434"
-				d.app.RequestUpdate()
-			}),
-			choiceButton("Remote OpenAI-compatible", d.modelProvider == ProviderOpenAICompatible).OnClick(func() {
-				if !providerSelectionChanges(d.modelProvider, ProviderOpenAICompatible) {
-					return
-				}
-				defaultEndpoint := "https://api.openai.com/v1"
-				saved := d.client.LocalAISettings()
-				d.remoteAskEnabled = saved.Provider == ProviderOpenAICompatible && saved.Endpoint == defaultEndpoint && saved.Model == strings.TrimSpace(d.modelName) && saved.RemoteAskEnabled
-				d.modelProvider = ProviderOpenAICompatible
-				d.modelEndpoint = defaultEndpoint
-				d.app.RequestUpdate()
-			}),
+			choiceButton("Apple on-device", d.modelProvider == ProviderApple).OnClick(func() { d.selectModelProvider(ProviderApple) }),
+			choiceButton("Local Ollama", d.modelProvider == ProviderOllama).OnClick(func() { d.selectModelProvider(ProviderOllama) }),
 		).Spacing(8),
-		ui.TextInput().Text(d.modelEndpoint).Placeholder("http://127.0.0.1:11434").OnText(func(value string) {
-			if value != d.modelEndpoint {
-				d.remoteAskEnabled = false
-			}
-			d.modelEndpoint = value
-			d.app.RequestUpdate()
-		}),
-		ui.TextInput().Text(d.modelName).Placeholder("Model name").OnText(func(value string) {
-			if value != d.modelName {
-				d.remoteAskEnabled = false
-			}
-			d.modelName = value
-			d.app.RequestUpdate()
-		}),
+		ui.HBox(
+			choiceButton("ChatGPT account", d.modelProvider == ProviderChatGPT).OnClick(func() { d.selectModelProvider(ProviderChatGPT) }),
+			choiceButton("Claude API", d.modelProvider == ProviderClaude).OnClick(func() { d.selectModelProvider(ProviderClaude) }),
+			choiceButton("Remote OpenAI-compatible", d.modelProvider == ProviderOpenAICompatible).OnClick(func() { d.selectModelProvider(ProviderOpenAICompatible) }),
+		).Spacing(8),
 	}
+	if cloudAccountProvider(d.modelProvider) {
+		return d.cloudAISettingsView(savedSettings, rows)
+	}
+	if d.modelProvider == ProviderApple {
+		availability := d.appleAvailability
+		if d.appleChecking {
+			availability = "Checking Apple Intelligence availability…"
+		}
+		if availability == "" {
+			availability = "Checking Apple Intelligence on this Mac…"
+		}
+		rows = append(rows,
+			wrapLabel("Apple system language model. Managed by macOS; no endpoint, API key, or account login."),
+			wrapLabel(availability).Style(modern.MutedText),
+		)
+	} else {
+		rows = append(rows,
+			ui.TextInput().Text(d.modelEndpoint).Placeholder("http://127.0.0.1:11434").OnText(func(value string) {
+				if value != d.modelEndpoint {
+					d.remoteAskEnabled = false
+				}
+				d.modelEndpoint = value
+				d.queueModelDiscovery()
+				d.app.RequestUpdate()
+			}),
+			ui.TextInput().Text(d.modelName).Placeholder("Model name").OnText(func(value string) {
+				if value != d.modelName {
+					d.remoteAskEnabled = false
+				}
+				d.modelName = value
+				d.app.RequestUpdate()
+			}),
+		)
+		if d.modelProvider == ProviderOllama {
+			rows = append(rows, d.detectedModelRows(false)...)
+		}
+	}
+
 	if !d.loading {
 		if notice := localAISettingsDraftNotice(savedSettings, d.modelProvider, d.modelEndpoint, d.modelName, d.remoteAskEnabled); notice != "" {
 			rows = append(rows, wrapLabel(notice).Style(modern.MutedText))
@@ -3354,13 +3936,17 @@ func (d *desktop) localAISettingsView() ui.View {
 			d.configureLocalAI(true)
 		})))
 	}
-	if d.localAIEnabled {
+	if d.localAIEnabled || savedSettings.Enabled {
+		label, ready := d.localAIModelSaveState(savedSettings)
 		rows = append(rows,
-			primaryButton("Save and enable").Enabled(!d.loading).OnClick(func() { d.configureLocalAI(true) }),
+			primaryButton(label).Enabled(ready).OnClick(func() { d.configureLocalAI(true) }),
 			flatButton("Disable model").Enabled(!d.loading).OnClick(func() { d.configureLocalAI(false) }),
 		)
 	} else {
 		label := "Enable local model"
+		if d.modelProvider == ProviderApple {
+			label = "Use Apple on-device model"
+		}
 		if d.modelProvider == ProviderOpenAICompatible {
 			label = "Enable remote provider & send notes"
 		}
@@ -3369,11 +3955,37 @@ func (d *desktop) localAISettingsView() ui.View {
 	return surfaceBox(14, 8, hugButtons(rows)...)
 }
 
+func (d *desktop) localAIModelSaveState(saved LocalAISettings) (string, bool) {
+	if d.loading && d.status == "Saving AI settings…" {
+		return "Saving…", false
+	}
+	ready := !d.loading && strings.TrimSpace(d.modelName) != "" && (d.modelProvider == ProviderApple || strings.TrimSpace(d.modelEndpoint) != "")
+	if cloudAccountProvider(d.modelProvider) {
+		ready = d.cloudDraftReady(saved)
+		if d.aiNeedsRepair {
+			return "Repair settings", ready
+		}
+		if !d.cloudDraftMatchesSaved(saved) || d.remoteAskEnabled != saved.RemoteAskEnabled || d.remoteNotesEnabled != saved.RemoteNotesEnabled {
+			return "Save changes", ready
+		}
+		return "Saved", false
+	}
+	if d.aiNeedsRepair {
+		return "Repair settings", ready
+	}
+	dirty := localAISettingsDraftNotice(saved, d.modelProvider, d.modelEndpoint, d.modelName, d.remoteAskEnabled) != "" ||
+		d.modelProvider == ProviderOpenAICompatible && d.modelCredential != ""
+	if dirty {
+		return "Save changes", ready
+	}
+	return "Saved", false
+}
+
 func remoteAskConsentCopy(enabled bool) string {
 	if enabled {
-		return "Remote Ask is on: your question and up to eight matching captured sources go to the saved endpoint only when you ask. With no matches, only your question is sent. The provider may retain requests."
+		return "Saved-memory AI is on: searching or asking may send your question and bounded saved passages to the saved endpoint for recall. Answers use up to eight matching sources. The provider may retain requests."
 	}
-	return "Remote Ask is off. Allowing it sends your question and up to eight matching captured sources to this endpoint only when you ask. With no matches, only your question is sent; the provider may retain requests."
+	return "Saved-memory AI is off. Allowing it lets search and answers send your question and bounded saved passages to this endpoint for recall. Answers use up to eight matching sources. The provider may retain requests."
 }
 
 func localAISettingsDraftNotice(saved LocalAISettings, provider, endpoint, model string, remoteAskDraft bool) string {
@@ -3398,13 +4010,13 @@ func localAISettingsDraftNotice(saved LocalAISettings, provider, endpoint, model
 }
 
 func (d *desktop) chronicleSettingsView() ui.View {
-	ready := d.localAIEnabled && !d.aiNeedsRepair && d.modelProvider == ProviderOllama
+	ready := d.client != nil && d.localAIEnabled && !d.aiNeedsRepair && isLocalCompletionProvider(effectiveProvider(d.client.LocalAISettings()))
 	state := "Off. Blur won’t automatically send captured text for summaries; Ask remains user-started."
 	if d.backgroundSummaries {
-		state = "On. Completed hours are summarized only by Ollama on this device."
+		state = "On. Completed hours are summarized by the saved local answer model on this device."
 	}
 	if !ready && !d.backgroundSummaries {
-		state += " Enable local Ollama first."
+		state += " Enable Apple’s on-device model or local Ollama first."
 	}
 	label := "Enable hourly recaps"
 	if d.backgroundSummaries {
@@ -3429,7 +4041,7 @@ func (d *desktop) toggleBackgroundSummaries() {
 		d.app.Post(func() {
 			d.loading = false
 			if err != nil {
-				d.status = backgroundSummariesErrorStatus(enabled, err)
+				d.status = backgroundSummariesErrorStatus(enabled, err, effectiveProvider(d.client.LocalAISettings()))
 			} else {
 				d.backgroundSummaries = enabled
 				if enabled {
@@ -3446,9 +4058,12 @@ func (d *desktop) toggleBackgroundSummaries() {
 // backgroundSummariesErrorStatus explains why the hourly recap preference was
 // not changed; only an unavailable-settings failure while enabling points the
 // user at local Ollama.
-func backgroundSummariesErrorStatus(enabled bool, err error) string {
+func backgroundSummariesErrorStatus(enabled bool, err error, provider ...string) string {
 	switch {
 	case errors.Is(err, errLocalAIUnavailable) && enabled:
+		if len(provider) > 0 && provider[0] == ProviderApple {
+			return "Hourly recap setting was not changed. Check Apple Intelligence availability in AI settings first."
+		}
 		return "Hourly recap setting was not changed. Enable local Ollama first."
 	case errors.Is(err, errLocalAIUnavailable):
 		return "Hourly recaps could not be paused because the setting could not be saved. Try again."
@@ -3466,14 +4081,27 @@ func backgroundSummariesPausedNote(before, after bool) string {
 }
 
 func localAIDataFlowCopy(enabled bool, provider string, remoteAskConsent ...bool) string {
+	if enabled && cloudAccountProvider(provider) {
+		ask, notes := false, false
+		if len(remoteAskConsent) > 0 {
+			ask = remoteAskConsent[0]
+		}
+		if len(remoteAskConsent) > 1 {
+			notes = remoteAskConsent[1]
+		}
+		return cloudDataFlowCopy(provider, ask, notes)
+	}
 	if !enabled {
-		return "No AI requests are made while the model is off. Your saved notes and captured sources remain on this device."
+		return "AI processing is off. Exact memory search stays available locally. Your saved notes and captured sources remain on this device."
 	}
 	if provider == ProviderOpenAICompatible {
 		if len(remoteAskConsent) > 0 && remoteAskConsent[0] {
-			return "Sanitized notes you save, and your question plus up to eight matching captured sources when you explicitly ask, go to the configured remote provider. With no matches, only your question is sent. It may retain requests."
+			return "Sanitized notes you save, and your question plus bounded saved passages when you search or ask, go to the configured remote provider. Answers use up to eight matching sources. It may retain requests."
 		}
 		return "Only sanitized notes you save are sent to the configured remote provider, which may retain requests. Captured sources are never sent remotely unless you separately enable remote Ask."
+	}
+	if provider == ProviderApple {
+		return "Search by meaning, answers, and notes use Apple’s selected on-device system model. Blur uses no model server or account login. Apple Intelligence manages its own model assets in macOS."
 	}
 	return "Sanitized notes are processed when you save them. When you explicitly ask, your question plus any matching captured sources go to loopback Ollama on this device. With no matches, only your question is sent; Ollama may retain request logs or model state."
 }
@@ -3485,18 +4113,30 @@ func (d *desktop) configureLocalAI(enabled bool) {
 	d.invalidateAsk()
 	settings := d.client.LocalAISettings()
 	settings.Enabled = enabled
-	settings.RemoteAskEnabled = enabled && d.modelProvider == ProviderOpenAICompatible && d.remoteAskEnabled
+	settings.RemoteAskEnabled = enabled && isRemoteCompletionProvider(d.modelProvider) && d.remoteAskEnabled
+	settings.RemoteNotesEnabled = enabled && cloudAccountProvider(d.modelProvider) && d.remoteNotesEnabled
 	hadBackgroundSummaries := settings.BackgroundSummaries
-	if !enabled || d.modelProvider != ProviderOllama {
+	if !enabled || !isLocalCompletionProvider(d.modelProvider) {
 		settings.BackgroundSummaries = false
+		settings.AutomaticLibrary = false
 	}
 	if enabled {
 		settings.Endpoint, settings.Model = strings.TrimSpace(d.modelEndpoint), strings.TrimSpace(d.modelName)
 		settings.Provider = d.modelProvider
+		settings.AccountID, settings.WorkspaceID = "", ""
+		if cloudAccountProvider(d.modelProvider) {
+			settings = d.cloudSettingsDraft(settings, enabled)
+		}
+		if d.modelProvider == ProviderApple {
+			settings.Endpoint, settings.Model, settings.CredentialRef = "", AppleSystemModel, ""
+		}
 	}
 	d.loading = true
-	provider := d.modelProvider
-	credential := d.modelCredential
+	provider := effectiveProvider(settings)
+	credential := ""
+	if enabled {
+		credential = d.modelCredential
+	}
 	if enabled {
 		d.status = "Saving AI settings…"
 	} else {
@@ -3505,7 +4145,7 @@ func (d *desktop) configureLocalAI(enabled bool) {
 	d.app.RequestUpdate()
 	go func() {
 		var err error
-		if provider == ProviderOpenAICompatible {
+		if isRemoteCompletionProvider(provider) {
 			err = d.client.ConfigureAI(context.Background(), settings, credential)
 		} else {
 			err = d.client.ConfigureLocalAI(context.Background(), settings)
@@ -3516,18 +4156,29 @@ func (d *desktop) configureLocalAI(enabled bool) {
 			d.aiNeedsRepair = d.client.LocalAISettingsNeedRepair()
 			d.backgroundSummaries = d.client.LocalAISettings().BackgroundSummaries
 			d.remoteAskEnabled = d.client.LocalAISettings().RemoteAskEnabled
+			d.remoteNotesEnabled = d.client.LocalAISettings().RemoteNotesEnabled
 			if err == nil {
 				d.modelCredential = ""
 			}
 			if err != nil {
-				d.status = "Settings were not saved. Check the endpoint, model name, and provider credential."
+				if provider == ProviderApple {
+					d.status = "Apple model settings were not saved. Check Apple Intelligence availability and that Blur includes its on-device model helper."
+					d.refreshAppleAvailability()
+				} else {
+					d.status = "Settings were not saved. Check the endpoint, model name, and provider credential."
+				}
 			} else if enabled {
-				if provider == ProviderOpenAICompatible {
+				if cloudAccountProvider(provider) {
+					d.status = "Cloud model selected. Saved memory and note permissions apply only as separately enabled for this account and model."
+				} else if provider == ProviderOpenAICompatible {
 					if d.client.LocalAISettings().RemoteAskEnabled {
 						d.status = "Remote provider enabled. Saved notes and matching sources for explicit Ask go to the configured endpoint."
 					} else {
 						d.status = "Remote provider enabled. Only sanitized quick-note text is sent when you save a note."
 					}
+				} else if provider == ProviderApple {
+					d.status = "Apple on-device model selected. Questions and note suggestions stay on this Mac."
+					d.refreshAppleAvailability()
 				} else {
 					d.status = "Local model enabled. Blur sends sanitized quick-note text only to this device."
 				}
@@ -3581,20 +4232,27 @@ func (d *desktop) toggleCapture() {
 			}
 		}()
 		var report platform.CapabilityReport
-		configureCtx, cancelConfigure := context.WithTimeout(context.Background(), 8*time.Second)
-		err := d.client.ConfigureApplicationPreferences(configureCtx, config)
-		cancelConfigure()
-		if err != nil {
-			slog.Error("capture preference update failed", "stage", "configure", "error", err)
-		}
-		if err == nil && wasRunning {
+		var err error
+		preferenceSaved := false
+		rollbackFailed := false
+		if wasRunning {
 			pauseCtx, cancelPause := context.WithTimeout(context.Background(), 8*time.Second)
 			err = d.capture.Pause(pauseCtx)
 			cancelPause()
 			if err != nil {
 				slog.Error("capture worker did not pause cleanly", "stage", "pause", "error", err)
 			}
-		} else if err == nil {
+		}
+		if err == nil {
+			configureCtx, cancelConfigure := context.WithTimeout(context.Background(), 8*time.Second)
+			err = d.client.ConfigureApplicationPreferences(configureCtx, config)
+			preferenceSaved = err == nil
+			cancelConfigure()
+			if err != nil {
+				slog.Error("capture preference update failed", "stage", "configure", "error", err)
+			}
+		}
+		if err == nil && !wasRunning {
 			capabilityCtx, cancelCapability := context.WithTimeout(context.Background(), 8*time.Second)
 			report, err = d.capture.Capability(capabilityCtx)
 			cancelCapability()
@@ -3619,9 +4277,10 @@ func (d *desktop) toggleCapture() {
 				}
 			}
 		}
-		if err != nil && !errors.Is(err, errCapturePermissionRequired) && !errors.Is(err, errCaptureUnavailable) {
+		if err != nil && !wasRunning && !errors.Is(err, errCapturePermissionRequired) && !errors.Is(err, errCaptureUnavailable) {
 			rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 3*time.Second)
 			if rollbackErr := d.client.ConfigureApplicationPreferences(rollbackCtx, previousConfig); rollbackErr != nil {
+				rollbackFailed = true
 				slog.Error("capture preference rollback failed", "stage", "rollback", "error", rollbackErr)
 			}
 			cancelRollback()
@@ -3629,16 +4288,33 @@ func (d *desktop) toggleCapture() {
 		d.app.Post(func() {
 			d.loading = false
 			d.captureState = captureAvailabilityState(report, d.capture.Running(), err)
+			if wasRunning && !d.capture.Running() && !preferenceSaved {
+				// Keep an explicitly requested pause even when its disk write fails.
+				// Do not restart capture merely to roll back an unsaved preference.
+				d.capturePauseUnsaved = true
+				d.captureState = "paused"
+				d.setupRequired = false
+				d.stopPermissionWatch()
+				d.status = capturePauseUnsavedCopy
+				d.updateMenuBarCaptureState()
+				d.app.RequestUpdate()
+				return
+			}
 			if err == nil || errors.Is(err, errCapturePermissionRequired) || errors.Is(err, errCaptureUnavailable) {
 				d.preferences.CaptureEnabled = wantEnabled
+				d.capturePauseUnsaved = false
 			}
 			switch {
+			case rollbackFailed:
+				d.status = "Capture could not be changed, and its previous setting could not be restored. Review capture in Settings before retrying."
 			case err == nil && d.capture.Running():
 				d.status = "Capture is on for the currently focused app."
 			case err == nil && wantEnabled:
 				d.captureState = "unavailable"
 				d.status = "Capture stopped unexpectedly. Check Settings, then resume capture."
 			case err == nil:
+				d.setupRequired = false
+				d.stopPermissionWatch()
 				d.status = "Capture is paused."
 			case errors.Is(err, errCapturePermissionRequired):
 				d.setupRequired = true
@@ -3647,9 +4323,9 @@ func (d *desktop) toggleCapture() {
 			case errors.Is(err, errCaptureUnavailable):
 				d.status = "Capture is enabled but unavailable. Check accessibility availability and try again."
 			case errors.Is(err, context.DeadlineExceeded):
-				d.status = "Capture did not respond in time. Its setting was restored; check Blur’s log before retrying."
+				d.status = "Capture did not respond in time. Review its current state in Settings before retrying."
 			default:
-				d.status = "Capture could not be changed. Its setting was restored; check Blur’s log before retrying."
+				d.status = "Capture could not be changed. Review its current state in Settings before retrying."
 			}
 			d.updateMenuBarCaptureState()
 			if err != nil {
@@ -3670,8 +4346,14 @@ func (d *desktop) openSettingsFromMenu() {
 		return
 	}
 	d.app.Post(func() {
+		if d.meetingUI.overlayOpen {
+			d.hideMeetingOverlay()
+		}
+		d.hideQuickPanel()
 		d.dashboardOpen = true
+		d.quickUI.preferQuick = false
 		d.openSettings(d.settingsGroup)
+		d.app.Post(func() { d.presentDashboard(0) })
 	})
 }
 
@@ -3693,7 +4375,7 @@ func (d *desktop) toggleCaptureFromMenu() {
 }
 
 func (d *desktop) toggleSafariPageCapture() {
-	if d == nil || d.capture == nil || d.loading || !safariPageCaptureToggleAllowed(d.preferences.SafariPageCaptureEnabled, safariPageCaptureBuildConfigured()) {
+	if d == nil || d.client == nil || d.app == nil || d.capture == nil || d.loading || !safariPageCaptureToggleAllowed(d.preferences.SafariPageCaptureEnabled, safariPageCaptureBuildConfigured()) {
 		return
 	}
 	previous := d.preferences
@@ -3708,36 +4390,17 @@ func (d *desktop) toggleSafariPageCapture() {
 	}
 	d.app.RequestUpdate()
 	go func() {
-		ctx := context.Background()
-		err := d.client.ConfigureApplicationPreferences(ctx, next)
-		if err == nil && wasRunning {
-			err = d.capture.Pause(ctx)
-			if err == nil {
-				err = d.capture.Start(ctx)
-				if err == nil {
-					d.app.Post(d.noteCaptureStarted)
-				}
-			}
-		}
-		if err != nil {
-			_ = d.client.ConfigureApplicationPreferences(context.Background(), previous)
-			if wasRunning && !d.capture.Running() {
-				d.startCaptureNoted(context.Background())
-			}
-		}
+		result := applySafariCaptureToggle(d.capture, d.client, previous, next, wasRunning)
 		d.app.Post(func() {
 			d.loading = false
-			if err == nil {
-				d.preferences = next
-				if next.SafariPageCaptureEnabled {
-					d.status = "Safari page capture enabled for active, non-private tabs."
-				} else {
-					d.status = "Safari page capture disabled."
-				}
-			} else {
-				d.preferences = previous
-				d.status = "Safari capture setting could not be applied; the previous setting was restored."
+			d.preferences = result.Preferences
+			if result.Started && result.Running {
+				d.noteCaptureStarted()
 			}
+			if !result.Running {
+				d.captureState = "paused"
+			}
+			d.status = safariToggleRecoveryMessage(result, next)
 			d.app.RequestUpdate()
 		})
 	}()
@@ -3755,6 +4418,7 @@ func (d *desktop) openAccessibilitySettings() {
 	d.app.RequestUpdate()
 }
 
+//nolint:unused // Called by the macOS menu adapter.
 func (d *desktop) toggleMenuBarItem() {
 	if d == nil || d.client == nil || d.app == nil || d.loading {
 		return
@@ -3767,15 +4431,16 @@ func (d *desktop) toggleMenuBarItem() {
 		d.app.RequestUpdate()
 		return
 	}
-	if err := d.client.ConfigureApplicationPreferences(context.Background(), next); err != nil {
-		_ = setDesktopMenuBarVisible(d.app, d.ensurePauseScheduler(), previous.MenuBarItemEnabled, d.openQuickPanel, d.openSettingsFromMenu, d.toggleCaptureFromMenu)
-		d.status = "The menu bar preference could not be saved."
-		d.app.RequestUpdate()
-		return
-	}
-	d.preferences = next
-	d.status = "Menu bar setting saved."
-	d.app.RequestUpdate()
+	d.status = "Saving menu bar setting…"
+	d.persistApplicationPreferences(next, func(err error) {
+		if err != nil {
+			_ = setDesktopMenuBarVisible(d.app, d.ensurePauseScheduler(), previous.MenuBarItemEnabled, d.openQuickPanel, d.openSettingsFromMenu, d.toggleCaptureFromMenu)
+			d.status = "The menu bar preference could not be saved."
+			return
+		}
+		d.preferences = next
+		d.status = "Menu bar setting saved."
+	})
 }
 
 func (d *desktop) restoreDefaultPreferences() {
@@ -3783,15 +4448,20 @@ func (d *desktop) restoreDefaultPreferences() {
 		return
 	}
 	defaults := preferences.DefaultConfig()
-	if err := d.client.ConfigureApplicationPreferences(context.Background(), defaults); err != nil {
-		d.status = "Default preferences could not be saved."
-		d.app.RequestUpdate()
-		return
-	}
-	if err := setDesktopMenuBarVisible(d.app, d.ensurePauseScheduler(), defaults.MenuBarItemEnabled, d.openQuickPanel, d.openSettingsFromMenu, d.toggleCaptureFromMenu); err != nil {
-		d.status = "Preferences were restored, but the menu bar item could not be shown."
-	}
+	d.status = "Restoring default preferences…"
+	d.persistApplicationPreferences(defaults, func(err error) {
+		if err != nil {
+			d.status = "Default preferences could not be saved."
+			return
+		}
+		d.applyDefaultPreferences(defaults)
+	})
+}
+
+func (d *desktop) applyDefaultPreferences(defaults preferences.Config) {
+	menuErr := setDesktopMenuBarVisible(d.app, d.ensurePauseScheduler(), defaults.MenuBarItemEnabled, d.openQuickPanel, d.openSettingsFromMenu, d.toggleCaptureFromMenu)
 	d.preferences = defaults
+	d.capturePauseUnsaved = false
 	d.applyQuickAskHotkey()
 	d.captureDefaultDisabledDraft = defaults.CaptureDefaultDisabled
 	d.excludedAppsDraft = strings.Join(defaults.ExcludedApps, "\n")
@@ -3801,6 +4471,9 @@ func (d *desktop) restoreDefaultPreferences() {
 	d.mcpStatus = ""
 	d.preferencesNeedsRepair = false
 	d.status = "Default preferences restored. Capture will start when available."
+	if menuErr != nil {
+		d.status = "Preferences were restored, but the menu bar item could not be shown."
+	}
 	if defaults.CaptureEnabled {
 		d.startCaptureOnLaunch()
 	}
@@ -3815,4 +4488,109 @@ func friendlyError(err error) string {
 		return "That input could not be accepted. Check its length and try again."
 	}
 	return "Blur could not complete that local operation. If it was a note, it remains saved when storage had already accepted it."
+}
+
+// selectModelProvider changes only the draft. Saved provider preferences remain
+// active until the user saves this explicit selection.
+func (d *desktop) selectModelProvider(provider string) {
+	if d == nil || !providerSelectionChanges(d.modelProvider, provider) {
+		return
+	}
+	saved := LocalAISettings{}
+	if d.client != nil {
+		saved = d.client.LocalAISettings()
+	}
+	d.cancelCloudOperation()
+	d.cloudAI.models = nil
+	d.modelCredential = ""
+	d.modelAccountID, d.modelWorkspaceID = "", ""
+	d.remoteNotesEnabled = false
+	switch provider {
+	case ProviderChatGPT, ProviderClaude:
+		d.modelEndpoint, d.modelName = "", ""
+		d.remoteAskEnabled = false
+		if effectiveProvider(saved) == provider {
+			d.modelName = saved.Model
+			d.modelAccountID, d.modelWorkspaceID = saved.AccountID, saved.WorkspaceID
+			d.remoteAskEnabled, d.remoteNotesEnabled = saved.RemoteAskEnabled, saved.RemoteNotesEnabled
+		}
+	case ProviderApple:
+		d.modelEndpoint, d.modelName, d.modelCredential = "", AppleSystemModel, ""
+		d.remoteAskEnabled = false
+	case ProviderOllama, ProviderOpenAICompatible:
+		d.modelEndpoint = "http://127.0.0.1:11434"
+		if provider == ProviderOpenAICompatible {
+			d.modelEndpoint = "https://api.openai.com/v1"
+		}
+		if d.modelProvider == ProviderApple || cloudAccountProvider(d.modelProvider) {
+			d.modelName = ""
+		}
+		if effectiveProvider(saved) == provider {
+			d.modelEndpoint, d.modelName = saved.Endpoint, saved.Model
+		}
+		d.remoteAskEnabled = provider == ProviderOpenAICompatible && saved.Provider == provider && saved.Endpoint == d.modelEndpoint && saved.Model == strings.TrimSpace(d.modelName) && saved.RemoteAskEnabled
+	default:
+		return
+	}
+	d.modelProvider = provider
+	if d.app != nil {
+		if provider == ProviderChatGPT && !d.cloudAI.loaded {
+			d.refreshCloudAccounts()
+		}
+		if provider == ProviderApple || provider == ProviderOllama {
+			d.ensureAIModelStatus()
+		}
+		d.app.RequestUpdate()
+	}
+}
+
+func appleAvailabilityCopy(status model.AppleStatus, err error) string {
+	if err != nil && status.Reason == "" {
+		return "Apple’s on-device model is unavailable. Check that this Blur build includes its model helper, then check Apple Intelligence in System Settings."
+	}
+	if status.Available && err == nil {
+		return "Apple’s on-device system model is ready. Model assets are managed by macOS."
+	}
+	switch status.Reason {
+	case "unsupported_os":
+		return "Apple’s on-device model requires macOS 26 or later. Saved-memory search remains available."
+	case "device_not_eligible":
+		return "Apple Intelligence requires a supported Mac and supported language and region settings."
+	case "apple_intelligence_not_enabled":
+		return "Turn on Apple Intelligence in System Settings → Apple Intelligence & Siri, Blur will check again automatically."
+	case "model_not_ready":
+		return "macOS is readying Apple Intelligence’s on-device model. Let its model assets finish downloading, Blur will check again automatically."
+	default:
+		return "Apple’s on-device model is unavailable. Check Apple Intelligence in System Settings, Blur will check again automatically."
+	}
+}
+
+// Only status metadata is read here. Never run helper startup or wait for OS
+// model availability on the GUI thread, and never generate a validation prompt.
+func (d *desktop) refreshAppleAvailability() {
+	if d == nil || d.app == nil || d.appleChecking {
+		return
+	}
+	d.appleCheckRequest++
+	request := d.appleCheckRequest
+	d.appleChecking = true
+	d.app.RequestUpdate()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		status := model.AppleStatus{}
+		helper, err := model.NewApple()
+		if err == nil {
+			defer helper.CloseIdleConnections()
+			status, err = helper.Status(ctx)
+		}
+		copy := appleAvailabilityCopy(status, err)
+		d.app.Post(func() {
+			if request != d.appleCheckRequest {
+				return
+			}
+			d.appleChecking, d.appleAvailability = false, copy
+			d.app.RequestUpdate()
+		})
+	}()
 }

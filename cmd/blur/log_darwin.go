@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"github.com/hazcod/blur/internal/acceptance"
+	"github.com/hazcod/blur/internal/applog"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -103,7 +105,7 @@ func configurePersistentLogging() (func(), error) {
 	}
 	path := filepath.Join(directory, "blur.log")
 	output, openErr := openPersistentLog(directory, path)
-	if openErr != nil {
+	if openErr != nil && !acceptance.Enabled {
 		// Finder-launched apps should keep diagnostics even if Library/Logs is
 		// unavailable. The cache fallback is still private to this user and
 		// bounded/rotated exactly like the preferred log location.
@@ -118,7 +120,7 @@ func configurePersistentLogging() (func(), error) {
 		return nil, errors.New("log file unavailable")
 	}
 	persistentLogDirectory = directory
-	slog.SetDefault(slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: applog.Level()})))
 	if err := syscall.Dup2(int(output.file.Fd()), 2); err != nil {
 		slog.Warn("runtime stderr redirection unavailable", "result", "application logging remains active")
 	} else {
@@ -195,6 +197,14 @@ func openLogFile(path string, exclusive bool) (*os.File, error) {
 }
 
 func blurLogsDirectory() (string, error) {
+	if acceptance.Enabled {
+		config, err := acceptance.Load()
+		if err != nil {
+			return "", err
+		}
+		// Ignore production logging overrides in this separately built fixture.
+		return config.LogDirectory(), nil
+	}
 	if persistentLogDirectory != "" {
 		return persistentLogDirectory, nil
 	}

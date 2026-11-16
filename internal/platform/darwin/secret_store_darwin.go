@@ -48,6 +48,27 @@ func NewSecretStore() *SecretStore {
 	return &SecretStore{backend: &nativeKeychain{service: keychainService}}
 }
 
+// NewScopedSecretStore uses an explicit service without sharing a signed
+// access group. Acceptance builds use a nonce-bound service, never the stable
+// production namespace. The caller must retain that identity across reopen.
+func NewScopedSecretStore(service string) (*SecretStore, error) {
+	if !validKeychainIdentity(service, false) {
+		return nil, secretError(platform.SecretUnavailable)
+	}
+	return &SecretStore{backend: &nativeKeychain{service: service}}, nil
+}
+
+// ServiceIdentity exposes the public namespace, never stored values.
+func (s *SecretStore) ServiceIdentity() string {
+	if s == nil {
+		return ""
+	}
+	if backend, ok := s.backend.(*nativeKeychain); ok {
+		return backend.serviceName()
+	}
+	return ""
+}
+
 // NewSharedSecretStore scopes items to an explicit service and signed Keychain
 // access group. Both targets require matching entitlements; missing
 // entitlements fail closed through Security.framework.
@@ -72,7 +93,7 @@ func validKeychainIdentity(value string, group bool) bool {
 			}
 			continue
 		}
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
 			return false
 		}
 	}
@@ -154,7 +175,7 @@ func validSecretName(name string) bool {
 		return false
 	}
 	for _, r := range name {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-", r)) {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("._-", r) {
 			return false
 		}
 	}
@@ -246,7 +267,7 @@ func (n *nativeKeychain) get(name string, maxBytes int) ([]byte, error) {
 		return nil, secretError(platform.SecretCorrupt)
 	}
 	value := make([]byte, length)
-	a.cfDataGetBytes(result, cfRange{Length: length}, unsafe.Pointer(&value[0]))
+	a.cfDataGetBytes(result, cfRange{Length: length}, unsafe.Pointer(&value[0])) // #nosec G103 -- The authenticated CFData length is bounded before allocating the nonempty output; KeepAlive retains it through the copy.
 	runtime.KeepAlive(value)
 	return value, nil
 }
@@ -258,7 +279,7 @@ func (n *nativeKeychain) put(name string, value []byte) error {
 		return secretError(platform.SecretUnavailable)
 	}
 	a := n.api
-	data := a.cfData(0, unsafe.Pointer(&value[0]), len(value))
+	data := a.cfData(0, unsafe.Pointer(&value[0]), len(value)) // #nosec G103 -- CFDataCreate synchronously copies validated nonempty input; KeepAlive retains it through the call.
 	runtime.KeepAlive(value)
 	if data == 0 {
 		return secretError(platform.SecretUnavailable)
@@ -313,7 +334,7 @@ func (n *nativeKeychain) dictionary(keys, values []uintptr) (uintptr, func(), er
 }
 
 func (a keychainAPI) string(value string) uintptr {
-	ref := a.cfString(0, unsafe.Pointer(unsafe.StringData(value)), len(value), 0x08000100, 0)
+	ref := a.cfString(0, unsafe.Pointer(unsafe.StringData(value)), len(value), 0x08000100, 0) // #nosec G103 -- CFStringCreateWithBytes synchronously copies the string bytes; KeepAlive retains the input through the call.
 	runtime.KeepAlive(value)
 	return ref
 }

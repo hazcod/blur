@@ -33,7 +33,7 @@ func (g *OpenAICompatibleGenerator) CountInputTokens(ctx context.Context, system
 }
 
 func (g *OpenAICompatibleGenerator) Generate(ctx context.Context, packed PackedContext, maxOutputTokens int) (ModelAnswer, error) {
-	if g == nil || g.client == nil || ctx == nil || ctx.Err() != nil || maxOutputTokens < 1 || maxOutputTokens > MaxAnswerTokens || packed.System == "" || packed.User == "" || len(packed.SourceIDs) == 0 || len(packed.SourceIDs) > MaxEvidenceItems || packed.InputBytes != len(packed.System)+len(packed.User) || packed.InputBytes+maxOutputTokens+PromptTemplateReserve > ContextTokenLimit || !validPackedSources(packed.SourceIDs) {
+	if g == nil || g.client == nil || ctx == nil || ctx.Err() != nil || maxOutputTokens < 1 || maxOutputTokens > MaxAnswerTokens || packed.System == "" || packed.User == "" || len(packed.SourceIDs) == 0 || len(packed.SourceIDs) > packedEvidenceLimit(packed) || packed.InputBytes != len(packed.System)+len(packed.User) || packed.InputBytes+maxOutputTokens+PromptTemplateReserve > ContextTokenLimit || !validPackedSources(packed.SourceIDs) {
 		if ctx != nil && ctx.Err() != nil {
 			return ModelAnswer{}, ctx.Err()
 		}
@@ -43,5 +43,5 @@ func (g *OpenAICompatibleGenerator) Generate(ctx context.Context, packed PackedC
 	if err != nil {
 		return ModelAnswer{}, err
 	}
-	return parseGeneratedAnswer(content, packed.SourceIDs)
+	return parseGeneratedAnswerWithLimit(content, packed.SourceIDs, packedEvidenceLimit(packed))
 }

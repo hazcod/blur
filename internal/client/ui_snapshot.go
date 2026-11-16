@@ -243,7 +243,7 @@ func snapshotFileIsUniform(path string) bool {
 	if err != nil {
 		return false
 	}
-	defer file.Close()
+	defer func(close func() error) { _ = close() }(file.Close)
 	img, err := png.Decode(file)
 	return err == nil && isUniformImage(img)
 }

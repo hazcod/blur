@@ -43,6 +43,41 @@ func storeOpeners() []storeOpener {
 	}
 }
 
+func TestEncryptedStoreContractRepeatedVisitWindowsAndDeletion(t *testing.T) {
+	for _, opener := range storeOpeners() {
+		t.Run(opener.name, func(t *testing.T) {
+			s := opener.open(t)
+			defer func(close func() error) { _ = close() }(s.Close)
+			recorder, ok := s.(interface {
+				RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error
+			})
+			if !ok {
+				t.Fatal("store cannot retain repeated visits")
+			}
+			ctx := context.Background()
+			o := contractObservation(t, "Repeated visit contract")
+			first := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC)
+			visit := first.AddDate(0, 0, 2)
+			if err := s.PutObservationAt(ctx, o, first); err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.RecordObservationSighting(ctx, o, visit); err != nil {
+				t.Fatal(err)
+			}
+			page, err := s.ListObservationWindow(ctx, storage.ObservationWindowRequest{Start: visit, End: visit.Add(time.Hour), Limit: 5, MaxBytes: storage.MaxObservationPageBytes})
+			if err != nil || len(page.Observations) != 1 || !page.CapturedAt[0].Equal(visit) {
+				t.Fatalf("missing later visit: %+v %v", page, err)
+			}
+			if err := s.DeleteObservationRecord(ctx, o.ContentID()); err != nil {
+				t.Fatal(err)
+			}
+			if err := recorder.RecordObservationSighting(ctx, o, visit.Add(time.Hour)); err == nil {
+				t.Fatal("deleted source returned through visit metadata")
+			}
+		})
+	}
+}
+
 func TestEncryptedStoreContractObservationCopiesAndDuplicates(t *testing.T) {
 	for _, opener := range storeOpeners() {
 		t.Run(opener.name, func(t *testing.T) {
@@ -88,6 +123,86 @@ func TestEncryptedStoreContractPreservesCaptureTimesWithoutChangingSourceID(t *t
 			}
 			if page.Observations[0].ContentID() != observation.ContentID() {
 				t.Fatal("capture metadata changed the stable content ID")
+			}
+		})
+	}
+}
+
+func TestEncryptedStoreContractListsObservationsByCaptureWindow(t *testing.T) {
+	for _, opener := range storeOpeners() {
+		t.Run(opener.name, func(t *testing.T) {
+			store := opener.open(t)
+			t.Cleanup(func() { _ = store.Close() })
+			ctx := context.Background()
+			start := time.Date(2026, 10, 2, 3, 0, 0, 0, time.UTC)
+			items := []struct {
+				text string
+				at   time.Time
+			}{
+				{text: "old in window", at: start.Add(5 * time.Minute)},
+				{text: "older in window", at: start.Add(10 * time.Minute)},
+				{text: "newest in window", at: start.Add(20 * time.Minute)},
+				{text: "outside window", at: start.Add(time.Hour)},
+			}
+			for _, item := range items {
+				if err := store.PutObservationAt(ctx, contractObservation(t, item.text), item.at); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := storage.ObservationWindowRequest{Start: start, End: start.Add(time.Hour), Limit: 2, MaxBytes: storage.MaxObservationPageBytes}
+			page, err := store.ListObservationWindow(ctx, request)
+			if err != nil || len(page.Observations) != 2 || len(page.CapturedAt) != 2 || !page.HasMore {
+				t.Fatalf("window page = %+v err=%v", page, err)
+			}
+			if !strings.Contains(page.Observations[0].Text(), "newest in window") || !page.CapturedAt[0].Equal(start.Add(20*time.Minute)) || !strings.Contains(page.Observations[1].Text(), "older in window") || !page.CapturedAt[1].Equal(start.Add(10*time.Minute)) {
+				t.Fatalf("window page order/content = %+v, want newest first and outside source omitted", page)
+			}
+			request.BeforeCapturedAt, request.BeforeSourceID = page.NextCapturedAt, page.NextSourceID
+			next, err := store.ListObservationWindow(ctx, request)
+			if err != nil || len(next.Observations) != 1 || next.HasMore || !strings.Contains(next.Observations[0].Text(), "old in window") || !next.CapturedAt[0].Equal(start.Add(5*time.Minute)) {
+				t.Fatalf("continued window page = %+v err=%v, want the final older source", next, err)
+			}
+			if _, err := store.ListObservationWindow(ctx, storage.ObservationWindowRequest{Start: start, End: start, Limit: 1, MaxBytes: storage.MaxObservationPageBytes}); !contractStoreError(err, storage.Invalid) {
+				t.Fatalf("empty time window error = %v, want Invalid", err)
+			}
+		})
+	}
+}
+
+func TestEncryptedStoreContractCaptureWindowFiltersAndByteContinuation(t *testing.T) {
+	for _, opener := range storeOpeners() {
+		t.Run(opener.name, func(t *testing.T) {
+			store := opener.open(t)
+			t.Cleanup(func() { _ = store.Close() })
+			ctx := context.Background()
+			start := time.Date(2026, 11, 11, 8, 0, 0, 0, time.UTC)
+			for index, word := range []string{"alpha", "beta", "gamma"} {
+				app := "reader.app"
+				if index == 2 {
+					app = "excluded.app"
+				}
+				observation, err := capture.SanitizeObservation(app, "reading.example", strings.Repeat(word+" ", 125000), capture.MaxObservationTextBytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.PutObservationAt(ctx, observation, start.Add(time.Duration(index)*time.Minute)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := storage.ObservationWindowRequest{Start: start, End: start.Add(time.Hour), Limit: 3, MaxBytes: storage.MaxObservationTextBytes + 128 + 253}
+			for index := 2; index >= 0; index-- {
+				page, err := store.ListObservationWindow(ctx, request)
+				if err != nil || len(page.Observations) != 1 || page.Bytes > request.MaxBytes || page.HasMore != (index > 0) || !page.CapturedAt[0].Equal(start.Add(time.Duration(index)*time.Minute)) {
+					t.Fatalf("byte-bounded continuation index %d: count=%d bytes=%d more=%v err=%v", index, len(page.Observations), page.Bytes, page.HasMore, err)
+				}
+				request.BeforeCapturedAt, request.BeforeSourceID = page.NextCapturedAt, page.NextSourceID
+			}
+			request.BeforeCapturedAt, request.BeforeSourceID = time.Time{}, ""
+			request.Limit, request.AppID, request.Domain = 1, "reader.app", "reading.example"
+			request.ExcludeAppIDs = []string{"excluded.app"}
+			page, err := store.ListObservationWindow(ctx, request)
+			if err != nil || len(page.Observations) != 1 || page.Observations[0].AppID() != "reader.app" || !page.CapturedAt[0].Equal(start.Add(time.Minute)) {
+				t.Fatalf("filter before limit: count=%d err=%v", len(page.Observations), err)
 			}
 		})
 	}

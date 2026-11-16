@@ -78,7 +78,7 @@ func TestFirstRunDefaultsCaptureAndMenuBarOnWithoutWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := store.Load(context.Background())
-	want := Config{CaptureEnabled: true, MenuBarItemEnabled: true, SafariPageCaptureEnabled: false}
+	want := DefaultConfig()
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("first-run config = %+v, %v; want %+v", got, err, want)
 	}
@@ -93,7 +93,9 @@ func TestStorePersistsExplicitCapturePauseAndMenuBarChoice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{CaptureEnabled: false, MenuBarItemEnabled: false, SafariPageCaptureEnabled: true}
+	want := DefaultConfig()
+	want.CaptureEnabled, want.MenuBarItemEnabled, want.SafariPageCaptureEnabled = false, false, true
+	want.QuickAskHotkey = ""
 	if err := store.Save(context.Background(), want); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +143,8 @@ func TestStoreLoadsLegacyPreferencesWithSafariCaptureDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := store.Load(context.Background())
-	want := Config{CaptureEnabled: true, MenuBarItemEnabled: false, SafariPageCaptureEnabled: false}
+	want := DefaultConfig()
+	want.MenuBarItemEnabled = false
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("legacy preferences = %+v, %v; want %+v", got, err, want)
 	}
@@ -199,8 +202,8 @@ func TestStorePersistsQuickAskHotkeyAndDropsUnknownShortcuts(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := DefaultConfig()
-	if config.QuickAskHotkey != "" {
-		t.Fatalf("default hotkey = %q, want off", config.QuickAskHotkey)
+	if config.QuickAskHotkey != "alt+space" {
+		t.Fatalf("default hotkey = %q, want alt+space", config.QuickAskHotkey)
 	}
 	config.QuickAskHotkey = "alt+space"
 	if err := store.Save(context.Background(), config); err != nil {
@@ -217,5 +220,61 @@ func TestStorePersistsQuickAskHotkeyAndDropsUnknownShortcuts(t *testing.T) {
 	loaded, err = store.Load(context.Background())
 	if err != nil || loaded.QuickAskHotkey != "" {
 		t.Fatalf("unknown hotkey loaded as %q err=%v, want off", loaded.QuickAskHotkey, err)
+	}
+}
+
+func TestStorePersistsExplicitQuickAskOffAcrossReloads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "preferences.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConfig()
+	config.QuickAskHotkey = ""
+	if err := store.Save(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(fields["quick_ask_hotkey"]); got != `""` {
+		t.Fatalf("saved Off shortcut = %s; want an explicit empty string", got)
+	}
+	loaded, err := store.Load(context.Background())
+	if err != nil || loaded.QuickAskHotkey != "" {
+		t.Fatalf("explicit Off shortcut restored as %q, %v", loaded.QuickAskHotkey, err)
+	}
+}
+
+func TestStoreDefaultsOnlyMissingQuickAskShortcut(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "legacy missing", data: `{"capture_enabled":false,"menu_bar_item_enabled":false}`, want: "alt+space"},
+		{name: "explicit off", data: `{"capture_enabled":false,"menu_bar_item_enabled":false,"quick_ask_hotkey":""}`},
+		{name: "saved alternative", data: `{"capture_enabled":false,"menu_bar_item_enabled":false,"quick_ask_hotkey":"f19"}`, want: "f19"},
+		{name: "unknown stays off", data: `{"capture_enabled":false,"menu_bar_item_enabled":false,"quick_ask_hotkey":"hyper+q"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "preferences.json")
+			if err := os.WriteFile(path, []byte(test.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := store.Load(context.Background())
+			if err != nil || loaded.QuickAskHotkey != test.want || loaded.CaptureEnabled || loaded.MenuBarItemEnabled {
+				t.Fatalf("loaded shortcut choices = %+v, %v; want %q with saved capture/menu off", loaded, err, test.want)
+			}
+		})
 	}
 }

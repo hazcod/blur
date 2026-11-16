@@ -82,7 +82,7 @@ func TestDeleteObservationRecordsIsBoundedAndValidatesAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	first, err := capture.SanitizeObservation("batch.app", "", "first batch source", 128)
 	if err != nil {
 		t.Fatal(err)
@@ -117,8 +117,8 @@ func TestDeleteBatchSizerLeavesHeadroomForDenseSearchIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	terms := make([]string, search.MaxIndexedObservationTerms-2)
+	defer func(close func() error) { _ = close() }(store.Close)
+	terms := make([]string, search.InlineObservationTerms-2)
 	for i := range terms {
 		terms[i] = fmt.Sprintf("batchterm%03d", i)
 	}
@@ -230,7 +230,7 @@ func TestOpenDurablePersistsEncryptedObservationsWithoutPlaintextArtifacts(t *te
 	if err != nil {
 		t.Fatalf("OpenDurable(reopen) error = %v", err)
 	}
-	defer reopened.Close()
+	defer func(close func() error) { _ = close() }(reopened.Close)
 	got, found, err := reopened.GetObservation(ctx, id)
 	if err != nil || !found || got.ContentID() != id || got.Text() != sentinel {
 		t.Fatalf("GetObservation() = (%q, %t, %v), want recovered encrypted value", got.Text(), found, err)
@@ -349,7 +349,7 @@ func TestDurableDetectsRecordSwapAfterManifestConsistentRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("manifest-consistent swap should pass set verification before record auth: %v", err)
 	}
-	defer reopened.Close()
+	defer func(close func() error) { _ = close() }(reopened.Close)
 	if _, _, err := reopened.GetObservation(context.Background(), first.ContentID()); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("GetObservation(swapped record) error = %v, want ErrCorrupt", err)
 	}
@@ -367,8 +367,8 @@ func TestDurableRejectsRecordCopiedBetweenStoresWithSameDataKey(t *testing.T) {
 		_ = first.Close()
 		t.Fatal(err)
 	}
-	defer first.Close()
-	defer second.Close()
+	defer func(close func() error) { _ = close() }(first.Close)
+	defer func(close func() error) { _ = close() }(second.Close)
 
 	observation, err := capture.SanitizeObservation("store.app", "store.example", "password: cross-store fixture", 128)
 	if err != nil {
@@ -416,7 +416,7 @@ func TestDurableRejectsAuthenticatedRecordWithSwappedSchemaContext(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	observation, err := capture.SanitizeObservation("schema.app", "schema.example", "password: schema context swap", 128)
 	if err != nil {
 		t.Fatal(err)
@@ -470,7 +470,7 @@ func TestDurableListCursorsRaceSafelyWithClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	ctx := context.Background()
 	observation, err := capture.SanitizeObservation("cursor.app", "cursor.example", "password: cursor race", 128)
 	if err != nil {
@@ -618,7 +618,7 @@ func TestDurableUpdateAtomicallyRollsBackObservationAndIndexExtension(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	observation, err := capture.SanitizeObservation("atomic.app", "atomic.example", "password: atomic rollback", 128)
 	if err != nil {
 		t.Fatal(err)
@@ -678,7 +678,7 @@ func TestDurablePageSkipsDecryptingOverBudgetRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	observation, err := capture.SanitizeObservation("page.app", "page.example", "password: page has more bytes than one", 128)
 	if err != nil {
 		t.Fatal(err)
@@ -728,7 +728,7 @@ func TestDurableObservationCaptureTimePersistsOutsideContentIdentity(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	page, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 4, MaxBytes: storage.MaxObservationPageBytes})
 	if err != nil || len(page.Observations) != 1 || len(page.CapturedAt) != 1 || !page.CapturedAt[0].Equal(capturedAt) {
 		t.Fatalf("persisted capture metadata = (%d, %v, %v), want one record at %s", len(page.Observations), page.CapturedAt, err, capturedAt)
@@ -787,7 +787,7 @@ func TestDurableOpenBackfillsLegacyCaptureTimeMetadataOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	page, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 2, MaxBytes: storage.MaxObservationPageBytes})
 	if err != nil || len(page.Observations) != 1 || len(page.CapturedAt) != 1 || !page.CapturedAt[0].Equal(baseline) {
 		t.Fatalf("legacy capture metadata after migration = (%d, %v, %v), want persisted conservative baseline %s", len(page.Observations), page.CapturedAt, err, baseline)
@@ -799,7 +799,7 @@ func TestCreateNewStoreMarksCaptureTimeMigrationComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	baseline, complete, found, err := store.readCaptureTimeMigration(context.Background())
 	if err != nil || !found || !complete || !validCaptureTime(baseline) {
 		t.Fatalf("fresh store capture-time migration marker = (%v, %t, %t, %v), want valid completed marker", baseline, complete, found, err)
@@ -835,7 +835,7 @@ func TestDurableRetentionPolicyDefaultsToNinetyDaysAndPersists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	policy, err = store.GetRetentionPolicy(ctx)
 	if err != nil || policy.Days != 30 || !policy.LastSweepAt.Equal(sweptAt) {
 		t.Fatalf("reopened retention policy = %+v, %v; want 30 days at %s", policy, err, sweptAt)
@@ -862,7 +862,7 @@ func TestDurableObservationSizeMetadataIsSealedAndBoundToOrderKey(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 
 	first, err := capture.SanitizeObservation("size.app", "size.example", "password: first size fixture\nfirst row", 128)
 	if err != nil {
@@ -943,46 +943,57 @@ func TestDurableObservationSizeMetadataIsSealedAndBoundToOrderKey(t *testing.T) 
 }
 
 func TestDurableSchemaMigrationIsAtomicAndIdempotent(t *testing.T) {
-	path := durableTestPath(t)
-	key := durableTestKey(t, 0x54)
-	writeSchemaVersionFixture(t, path, key, 1)
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := openDurableWithHook(path, key, OpenExisting, func() error { return errors.New("sentinel migration failure") }); !errors.Is(err, ErrMigration) {
-		t.Fatalf("interrupted migration error = %v, want ErrMigration", err)
-	}
-	afterFailure, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(afterFailure, before) {
-		t.Fatalf("failed migration changed durable bytes: err=%v", err)
-	}
-	store, err := OpenDurable(path, key, OpenExisting)
-	if err != nil {
-		t.Fatalf("OpenDurable(after interrupted migration) error = %v", err)
-	}
-	wantObservation := schemaMigrationFixtureObservation(t)
-	got, found, getErr := store.GetObservation(context.Background(), wantObservation.ContentID())
-	if getErr != nil || !found || got.ContentID() != wantObservation.ContentID() {
-		t.Fatalf("GetObservation(after schema migration) found=%t err=%v", found, getErr)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	afterMigration, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err = OpenDurable(path, key, OpenExisting)
-	if err != nil {
-		t.Fatalf("OpenDurable(repeated open) error = %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	afterRepeatedOpen, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(afterRepeatedOpen, afterMigration) {
-		t.Fatalf("repeated open changed migrated bytes: err=%v", err)
+	for _, version := range []uint32{1, 2, 3, 4, 5, 6} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			path := durableTestPath(t)
+			key := durableTestKey(t, 0x54)
+			writeSchemaVersionFixture(t, path, key, version)
+			beforePrimary := schemaFixturePrimaryBytes(t, path)
+			defer clear(beforePrimary)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := openDurableWithHook(path, key, OpenExisting, func() error { return errors.New("sentinel migration failure") }); !errors.Is(err, ErrMigration) {
+				t.Fatalf("interrupted migration error = %v, want ErrMigration", err)
+			}
+			afterFailure, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(afterFailure, before) {
+				t.Fatalf("failed migration changed durable bytes: err=%v", err)
+			}
+			store, err := OpenDurable(path, key, OpenExisting)
+			if err != nil {
+				t.Fatalf("OpenDurable(after interrupted migration) error = %v", err)
+			}
+			wantObservation := schemaMigrationFixtureObservation(t)
+			got, found, getErr := store.GetObservation(context.Background(), wantObservation.ContentID())
+			if getErr != nil || !found || got.ContentID() != wantObservation.ContentID() {
+				t.Fatalf("GetObservation(after schema migration) found=%t err=%v", found, getErr)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			afterPrimary := schemaFixturePrimaryBytes(t, path)
+			defer clear(afterPrimary)
+			if !bytes.Equal(beforePrimary, afterPrimary) {
+				t.Fatal("schema migration changed historical primary ciphertext")
+			}
+			afterMigration, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err = OpenDurable(path, key, OpenExisting)
+			if err != nil {
+				t.Fatalf("OpenDurable(repeated open) error = %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			afterRepeatedOpen, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(afterRepeatedOpen, afterMigration) {
+				t.Fatalf("repeated open changed migrated bytes: err=%v", err)
+			}
+		})
 	}
 }
 
@@ -1019,7 +1030,7 @@ func TestDurableCrashAfterCommittedWriteCanReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenDurable(after process exit) error = %v", err)
 	}
-	defer reopened.Close()
+	defer func(close func() error) { _ = close() }(reopened.Close)
 	want, err := capture.SanitizeObservation("crash.app", "crash.example", "password: committed before exit", 128)
 	if err != nil {
 		t.Fatal(err)
@@ -1088,8 +1099,20 @@ func TestDurable100kTinyExtensionRecords(t *testing.T) {
 			break
 		}
 	}
-	if count != total+2 {
-		t.Fatalf("stored extension and mandatory metadata record count = %d; want %d", count, total+2)
+	// Projection, capture-time, timeline, deletion migration, deletion cursor,
+	// the capture index's completed empty-store backfill cursor, and the
+	// capture-part timeline and recap-dependency initialization markers.
+	if count != total+8 {
+		t.Fatalf("stored extension and mandatory metadata record count = %d; want %d", count, total+8)
+	}
+	if err := store.view(ctx, func(reader bolt.Reader) error {
+		backfill, found, err := store.captureIndexBackfillReader(reader)
+		if err != nil || !found || backfill.Next != "" {
+			t.Fatalf("new-store capture index backfill cursor: found=%t next=%q err=%v", found, backfill.Next, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -1125,45 +1148,34 @@ func writeSchemaVersionFixture(t *testing.T, path string, key securestore.Key, v
 		_ = store.Close()
 		t.Fatalf("write schema fixture observation: %v", err)
 	}
+	if version < 5 {
+		if err := store.Update(context.Background(), func(tx *Tx) error {
+			if err := tx.deleteKnowledgeRecord(captureTimeMigrationNamespace, deletionMigrationID); err != nil {
+				return err
+			}
+			return tx.deleteKnowledgeRecord(deletionCutoffNS, deletionSequenceID)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	err = store.state.db.Update(context.Background(), func(writer bolt.Writer) error {
 		tx := &Tx{store: store, writer: writer, active: true}
 		if err := tx.loadManifestLocked(); err != nil {
 			return err
 		}
-		entries, _, err := writer.Scan(nil, nil, 64, bolt.MaxTransactionBytes-bolt.MaxKeyBytes)
+		entries, more, err := writer.Scan(nil, nil, 64, bolt.MaxTransactionBytes-bolt.MaxKeyBytes)
 		if err != nil {
 			return err
+		}
+		if more {
+			t.Fatal("schema fixture exceeded its record bound")
 		}
 		defer clearBoltEntries(entries)
 		for _, entry := range entries {
 			if bytes.Equal(entry.Key, manifestKey) {
 				continue
 			}
-			var replacement []byte
-			switch {
-			case bytes.Equal(entry.Key, identityKey):
-				replacement, err = store.sealIdentity(store.state.storeID, version)
-			case bytes.Equal(entry.Key, schemaKey):
-				plain := encodeSchema(version)
-				replacement, err = store.sealAtSchema(schemaKey, "schema", plain, version)
-				clear(plain)
-			case bytes.HasPrefix(entry.Key, observationRecordPrefix):
-				var plain []byte
-				plain, err = store.open(entry.Key, "observations", entry.Value)
-				if err == nil {
-					replacement, err = store.sealAtSchema(entry.Key, "observations", plain, version)
-				}
-				clear(plain)
-			case bytes.HasPrefix(entry.Key, observationOrderPrefix):
-				var plain []byte
-				plain, err = store.open(entry.Key, "observation-size", entry.Value)
-				if err == nil {
-					replacement, err = store.sealAtSchema(entry.Key, "observation-size", plain, version)
-				}
-				clear(plain)
-			default:
-				continue
-			}
+			replacement, err := schemaFixtureRecordAtVersion(t, store, entry, version)
 			if err != nil {
 				clear(replacement)
 				return err

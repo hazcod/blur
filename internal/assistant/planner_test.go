@@ -82,6 +82,161 @@ func TestPlanQuestionKindAndScope(t *testing.T) {
 	}
 }
 
+func TestLatestSecurityNewsIsATopicLookupWithoutFreshnessExactTerm(t *testing.T) {
+	plan, err := PlanQuestion("latest security news", time.Date(2026, 11, 15, 14, 0, 0, 0, time.UTC), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok := memoryLookupCandidate(plan, nil)
+	if !ok {
+		t.Fatal("bare topic was not considered for personal memory lookup")
+	}
+	if plan.Kind != KindLookup || plan.Entity != "" || strings.Join(plan.Terms, " ") != "news security" {
+		t.Fatalf("latest topic was not reduced to historical lookup terms: %+v", plan)
+	}
+}
+
+func TestWholeDocumentRequestsAreExplicitAndKeepTopicTerms(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	whole := []struct {
+		question string
+		terms    []string
+	}{
+		{"Summarize the whole page about TLS", []string{"tls"}},
+		{"Summarize the article about TLS", []string{"tls"}},
+		{"Can you summarise this entire article on certificate rotation?", []string{"certificate", "rotation"}},
+		{"Give me an overview of the full document about project Orion.", []string{"project"}},
+		{"Give me the gist of this transcript about TLS", []string{"tls"}},
+		{"What are the key points in the Northstar report?", []string{"northstar"}},
+		{"What is this article about?", nil},
+		{"What’s this webpage about?", nil},
+		{"Explain this document", nil},
+		{"Can you explain that page to me?", nil},
+		{"Walk me through this report", nil},
+		{"Give me a breakdown of this document", nil},
+		{"Summarize the email about compliance", []string{"compliance"}},
+		{"Explain this webpage in its entirety", nil},
+		{"Review the complete report", nil},
+		{"Analyze all of this captured source", nil},
+		{"résume toute la page sur Atlas", []string{"atlas"}},
+	}
+	for _, test := range whole {
+		t.Run(test.question, func(t *testing.T) {
+			plan, err := PlanQuestion(test.question, now, nil)
+			if err != nil || !plan.WholeDocument || plan.Kind != KindLookup {
+				t.Fatalf("whole-document request plan = %+v, err=%v", plan, err)
+			}
+			for _, term := range plan.Terms {
+				if isWholeDocumentGrammarWord(term) {
+					t.Fatalf("request grammar leaked into topic terms: %+v", plan.Terms)
+				}
+			}
+			for _, want := range test.terms {
+				if !containsString(plan.Terms, want) {
+					t.Fatalf("topic term %q was dropped from plan: %+v", want, plan)
+				}
+			}
+		})
+	}
+	for _, question := range []string{
+		"What does the second paragraph say about TLS?",
+		"Summarize the paragraph about TLS",
+		"What is the full path for the config file?",
+		"Explain the full path for the config file",
+		"What does this page say about Orion?",
+		"What does the article say about TLS?",
+		"Which sentence from the report mentions TLS?",
+		"What was that email about?",
+	} {
+		plan, err := PlanQuestion(question, now, nil)
+		if err != nil || plan.WholeDocument {
+			t.Fatalf("passage or ordinary question was expanded: question=%q plan=%+v err=%v", question, plan, err)
+		}
+	}
+}
+
+func TestOutstandingProjectQuestionsUseStructuredOpenWorkIntent(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	for _, question := range []string{
+		"What's outstanding for CraftedSignal?",
+		"What's outstanding with CraftedSignal?",
+		"What's outstanding on CraftedSignal?",
+		"What is outstanding at CraftedSignal?",
+		"What are the outstanding items for CraftedSignal?",
+		"What is still pending with CraftedSignal?",
+		"whats outstanding for CraftedSignal",
+		"what’s outstanding for CraftedSignal",
+		"what's still open for CraftedSignal",
+		"what are we still waiting on from CraftedSignal",
+		"Anything left to do for CraftedSignal?",
+		"What do I still owe CraftedSignal?",
+		"What do we owe CraftedSignal?",
+		"What are we waiting for from CraftedSignal?",
+		"What are we waiting on from CraftedSignal?",
+		"What follow-ups are still open for CraftedSignal?",
+		"Where did we leave things with CraftedSignal?",
+		"What is left to do for CraftedSignal?",
+		"What do I need to do for CraftedSignal?",
+		"What should I do for CraftedSignal?",
+		"What have I got to do for CraftedSignal?",
+		"What are the next steps for CraftedSignal?",
+		"What remains to do for CraftedSignal?",
+		"Any blockers for CraftedSignal?",
+		"What are we waiting on for CraftedSignal?",
+		"What needs follow-up for CraftedSignal?",
+		"What’s on my plate for CraftedSignal?",
+		"What tasks do I have for CraftedSignal?",
+		"What are my tasks for CraftedSignal?",
+		"Which tasks are still open for CraftedSignal?",
+		"Any pending work for CraftedSignal?",
+		"What’s the next step for CraftedSignal?",
+	} {
+		t.Run(question, func(t *testing.T) {
+			plan, err := PlanQuestion(question, now, nil)
+			if err != nil || plan.Kind != KindEntity || plan.Entity != "craftedsignal" || !plan.MatchOnly || strings.Join(plan.Terms, " ") != "craftedsignal" || !IsOutstandingQuestion(question) {
+				t.Fatalf("outstanding question plan = %+v, err=%v", plan, err)
+			}
+		})
+	}
+	for _, question := range []string{"What's the outstanding balance?", "Show me the CraftedSignal sign-in page"} {
+		if IsOutstandingQuestion(question) {
+			t.Fatalf("unrelated question classified as outstanding work: %q", question)
+		}
+	}
+	domainAlias := KnownApp{ID: "accounts.craftedsignal.io", Name: "accounts.craftedsignal.io", Aliases: []string{"craftedsignal"}, Domain: true}
+	plan, err := PlanQuestion("What's outstanding for CraftedSignal?", now, []KnownApp{domainAlias})
+	if err != nil || len(plan.Domains) != 0 || len(plan.AppIDs) != 0 || plan.Entity != "craftedsignal" {
+		t.Fatalf("project was incorrectly scoped to a same-named website: %+v err=%v", plan, err)
+	}
+}
+
+func TestOutstandingProjectQuestionUnderstandsOpenLoopParaphrases(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	for _, question := range []string{
+		"What's still on the table for CraftedSignal?",
+		"What open loops do we have for CraftedSignal?",
+		"What are the open loops with CraftedSignal?",
+		"What do we still have to do for CraftedSignal?",
+		"What are we blocked on at CraftedSignal?",
+	} {
+		t.Run(question, func(t *testing.T) {
+			plan, err := PlanQuestion(question, now, nil)
+			if err != nil || plan.Kind != KindEntity || plan.Entity != "craftedsignal" || !plan.MatchOnly || !IsOutstandingQuestion(question) {
+				t.Fatalf("open-work paraphrase was not routed to structured retrieval: plan=%+v err=%v", plan, err)
+			}
+		})
+	}
+	for _, question := range []string{
+		"What is the outstanding balance for CraftedSignal?",
+		"What are the open invoices for CraftedSignal?",
+		"What is the open source license for CraftedSignal?",
+	} {
+		if IsOutstandingQuestion(question) {
+			t.Fatalf("financial status was classified as open work: %q", question)
+		}
+	}
+}
+
 func TestPlanQuestionAppsDomainsAndTerms(t *testing.T) {
 	now := time.Date(2026, 11, 11, 14, 30, 0, 0, time.UTC)
 	apps := []KnownApp{
@@ -119,6 +274,17 @@ func TestPlanQuestionAppsDomainsAndTerms(t *testing.T) {
 				t.Fatalf("terms = %q, want %q", got, tt.terms)
 			}
 		})
+	}
+}
+
+func TestQuestionSearchTermsKeepTopicAndDropEmailConversationScaffolding(t *testing.T) {
+	plan, err := PlanQuestion("What integrity emails were we talking about?", time.Now(), nil)
+	if err != nil || plan.Kind != KindLookup || strings.Join(plan.Terms, " ") != "integrity" {
+		t.Fatalf("conversation wording obscured the topic term: plan=%+v err=%v", plan, err)
+	}
+	plan, err = PlanQuestion("What was that email about?", time.Now(), nil)
+	if err != nil || plan.Kind != KindLookup || strings.Join(plan.Terms, " ") != "email" {
+		t.Fatalf("source-type cue was lost when no topic was supplied: plan=%+v err=%v", plan, err)
 	}
 }
 
@@ -165,12 +331,12 @@ func (r *planTestRetriever) RetrievePlan(_ context.Context, p Plan) (Retrieval, 
 	r.got = p
 	return r.retrieval, nil
 }
-func (r *planTestRetriever) AnswerDirect(_ context.Context, p Plan) (Answer, bool, error) {
+func (r *planTestRetriever) AnswerDirect(_ context.Context, p Plan) (DirectAnswer, bool, error) {
 	r.got = p
 	if r.direct == nil {
-		return Answer{}, false, nil
+		return DirectAnswer{}, false, nil
 	}
-	return *r.direct, true, nil
+	return DirectAnswer{Answer: *r.direct}, true, nil
 }
 
 func TestAskWithHistoryDirectAnswerSkipsModel(t *testing.T) {
@@ -194,6 +360,7 @@ func TestAskWithHistoryEmptyEvidenceExplainsWhy(t *testing.T) {
 		{"paused", "what did I do today", Diagnosis{CapturePaused: true, PausedSince: paused}, "Capture has been paused since 13:10, so nothing new has been saved. Resume capture and ask again."},
 		{"unknown app", "what did I read in whatsapp", Diagnosis{}, "I haven't captured anything from WhatsApp yet. Check Capture scope in Settings if it should be included."},
 		{"empty scope", "what did I read yesterday", Diagnosis{}, "Nothing captured yesterday yet."},
+		{"outstanding project work", "What's outstanding for CraftedSignal?", Diagnosis{}, "I couldn't find any saved open work for that project."},
 		{"other", "what did I read about tls", Diagnosis{}, "I couldn't find that in your memory. Try naming the app, the day, or a word on screen."},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -241,7 +408,7 @@ func TestPackContextLayersItemsAndTimes(t *testing.T) {
 	start := time.Date(2026, 11, 11, 9, 0, 0, 0, loc)
 	ev := []Evidence{{SourceID: mk("a"), Text: "raw", CapturedAt: start}, {SourceID: mk("b"), Text: "hour", Layer: LayerHour, CapturedAt: start, EndAt: start.Add(time.Hour)}, {SourceID: mk("d"), Text: "digest", Layer: LayerDigest}}
 	for i := 0; i < 14; i++ {
-		ev = append(ev, Evidence{SourceID: strings.Repeat(string(rune('e'+i%1)), 0) + mk("e")[:63] + string(rune('0'+i%10)), Text: "more"})
+		ev = append(ev, Evidence{SourceID: mk("e")[:63] + string(rune('0'+i%10)), Text: "more"})
 	}
 	got, err := PackContext("recap my day", ev)
 	if err != nil {
@@ -250,10 +417,27 @@ func TestPackContextLayersItemsAndTimes(t *testing.T) {
 	if len(got.SourceIDs) != MaxEvidenceItems || got.SourceIDs[0] != mk("d") || got.SourceIDs[1] != mk("b") {
 		t.Fatalf("layer order/limit wrong: %d %v", len(got.SourceIDs), got.SourceIDs[:2])
 	}
-	if !strings.Contains(got.User, `"time":"09:00–10:00"`) || !strings.Contains(got.User, `"layer":"hour"`) || got.InputBytes != len(got.System)+len(got.User) {
+	if !strings.Contains(got.User, `"time":"2026-11-11T09:00:00+01:00–2026-11-11T10:00:00+01:00"`) || !strings.Contains(got.User, `"layer":"hour"`) || got.InputBytes != len(got.System)+len(got.User) {
 		t.Fatalf("user = %s", got.User)
 	}
 	if !strings.Contains(got.System, "same language") || !strings.Contains(got.System, "chronological") {
 		t.Fatal("system prompt lacks recap/language rules")
+	}
+}
+
+func TestAskExplainsPendingIndexInsteadOfClaimingNothingWasCaptured(t *testing.T) {
+	r := &planTestRetriever{retrieval: Retrieval{Diagnosis: Diagnosis{IndexingPending: true}}}
+	g := &testGenerator{}
+	svc := NewService(r, g, testCounter{tokens: 10}, 4096)
+	result, err := svc.Ask(context.Background(), "What did I read about zzztailneedle?")
+	if err != nil || !result.IndexingPending || !result.Answer.InsufficientEvidence || !strings.Contains(result.Answer.Text, "saved content is still being indexed") || g.calls != 0 {
+		t.Fatal(result, err)
+	}
+	id := strings.Repeat("a", 64)
+	r.retrieval.Evidence = []Evidence{{SourceID: id, Text: "A saved fact."}}
+	g.answer = ModelAnswer{Text: "A saved fact.", SourceIDs: []string{id}}
+	result, err = svc.Ask(context.Background(), "What did I read about zzztailneedle?")
+	if err != nil || !result.IndexingPending || len(result.Sources) != 1 || g.calls != 1 {
+		t.Fatal("partial answer hid coverage", result, err)
 	}
 }

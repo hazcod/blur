@@ -6,28 +6,31 @@ import (
 	"time"
 
 	"github.com/golang-gui/goui/core/geometry"
+	"github.com/golang-gui/goui/gui"
 	"github.com/golang-gui/goui/layout"
+	"github.com/hazcod/blur/internal/assistant"
 )
 
 // Quick ask geometry, in points. The window height always fits its content:
 // safe-area inset + top padding + composer + bottom padding, plus the measured
 // body when there is one.
 const (
-	quickPanelWidth           = 560
+	quickPanelWidth           = 500
 	quickPanelChatWidth       = quickPanelWidth // retained: the panel no longer changes width
-	quickPanelPadX            = 20
-	quickPanelPadTop          = 10
-	quickPanelPadBottom       = 10
-	quickPanelComposerHeight  = 36
+	quickPanelPadX            = 16
+	quickPanelPadTop          = 8
+	quickPanelPadBottom       = 8
+	quickPanelComposerHeight  = 32
 	quickPanelBodyGap         = 6
 	quickPanelProgressHeight  = 2
-	quickPanelMaxHeight       = 340
+	quickPanelMaxHeight       = 300
 	quickPanelAnswerHeight    = quickPanelMaxHeight
 	quickPanelStatusLine      = 16
 	quickPanelPreviewRows     = 6
 	interactPaintCornerRadius = 0
-	quickConversationLimit    = 4
-	quickConversationBytes    = 6000
+	quickConversationLimit    = 20
+	quickModelHistoryLimit    = 4
+	quickConversationBytes    = assistant.MaxAnswerBytes
 )
 
 // quickPanelFitHeight is the window height for a panel whose body measures
@@ -58,6 +61,7 @@ func ceilPoints(v float32) int {
 	return n
 }
 
+//nolint:unused // Called by the macOS window sizing adapter.
 func quickPanelWidthForContent(bool) int { return quickPanelWidth }
 
 // quickPanelHeight is the compact, composer-only height.
@@ -73,14 +77,14 @@ func quickPanelInsets() geometry.Insets {
 
 // quickPanelExpanded reports whether an answer is on screen. A pending ask is
 // not expanded: it only adds a status line until the answer exists.
-func (d *desktop) quickPanelExpanded() bool { return d != nil && len(d.quickConversation) > 0 }
+func (d *desktop) quickPanelExpanded() bool { return d != nil && len(d.quickVisibleTurns()) > 0 }
 
 // quickPanelBusy is true while an answer exists or is being produced, which
 // replaces the day recap.
 func (d *desktop) quickPanelBusy() bool { return d.quickPanelExpanded() || d.quickAskPending }
 
 func (d *desktop) quickPanelProgressing() bool {
-	return d != nil && d.quickAskPending && d.askLoading
+	return d != nil && (d.quickAskPending && d.askLoading || d.quickEntryLoading)
 }
 
 // quickPanelHasContent reports typed text, an answer, a pending ask or a
@@ -94,10 +98,16 @@ func (d *desktop) quickPanelHasContent() bool {
 
 // quickPanelExtras is panel state that lives beside the desktop struct.
 type quickPanelExtras struct {
-	fitEpoch    uint64
-	revealEpoch uint64
-	lastEscape  time.Time
-	lastEnter   time.Time
+	fitEpoch           uint64
+	revealEpoch        uint64
+	lastEnter          time.Time
+	preferQuick        bool
+	selectedTurn       *quickConversationTurn
+	draftRevision      uint64
+	historyOpen        bool
+	historyHidden      bool
+	keyboardWidget     gui.Widget
+	keyboardController *gui.KeyEventController
 	// saveNoteFn replaces the note save in tests.
 	saveNoteFn      func()
 	savedFlash      bool
@@ -153,6 +163,9 @@ func (d *desktop) measureQuickPanelBody() (float32, bool) {
 // quickPanelBodyEstimate is the body height used before layout is available.
 // Zero means the panel has no body.
 func (d *desktop) quickPanelBodyEstimate() float32 {
+	if d.startupIssue != "" {
+		return 110
+	}
 	showPreview := d.quickPanelShowsPreview()
 	switch {
 	case showPreview:
@@ -167,13 +180,24 @@ func (d *desktop) quickPanelBodyEstimate() float32 {
 			return quickPanelStatusLine
 		}
 		return float32(rows*22 + titles*26)
-	case len(d.quickConversation) > 0:
+	case len(d.quickVisibleTurns()) > 0:
 		height := float32(0)
-		for _, turn := range d.quickConversation {
-			lines := len(turn.answer)/62 + 1
-			height += 15 + 8 + float32(lines)*22 + 10 + 14 + 12
+		last, selected := len(d.quickConversation)-1, d.quickSelectedTurnIndex()
+		for position, i := range d.quickVisibleTurns() {
+			turn := d.quickConversation[i]
+			if position > 0 {
+				height += 21
+			}
+			height += 15
+			if i == last || i == selected || d.quickUI.expandedTurns[i] {
+				lines := len(turn.answer)/62 + 1
+				height += 8 + float32(lines)*22
+				if quickTurnMeta(turn) != "" {
+					height += 24
+				}
+			}
 		}
-		return min(height+50, quickPanelMaxHeight)
+		return min(height, quickPanelMaxHeight)
 	case d.quickAskPending || d.quickExtras().savedFlash || quickPanelShowsDraftStatus(d.quickInput, d.status):
 		return quickPanelStatusLine
 	}
@@ -183,14 +207,14 @@ func (d *desktop) quickPanelBodyEstimate() float32 {
 // quickPanelHairline reports whether a divider sits between the composer and a
 // list-like body (answer or recap); status lines have none.
 func (d *desktop) quickPanelHairline() bool {
-	return d.quickPanelShowsPreview() && quickPreviewHasRows(d) || len(d.quickConversation) > 0
+	return d.quickPanelShowsPreview() && quickPreviewHasRows(d) || len(d.quickVisibleTurns()) > 0
 }
 
 func quickPreviewHasRows(d *desktop) bool {
 	if d.todayLoading {
 		return false
 	}
-	for _, group := range quickPreviewGroups(d.today.Snapshot, d.hourlySummaries) {
+	for _, group := range d.currentQuickPreviewGroups() {
 		if len(group.items) > 0 {
 			return true
 		}

@@ -2,6 +2,8 @@
 
 Detailed development status, security model, platform notes and packaging detail for Blur, moved here from the README. For the product overview, see the [README](../README.md).
 
+The current macOS Voice notes implementation, related fixes and remaining live
+acceptance work are tracked in [Voice notes status](voice-notes-status.md).
 
 Blur is a local-first memory and writing assistant in development. This
 repository contains a Go desktop shell, encrypted local durable storage,
@@ -123,15 +125,19 @@ use the per-user cache directory at
 `~/Library/Caches/Blur/Logs` instead. Directories and log files are
 user-private. Diagnostics are intended for troubleshooting, not as a memory
 export, but should still be treated as private files.
-App Sandbox (default): `make macos-app` signs the bundle with
-`platform/macos/Blur.sandbox.entitlements` (app-sandbox, outbound network
-client, user-selected read/write for the sync folder picker). Use
-`make macos-app MACOS_SANDBOX=0` for an unsandboxed build (data then lives in
-`~/Library/Application Support/Blur`). `make macos-app-sandbox-check` verifies
-the built bundle carries the sandbox entitlement. When `BLUR_APP_GROUP_ID` /
-`BLUR_KEYCHAIN_ACCESS_GROUP` are set, a merged entitlements plist is generated
-next to the build binary. Under the sandbox `HOME` is the container, so data
-lives in
+Direct-download builds are unsandboxed by default (`MACOS_SANDBOX=0`), including
+the Foundation Models helper, to support cross-app macOS Accessibility reads.
+The stable local target uses the same policy. Startup keeps an existing valid
+container data directory in place; fresh installs without one use
+`~/Library/Application Support/Blur`. Desktop and MCP share that resolver.
+Use `make macos-app MACOS_SANDBOX=1` only for an explicit sandbox compatibility
+build; cross-app Accessibility capture is unsupported there.
+It signs the bundle with `platform/macos/Blur.sandbox.entitlements`
+(app-sandbox, outbound network client, user-selected read/write for the sync
+folder picker). `make macos-app-sandbox-check` verifies that optional build's
+sandbox entitlement. When `BLUR_APP_GROUP_ID` / `BLUR_KEYCHAIN_ACCESS_GROUP`
+are set for a sandbox build, a merged entitlements plist is generated next to
+the build binary. Under the sandbox `HOME` is the container, so data lives in
 `~/Library/Containers/com.hazcod.blur/Data/Library/Application Support/Blur`
 and logs in `~/Library/Containers/com.hazcod.blur/Data/Library/Logs/Blur`
 (same content-free `blur.log` / `startup.log`). The `blur mcp` bridge runs from
@@ -360,7 +366,7 @@ a shell cannot read the container, so for review tooling build a dev-only app wi
 the snapshot directory at the same path (never use or distribute that build):
 
 ```sh
-make macos-app MACOS_SANDBOX_DEV_PATH=/tmp/blur-ui-snapshots
+make macos-app MACOS_SANDBOX=1 MACOS_SANDBOX_DEV_PATH=/tmp/blur-ui-snapshots
 BLUR_UI_SNAPSHOT_DIR=/tmp/blur-ui-snapshots ~/Downloads/Blur.app/Contents/MacOS/blur
 ```
 

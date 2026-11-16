@@ -212,7 +212,7 @@ func TestElevatedTargetIsNeverRead(t *testing.T) {
 func TestNextCoalescesForegroundAndFocusEvents(t *testing.T) {
 	backend := readyBackend()
 	adapter := newAdapter(backend)
-	defer adapter.Suspend(context.Background())
+	defer func() { _ = adapter.Suspend(context.Background()) }()
 	backend.events <- platform.CaptureEvent{Kind: "frontmost_app_changed"}
 	backend.events <- platform.CaptureEvent{Kind: "focused_context_changed"}
 	event, err := adapter.Next(context.Background())

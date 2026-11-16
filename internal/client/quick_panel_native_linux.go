@@ -20,8 +20,6 @@ func unregisterQuickAskHotkey()                   {}
 
 const quickAskHotkeySupported = false
 
-func activateDesktopApp() {}
-
 func orderWindowFrontQuietly(uintptr) error { return errors.New("unavailable") }
 
 func setDesktopQuickPanelAlpha(ui.App, float64) error { return nil }

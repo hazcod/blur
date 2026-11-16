@@ -20,7 +20,7 @@ func TestRunIfDuePrunesOnlyExpiredRecordsAndRunsAtMostDaily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	deleter, err := deletion.NewService(store, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestRunIfDueFailsClosedOnUntrustworthyClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	deleter, err := deletion.NewService(store, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +103,7 @@ func TestBeforeSweepRunsOnlyWhenExpiredMemoryWillBePruned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	deleter, err := deletion.NewService(store, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestDefaultNinetyDayRetentionPrunesExpiredSourceWithoutSetup(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	deleter, err := deletion.NewService(store, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +191,7 @@ func TestRunNowCanApplyAnExplicitPolicyChangeImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	deleter, err := deletion.NewService(store, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +229,7 @@ func TestSweepUsesBoundedPagesForMoreThanOnePage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	deleter, err := deletion.NewService(store, nil)
 	if err != nil {
 		t.Fatal(err)

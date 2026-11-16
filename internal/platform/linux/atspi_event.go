@@ -87,24 +87,6 @@ func (t *focusTracker) updateWithStatus(focused, window atspiObjectRef, appID st
 	return platform.CaptureEvent{Kind: "focus", TargetID: token}, nil
 }
 
-func (t *focusTracker) current() (focusTarget, bool) {
-	if t == nil {
-		return focusTarget{}, false
-	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.active, t.active.token != ""
-}
-
-func (t *focusTracker) clear() {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	t.active = focusTarget{}
-	t.mu.Unlock()
-}
-
 func (t *focusTracker) target(token string) (focusTarget, bool) {
 	if t == nil || token == "" {
 		return focusTarget{}, false
@@ -122,7 +104,7 @@ func validLinuxAppID(value string) bool {
 		return false
 	}
 	for _, char := range value {
-		if !(char >= 'a' && char <= 'z') && !(char >= '0' && char <= '9') && char != '.' && char != '_' && char != '-' {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '.' && char != '_' && char != '-' {
 			return false
 		}
 	}
@@ -190,7 +172,7 @@ func validATSPIDBusAddress(address string) bool {
 				return false
 			}
 			for _, c := range value {
-				if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+				if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 					return false
 				}
 			}
@@ -228,8 +210,12 @@ func atspiRefreshSignal(signal *dbus.Signal) bool {
 	}
 }
 
+// validATSPISender accepts D-Bus unique connection names (":1.0", ":1.42"):
+// a leading colon and at least two non-empty dot-separated parts. The first
+// connections on a bus get four-character names such as ":1.0", so the
+// minimum length is four.
 func validATSPISender(name string) bool {
-	if len(name) < 5 || len(name) > 255 || name[0] != ':' {
+	if len(name) < 4 || len(name) > 255 || name[0] != ':' {
 		return false
 	}
 	parts := strings.Split(name[1:], ".")
@@ -242,7 +228,7 @@ func validATSPISender(name string) bool {
 		}
 		for i := 0; i < len(part); i++ {
 			c := part[i]
-			if !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') && c != '_' && c != '-' {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' && c != '-' {
 				return false
 			}
 		}

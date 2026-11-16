@@ -14,6 +14,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/activity"
+	"github.com/hazcod/blur/internal/appidentity"
+	"github.com/hazcod/blur/internal/applog"
 	"github.com/hazcod/blur/internal/assistant"
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/chronicle"
@@ -23,10 +25,13 @@ import (
 	"github.com/hazcod/blur/internal/notes"
 	"github.com/hazcod/blur/internal/power"
 	"github.com/hazcod/blur/internal/preferences"
+	"github.com/hazcod/blur/internal/reminders"
 	"github.com/hazcod/blur/internal/retention"
 	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/semantic"
 	"github.com/hazcod/blur/internal/storage"
 	"github.com/hazcod/blur/internal/storage/durable"
+	"github.com/hazcod/blur/internal/tasks"
 	"github.com/hazcod/blur/internal/today"
 )
 
@@ -89,6 +94,10 @@ type ActivityData interface {
 	ListActivitySegmentsForDates(context.Context, []string, int) ([]activity.Segment, error)
 }
 
+type ObservationWindowReader interface {
+	ListObservationWindow(context.Context, storage.ObservationWindowRequest) (storage.ObservationWindow, error)
+}
+
 type TodaySnapshotWriter interface {
 	PutTodaySnapshot(context.Context, today.Snapshot) error
 }
@@ -117,23 +126,37 @@ type AllSourceDeleter interface {
 
 type Client struct {
 	data                   Data
+	meetings               *meetingController
 	chronicles             storage.ChronicleStore
 	notes                  NoteAdder
+	noteProcessingMu       sync.Mutex
+	noteProcessing         *noteProcessingWorker
+	noteProcessingChanges  chan struct{}
 	deletion               SourceDeleter
 	localAI                *localAIController
+	memoryIndex            *memoryIndexController
+	exactIndex             *exactIndexController
+	memoryIndexChanges     chan struct{}
+	reminders              *reminders.Service
+	taskChanges            chan struct{}
+	taskOpened             <-chan string
 	retention              *retention.Service
 	power                  *power.Controller
 	preferences            *preferences.Store
+	preferencesConfigMu    sync.Mutex
 	mcpControl             MCPPreferenceControl
 	replica                *replicaService
 	retentionStartupFailed bool
 	captureChanges         chan struct{}
 	captureStateChanges    chan struct{}
+	captureHealth          captureHealthState
 	safariCaptureMu        sync.Mutex
 	safariCaptureStatus    string
 	safariCaptureChanges   chan struct{}
 	memoryChangeMu         sync.Mutex
 	memoryStartMu          sync.Mutex
+	aiPolicyMu             sync.RWMutex
+	aiPolicyEpoch          uint64
 	activeAsks             map[uint64]context.CancelFunc
 	nextAskID              uint64
 	memoryChanges          chan struct{}
@@ -155,6 +178,7 @@ type Client struct {
 const (
 	noteOperationTimeout  = 60 * time.Second
 	shortOperationTimeout = 15 * time.Second
+	wholeDocumentTimeout  = 30 * time.Minute
 )
 
 // ErrClientClosed is returned for operations started after, or interrupted by,
@@ -196,6 +220,8 @@ func (c *Client) Close() {
 	if cancel != nil {
 		cancel()
 	}
+	c.meetings.close()
+	c.closeNoteProcessing()
 	c.inflight.Wait()
 }
 
@@ -211,9 +237,11 @@ func (c *Client) addMemoryChangingHook(hook func()) {
 }
 
 func NewClient(data Data) *Client {
-	client := &Client{data: data, captureChanges: make(chan struct{}, 1), captureStateChanges: make(chan struct{}, 1), safariCaptureChanges: make(chan struct{}, 1), activeAsks: make(map[uint64]context.CancelFunc), memoryChanges: make(chan struct{}, 1)}
+	client := &Client{data: data, captureChanges: make(chan struct{}, 1), captureStateChanges: make(chan struct{}, 1), safariCaptureChanges: make(chan struct{}, 1), activeAsks: make(map[uint64]context.CancelFunc), memoryChanges: make(chan struct{}, 1), memoryIndexChanges: make(chan struct{}, 1), taskChanges: make(chan struct{}, 1), noteProcessingChanges: make(chan struct{}, 1)}
 	client.lifeCtx, client.lifeCancel = context.WithCancel(context.Background())
 	client.addMemoryChangingHook(client.invalidateKnownApps)
+	client.addMemoryChangingHook(client.invalidateNoteProcessing)
+	client.configureMeetings()
 	if repository, ok := data.(storage.ChronicleStore); ok {
 		client.chronicles = repository
 	}
@@ -265,7 +293,7 @@ func (c *Client) ChronicleSourcesPage(ctx context.Context, hourID, after string,
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
-		observation, found, err := c.data.GetObservation(ctx, id)
+		observation, found, err := storage.ReadSourceEvidence(ctx, c.data, id)
 		if err != nil {
 			return nil, "", err
 		}
@@ -280,7 +308,7 @@ func (c *Client) ChronicleSourcesPage(ctx context.Context, hourID, after string,
 				text = text[:len(text)-1]
 			}
 		}
-		result = append(result, SearchHit{SourceID: id, AppID: observation.AppID(), Domain: observation.Domain(), Text: text, Truncated: truncated})
+		result = append(result, SearchHit{SourceID: id, AppID: observation.AppID(), Domain: observation.Domain(), Text: text, Truncated: truncated || observation.Truncated(), Partial: observation.Truncated()})
 	}
 	next := ""
 	if end < len(summary.SourceIDs) && end > 0 {
@@ -371,12 +399,16 @@ func boundedKnowledgeEvidence(hits []SearchHit) []derive.Evidence {
 }
 
 func fitKnowledgeEvidence(ctx context.Context, generator derive.Generator, evidence []derive.Evidence) ([]derive.Evidence, error) {
+	capacity, err := model.RuntimeContextLimit(ctx, generator, model.ContextTokenLimit)
+	if err != nil {
+		return nil, err
+	}
 	for len(evidence) > 0 {
 		count, err := generator.CountInputTokens(ctx, evidence)
 		if err != nil {
 			return nil, err
 		}
-		if count <= derive.MaxInputTokens && count+derive.MaxOutputTokens+model.PromptTemplateReserve <= model.ContextTokenLimit {
+		if count >= 0 && count <= derive.MaxInputTokens && count+derive.MaxOutputTokens+model.PromptTemplateReserve <= capacity {
 			return evidence, nil
 		}
 		evidence = evidence[:len(evidence)-1]
@@ -398,14 +430,14 @@ func (c *Client) ChronicleSource(ctx context.Context, sourceID string) (SearchHi
 	if c == nil || c.data == nil || ctx == nil || !validKnowledgeID(sourceID) {
 		return SearchHit{}, ErrInvalidRequest
 	}
-	observation, found, err := c.data.GetObservation(ctx, sourceID)
+	observation, found, err := storage.ReadSourceEvidence(ctx, c.data, sourceID)
 	if err != nil {
 		return SearchHit{}, err
 	}
 	if !found {
 		return SearchHit{}, ErrInvalidRequest
 	}
-	return SearchHit{SourceID: sourceID, AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text()}, nil
+	return SearchHit{SourceID: sourceID, AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), Truncated: observation.Truncated(), Partial: observation.Truncated()}, nil
 }
 
 // CaptureChanges returns a coalesced, payload-free signal for newly persisted
@@ -454,6 +486,7 @@ const (
 	safariCaptureUnavailableStatus = "Safari page capture could not start. Check the app's Safari extension and website permissions; native capture remains active."
 )
 
+//nolint:unused // Called by the macOS Safari capture bridge.
 func (c *Client) setSafariCaptureStatus(status string) {
 	if c == nil {
 		return
@@ -556,12 +589,19 @@ func (c *Client) PublishMemoryRead(epoch uint64, publish func()) bool {
 // NotifyMemoryChanging cancels active Ask operations and non-blockingly signals
 // the UI before a deletion or retention sweep can mutate stored evidence.
 func (c *Client) NotifyMemoryChanging() {
+	c.notifyMemoryChangingEpoch(nil)
+}
+func (c *Client) notifyMemoryChangingEpoch(epoch *uint64) bool {
 	if c == nil {
-		return
+		return false
 	}
 	c.memoryStartMu.Lock()
 	defer c.memoryStartMu.Unlock()
 	c.memoryChangeMu.Lock()
+	if epoch != nil && (c.memoryMutationDepth != 0 || c.memoryMutationEpoch != *epoch) {
+		c.memoryChangeMu.Unlock()
+		return false
+	}
 	first := c.memoryMutationDepth == 0
 	c.memoryMutationDepth++
 	c.memoryMutationEpoch++
@@ -588,6 +628,7 @@ func (c *Client) NotifyMemoryChanging() {
 	if first && invalidate != nil {
 		invalidate()
 	}
+	return true
 }
 
 // NotifyMemoryStable ends a deletion window and wakes the UI to refresh its
@@ -605,12 +646,17 @@ func (c *Client) NotifyMemoryStable() {
 	default:
 	}
 	c.memoryChangeMu.Unlock()
+	c.memoryIndex.Wake()
+	c.localAI.WakeLibrary()
 }
 
 func (c *Client) registerAsk(cancel context.CancelFunc) (uint64, bool) {
+	return c.registerAskEpoch(cancel, nil)
+}
+func (c *Client) registerAskEpoch(cancel context.CancelFunc, epoch *uint64) (uint64, bool) {
 	c.memoryChangeMu.Lock()
 	defer c.memoryChangeMu.Unlock()
-	if c.memoryMutationDepth > 0 {
+	if c.memoryMutationDepth > 0 || epoch != nil && *epoch != c.memoryMutationEpoch {
 		return 0, false
 	}
 	c.nextAskID++
@@ -660,6 +706,9 @@ func (c *Client) WithPower(controller *power.Controller) *Client {
 func (c *Client) WithPreferences(store *preferences.Store) *Client {
 	if c != nil {
 		c.preferences = store
+		if store != nil {
+			c.applySavedLogLevel()
+		}
 	}
 	return c
 }
@@ -675,6 +724,8 @@ func (c *Client) ConfigureApplicationPreferences(ctx context.Context, config pre
 	if c == nil || c.preferences == nil {
 		return ErrNotConfigured
 	}
+	c.preferencesConfigMu.Lock()
+	defer c.preferencesConfigMu.Unlock()
 	previous, err := c.preferences.Load(ctx)
 	if err != nil {
 		return err
@@ -696,6 +747,7 @@ func (c *Client) ConfigureApplicationPreferences(ctx context.Context, config pre
 		}
 		return err
 	}
+	_ = applog.SetLevel(config.LogLevel)
 	if previous.CaptureEnabled && !config.CaptureEnabled {
 		c.flushReplica() // pause: push pending changes to the sync folder
 	}
@@ -715,7 +767,12 @@ func (c *Client) ConfigurePower(ctx context.Context, config power.Config) error 
 	if c == nil || c.power == nil {
 		return ErrNotConfigured
 	}
-	return c.power.Configure(ctx, config)
+	if err := c.power.Configure(ctx, config); err != nil {
+		return err
+	}
+	c.memoryIndex.Wake()
+	c.localAI.WakeLibrary()
+	return nil
 }
 
 func (c *Client) EffectivePower(ctx context.Context) (power.Effective, error) {
@@ -768,15 +825,11 @@ func (c *Client) LocalAISettingsNeedRepair() bool {
 	return c != nil && c.localAI != nil && c.localAI.NeedsRepair()
 }
 
-// CanAskMemory reports whether a configured model is enabled for cited
-// questions over locally retrieved memory. Remote providers require separate
-// persisted consent before captured evidence can be sent.
+// CanAskMemory reports whether local evidence is available to the Ask path.
+// Source lookup and quotations do not require an answer model. Generated
+// answers still require a configured model and provider-specific consent.
 func (c *Client) CanAskMemory() bool {
-	if c == nil || c.data == nil || c.localAI == nil {
-		return false
-	}
-	_, ok := c.localAI.askService(c)
-	return ok
+	return c != nil && c.data != nil
 }
 
 // AskMemory retrieves a small exact-match evidence set and asks the configured
@@ -788,36 +841,61 @@ func (c *Client) AskMemory(ctx context.Context, question string) (assistant.Resu
 // AskMemoryWithHistory is AskMemory with earlier turns, so a follow-up can
 // inherit the previous scope and app.
 func (c *Client) AskMemoryWithHistory(ctx context.Context, question string, history []assistant.Turn) (assistant.Result, error) {
-	if c == nil || c.data == nil || c.localAI == nil || ctx == nil {
+	return c.askMemoryWithMode(ctx, question, history, "")
+}
+func (c *Client) askMemoryWithMode(ctx context.Context, question string, history []assistant.Turn, mode string) (assistant.Result, error) {
+	return c.askMemoryWithModeProgress(ctx, question, history, mode, nil)
+}
+
+func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string, history []assistant.Turn, mode string, progress func(assistant.DocumentProgress)) (assistant.Result, error) {
+	if c == nil || c.data == nil || ctx == nil {
 		return assistant.Result{}, ErrNotConfigured
 	}
-	opCtx, done, err := c.beginOperation(ctx, noteOperationTimeout)
+	opCtx, done, err := c.beginOperation(ctx, askOperationTimeout(question))
 	if err != nil {
 		return assistant.Result{}, err
 	}
 	defer done()
-	service, ok := c.localAI.askService(c)
-	if !ok {
-		return assistant.Result{}, assistant.ErrAskUnavailable
+	service, askCtx, finishAsk, err := c.beginAIAsk(opCtx)
+	if err != nil {
+		return assistant.Result{}, err
 	}
-	askCtx, cancel := context.WithCancel(opCtx)
-	requestID, ok := c.registerAsk(cancel)
-	if !ok {
-		cancel()
-		return assistant.Result{}, ErrMemoryChanging
+	defer finishAsk()
+	var result assistant.Result
+	if text, calculated := assistant.Calculate(question); calculated {
+		result = assistant.Result{Answer: assistant.Answer{Text: text}, Direct: true, General: true, Plan: assistant.Plan{Question: question}}
+	} else {
+		result, err = service.AskWithHistoryModeProgress(askCtx, question, history, mode, progress)
 	}
-	defer func() {
-		cancel()
-		c.unregisterAsk(requestID)
-	}()
-	return service.AskWithHistory(askCtx, question, history)
+	if err != nil {
+		return assistant.Result{}, err
+	}
+	if err := c.validateTaskTargets(askCtx, result); err != nil {
+		return assistant.Result{}, err
+	}
+	// Linearize publication with policy changes. Providers may return a late
+	// successful response after cancellation; it must not reach the caller.
+	c.aiPolicyMu.RLock()
+	defer c.aiPolicyMu.RUnlock()
+	if err := askCtx.Err(); err != nil {
+		return assistant.Result{}, err
+	}
+	return result, nil
+}
+
+func askOperationTimeout(question string) time.Duration {
+	plan, err := assistant.PlanQuestion(question, time.Now(), nil)
+	if err == nil && plan.WholeDocument {
+		return wholeDocumentTimeout
+	}
+	return noteOperationTimeout
 }
 
 func (c *Client) ConfigureLocalAI(ctx context.Context, settings LocalAISettings) error {
 	if c == nil || c.localAI == nil {
 		return ErrNotConfigured
 	}
-	return c.localAI.Configure(ctx, settings)
+	return c.configureAIPolicy(ctx, settings)
 }
 
 // ConfigureAI configures an explicitly selected note-processing provider. Any
@@ -826,7 +904,7 @@ func (c *Client) ConfigureAI(ctx context.Context, settings LocalAISettings, cred
 	if c == nil || c.localAI == nil {
 		return ErrNotConfigured
 	}
-	return c.localAI.Configure(ctx, settings, credential)
+	return c.configureAIPolicy(ctx, settings, credential)
 }
 
 func (c *Client) SetBackgroundSummaries(ctx context.Context, enabled bool) error {
@@ -858,6 +936,17 @@ func (c *Client) DeleteSource(sourceID string) (int, error) {
 		return 0, ErrInvalidRequest
 	}
 	clear(decoded)
+	if _, ok := c.data.(noteDocumentReader); ok {
+		if _, canDelete := c.deletion.(noteDocumentDeleter); canDelete {
+			document, lookupErr := c.NoteDocument(context.Background(), sourceID)
+			if lookupErr == nil {
+				return 1, c.DeleteNoteDocument(context.Background(), document.ID, document.Revision)
+			}
+			if !errors.Is(lookupErr, notes.ErrDocumentNotFound) && !errors.Is(lookupErr, durable.ErrDeletionPending) {
+				return 0, lookupErr
+			}
+		}
+	}
 	c.NotifyMemoryChanging()
 	defer c.NotifyMemoryStable()
 	ctx, done, err := c.beginOperation(context.Background(), shortOperationTimeout)
@@ -887,18 +976,50 @@ func (c *Client) DeleteAll(ctx context.Context) (int, error) {
 }
 
 func (c *Client) AddNote(text string) (notes.Result, error) {
+	return c.addNoteWithEpoch(context.Background(), text, nil)
+}
+func (c *Client) addNoteAtEpoch(ctx context.Context, text string, epoch uint64) (notes.Result, error) {
+	return c.addNoteWithEpoch(ctx, text, &epoch)
+}
+func (c *Client) addNoteWithEpoch(parent context.Context, text string, epoch *uint64) (notes.Result, error) {
 	if c == nil || c.notes == nil {
 		return notes.Result{}, ErrNotConfigured
 	}
 	if len(text) == 0 || len(text) > notes.MaxNoteBytes || !utf8.ValidString(text) || strings.TrimSpace(text) == "" || strings.IndexByte(text, 0) >= 0 {
 		return notes.Result{}, ErrInvalidRequest
 	}
-	ctx, done, err := c.beginOperation(context.Background(), noteOperationTimeout)
+	ctx, done, err := c.beginOperation(parent, noteOperationTimeout)
 	if err != nil {
 		return notes.Result{}, err
 	}
 	defer done()
-	return c.notes.Add(ctx, text)
+	ctx, cancel := context.WithCancel(ctx)
+	if epoch == nil {
+		current, _ := c.BeginMemoryRead()
+		epoch = &current
+	}
+	id, stable := c.registerAskEpoch(cancel, epoch)
+	if !stable {
+		cancel()
+		return notes.Result{}, ErrMemoryChanging
+	}
+	defer func() { cancel(); c.unregisterAsk(id) }()
+	// Desktop save acknowledges the durable receipt. Optional task extraction
+	// and Library inference have separate bounded background lifecycles.
+	var result notes.Result
+	if receipt, ok := c.notes.(interface {
+		AddReceipt(context.Context, string) (notes.Result, error)
+	}); ok {
+		result, err = receipt.AddReceipt(ctx, text)
+	} else {
+		result, err = c.notes.Add(ctx, text)
+	}
+	if err == nil {
+		c.memoryIndex.NotifySource(result.SourceID)
+		c.localAI.NotifyLibrarySource(result.SourceID)
+		result.Processing = c.queueNoteProcessing(ctx, result, *epoch)
+	}
+	return result, err
 }
 
 // ConfirmProposal activates one stored suggestion only after an explicit user
@@ -915,52 +1036,87 @@ func (c *Client) ConfirmProposal(date, proposalID string) error {
 		return err
 	}
 	defer done()
-	return c.data.ConfirmProposal(ctx, date, proposalID)
+	ctx, cancel := context.WithCancel(ctx)
+	id, stable := c.registerAsk(cancel)
+	if !stable {
+		cancel()
+		return ErrMemoryChanging
+	}
+	defer func() { cancel(); c.unregisterAsk(id) }()
+	if err := c.data.ConfirmProposal(ctx, date, proposalID); err != nil {
+		return err
+	}
+	c.notifyTasksChanged()
+	return nil
 }
 
 func (c *Client) AnswerQuestion(date, questionID, answer string) error {
-	if c == nil || c.data == nil {
-		return ErrNotConfigured
-	}
-	if !validDate(date) || !validOpaqueID(questionID) || len(answer) == 0 || len(answer) > notes.MaxNoteBytes || !utf8.ValidString(answer) || strings.TrimSpace(answer) == "" || strings.IndexByte(answer, 0) >= 0 {
-		return ErrInvalidRequest
-	}
-	ctx, done, err := c.beginOperation(context.Background(), shortOperationTimeout)
-	if err != nil {
-		return err
-	}
-	defer done()
-	return c.data.AnswerQuestion(ctx, date, questionID, answer, time.Now())
+	return c.resolveTodayQuestion(date, questionID, answer, false, nil)
 }
 
 func (c *Client) DismissQuestion(date, questionID string) error {
+	return c.resolveTodayQuestion(date, questionID, "", true, nil)
+}
+
+// UI callers bind the action to the epoch at click time. Direct callers bind
+// at registration; both are canceled and drained before memory erasure.
+func (c *Client) resolveTodayQuestion(date, questionID, answer string, dismiss bool, epoch *uint64) error {
 	if c == nil || c.data == nil {
 		return ErrNotConfigured
 	}
 	if !validDate(date) || !validOpaqueID(questionID) {
 		return ErrInvalidRequest
 	}
+	if !dismiss && (len(answer) == 0 || len(answer) > notes.MaxNoteBytes || !utf8.ValidString(answer) || strings.TrimSpace(answer) == "" || strings.IndexByte(answer, 0) >= 0) {
+		return ErrInvalidRequest
+	}
 	ctx, done, err := c.beginOperation(context.Background(), shortOperationTimeout)
 	if err != nil {
 		return err
 	}
 	defer done()
-	return c.data.DismissQuestion(ctx, date, questionID)
+	ctx, cancel := context.WithCancel(ctx)
+	request, stable := c.registerAskEpoch(cancel, epoch)
+	if !stable {
+		cancel()
+		return ErrMemoryChanging
+	}
+	defer func() { cancel(); c.unregisterAsk(request) }()
+	if dismiss {
+		return c.data.DismissQuestion(ctx, date, questionID)
+	}
+	return c.data.AnswerQuestion(ctx, date, questionID, answer, c.askClock())
 }
 
 type TodayView struct {
-	State        string         `json:"state"`
-	Date         string         `json:"date"`
-	CaptureState string         `json:"capture_state"`
-	Snapshot     today.Snapshot `json:"snapshot"`
+	State           string          `json:"state"`
+	Date            string          `json:"date"`
+	CaptureState    string          `json:"capture_state"`
+	Snapshot        today.Snapshot  `json:"snapshot"`
+	RecentCaptures  []RecentCapture `json:"recent_captures,omitempty"`
+	Tasks           []tasks.Item    `json:"tasks,omitempty"`
+	TaskIssues      int             `json:"task_issues,omitempty"`
+	UnimportedTasks []today.Todo    `json:"unimported_tasks,omitempty"`
+}
+
+type RecentCapture struct {
+	SearchHit
+	CapturedAt time.Time `json:"captured_at"`
 }
 
 type SearchHit struct {
-	SourceID  string `json:"source_id"`
-	AppID     string `json:"app_id"`
-	Domain    string `json:"domain"`
-	Text      string `json:"text"`
-	Truncated bool   `json:"truncated,omitempty"`
+	TimeUnknown bool                         `json:"capture_time_unknown,omitempty"`
+	CapturedAt  time.Time                    `json:"captured_at,omitzero"`
+	Task        *tasks.Item                  `json:"task,omitempty"`
+	Partial     bool                         `json:"partial_capture,omitempty"`
+	SourceID    string                       `json:"source_id"`
+	AppID       string                       `json:"app_id"`
+	Domain      string                       `json:"domain"`
+	Text        string                       `json:"text"`
+	Truncated   bool                         `json:"truncated,omitempty"`
+	MatchStart  int                          `json:"match_start,omitempty"`
+	MatchEnd    int                          `json:"match_end,omitempty"`
+	Document    assistant.DocumentProvenance `json:"-"`
 }
 
 func (c *Client) Today(date string) (TodayView, error) {
@@ -981,12 +1137,14 @@ func (c *Client) Today(date string) (TodayView, error) {
 	if err != nil {
 		return TodayView{}, err
 	}
+	zone := localZoneName()
+	if found && snapshot.Zone != "" {
+		if _, err := loadZone(snapshot.Zone); err == nil {
+			zone = snapshot.Zone
+		}
+	}
 	if reader, ok := c.data.(ActivityData); ok {
 		if writer, ok := c.data.(TodaySnapshotWriter); ok {
-			zone := localZoneName()
-			if _, iana := time.LoadLocation(zone); iana == nil && found && snapshot.Zone != "" {
-				zone = snapshot.Zone
-			}
 			snapshot, found, err = materializeTodayActivity(ctx, date, zone, snapshot, found, reader, fencedTodayWriter{client: c, epoch: epoch, writer: writer})
 			if err != nil {
 				return TodayView{}, err
@@ -994,7 +1152,32 @@ func (c *Client) Today(date string) (TodayView, error) {
 		}
 	}
 	if found {
+		// A concurrent note/activity producer may have been reconciled with a
+		// newer task receipt in storage. Read that authoritative version back.
+		if current, ok, readErr := c.data.GetTodaySnapshot(ctx, date); readErr != nil {
+			return TodayView{}, readErr
+		} else if ok {
+			snapshot = current
+		}
 		out.State, out.CaptureState, out.Snapshot = "ready", "paused", snapshot.Clone()
+	}
+	if out.Snapshot.Date == "" {
+		out.Snapshot.Date, out.Snapshot.Zone = date, zone
+	}
+	if err := c.resolveTodayTasks(ctx, epoch, &out); err != nil {
+		return TodayView{}, err
+	}
+	if len(out.Tasks) > 0 {
+		out.State = "ready"
+	}
+	if reader, ok := c.data.(ObservationWindowReader); ok {
+		out.RecentCaptures, err = recentDayCaptures(ctx, reader, date, zone)
+		if err != nil {
+			return TodayView{}, err
+		}
+		if len(out.RecentCaptures) > 0 {
+			out.State, out.CaptureState = "ready", "paused"
+		}
 	}
 	return out, nil
 }
@@ -1014,6 +1197,15 @@ func (c *Client) searchContextLimit(ctx context.Context, query string, limit int
 	if err := ctx.Err(); err != nil {
 		return search.ExactPage{}, err
 	}
+	operation, done, err := c.beginOperation(ctx, shortOperationTimeout)
+	if err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return search.ExactPage{}, canceled
+		}
+		return search.ExactPage{}, err
+	}
+	defer done()
+	ctx = operation
 	query = strings.TrimSpace(query)
 	terms, err := search.NormalizeTokens(query, 32)
 	if err != nil || len(terms) == 0 {
@@ -1029,7 +1221,7 @@ func (c *Client) searchExactTerms(ctx context.Context, terms []string, limit, mi
 	if err := ctx.Err(); err != nil {
 		return search.ExactPage{}, err
 	}
-	page, err := c.data.SearchExact(ctx, search.ExactQuery{Terms: terms, MinTermMatches: minTermMatches, TopK: limit, MaxRows: maxRows, MaxBytes: search.MaxIndexBytes})
+	page, err := c.data.SearchExact(ctx, search.ExactQuery{Terms: terms, ExcludeAppIDs: []string{appidentity.BundleID}, MinTermMatches: minTermMatches, TopK: limit, MaxRows: maxRows, MaxBytes: search.MaxIndexBytes})
 	if err != nil {
 		return search.ExactPage{}, err
 	}
@@ -1042,7 +1234,7 @@ func (c *Client) searchExactTerms(ctx context.Context, terms []string, limit, mi
 	return page, nil
 }
 
-// SearchMemory hydrates exact top-k index hits under one aggregate byte
+// SearchMemory hydrates hybrid top-k index hits under one aggregate byte
 // budget. Results contain only sanitized evidence text.
 func (c *Client) SearchMemory(query string) ([]SearchHit, error) {
 	return c.SearchMemoryContext(context.Background(), query)
@@ -1052,12 +1244,95 @@ func (c *Client) SearchMemoryContext(ctx context.Context, query string) ([]Searc
 	return c.searchMemoryContext(ctx, query, MaxSearchResults)
 }
 
+type MemorySearchPage struct {
+	Hits            []SearchHit
+	IndexingPending bool
+	CoverageLimited bool
+	HasMore         bool
+	terms           []string
+}
+
 func (c *Client) searchMemoryContext(ctx context.Context, query string, limit int) ([]SearchHit, error) {
-	page, err := c.searchContextLimit(ctx, query, limit)
-	if err != nil {
-		return nil, err
+	page, err := c.searchMemoryPageContext(ctx, query, limit)
+	return page.Hits, err
+}
+
+func (c *Client) SearchMemoryPageContext(ctx context.Context, query string) (MemorySearchPage, error) {
+	return c.searchMemoryPageContext(ctx, query, MaxSearchResults)
+}
+
+func (c *Client) searchMemoryPageContext(ctx context.Context, query string, limit int) (MemorySearchPage, error) {
+	if c == nil || ctx == nil {
+		return MemorySearchPage{}, ErrInvalidRequest
 	}
-	return c.hydrateSearchPage(ctx, page)
+	if err := ctx.Err(); err != nil {
+		return MemorySearchPage{}, err
+	}
+	operation, done, err := c.beginOperation(ctx, noteOperationTimeout)
+	if err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return MemorySearchPage{}, canceled
+		}
+		return MemorySearchPage{}, err
+	}
+	defer done()
+	return c.memorySearchPage(operation, query, limit, false)
+}
+
+// memorySearchPage is shared by the public Search and MCP operation owners.
+// Each caller holds one Client lifetime operation through its whole response;
+// this helper must not add nested admission or reset their timing budgets.
+func (c *Client) memorySearchPage(ctx context.Context, query string, limit int, lookahead bool) (MemorySearchPage, error) {
+	if c == nil || ctx == nil {
+		return MemorySearchPage{}, ErrInvalidRequest
+	}
+	c.aiPolicyMu.RLock()
+	policyEpoch := c.aiPolicyEpoch
+	c.aiPolicyMu.RUnlock()
+	epoch, stable := c.BeginMemoryRead()
+	if !stable {
+		return MemorySearchPage{}, ErrMemoryChanging
+	}
+	candidates := limit
+	if lookahead {
+		candidates = min(MaxSearchResults, limit+1)
+	}
+	page, plan, err := c.naturalSearchPage(ctx, query, candidates)
+	if err != nil {
+		return MemorySearchPage{}, err
+	}
+	if len(page.Hits) > limit {
+		page.HasMore = true
+		page.Hits = page.Hits[:limit]
+	}
+	page = boundSearchHydration(page)
+	hits, err := c.hydrateSearchPage(ctx, page)
+	if err != nil {
+		return MemorySearchPage{}, err
+	}
+	terms := plan.Terms
+	locateExactPassages(hits, terms)
+	taskPlan := plan
+	if len(hits) > 0 && c.localAI != nil {
+		taskPlan.Literal = true
+	}
+	taskPage, err := c.naturalTaskSearch(ctx, taskPlan, candidates)
+	if err != nil {
+		return MemorySearchPage{}, err
+	}
+	hits, taskMore := mergeTaskSearchHits(hits, taskPage, limit)
+	c.aiPolicyMu.RLock()
+	defer c.aiPolicyMu.RUnlock()
+	if c.aiPolicyEpoch != policyEpoch {
+		return MemorySearchPage{}, context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return MemorySearchPage{}, err
+	}
+	if !c.MemoryReadCurrent(epoch) {
+		return MemorySearchPage{}, ErrMemoryChanging
+	}
+	return MemorySearchPage{Hits: hits, IndexingPending: page.IndexingPending, CoverageLimited: page.CoverageLimited || taskPage.historyIncomplete || taskPage.semanticIssue != "", HasMore: page.HasMore || taskMore, terms: plan.Terms}, nil
 }
 
 func (c *Client) hydrateSearchPage(ctx context.Context, page search.ExactPage) ([]SearchHit, error) {
@@ -1070,7 +1345,7 @@ func (c *Client) hydrateSearchPage(ctx context.Context, page search.ExactPage) (
 		if hit.Bytes < 1 || hit.Bytes > MaxSearchBytes-used {
 			return nil, ErrInvalidRequest
 		}
-		observation, found, err := c.data.GetObservation(ctx, hit.SourceID)
+		observation, found, err := storage.ReadSourceEvidence(ctx, c.data, hit.SourceID)
 		if err != nil {
 			return nil, err
 		}
@@ -1078,11 +1353,27 @@ func (c *Client) hydrateSearchPage(ctx context.Context, page search.ExactPage) (
 			continue
 		}
 		bytes := len(observation.Text()) + len(observation.AppID()) + len(observation.Domain())
-		if observation.ContentID() != hit.SourceID || bytes != hit.Bytes || bytes > MaxSearchBytes-used {
+		if observation.SourceID() != hit.SourceID || bytes != hit.Bytes || bytes > MaxSearchBytes-used {
 			return nil, ErrInvalidRequest
 		}
 		used += bytes
-		results = append(results, SearchHit{SourceID: observation.ContentID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text()})
+		if hit.MatchStart < 0 || hit.MatchEnd < hit.MatchStart || hit.MatchEnd > len(observation.Text()) || hit.MatchEnd > 0 && !utf8.ValidString(observation.Text()[hit.MatchStart:hit.MatchEnd]) {
+			return nil, ErrInvalidRequest
+		}
+		at, unknown, err := c.sourceCaptureTime(ctx, hit.SourceID, hit.CapturedAt)
+		if err != nil {
+			return nil, err
+		}
+		result := SearchHit{TimeUnknown: unknown, CapturedAt: at, SourceID: observation.SourceID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), MatchStart: hit.MatchStart, MatchEnd: hit.MatchEnd, Truncated: observation.Truncated(), Partial: observation.Truncated()}
+		if provenance, ok := observation.Provenance(); ok {
+			result.Document = assistant.DocumentProvenance{
+				EditionID: provenance.EditionID, FamilyID: provenance.FamilyID, Publication: provenance.Publication,
+				PartIndex: provenance.PartIndex, PartCount: provenance.PartCount,
+				TotalBytes: provenance.TotalBytes, Start: provenance.Start, End: provenance.End,
+				Coverage: uint8(provenance.Coverage),
+			}
+		}
+		results = append(results, result)
 	}
 	return results, nil
 }
@@ -1109,10 +1400,20 @@ func (c *Client) retrieveMemoryContext(ctx context.Context, query string, limit 
 			return nil, err
 		}
 	}
-	return c.hydrateSearchPage(ctx, page)
+	page, err = c.hybridPage(ctx, query, page, semantic.Query{Limit: limit}, limit)
+	if err != nil {
+		return nil, err
+	}
+	page = boundSearchHydration(page)
+	hits, err := c.hydrateSearchPage(ctx, page)
+	if err != nil {
+		return nil, err
+	}
+	locateExactPassages(hits, terms)
+	return hits, nil
 }
 
-// Retrieve adapts exact local search to the assistant's minimal evidence port.
+// Retrieve adapts hybrid local search to the assistant's minimal evidence port.
 func (c *Client) Retrieve(ctx context.Context, question string) ([]assistant.Evidence, error) {
 	query, err := assistant.QuestionSearchQuery(question)
 	if err != nil {
@@ -1124,7 +1425,7 @@ func (c *Client) Retrieve(ctx context.Context, question string) ([]assistant.Evi
 	}
 	evidence := make([]assistant.Evidence, 0, len(hits))
 	for _, hit := range hits {
-		evidence = append(evidence, assistant.Evidence{SourceID: hit.SourceID, AppID: hit.AppID, Domain: hit.Domain, Text: hit.Text})
+		evidence = append(evidence, assistant.Evidence{SourceID: hit.SourceID, AppID: hit.AppID, Domain: hit.Domain, Text: hit.Text, MatchStart: hit.MatchStart, MatchEnd: hit.MatchEnd, Partial: hit.Partial, Document: hit.Document})
 	}
 	return evidence, nil
 }
@@ -1133,7 +1434,7 @@ func (c *Client) Knowledge(after string) (knowledge.Page, error) {
 	if c == nil || c.data == nil || len(after) > 128 {
 		return knowledge.Page{}, ErrInvalidRequest
 	}
-	return c.data.ListKnowledge(context.Background(), knowledge.PageRequest{Limit: 50, After: after})
+	return c.knowledgePage(after)
 }
 
 type knowledgeEntityWriter interface {
@@ -1174,6 +1475,11 @@ func (c *Client) DeleteKnowledge(ctx context.Context, id string) error {
 	if ctx == nil || ctx.Err() != nil || !validKnowledgeID(id) || c == nil || c.data == nil {
 		return ErrInvalidRequest
 	}
+	if repository, ok := c.inferredRepository(); ok && strings.HasPrefix(id, "auto-") {
+		c.NotifyMemoryChanging()
+		defer c.NotifyMemoryStable()
+		return repository.DeleteInferredKnowledge(ctx, id)
+	}
 	deleter, ok := c.data.(knowledgeEntityDeleter)
 	if !ok {
 		return ErrNotConfigured
@@ -1190,7 +1496,7 @@ func validKnowledgeID(id string) bool {
 	}
 	for i := range id {
 		c := id[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' {
 			return false
 		}
 	}

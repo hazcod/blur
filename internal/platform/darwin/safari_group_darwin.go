@@ -19,7 +19,7 @@ import (
 var SafariAppGroupID string
 var SafariKeychainAccessGroup string
 
-var errSafariGroupUnavailable = errors.New("Safari App Group unavailable")
+var errSafariGroupUnavailable = errors.New("safari app group unavailable")
 
 func validSafariAppGroupID(value string) bool {
 	if len(value) < 12 || len(value) > 255 || !strings.HasPrefix(value, "group.") || value[len(value)-1] == '.' {
@@ -29,7 +29,7 @@ func validSafariAppGroupID(value string) bool {
 	for i := 0; i <= len(value); i++ {
 		if i < len(value) && value[i] != '.' {
 			c := value[i]
-			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
 				return false
 			}
 			continue
@@ -116,7 +116,7 @@ func SafariContainerPath(groupID string) (string, error) {
 		return "", errSafariGroupUnavailable
 	}
 	bytes := make([]byte, 4097)
-	if getCString(pathString, unsafe.Pointer(&bytes[0]), int64(len(bytes)), 0x08000100) == 0 {
+	if getCString(pathString, unsafe.Pointer(&bytes[0]), int64(len(bytes)), 0x08000100) == 0 { // #nosec G103 -- CoreFoundation receives the exact nonempty output capacity and the copied path is bounded and NUL-checked.
 		clear(bytes)
 		return "", errSafariGroupUnavailable
 	}

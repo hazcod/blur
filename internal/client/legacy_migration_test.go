@@ -13,7 +13,8 @@ func fakeMod(files map[string]time.Time) func(string) (time.Time, bool) {
 }
 
 func TestShouldMigrateLegacy(t *testing.T) {
-	const c, l = "/home/Containers/Data/Library/Application Support/Blur", "/home/Library/Application Support/Blur"
+	c := filepath.Join(t.TempDir(), "container", "Blur")
+	l := filepath.Join(t.TempDir(), "legacy", "Blur")
 	old := time.Unix(1000, 0)
 	newer := old.Add(time.Hour)
 	cases := []struct {
@@ -22,15 +23,15 @@ func TestShouldMigrateLegacy(t *testing.T) {
 		files map[string]time.Time
 		want  bool
 	}{
-		{"container store missing", legacyMigrationInput{true, c, l}, map[string]time.Time{l + "/memory.db": old}, true},
-		{"legacy newer wins", legacyMigrationInput{true, c, l}, map[string]time.Time{l + "/memory.db": newer, c + "/memory.db": old}, true},
-		{"container newer wins", legacyMigrationInput{true, c, l}, map[string]time.Time{l + "/memory.db": old, c + "/memory.db": newer}, false},
-		{"equal mtime keeps container", legacyMigrationInput{true, c, l}, map[string]time.Time{l + "/memory.db": old, c + "/memory.db": old}, false},
-		{"marker alone does not block", legacyMigrationInput{true, c, l}, map[string]time.Time{l + "/memory.db": old, c + "/migrated-from-legacy": old}, true},
-		{"not sandboxed", legacyMigrationInput{false, c, l}, map[string]time.Time{l + "/memory.db": newer}, false},
-		{"no legacy store", legacyMigrationInput{true, c, l}, map[string]time.Time{c + "/memory.db": old}, false},
-		{"same directory", legacyMigrationInput{true, l, l}, map[string]time.Time{l + "/memory.db": old}, false},
-		{"unknown legacy dir", legacyMigrationInput{true, c, ""}, map[string]time.Time{l + "/memory.db": old}, false},
+		{"container store missing", legacyMigrationInput{true, c, l}, map[string]time.Time{filepath.Join(l, "memory.db"): old}, true},
+		{"legacy newer wins", legacyMigrationInput{true, c, l}, map[string]time.Time{filepath.Join(l, "memory.db"): newer, filepath.Join(c, "memory.db"): old}, true},
+		{"container newer wins", legacyMigrationInput{true, c, l}, map[string]time.Time{filepath.Join(l, "memory.db"): old, filepath.Join(c, "memory.db"): newer}, false},
+		{"equal mtime keeps container", legacyMigrationInput{true, c, l}, map[string]time.Time{filepath.Join(l, "memory.db"): old, filepath.Join(c, "memory.db"): old}, false},
+		{"marker alone does not block", legacyMigrationInput{true, c, l}, map[string]time.Time{filepath.Join(l, "memory.db"): old, filepath.Join(c, "migrated-from-legacy"): old}, true},
+		{"not sandboxed", legacyMigrationInput{false, c, l}, map[string]time.Time{filepath.Join(l, "memory.db"): newer}, false},
+		{"no legacy store", legacyMigrationInput{true, c, l}, map[string]time.Time{filepath.Join(c, "memory.db"): old}, false},
+		{"same directory", legacyMigrationInput{true, l, l}, map[string]time.Time{filepath.Join(l, "memory.db"): old}, false},
+		{"unknown legacy dir", legacyMigrationInput{true, c, ""}, map[string]time.Time{filepath.Join(l, "memory.db"): old}, false},
 	}
 	for _, tc := range cases {
 		if got := shouldMigrateLegacy(tc.in, fakeMod(tc.files)); got != tc.want {

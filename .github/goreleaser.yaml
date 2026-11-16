@@ -107,11 +107,14 @@ release:
   header: |
     ## Blur {{ .Tag }}
 
-    Everything runs locally and nothing leaves your device.
+    Memory is stored locally and encrypted. AI, folder sync and MCP are optional;
+    configured remote providers and MCP clients may receive selected content.
   footer: |
     ---
 
-    **macOS:** download `Blur_{{ .Version }}_macos_universal.zip` (Developer ID signed, notarized, universal arm64 + x86_64). It is attached by a separate job shortly after this release is created.
+    **macOS:** the universal arm64 + x86_64 app is attached after this release is created. Download `Blur_{{ .Version }}_macos_universal.zip` for a Developer ID signed and notarized build, or `Blur_{{ .Version }}_macos_universal_development.zip` when Apple CI credentials are absent. Development builds use ad-hoc signatures, are not notarized, and may be blocked by Gatekeeper. Each app archive has its own `.zip.sha256` checksum and `.json` signing metadata.
+
+    Extract the archive and move `Blur.app` to Applications. The macOS app includes its signed on-device Foundation Models helper. A failed macOS build blocks release creation; an attachment failure is reported as a failed workflow.
 
     **Verify:** `sha256sum -c checksums.txt` and
     `cosign verify-blob --bundle checksums.txt.sigstore.json --certificate-identity-regexp 'https://github.com/hazcod/blur/' --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt`

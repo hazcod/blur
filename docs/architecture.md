@@ -1,8 +1,8 @@
 # Implemented architecture
 
-This document describes the cross-platform foundation and durable memory core
-as of the 2026-11-06 implementation checkpoint. The broader product design is
-a roadmap, not a claim that the desktop product is complete.
+This document describes the current cross-platform foundation and durable
+memory core as of the 2026-11-15 checkpoint. The broader product design remains
+a roadmap, not a claim that native acceptance or the desktop product is complete.
 
 ## Runtime shape
 
@@ -22,26 +22,98 @@ uses an OS-secret-backed read grant to call that owner process and never opens
 the database. It exposes only exact `search_memory`; all other and mutation
 methods are rejected. It is off by default. The Windows pipe uses an explicit
 current-SID DACL, rejects remote clients, and verifies the peer process token;
-this is user-level authorization, not process isolation. The desktop's quick-note flow can explicitly opt into an existing
-Ollama model or an OpenAI-compatible provider from Privacy settings; no model
-is downloaded. Only sanitized user-authored notes enter the note-processing
-flow, and only after the user adds them. A separate Ask action retrieves up to
-eight exact local matches and packs at most 4 KiB of evidence. By default it
-uses explicitly configured loopback Ollama. An OpenAI-compatible endpoint can
-receive Ask evidence only after a separate, persisted Privacy-settings opt-in;
-changing its endpoint or model clears that consent. Background summaries and
-knowledge derivation remain local-Ollama-only. Both local and remote model
-services are separate trust boundaries and may retain request logs or model
-state. Preferences contain only provider/endpoint/model and an opaque
-credential reference in a private config file; compatible-provider credentials
-are held only by the OS secret store. Remote endpoints require HTTPS. Remote
-providers may retain request data under their own policies. The Ollama extractor sets
-`options.num_ctx` to 8,192, caps output at 384 tokens, and refuses prompts
-whose UTF-8 byte upper bound plus 512 tokens of template headroom and the full
-output allowance exceeds that context. The note remains saved and deterministic
-TODO parsing continues when model admission refuses it. Ask output is bounded,
-validated as structured data, restricted to citations from the packed sources,
-and remains transient in the client rather than persisted as generated memory.
+this is user-level authorization, not process isolation.
+
+On macOS, the default model setting selects Apple's on-device system model and
+enables automatic Library processing and background recaps. One provider
+selection serves meaning search, answers, saved-note processing, intent, and
+eligible background work. Exact local search remains available without a model.
+Ollama is an optional loopback provider; Claude, ChatGPT, and OpenAI-compatible
+providers are separate explicit choices with scoped consent for sending saved
+memory or notes. The standard runtime does not start the legacy standalone
+embedding service or expose a second embedding-model choice. No provider switch
+silently falls back to a remote service.
+
+Only sanitized user-authored notes enter note processing, after the user adds
+them. Cloud evidence and note processing each require their applicable persisted
+consent. Preferences contain provider/model routing and opaque account or
+credential references in private configuration; secrets are held only by the
+OS secret store. Remote endpoints require HTTPS and may retain request data
+under their policies. The Ollama extractor sets `options.num_ctx` to 8,192,
+caps output at 384 tokens, and refuses prompts whose UTF-8 byte upper bound plus
+512 tokens of template headroom and the full output allowance exceeds that
+context. A note remains saved when model admission refuses it, and deterministic
+TODO suggestions stay unconfirmed and source-linked. Ask output is bounded,
+validated as structured data, restricted to citations from packed sources, and
+remains transient rather than becoming generated memory.
+
+Ask's local evidence path is available without an answer model or populated
+Library. Ambiguous identity/factual questions and short keyword queries first
+probe bounded local retrieval; a matching source turns the request into a memory
+question. These ambiguity probes require a topic match and cannot substitute
+unrelated recent content from a named app. Explicit general mode,
+writing/explanation requests and arithmetic keep the general path. Unmatched questions can use the configured
+general model without sending saved evidence. A pending index prevents a false
+absence conclusion. Model readiness is checked after personal-memory retrieval:
+when no answer model is admitted, Ask returns bounded quoted passages with
+source links, full original inspection, partial/omitted coverage and zero model
+transmissions. Generated synthesis still requires an admitted provider. Remote
+Ask consent gates model egress, not the ability to inspect local evidence.
+
+Clear question prefixes with an unambiguous read plan skip model-based intent
+classification. Pending tasks/reminders are handled first; ambiguous help and
+polite action requests still use typed interpretation. Interactive local
+answers request ten minutes of Ollama residency, bounded and optional at the
+model transport; background calls retain the provider default. This can keep
+the model's RAM occupied longer, and the provider may still unload it. There is
+no background warm-up request. Simple factual answers request one direct
+sentence; detailed questions, conflicting evidence and coverage gaps retain
+their explanation and the existing output budget. Source validation, context
+admission and local-model manifest checks remain in place. Content-free debug
+timings identify the request surface, elapsed time and source count without
+logging questions or answers.
+
+### Apple on-device model
+
+Apple's [`SystemLanguageModel`](https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel)
+is an explicit local completion provider on eligible Macs running macOS26 or
+later with Apple Intelligence enabled and its model ready. It requires no
+account login, API key or separately configured server. Existing saved provider
+preferences remain active until a new selection is saved. Settings query
+availability asynchronously and explain unsupported OS/hardware, disabled
+Apple Intelligence and model assets that are not ready. There is no automatic
+remote fallback. The selected provider also handles meaning search and note
+processing; exact local search remains immediate. The legacy embedding service
+is dormant in standard startup and is not exposed as a second model setting.
+
+A bundled Swift helper weak-links FoundationModels with a macOS13 deployment
+target, preserving the application's existing launch floor. The universal
+helper is signed before the application; sandbox builds give it only the
+sandbox/inherit entitlements. Go resolves it relative to the application
+executable, never through PATH. Each request uses bounded private stdin/stdout,
+a fresh session, default guardrails and the concrete on-device system model.
+The transport applies deadlines, cancellation and a global inference gate;
+questions and native errors never enter process arguments or diagnostic logs.
+
+Ask/general answers, sanitized-note proposals, typed intent, Chronicle and
+Library use their existing authoritative validators. Explicit background
+opt-ins remain required. Common JSON envelopes use guided generation; the
+intent adapter uses closed kind classification followed, when needed, by a
+closed schema containing only that kind's fields. Kind-specific validation
+remains authoritative. Generation structure does not establish semantic
+correctness or authorize a mutation. Runtime token counts and context size
+admit the complete output budget before inference, with conservative byte
+accounting on supported systems without native tokenizer APIs. The effective
+context is capped at8192; a smaller context is reflected in upstream budget
+admission. Large evidence and indexing remain independent of model limits.
+
+Apple controls model assets and residency. Its job identity names the provider,
+OS build and effective context; Apple does not expose an immutable model-asset
+digest, so this cannot prove identical weights across jobs or asset updates.
+On this Mac, native synthetic source/unknown/refusal/context checks pass; app
+UI selection and capture/reminder acceptance remain separate gates in the
+personal-memory plan. Memory measurements of the small helper process do not
+represent the total shared system model footprint.
 
 ```text
 blur desktop                         blurctl / blur-core
@@ -64,7 +136,7 @@ target leases, hotkeys, surfaces, audio, secret storage, local transport,
 private paths, autostart, and session state. Reports use a closed state
 vocabulary and fixed evidence codes. The Darwin, Windows, and Linux capture
 adapters are not at parity. Darwin has a TCC-gated AppKit target probe,
-event-driven app/focused-context notifications, and a bounded AXUIElement
+event-driven app/focused-context notifications, an idle-aware periodic refresh, and a bounded AXUIElement
 reader; capability checks are non-interactive and report permission-required
 when trust is absent. If capture is enabled at startup, the controller may ask
 macOS to show its own Accessibility guidance once; Blur never grants or edits
@@ -115,13 +187,16 @@ deferred value read to reject navigation races. This reads only the active
 document's Accessibility metadata and never navigates, enumerates tabs, or
 queries browser history.
 Capture errors do not include underlying reader errors or captured values.
-Common controls are filtered before their deferred values are read. Editable
-text fields, text areas, search fields, and combo boxes are marked sensitive;
-their values and descendants are never requested, so unsent drafts and search
-queries stay out of memory while rendered message/history text remains
-eligible. On Linux, the AT-SPI entry, date-editor, edit-bar, password-text,
-and text roles are mapped conservatively to these sensitive roles before
-traversal.
+Common controls are filtered before their deferred values are read. On macOS,
+visible edited text is eligible just like read-only document content. Secure
+text/password roles and subroles are pruned before text or children are read,
+and sensitivity is rechecked around deferred native values. The native reader
+accepts CFString and CFAttributedString values and a bounded AXStringForRange
+fallback; long values prefer the current visible range to an old scrollback
+prefix. Omitted off-screen content is reported as partial. Linux and Windows
+retain their conservative editable-role exclusion until equivalent native
+sensitivity contracts are implemented. Blur's own interface is excluded on
+every platform, keeping its searches and answers out of passive capture.
 Built-in Slack profiles filter tab groups, tabs, images, and separators; user
 profile roles are merged within fixed profile/role limits, while other
 descendants remain eligible so message content already loaded off-screen can
@@ -130,12 +205,31 @@ Darwin reader revalidates both the frontmost process and focused-window
 identity around reads; the Linux reader revalidates its focus lease and AT-SPI
 focused state around reads; the Windows reader revalidates foreground window,
 PID, process creation time, executable identity, elevation, and secure-desktop
-state around structure and each deferred value read. Capture is event-driven
-and enabled by default after first launch, subject to permission, privacy
+state around structure and each deferred value read. Capture uses events, with
+a macOS refresh after 15 seconds without one, and is enabled by default after first launch, subject to permission, privacy
 filters, and the user's persisted pause choice; its controller writes sanitized
 observations and source-linked activity segments to the encrypted store. Pause
 waits for the worker to stop and then unregisters passive OS listeners; a later
 Start may subscribe again. Normal worker exit follows the same suspension path.
+
+The macOS browser reader locates one visible outer web area using bounded
+structural metadata. Browser chrome and input subtrees are not read for text.
+The page's retained parent/child path is checked before and after the frame;
+page/window URL hosts are rechecked around values. Selection never walks the
+full window separately for every value. CFURL and CFString location attributes
+are accepted, and unknown required domains fail before text reads. Supported
+applications receive a rate-bounded AXManualAccessibility request under existing
+AX permission; this does not open an OS permission prompt.
+
+Only aggregate input age is queried for macOS idle detection using
+[CGEventSourceSecondsSinceLastEventType](https://developer.apple.com/documentation/coregraphics/cgeventsource/secondssincelasteventtype(_:eventtype:)).
+After three minutes without input, capture rests until activity resumes. No
+individual input events or keys are observed. Capture failures, exclusions,
+and idle transitions close attribution to the previously seen source; measured
+durations use the monotonic clock, with sub-millisecond wall-clock skew absorbed
+to keep adjacent segments coalescible. Content-free health distinguishes idle,
+permission, exclusions, inaccessible page/domain, empty text, timeout and storage
+failure, and preserves the last unresolved problem across an excluded UI focus.
 
 An observation has private fields and a validating constructor. Its storage
 boundary checks canonical app/domain identifiers, the current redaction
@@ -210,7 +304,11 @@ updated in the same transaction. A random persistent store identity and each
 record's schema context are authenticated as AEAD associated data. Schema
 upgrades atomically advance identity/schema/manifest metadata; old values
 remain readable only under their authenticated older schema context, while
-new writes use the current schema. Open requires explicit create-new or
+new writes use the current schema. Schema 6 atomically upgrades version 1–5
+metadata while retaining the authenticated older value contexts. Its
+identity version makes older clients reject a store whose personal-memory
+projections, repeated-visit metadata, capture editions and permanent deletion
+fences they cannot honor. Open requires explicit create-new or
 open-existing mode; reads verify the manifest before serving the store, and
 observation pages authenticate a small sealed size record to enforce byte
 ceilings before fetching/decrypting a record that will not fit. Each size
@@ -218,6 +316,12 @@ record also authenticates a store insertion timestamp without including it in
 the content-derived source ID. On upgrade, old size records receive a stable
 encrypted migration-time baseline in bounded transactions; this conservatively
 starts any future age-based policy at upgrade rather than guessing old dates.
+The baseline is not an observed capture time. Before publishing a store, Blur
+loads its authenticated baseline and conservatively treats an equal timestamp
+as unknown for dated recall. The value remains unchanged for retention and
+index compatibility. Real later sightings remain dated evidence. Search, MCP,
+and model context expose unknown original capture times without inventing a
+date; date windows and hourly recaps exclude baseline-only occurrences.
 A single
 internal transaction extension boundary is available to later index
 materializers.
@@ -225,12 +329,19 @@ The durable backend now includes encrypted exact search, activity segments,
 materialized Today snapshots, and the evidence-backed knowledge library. The
 store contract exposes `DeleteObservationRecord` for idempotent source removal;
 the durable implementation deletes the authenticated source and exact-search
-postings, then removes its knowledge-source links in one transaction. Claims
-and loops with no remaining source are dropped. Today snapshots are updated via
+postings and removes its knowledge-source links. Ordinary bounded cascades
+commit in one transaction. When a valid cascade exceeds a physical budget,
+an encrypted source-erasure journal drives bounded task/entity/date/activity
+steps. A store-wide publication gate rejects reads and writes while cleanup
+is pending; old transactions drain before the first step. Each step and cursor
+commit together, the final source/journal removal is atomic, and reopen finishes
+recovery before publishing the store. Interrupted cleanup stays unavailable
+until recovery succeeds. Transaction limits remain unchanged. Claims and loops
+with no remaining source are dropped; saved merge originals are cleaned too,
+so unmerge cannot retain erased provenance. Today snapshots are updated via
 an encrypted source-to-date index, removing all text-bearing entries that cite
 the source while preserving unrelated evidence. Activity segments are deleted
-through an encrypted source-to-segment index. These cascades share the source
-deletion transaction; each reverse index is bounded to 64 references per
+through an encrypted source-to-segment index. These cascades participate in the same deletion publication boundary; each reverse index is bounded to 64 references per
 source and rejects writes that would exceed that limit. Existing stores created
 before these indexes require an explicit backfill migration before deletion can
 be represented as complete. Today snapshot validation also requires every
@@ -320,6 +431,58 @@ sources and their derivatives.
 
 The durable backend has a private encrypted exact search index with bounded
 global top-k retrieval, keyed term/app/domain postings and deletion repair.
+Primary evidence is committed independently of exact posting maintenance with
+an encrypted ID-only work receipt. The 128-term inline threshold is only an
+optimization; large sources retain their complete text and are fully indexed
+in resumable 64-term transactions by a local worker that needs no AI model.
+Per-term proofs keep query reads independent of document vocabulary size;
+paged reverse references participate in staged source erasure. Search, Ask,
+MCP and Settings disclose pending coverage. A failed derived write cannot roll
+back an accepted capture. Query-selected passages let long-page tail matches
+reach the model and MCP while preserving the full original for inspection.
+Local hydration budgets are separate from external response/context budgets.
+The passive AX reader still has per-frame work bounds, and the legacy single
+observation format has a 1 MiB text bound. On macOS, the production capture
+controller also uses a whole-document path when the focused app exposes a
+continuable Accessibility tree: bounded Unicode reads feed continuous mapped
+redaction and canonical parts of at most 32 KiB and 256 source spans. That path
+has no total document-size ceiling. Apps that do not expose a continuable tree
+fall back to bounded observation capture, where partial coverage is reported;
+support across every app and long-running native acceptance remain open.
+
+The encrypted capture repository stages parts privately, verifies the complete
+chain at atomic publication, deduplicates editions, and retains exact capture
+visits. Production capture writes through this path. Publication queues
+resumable part indexing and exact visit indexing; public exact search merges
+capture parts and observations under shared query budgets. Ask, Search, source
+inspection, MCP and Today hydrate published part evidence with its original
+provenance. Open discards unfinished and duplicate staging in bounded resumable
+steps. Generic source erasure, family forget, Delete All and retention include
+capture payloads and derived indexes through the existing gated erasure journal.
+Conditional deletion preserves newer real visits; a monotonic capture retention
+cutoff rejects delayed older jobs. Catalog cursors bind publication
+incarnations, and native preparation finishes before a family intent becomes
+restart-resumable. The durable store schema is 7; opening it performs bounded
+metadata/index initialization and preserves the existing encrypted user store.
+Saved pages, notes and app activity are called captures. The original encrypted
+namespace, hash domains and journal field names remain unchanged for compatibility.
+The bounded exact posting tree now supports a private capture-part scope with
+separate keyed lookup domains, record namespaces and physical group 0x41. The
+observation scope retains its existing group 0x40 and format. Both scopes share
+the same database lifetime and deletion gate. A scoped search transaction facade
+uses the original transaction's writer, mutex and manifest, so future part erasure
+can update postings and capture records together. Isolation, rollback, reopen,
+split trees, paged term proofs and foreign-ciphertext rejection are tested.
+The production publisher queues capture-part index rows without tokenizing the
+whole source during publication. A local worker advances bounded batches and
+reports pending coverage. Search checks live edition membership before ranking
+and verifies the publication incarnation during hydration. Native acceptance
+still needs broad application coverage for apps with different Accessibility
+trees, large documents, cancellation and partial-content behavior.
+Partial capture provenance is retained from the authenticated source through
+Search, Ask, MCP and source inspection, and appears in model context separately
+from choosing a bounded answer excerpt. Current content-free capture health
+also reports whether its last readable content was partial.
 `search.Engine` uses this index whenever the store implements `ExactIndex`;
 the durable store does. Index queries bound rows, bytes, tree nodes, returned
 hits, and subsequent source hydration, and reject a partial ranking when the
@@ -331,9 +494,53 @@ contract; the store reports page bytes and whether more records remain before
 returning copies. The core service permits at most two searches at once and
 waits for a slot with context cancellation. Results, snippets, serialized
 response bytes, and provenance content IDs are bounded too. Search does not
-generate or persist derived content. Fuzzy or semantic retrieval and
-generated summaries remain unimplemented; the macOS Ask surface is a
-transient local answer path over the client's encrypted exact index.
+generate or persist derived content. Optional local semantic retrieval now
+combines with exact matches, primary captures, and available hourly summaries;
+its implementation and remaining acceptance limits are described below.
+
+Primary observations also have a separate encrypted, paged capture-time
+index. `ListObservationWindow` reads at most 31 days, returning at most 64
+sources and 2 MiB of source data in newest-first order with a timestamp/source
+cursor. App, domain, and app-exclusion filters run before selecting that
+prefix. This index is independent of the 64-source hourly chronicle recovery
+selection: an hour may contain up to 65,536 primary sources, and exceeding
+that hard capacity refuses the write rather than silently omitting evidence.
+Timeline reads use a separate 4,096-operation read-only snapshot, with the
+existing 16 MiB transaction byte ceiling and cancellation checks. Default reads
+and all writes retain their 1,024-operation ceiling. Dense requests return
+`storage.Incomplete` instead of a partial ranking.
+Opening an older store backfills the index from authenticated observations
+and timestamps with an encrypted, resumable source cursor. Legacy timestamps
+previously replaced by the capture-time migration baseline cannot recover the
+original observation dates. Such baseline-only rows do not qualify as observed
+visits. Existing hourly summaries with those undated sources are omitted from
+date-based recall, while the original content remains searchable unscoped.
+Source deletion updates the timeline in the same
+transaction and refuses deletion when its reverse provenance is missing.
+
+Ask's exact-index scope applies capture time before global top-k selection,
+additionally admitting source IDs from activity sightings inside the requested
+window. Thus new captures need no closed activity segment to be found, while
+an older source seen again can retain its later activity context. Client Ask
+and Search exclude older captures of Blur's own interface before ranking;
+future self-capture is blocked at capture policy too. Direct capture answers
+carry inspectable source evidence without invoking a model. Today reads a
+small primary-capture preview without waiting for a materialized snapshot or
+hourly summary.
+
+Repeated visits preserve immutable primary text and its first-capture time.
+The encrypted timeline stores one latest-visit row per source/hour; separate
+source-linked hour records retain exact timestamps for arbitrary sub-hour
+windows. Month metadata admits visits before exact and semantic ranking.
+Native capture, the optional Safari bridge, authenticated ingest, and repeated
+quick notes record new visits without re-embedding unchanged source text.
+Chronological pagination returns each source once at its latest visit within
+the requested interval. A linked source/hour chain allows phase-7 erasure to
+drain one hour atomically with its month membership and chain reference;
+interrupted erasure resumes before publishing the store. Original phase-7
+journals from schema 3 remain compatible. Visit history currently remains local
+to this device; cross-device visit replication and legacy timestamp provenance
+remain separate acceptance work.
 
 ### Secrets and diagnostics
 
@@ -460,10 +667,85 @@ capture state, reports bridge readiness/failure in the UI, and never starts
 when the shared entitlements are absent.
 The opt-in signed target requires and checks separate host/extension profiles,
 emits matching App Group/Keychain entitlements, signs the extension before the
-host, and verifies both signatures. The default app still excludes Safari;
-registered identifiers, release signing/notarization, and live Safari
-verification remain outstanding, so browser capture remains unavailable in
-default builds. The complete
+host, and verifies both signatures. The baseline foreground AX pipeline now
+includes Safari and other recognized browsers without an extension; actual
+coverage still needs native acceptance for each browser. The optional extension
+route has separate identifiers, release signing/notarization, and live Safari
+verification outstanding. The complete
 proposed direction and gates are in the
 [design](superpowers/specs/2026-11-04-blur-design.md) and
 [implementation plan](superpowers/plans/2026-11-04-blur-cross-platform-foundation.md).
+
+## Legacy source-linked embedding index
+
+`internal/semantic` chunks sanitized sources on UTF-8 boundaries, embeds them
+using a local Ollama embedding model, and keeps an HNSW graph only in process
+memory. The graph/heap core is adapted from coder/hnsw under CC0 (see its local
+README and license); no graph file import/export API is included. Scoped
+queries rank eligible documents before selection, preserving app, domain,
+capture-time, and later-sighting filters.
+
+Durable vectors use an authenticated encrypted binary record per source and
+an encrypted directory and backfill checkpoint. Model manifest digest,
+dimensions, and input format identify each compatible generation. Publication
+checks the original source and timestamp in the same transaction. Deletion
+removes vectors, directory records, and a matching cursor atomically. Oversized
+deletion batches are split only after a classified atomic transaction-limit
+rejection; corruption and general storage errors are not retried.
+
+The worker reloads encrypted vectors after restart, resumes source traversal,
+and queues only source IDs for new captures and notes. Queue overflow schedules
+a repair pass; memory mutations cancel jobs and queries and detach the cached
+graph before deletion begins. Background embedding follows power policy;
+interactive queries can still use the saved index in Saver mode.
+
+The former `memory-index.json` endpoint/model choice is not part of the standard
+product flow. Standard bootstrap leaves the legacy embedding index dormant and
+preserves any old settings file without starting its model service. The one
+selected provider handles meaning search, answers, and notes; exact search
+remains available without it. The encrypted vector implementation remains
+source-compatible for legacy and isolated acceptance paths, but must not become
+a separate user-facing model choice again.
+
+
+## Connected answer accounts
+
+ChatGPT uses official public-client OIDC with PKCE and a loopback callback, verified JWKS identity, installation-stable host identity, and separate account registrations. Rotating tokens live only in the injected OS secret store. Responses streaming requires successful terminal completion; partial text, tool output, and mismatched output streams are rejected. The preview API lacks a hard per-request output-token cap, so the adapter explicitly admits local byte/deadline limits instead of sending unsupported fields.
+
+Claude uses the fixed official Anthropic origin, current Messages API, explicit API key and optional workspace, metadata-only model discovery, and bounded schema-validated completion. Consumer Claude login is not offered.
+
+Connection, selection, saved-memory permission, and note-processing permission are distinct. New cloud selections can answer public questions while saved memory is shown locally as quotations until evidence permission is granted. Notes stay local until separate note-processing permission. Permissions bind to provider/account/model/destination/workspace and clear for replacement API keys. Provider transitions cancel registered Ask work before admitting the replacement policy. Personal facts, writing rules, task context, conversation history, background recaps, and automatic Library do not implicitly enter cloud requests.
+
+### Permanent deletion cutoffs and sync admission
+
+Schema 5 stores a sealed maximum deletion cutoff per source and a maximum
+all-sources cutoff. They do not evict. Per-source deletion includes a capture
+at the cutoff; all-before deletion is strict. Every primary, repeated sighting
+and note admission checks the cutoffs inside its write transaction. Prepared
+Today projections verify that every referenced primary still exists at commit.
+An imported note failure never falls back to a raw observation write. Imported
+origin tracking commits with source admission; a later genuine local recapture
+clears a stale imported origin.
+
+Each advancing cutoff appends its original deletion time to an encrypted
+64-event page using a monotonic local sequence. Sync exports at most 256
+changes per read and persists that sequence as its cursor. The runner drains up to 200 segments per pass and queues an immediate continuation for remaining work; caller cancellation and shutdown deadlines apply. Relayed older times
+and equal timestamps cannot fall behind a time watermark. An absent legacy
+cursor starts at zero; a changed sync folder also resets it. The compatibility
+Tombstones snapshot is bounded and is not an admission/export capability.
+
+Startup advances authenticated identity before migrating the intact historical
+log in atomic batches of 32. Sealed progress, cutoffs and change pages commit
+together; restart resumes the last checkpoint before the store is published.
+The completion marker, sequence and final page are checked before publication.
+Older clients reject the new identity. Previously evicted historical deletions
+cannot be reconstructed, and this migration does not claim to recover them.
+
+Replayed deletion checks the current primary's capture time under the exclusive
+erasure gate. Bounded cleanup commits in one atomic transaction; a classified
+budget failure rolls back before resumable erasure begins. A newer primary survives. A missing primary still runs derivative cleanup, covering authenticated legacy orphaned projections. The reminder service pauses scheduling
+before that gate; linked tasks are read under the gate and their exact native
+notices are canceled before the deletion intent commits. A skipped cutoff
+does not cancel surviving reminders. Cancellation failure prevents erasure; a
+committed erasure journal remains resumable. Import retries recover it inside the client publication window before attempting normal gated reads or writes. Native delivery acceptance is a
+separate gate from the deterministic notification-port regressions.

@@ -26,7 +26,7 @@ func TestUnixServerAcceptsAuthenticatedBoundedFrameAndStopsCleanly(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	_ = os.Chmod(dir, 0o700)
 	path := filepath.Join(dir, "capture.sock")
 	server, err := NewUnixServer(localapi.NewUnixTransport(MaxWireBytes), localapi.EndpointDescriptor{Kind: localapi.EndpointUnix, Address: path}, receiver)
@@ -111,7 +111,7 @@ func TestUnixServerParentCancellationRemovesEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	_ = os.Chmod(dir, 0o700)
 	path := filepath.Join(dir, "s")
 	endpoint := localapi.EndpointDescriptor{Kind: localapi.EndpointUnix, Address: path}

@@ -19,7 +19,7 @@ func TestSafariGroupIDValidationAndPrivateSocketDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(root)
+	defer func() { _ = os.RemoveAll(root) }()
 	info, err := os.Lstat(root)
 	if err != nil {
 		t.Fatal(err)

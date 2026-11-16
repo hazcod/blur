@@ -11,7 +11,9 @@ import (
 	"runtime/debug"
 	"sync"
 
+	"github.com/hazcod/blur/internal/applog"
 	platformwindows "github.com/hazcod/blur/internal/platform/windows"
+	"golang.org/x/sys/windows"
 )
 
 const maxPersistentLogBytes = 4 << 20
@@ -113,7 +115,7 @@ func configurePersistentLogging() (func(), error) {
 	if err != nil {
 		return nil, errors.New("log file unavailable")
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(writer, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(writer, &slog.HandlerOptions{Level: applog.Level()})))
 	crashLog, crashErr := openWindowsCrashLog(filepath.Join(directory, "crash.log"))
 	if crashErr != nil {
 		slog.Warn("runtime crash log unavailable", "result", "application log remains active")
@@ -187,14 +189,24 @@ func openWindowsPersistentLogForUser(path string) (*windowsPersistentLogWriter, 
 }
 
 func openWindowsLogFile(path string, exclusive bool) (*os.File, error) {
-	flags := os.O_CREATE | os.O_APPEND | os.O_WRONLY
-	if exclusive {
-		flags |= os.O_EXCL
-	}
-	file, err := os.OpenFile(path, flags, 0o600)
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
 	}
+	disposition := uint32(windows.OPEN_ALWAYS)
+	if exclusive {
+		disposition = windows.CREATE_NEW
+	}
+	// Rotation renames the current log before closing its handle. Keep append
+	// access and allow that rename explicitly; os.OpenFile omits share-delete.
+	handle, err := windows.CreateFile(name,
+		windows.FILE_APPEND_DATA|windows.FILE_READ_ATTRIBUTES|windows.FILE_WRITE_ATTRIBUTES|windows.FILE_WRITE_EA|windows.STANDARD_RIGHTS_WRITE|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, disposition, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(handle), path)
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		return nil, errors.New("log file permissions unavailable")

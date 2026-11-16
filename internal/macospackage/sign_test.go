@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,22 +28,22 @@ func TestSignValidatesProfilesSignsExtensionBeforeHostAndVerifiesBoth(t *testing
 	if err := Sign(context.Background(), cfg, runner); err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
-	if len(runner.runs) != 4 {
-		t.Fatalf("commands = %v, want two signatures and two verifications", runner.runs)
+	if len(runner.runs) != 8 {
+		t.Fatalf("commands = %v, want four signatures and four verifications", runner.runs)
 	}
 	if runner.runs[0][0] != "codesign" || runner.runs[1][0] != "codesign" || runner.runs[2][0] != "codesign" || runner.runs[3][0] != "codesign" {
 		t.Fatalf("commands = %v, want codesign commands", runner.runs)
 	}
-	if !strings.HasSuffix(runner.runs[0][len(runner.runs[0])-1], "BlurSafariCapture.appex") {
-		t.Fatalf("first signed target = %q, want nested extension", runner.runs[0][len(runner.runs[0])-1])
+	if !strings.HasSuffix(runner.runs[2][len(runner.runs[2])-1], "BlurSafariCapture.appex") {
+		t.Fatalf("third signed target = %q, want nested extension", runner.runs[2][len(runner.runs[2])-1])
 	}
-	if runner.runs[1][len(runner.runs[1])-1] != app {
-		t.Fatalf("second signed target = %q, want host app", runner.runs[1][len(runner.runs[1])-1])
+	if runner.runs[3][len(runner.runs[3])-1] != app {
+		t.Fatalf("fourth signed target = %q, want host app", runner.runs[3][len(runner.runs[3])-1])
 	}
 	if len(runner.entitlements) != 2 || !strings.Contains(string(runner.entitlements[0]), "<true/>") || strings.Contains(string(runner.entitlements[1]), "com.apple.security.app-sandbox") {
 		t.Fatalf("generated entitlements do not isolate the Safari sandbox: %q", runner.entitlements)
 	}
-	if !containsArg(runner.runs[0], cfg.Identity) || !containsArg(runner.runs[0], "--timestamp") || !containsArg(runner.runs[0], "runtime") {
+	if !containsArg(runner.runs[0], fmt.Sprintf("%X", sha1.Sum([]byte("fixture certificate")))) || !containsArg(runner.runs[0], "--timestamp") || !containsArg(runner.runs[0], "runtime") {
 		t.Fatalf("extension signing arguments omit identity or hardened runtime: %v", runner.runs[0])
 	}
 	if _, err := os.Stat(filepath.Join(app, "Contents", "embedded.provisionprofile")); err != nil {
@@ -50,6 +51,164 @@ func TestSignValidatesProfilesSignsExtensionBeforeHostAndVerifiesBoth(t *testing
 	}
 	if _, err := os.Stat(filepath.Join(app, "Contents", "PlugIns", "BlurSafariCapture.appex", "Contents", "embedded.provisionprofile")); err != nil {
 		t.Fatalf("extension profile was not embedded: %v", err)
+	}
+}
+
+func TestSignIncludesFoundationHelperBeforeOuterBundle(t *testing.T) {
+	app := signingFixture(t)
+	helper := filepath.Join(app, "Contents", "Helpers", "blur-foundation-models")
+	if err := os.Mkdir(filepath.Dir(helper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(helper, []byte("fixture executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hostProfile := writeProfile(t, app, "host.provisionprofile", profileXML("com.hazcod.blur"))
+	extensionProfile := writeProfile(t, app, "extension.provisionprofile", profileXML("com.hazcod.blur.safaricapture"))
+	runner := &recordingRunner{profiles: map[string][]byte{
+		filepath.Join(app, "Contents", "embedded.provisionprofile"):                                                   []byte(profileXML("com.hazcod.blur")),
+		filepath.Join(app, "Contents", "PlugIns", "BlurSafariCapture.appex", "Contents", "embedded.provisionprofile"): []byte(profileXML("com.hazcod.blur.safaricapture")),
+	}}
+	cfg := Config{AppPath: app, Identity: "Developer ID Application: Blur Builder (TEAMID123)", AppGroupID: "group.sh.blur.capture", KeychainAccessGroup: "TEAMID123.sh.blur.capture", HostProfile: hostProfile, ExtensionProfile: extensionProfile}
+	if err := Sign(context.Background(), cfg, runner); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.runs) != 10 || runner.runs[0][len(runner.runs[0])-1] != helper || runner.runs[4][len(runner.runs[4])-1] != app || !containsArg(runner.runs[7], "--verify") || runner.runs[7][len(runner.runs[7])-1] != helper {
+		t.Fatalf("helper was not signed and verified before outer bundle: %v", runner.runs)
+	}
+	if containsArg(runner.runs[0], "--entitlements") {
+		t.Fatal("unsandboxed Safari host helper inherited unrelated entitlements")
+	}
+}
+
+func TestSignIncludesMeetingLibraryAndHostAudioResourceAccess(t *testing.T) {
+	app := signingFixture(t)
+	hostProfile := writeProfile(t, app, "host.provisionprofile", profileXML("com.hazcod.blur"))
+	extensionProfile := writeProfile(t, app, "extension.provisionprofile", profileXML("com.hazcod.blur.safaricapture"))
+	runner := &recordingRunner{profiles: map[string][]byte{
+		filepath.Join(app, "Contents", "embedded.provisionprofile"):                                                   []byte(profileXML("com.hazcod.blur")),
+		filepath.Join(app, "Contents", "PlugIns", "BlurSafariCapture.appex", "Contents", "embedded.provisionprofile"): []byte(profileXML("com.hazcod.blur.safaricapture")),
+	}}
+	cfg := Config{AppPath: app, Identity: "Developer ID Application: Blur Builder (TEAMID123)", AppGroupID: "group.sh.blur.capture", KeychainAccessGroup: "TEAMID123.sh.blur.capture", HostProfile: hostProfile, ExtensionProfile: extensionProfile}
+	if err := Sign(context.Background(), cfg, runner); err != nil {
+		t.Fatal(err)
+	}
+	library := filepath.Join(app, "Contents", "Frameworks", "libBlurMeetingAudio.dylib")
+	if runner.runs[0][len(runner.runs[0])-1] != library || containsArg(runner.runs[0], "--entitlements") || !containsArg(runner.runs[0], "runtime") {
+		t.Fatalf("meeting library not signed first with hardened runtime: %v", runner.runs)
+	}
+	if !strings.Contains(string(runner.entitlements[len(runner.entitlements)-1]), "com.apple.security.device.audio-input") || strings.Contains(string(runner.entitlements[len(runner.entitlements)-1]), "disable-library-validation") {
+		t.Fatal("Safari signing removed microphone access or library validation")
+	}
+	var verified bool
+	for _, args := range runner.runs {
+		if args[len(args)-1] == library && containsArg(args, "--verify") {
+			verified = true
+		}
+	}
+	if !verified {
+		t.Fatal("meeting library was not explicitly verified")
+	}
+}
+
+func TestSignIncludesScreenTextLibraryWithSameCertificateAndRuntime(t *testing.T) {
+	app := signingFixture(t)
+	hostProfile := writeProfile(t, app, "host.provisionprofile", profileXML("com.hazcod.blur"))
+	extensionProfile := writeProfile(t, app, "extension.provisionprofile", profileXML("com.hazcod.blur.safaricapture"))
+	runner := &recordingRunner{profiles: map[string][]byte{
+		filepath.Join(app, "Contents", "embedded.provisionprofile"):                                                   []byte(profileXML("com.hazcod.blur")),
+		filepath.Join(app, "Contents", "PlugIns", "BlurSafariCapture.appex", "Contents", "embedded.provisionprofile"): []byte(profileXML("com.hazcod.blur.safaricapture")),
+	}}
+	cfg := Config{AppPath: app, Identity: "Developer ID Application: Blur Builder (TEAMID123)", AppGroupID: "group.sh.blur.capture", KeychainAccessGroup: "TEAMID123.sh.blur.capture", HostProfile: hostProfile, ExtensionProfile: extensionProfile}
+	if err := Sign(context.Background(), cfg, runner); err != nil {
+		t.Fatal(err)
+	}
+	library := filepath.Join(app, "Contents", "Frameworks", "libBlurScreenText.dylib")
+	var signed, verified bool
+	for _, args := range runner.runs {
+		if args[len(args)-1] != library {
+			continue
+		}
+		if containsArg(args, "--sign") {
+			signed = containsArg(args, fmt.Sprintf("%X", sha1.Sum([]byte("fixture certificate")))) && containsArg(args, "runtime") && containsArg(args, "com.hazcod.blur.screen-text") && !containsArg(args, "--entitlements")
+		} else if containsArg(args, "--verify") {
+			verified = true
+		}
+	}
+	if !signed || !verified || runner.runs[1][len(runner.runs[1])-1] != library {
+		t.Fatalf("screen text library missing inside-out signature/verification: %v", runner.runs)
+	}
+}
+
+func TestSignRejectsScreenTextLibraryAboveHostMinimumOrMissing(t *testing.T) {
+	for _, broken := range []string{"missing", "min-os", "symlink"} {
+		t.Run(broken, func(t *testing.T) {
+			app := signingFixture(t)
+			library := filepath.Join(app, "Contents", "Frameworks", "libBlurScreenText.dylib")
+			if broken == "min-os" {
+				if err := os.WriteFile(library, syntheticMeetingMachO(14), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Remove(library); err != nil {
+					t.Fatal(err)
+				}
+				if broken == "symlink" {
+					if err := os.Symlink("/tmp/nonexistent", library); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			runner := &recordingRunner{}
+			cfg := Config{AppPath: app, Identity: "fixture", AppGroupID: "group.sh.blur.capture", KeychainAccessGroup: "TEAMID123.sh.blur.capture", HostProfile: filepath.Join(filepath.Dir(app), "host"), ExtensionProfile: filepath.Join(filepath.Dir(app), "extension")}
+			if err := Sign(context.Background(), cfg, runner); err != ErrInvalidBundle || len(runner.runs) != 0 {
+				t.Fatalf("invalid screen text library reached signing: %v", err)
+			}
+		})
+	}
+}
+
+func syntheticMeetingMachO(minimum uint32) []byte {
+	data := make([]byte, 8192+56)
+	binary.BigEndian.PutUint32(data, 0xcafebabe)
+	binary.BigEndian.PutUint32(data[4:], 2)
+	for i, cpu := range []uint32{0x0100000c, 0x01000007} {
+		offset := uint32(4096 * (i + 1))
+		for field, value := range []uint32{cpu, 0, offset, 56, 12} {
+			binary.BigEndian.PutUint32(data[8+i*20+field*4:], value)
+		}
+		for field, value := range []uint32{0xfeedfacf, cpu, 0, 6, 1, 24, 0, 0, 0x32, 24, 1, minimum << 16, 27 << 16, 0} {
+			binary.LittleEndian.PutUint32(data[int(offset)+field*4:], value)
+		}
+	}
+	return data
+}
+
+func TestSignRejectsMeetingLibraryAboveHostMinimumOrMissing(t *testing.T) {
+	for _, broken := range []string{"missing", "min-os", "symlink"} {
+		t.Run(broken, func(t *testing.T) {
+			app := signingFixture(t)
+			library := filepath.Join(app, "Contents", "Frameworks", "libBlurMeetingAudio.dylib")
+			if broken == "min-os" {
+				if err := os.WriteFile(library, syntheticMeetingMachO(14), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Remove(library); err != nil {
+					t.Fatal(err)
+				}
+				if broken == "symlink" {
+					if err := os.Symlink("/tmp/nonexistent", library); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			runner := &recordingRunner{}
+			cfg := Config{AppPath: app, Identity: "fixture", AppGroupID: "group.sh.blur.capture", KeychainAccessGroup: "TEAMID123.sh.blur.capture", HostProfile: filepath.Join(filepath.Dir(app), "host"), ExtensionProfile: filepath.Join(filepath.Dir(app), "extension")}
+			if err := Sign(context.Background(), cfg, runner); err != ErrInvalidBundle || len(runner.runs) != 0 {
+				t.Fatalf("invalid meeting library reached signing: %v", err)
+			}
+		})
 	}
 }
 
@@ -220,9 +379,15 @@ func signingFixture(t *testing.T) string {
 	extension := filepath.Join(app, "Contents", "PlugIns", "BlurSafariCapture.appex")
 	for _, dir := range []string{
 		filepath.Join(app, "Contents", "MacOS"),
+		filepath.Join(app, "Contents", "Frameworks"),
 		filepath.Join(extension, "Contents", "MacOS"),
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"libBlurMeetingAudio.dylib", "libBlurScreenText.dylib"} {
+		if err := os.WriteFile(filepath.Join(app, "Contents", "Frameworks", name), syntheticMeetingMachO(13), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -241,6 +406,9 @@ func signingFixture(t *testing.T) string {
 		contents := "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>" + bundleID + "</string>"
 		if bundleID == extensionBundleID {
 			contents += "<key>BlurAppGroupIdentifier</key><string>group.sh.blur.capture</string><key>BlurKeychainAccessGroup</key><string>TEAMID123.sh.blur.capture</string>"
+		}
+		if bundleID == hostBundleID {
+			contents += "<key>LSMinimumSystemVersion</key><string>13.0</string><key>NSMicrophoneUsageDescription</key><string>Explicit microphone transcription</string><key>NSAudioCaptureUsageDescription</key><string>Explicit system audio transcription</string>"
 		}
 		contents += "</dict></plist>"
 		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {

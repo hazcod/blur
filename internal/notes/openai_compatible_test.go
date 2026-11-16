@@ -70,8 +70,8 @@ func TestOpenAICompatibleExtractorNeverForwardsCredentialOnRedirect(t *testing.T
 	var redirectedRequests int
 	redirected := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) { redirectedRequests++ }))
 	defer redirected.Close()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Redirect(w, nil, redirected.URL+"/capture", http.StatusTemporaryRedirect)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirected.URL+"/capture", http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
 	extractor, err := NewOpenAICompatibleExtractor(server.URL, "model", "test-token")

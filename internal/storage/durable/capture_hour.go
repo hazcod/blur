@@ -9,7 +9,6 @@ import (
 
 	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/storage"
-	"github.com/hazcod/blur/internal/storage/physical/bolt"
 	"github.com/hazcod/blur/internal/storage/recordcodec"
 )
 
@@ -19,57 +18,31 @@ const (
 	maxSourcesPerCaptureHour = 64
 )
 
-// CaptureHourEvidence reads only the encrypted source IDs indexed for one UTC
-// hour. It never enumerates apps, files, browser history, or neighboring hours.
+// CaptureHourEvidence recovers legacy sources and indexed capture parts from
+// encrypted time directories for exactly one UTC hour. Revisit evidence uses
+// actual authenticated visit times, independently of saved-first provenance.
 func (s *Store) CaptureHourEvidence(ctx context.Context, start time.Time) (chronicle.Hour, error) {
-	var empty chronicle.Hour
 	if ctx == nil || start.IsZero() || start.Location() != time.UTC || !start.Equal(start.Truncate(time.Hour)) {
-		return empty, &storage.StoreError{Code: storage.Invalid}
+		return chronicle.Hour{}, &storage.StoreError{Code: storage.Invalid}
 	}
-	end := start.Add(time.Hour)
-	id := "hour:" + start.Format("20060102T15Z")
-	hour := chronicle.Hour{Start: start, End: end}
-	err := s.view(ctx, func(reader bolt.Reader) error {
-		encoded, found, err := s.readIndexValueReader(reader, captureHourNS, id, 8192)
-		if err != nil || !found {
-			return err
-		}
-		defer clear(encoded)
-		var ids []string
-		if json.Unmarshal(encoded, &ids) != nil || len(ids) > maxSourcesPerCaptureHour || !validSourceHashIDs(ids) {
-			return ErrCorrupt
-		}
-		for _, sourceID := range ids {
-			observation, found, err := s.getObservationReader(reader, sourceID)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return ErrCorrupt
-			}
-			at, err := s.observationCapturedAtReader(reader, sourceID)
-			if err != nil {
-				return err
-			}
-			if at.Before(start) || !at.Before(end) {
-				return ErrCorrupt
-			}
-			if len(observation.Text()) > chronicle.MaxEvidenceItemBytes {
-				continue
-			}
-			score := min(9, 1+len(observation.Text())/128)
-			hour.Evidence = append(hour.Evidence, chronicle.Evidence{Observation: observation, At: at, Salience: uint8(score)})
-		}
-		return nil
-	})
+	page, err := s.ListSourceEvidenceWindow(ctx, storage.ObservationWindowRequest{Start: start, End: start.Add(time.Hour), Limit: chronicle.MaxEvidence, MaxBytes: storage.MaxObservationPageBytes})
 	if err != nil {
-		return empty, err
+		return chronicle.Hour{}, err
+	}
+	hour := chronicle.Hour{Start: start, End: start.Add(time.Hour), SourceLimitReached: page.HasMore || page.Pending}
+	for i, source := range page.Sources {
+		score := min(9, 1+len(source.Text())/128)
+		evidence, err := chronicle.NewSourceEvidence(source, page.CapturedAt[i], uint8(score))
+		if err != nil {
+			return chronicle.Hour{}, ErrCorrupt
+		}
+		hour.Evidence = append(hour.Evidence, evidence)
 	}
 	sort.Slice(hour.Evidence, func(i, j int) bool {
 		if !hour.Evidence[i].At.Equal(hour.Evidence[j].At) {
 			return hour.Evidence[i].At.Before(hour.Evidence[j].At)
 		}
-		return hour.Evidence[i].Observation.ContentID() < hour.Evidence[j].Observation.ContentID()
+		return hour.Evidence[i].SourceID() < hour.Evidence[j].SourceID()
 	})
 	return hour, nil
 }

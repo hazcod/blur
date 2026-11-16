@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -34,6 +35,35 @@ func TestWindowsCreatePrivateDirectoryAndDatabase(t *testing.T) {
 		t.Fatalf("handle-relative open did not verify protected database ACL: %v", err)
 	}
 	_ = file.Close()
+}
+
+func TestWindowsPrivateDirectoryAcceptsShortParentPath(t *testing.T) {
+	root := t.TempDir()
+	root16, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortBuffer := make([]uint16, 512)
+	n, err := windows.GetShortPathName(root16, &shortBuffer[0], uint32(len(shortBuffer)))
+	if err != nil || n == 0 {
+		t.Skipf("short-path aliases are unavailable: %v", err)
+	}
+	shortRoot := windows.UTF16ToString(shortBuffer[:n])
+	if strings.EqualFold(shortRoot, root) {
+		t.Skip("temporary directory has no short-path alias")
+	}
+
+	private := filepath.Join(shortRoot, "Blur Private")
+	if err := CreatePrivateDirectory(private); err != nil {
+		t.Fatalf("CreatePrivateDirectory(short parent path) error = %v", err)
+	}
+	database, err := Open(filepath.Join(private, "store.db"))
+	if err != nil {
+		t.Fatalf("Open() under private directory created through short path = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestWindowsOpenRejectsBroadDirectoryACL(t *testing.T) {

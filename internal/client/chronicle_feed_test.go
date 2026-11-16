@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -125,5 +126,74 @@ func TestMemoryChangePurgesPendingFeed(t *testing.T) {
 	defer feed.mu.Unlock()
 	if feed.current != nil {
 		t.Fatal("current hour survived memory change")
+	}
+}
+
+func TestChronicleFeedSummarizesLargeSavedSourceUnderOriginalIdentity(t *testing.T) {
+	feed := newChronicleFeed()
+	defer feed.Close()
+	repo := &feedRepo{rows: map[string]chronicle.Summary{}, notify: make(chan struct{}, 1)}
+	worker := chronicle.NewWorker(repo, feedPolicy{}, feedModel{}, chronicle.WorkerConfig{Enabled: true, Provider: power.LocalProvider})
+	defer worker.Close()
+	feed.SetWorker(worker)
+	start := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
+	source, err := capture.SanitizeObservation("editor.app", "", strings.Repeat("saved long page ", 1000), capture.MaxObservationTextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed.Add(source, start.Add(time.Minute))
+	next, _ := capture.SanitizeObservation("editor.app", "", "next hour", 1024)
+	feed.Add(next, start.Add(time.Hour+time.Minute))
+	select {
+	case <-repo.notify:
+	case <-time.After(time.Second):
+		t.Fatal("large saved source was silently dropped from the live recap")
+	}
+	row, found, err := repo.GetChronicle(context.Background(), "hour:"+start.Format("20060102T15Z"))
+	if err != nil || !found || len(row.SourceIDs) != 1 || row.SourceIDs[0] != source.ContentID() || !strings.Contains(row.Text, "1 source(s) excerpted") {
+		t.Fatalf("large-source recap lost provenance or coverage: %+v %t %v", row, found, err)
+	}
+}
+
+func TestChronicleFeedQueueRetainsOnlyBoundedLargeSourceProjection(t *testing.T) {
+	worker := newTestWorker()
+	defer worker.Close()
+	feed := &chronicleFeed{worker: worker, queue: make(chan capturedEvidence, maxChronicleFeedQueue)}
+	text := strings.Repeat("memory source ", 70000)
+	source, err := capture.SanitizeObservation("editor.app", "", text, capture.MaxObservationTextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC()
+	feed.Add(source, at)
+	select {
+	case queued := <-feed.queue:
+		if queued.evidence.SourceID() != source.ContentID() || len(queued.evidence.Text()) > chronicle.MaxEvidenceItemBytes || queued.evidence.Observation.Validate() == nil {
+			t.Fatal("queue retained a full large observation or lost original provenance")
+		}
+	default:
+		t.Fatal("large source was discarded before bounded queue admission")
+	}
+}
+
+func TestChronicleFeedReportsQueueOmissionBeforeFirstEventIsAccepted(t *testing.T) {
+	worker := newTestWorker()
+	defer worker.Close()
+	feed := &chronicleFeed{worker: worker, queue: make(chan capturedEvidence, maxChronicleFeedQueue)}
+	defer feed.Purge()
+	start := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
+	for i := 0; i < maxChronicleFeedQueue+1; i++ {
+		source, err := capture.SanitizeObservation("editor.app", "", strings.Repeat("x", i+1), 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		feed.Add(source, start.Add(time.Duration(i)*time.Second))
+	}
+	for len(feed.queue) > 0 {
+		feed.accept(<-feed.queue)
+	}
+	hour, found := feed.CurrentHour()
+	if !found || !hour.SourceLimitReached || len(hour.Evidence) != maxChronicleFeedQueue {
+		t.Fatal("queue omission disappeared before the first accepted event")
 	}
 }

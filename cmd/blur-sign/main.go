@@ -40,7 +40,7 @@ func main() {
 		}
 		fail(err.Error())
 	}
-	fmt.Fprintln(os.Stdout, "Blur app and Safari extension signatures verified.")
+	_, _ = fmt.Fprintln(os.Stdout, "Blur app and Safari extension signatures verified.")
 }
 
 func fail(message string) {

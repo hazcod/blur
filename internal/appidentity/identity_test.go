@@ -1,12 +1,19 @@
 package appidentity
 
-import "testing"
+import (
+	"github.com/hazcod/blur/internal/acceptance"
+	"testing"
+)
 
 func TestProductBundleIdentifiers(t *testing.T) {
-	if BundleID != "com.hazcod.blur" {
-		t.Fatalf("BundleID = %q, want com.hazcod.blur", BundleID)
+	want := "com.hazcod.blur"
+	if acceptance.Enabled {
+		want += ".acceptance"
 	}
-	if SafariExtensionBundleID != "com.hazcod.blur.safaricapture" {
-		t.Fatalf("SafariExtensionBundleID = %q, want com.hazcod.blur.safaricapture", SafariExtensionBundleID)
+	if BundleID != want {
+		t.Fatalf("BundleID = %q, want %q", BundleID, want)
+	}
+	if SafariExtensionBundleID != want+".safaricapture" {
+		t.Fatalf("SafariExtensionBundleID = %q, want %q", SafariExtensionBundleID, want+".safaricapture")
 	}
 }

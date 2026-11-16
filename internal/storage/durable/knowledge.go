@@ -37,7 +37,7 @@ func (s *Store) PutKnowledgeEntity(ctx context.Context, entity knowledge.Entity)
 }
 
 // PutKnowledgeEntityFromSource atomically checks that a single confirmed fact
-// cites a live observation before storing the entity. This is the acceptance
+// cites live source evidence before storing the entity. This is the acceptance
 // path for source-derived model proposals.
 func (s *Store) PutKnowledgeEntityFromSource(ctx context.Context, entity knowledge.Entity, sourceID string) error {
 	if !validKnowledgeSourceID(sourceID) || entity.State != knowledge.Confirmed || len(entity.Facts) != 1 || entity.Facts[0].State != knowledge.Confirmed || len(entity.Facts[0].Sources) != 1 || entity.Facts[0].Sources[0].ID != sourceID {
@@ -51,7 +51,7 @@ func validKnowledgeSourceID(value string) bool {
 		return false
 	}
 	for i := range value {
-		if !(value[i] >= '0' && value[i] <= '9' || value[i] >= 'a' && value[i] <= 'f') {
+		if (value[i] < '0' || value[i] > '9') && (value[i] < 'a' || value[i] > 'f') {
 			return false
 		}
 	}
@@ -77,7 +77,7 @@ func (s *Store) putKnowledgeEntity(ctx context.Context, entity knowledge.Entity,
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if _, found, err := s.getObservationReader(tx.writer, requiredSourceID); err != nil {
+			if _, _, found, err := s.sourceEvidenceReader(tx.writer, requiredSourceID); err != nil {
 				return err
 			} else if !found {
 				return &storage.StoreError{Code: storage.Invalid}
@@ -184,6 +184,9 @@ func (s *Store) DeleteAllKnowledge(ctx context.Context) error {
 	}
 	s.state.knowledgeMu.Lock()
 	defer s.state.knowledgeMu.Unlock()
+	if err := s.deleteAllInferredKnowledge(ctx); err != nil {
+		return err
+	}
 	const batchSize = 8
 	for {
 		if err := ctx.Err(); err != nil {
@@ -336,47 +339,88 @@ func (tx *Tx) quarantineKnowledgeSource(sourceID string) error {
 		if !ok {
 			continue
 		}
-		changed := false
-		facts := e.Facts[:0]
-		for _, f := range e.Facts {
-			f.Sources, changed = withoutSource(f.Sources, sourceID, changed)
-			if len(f.Sources) > 0 {
-				facts = append(facts, f)
-			} else {
-				changed = true
-			}
+		if err := tx.quarantineKnowledgeEntitySource(e, sourceID); err != nil {
+			return err
 		}
-		e.Facts = facts
-		loops := e.OpenLoops[:0]
-		for _, l := range e.OpenLoops {
-			l.Sources, changed = withoutSource(l.Sources, sourceID, changed)
-			if len(l.Sources) > 0 {
-				loops = append(loops, l)
-			} else {
-				changed = true
-			}
-		}
-		e.OpenLoops = loops
-		for _, sid := range e.ActivitySourceIDs {
-			if sid == sourceID {
-				changed = true
-				break
-			}
-		}
-		if changed {
-			filtered := e.ActivitySourceIDs[:0]
-			for _, sid := range e.ActivitySourceIDs {
-				if sid != sourceID {
-					filtered = append(filtered, sid)
-				}
-			}
-			e.ActivitySourceIDs = filtered
-			if err := tx.PutIndexRecord(knowledgeEntityNS, id, mustJSON(e)); err != nil {
-				return err
-			}
-		}
+
 	}
 	return nil
+}
+
+func (tx *Tx) quarantineKnowledgeEntitySource(e knowledge.Entity, sourceID string) error {
+	cleaned, changed := withoutKnowledgeSource(e, sourceID)
+	if changed {
+		if err := tx.PutIndexRecord(knowledgeEntityNS, e.ID, mustJSON(cleaned)); err != nil {
+			return err
+		}
+	}
+	// Undo history also contains source-derived text. Clean both originals so
+	// an unmerge stays usable without retaining or reviving erased evidence.
+	encoded, found, err := tx.readKnowledgeRecordLocked(knowledgeMergeNS, e.ID)
+	if err != nil || !found {
+		return err
+	}
+	defer clear(encoded)
+	var snapshot mergeSnapshot
+	if json.Unmarshal(encoded, &snapshot) != nil || snapshot.Source.ID != e.ID || snapshot.Source.Validate() != nil || snapshot.Target.Validate() != nil {
+		return ErrCorrupt
+	}
+	source, sourceChanged := withoutKnowledgeSource(snapshot.Source, sourceID)
+	target, targetChanged := withoutKnowledgeSource(snapshot.Target, sourceID)
+	if sourceChanged || targetChanged {
+		snapshot.Source, snapshot.Target = source, target
+		return tx.PutIndexRecord(knowledgeMergeNS, e.ID, mustJSON(snapshot))
+	}
+	return nil
+}
+
+func withoutKnowledgeSource(e knowledge.Entity, sourceID string) (knowledge.Entity, bool) {
+	changed := false
+	facts := e.Facts[:0]
+	for _, f := range e.Facts {
+		f.Sources, changed = withoutSource(f.Sources, sourceID, changed)
+		superseded := f.Supersedes[:0]
+		for _, id := range f.Supersedes {
+			if id == sourceID {
+				changed = true
+				continue
+			}
+			superseded = append(superseded, id)
+		}
+		f.Supersedes = superseded
+		if len(f.Sources) > 0 {
+			facts = append(facts, f)
+		} else {
+			changed = true
+		}
+	}
+	e.Facts = facts
+	loops := e.OpenLoops[:0]
+	for _, l := range e.OpenLoops {
+		l.Sources, changed = withoutSource(l.Sources, sourceID, changed)
+		if len(l.Sources) > 0 {
+			loops = append(loops, l)
+		} else {
+			changed = true
+		}
+	}
+	e.OpenLoops = loops
+	for _, sid := range e.ActivitySourceIDs {
+		if sid == sourceID {
+			changed = true
+			break
+		}
+	}
+	if changed {
+		filtered := e.ActivitySourceIDs[:0]
+		for _, sid := range e.ActivitySourceIDs {
+			if sid != sourceID {
+				filtered = append(filtered, sid)
+			}
+		}
+		e.ActivitySourceIDs = filtered
+	}
+	return e, changed
 }
 
 func withoutSource(sources []knowledge.Source, id string, changed bool) ([]knowledge.Source, bool) {

@@ -20,7 +20,7 @@ func sel(name string) objc.SEL { return objc.RegisterName(name) }
 
 func nsStringFrom(value string) objc.ID {
 	raw := append([]byte(value), 0)
-	return objc.Send[objc.ID](objc.ID(objc.GetClass("NSString")), sel("stringWithUTF8String:"), unsafe.Pointer(&raw[0]))
+	return objc.Send[objc.ID](objc.ID(objc.GetClass("NSString")), sel("stringWithUTF8String:"), unsafe.Pointer(&raw[0])) // #nosec G103 -- NSString synchronously copies the nonempty NUL-terminated UTF-8 slice.
 }
 
 func goStringFrom(str objc.ID) (string, bool) {
@@ -28,7 +28,7 @@ func goStringFrom(str objc.ID) (string, bool) {
 		return "", false
 	}
 	buffer := make([]byte, 4097)
-	if !objc.Send[bool](str, sel("getCString:maxLength:encoding:"), unsafe.Pointer(&buffer[0]), uint64(len(buffer)), uint64(nsUTF8StringEncoding)) {
+	if !objc.Send[bool](str, sel("getCString:maxLength:encoding:"), unsafe.Pointer(&buffer[0]), uint64(len(buffer)), uint64(nsUTF8StringEncoding)) { // #nosec G103 -- Foundation receives the exact nonempty destination-buffer capacity and completes the copy synchronously.
 		return "", false
 	}
 	for i, b := range buffer {
@@ -91,7 +91,7 @@ func ChooseFolder(startPath string) (string, []byte, error) {
 func bookmarkForURL(url objc.ID) ([]byte, error) {
 	var bookmarkError objc.ID
 	data := objc.Send[objc.ID](url, sel("bookmarkDataWithOptions:includingResourceValuesForKeys:relativeToURL:error:"),
-		uint64(nsURLBookmarkCreationWithSecurityScope), objc.ID(0), objc.ID(0), unsafe.Pointer(&bookmarkError))
+		uint64(nsURLBookmarkCreationWithSecurityScope), objc.ID(0), objc.ID(0), unsafe.Pointer(&bookmarkError)) // #nosec G103 -- Foundation synchronously writes to the live Objective-C error output slot.
 	bookmark, ok := dataBytes(data)
 	if !ok {
 		return nil, ErrBookmarkInvalid
@@ -118,7 +118,7 @@ func dataBytes(data objc.ID) ([]byte, bool) {
 		return nil, false
 	}
 	out := make([]byte, length)
-	objc.Send[objc.ID](data, sel("getBytes:length:"), unsafe.Pointer(&out[0]), length)
+	objc.Send[objc.ID](data, sel("getBytes:length:"), unsafe.Pointer(&out[0]), length) // #nosec G103 -- The validated NSData length matches the nonempty Go destination buffer.
 	return out, true
 }
 
@@ -130,14 +130,14 @@ func ResolveBookmark(data []byte) (path string, release func(), stale bool, err 
 	if len(data) == 0 || len(data) > MaxBookmarkBytes {
 		return "", nil, false, ErrBookmarkInvalid
 	}
-	nsData := objc.Send[objc.ID](objc.ID(objc.GetClass("NSData")), sel("dataWithBytes:length:"), unsafe.Pointer(&data[0]), uint64(len(data)))
+	nsData := objc.Send[objc.ID](objc.ID(objc.GetClass("NSData")), sel("dataWithBytes:length:"), unsafe.Pointer(&data[0]), uint64(len(data))) // #nosec G103 -- NSData synchronously copies the validated nonempty input slice.
 	if nsData == 0 {
 		return "", nil, false, ErrBookmarkInvalid
 	}
 	var isStale bool
 	var resolveError objc.ID
 	url := objc.Send[objc.ID](objc.ID(objc.GetClass("NSURL")), sel("URLByResolvingBookmarkData:options:relativeToURL:bookmarkDataIsStale:error:"),
-		nsData, uint64(nsURLBookmarkResolutionWithSecurityScope), objc.ID(0), unsafe.Pointer(&isStale), unsafe.Pointer(&resolveError))
+		nsData, uint64(nsURLBookmarkResolutionWithSecurityScope), objc.ID(0), unsafe.Pointer(&isStale), unsafe.Pointer(&resolveError)) // #nosec G103 -- Foundation synchronously writes to the live stale/error output slots.
 	if url == 0 {
 		return "", nil, false, ErrBookmarkInvalid
 	}

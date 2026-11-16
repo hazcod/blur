@@ -10,6 +10,7 @@ import (
 
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/notes"
+	"github.com/hazcod/blur/internal/tasks"
 	"github.com/hazcod/blur/internal/today"
 )
 
@@ -26,20 +27,40 @@ func (s *Store) SaveNote(ctx context.Context, observation capture.SanitizedObser
 	state := s.state
 	state.noteMu.Lock()
 	defer state.noteMu.Unlock()
+	return s.saveNoteLocked(ctx, observation, at)
+}
+
+func (s *Store) saveNoteLocked(ctx context.Context, observation capture.SanitizedObservation, at time.Time) error {
 	date, zone := localDate(at)
 	snapshot, err := s.noteSnapshot(ctx, date, zone, at, observation.ContentID(), observation.Text())
 	if err != nil {
 		return err
 	}
-	_, exists, err := s.GetObservation(ctx, observation.ContentID())
-	if err != nil {
-		return err
-	}
-	return s.Update(ctx, func(tx *Tx) error {
+	return s.noteDocumentUpdate(ctx, func(tx *Tx) error {
+		tx.mu.Lock()
+		if err := tx.checkSourceAdmissionLocked(observation.ContentID(), at); err != nil {
+			tx.mu.Unlock()
+			return err
+		}
+		key := s.logicalKey(groupRecord, kindObservation, "", observation.ContentID())
+		exists, err := tx.writer.Has(key)
+		clear(key)
+		tx.mu.Unlock()
+		if err != nil {
+			return mapStorePhysicalError(err)
+		}
 		if !exists {
 			if err := tx.PutObservationAt(observation, at); err != nil {
 				return err
 			}
+		} else if err := tx.recordObservationSighting(observation, at); err != nil {
+			return err
+		}
+		tx.mu.Lock()
+		err = tx.admitLegacyNoteLocked(observation, at)
+		tx.mu.Unlock()
+		if err != nil {
+			return err
 		}
 		return tx.putTodaySnapshot(snapshot)
 	})
@@ -54,13 +75,20 @@ func (s *Store) SaveProposals(ctx context.Context, sourceID string, proposals []
 	}
 	for i := range sourceID {
 		c := sourceID[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return ErrInvalidNote
 		}
 	}
 	state := s.state
 	state.noteMu.Lock()
 	defer state.noteMu.Unlock()
+	current, err := s.IsCurrentNoteSource(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return notes.ErrSourceUnavailable
+	}
 	observation, found, err := s.GetObservation(ctx, sourceID)
 	if err != nil || !found || observation.AppID() != "sh.blur.notes" {
 		return ErrInvalidNote
@@ -88,6 +116,9 @@ func (s *Store) SaveProposals(ctx context.Context, sourceID string, proposals []
 	snapshot.GeneratedAt = at
 	snapshot.GenerationID = "note-" + sourceID
 	for _, proposal := range proposals {
+		if hasTodo(snapshot.ConfirmedTodos, proposal.ID) {
+			continue
+		}
 		text := proposal.Text
 		switch proposal.Kind {
 		case notes.Question:
@@ -184,29 +215,19 @@ func (s *Store) resolveQuestion(ctx context.Context, date, questionID, answerSou
 	return ErrInvalidNote
 }
 
-// ConfirmProposal promotes one visible suggestion into the user's active Today
-// list. It does not schedule notifications or mutate any source application.
+// ConfirmProposal creates a source-linked task and its Today receipt atomically.
+// It does not schedule notifications or mutate any source application.
 func (s *Store) ConfirmProposal(ctx context.Context, date, proposalID string) error {
 	if s == nil || s.state == nil || ctx == nil || ctx.Err() != nil || !validTodayDate(date) || !validOpaqueID(proposalID) {
 		return ErrInvalidNote
 	}
-	s.state.noteMu.Lock()
-	defer s.state.noteMu.Unlock()
 	snapshot, found, err := s.GetTodaySnapshot(ctx, date)
 	if err != nil || !found {
 		return ErrInvalidNote
 	}
-	for i, candidate := range snapshot.TodoCandidates {
-		if candidate.ID != proposalID {
-			continue
-		}
-		if len(snapshot.ConfirmedTodos) >= today.MaxTodos {
-			return ErrInvalidNote
-		}
-		candidate.Confirmed = true
-		snapshot.TodoCandidates = append(snapshot.TodoCandidates[:i], snapshot.TodoCandidates[i+1:]...)
-		snapshot.ConfirmedTodos = append(snapshot.ConfirmedTodos, candidate)
-		return s.PutTodaySnapshot(ctx, snapshot)
+	if candidate, ok := findTodayTodo(snapshot, proposalID); ok {
+		_, err := s.ConfirmTodayTask(ctx, tasks.TodayCandidate{Date: date, ID: proposalID, Text: candidate.Text, SourceIDs: candidate.SourceIDs}, time.Now())
+		return err
 	}
 	return ErrInvalidNote
 }
@@ -283,6 +304,9 @@ func localDate(at time.Time) (string, string) {
 }
 
 func truncateNoteText(value string, max int) string {
+	// This helper formats derived display text, never the source observation.
+	// Today requires trimmed preview text even when a short note fits in full.
+	value = strings.TrimSpace(value)
 	if len(value) <= max {
 		return value
 	}
@@ -322,7 +346,7 @@ func validDigestID(value string) bool {
 	}
 	for i := range value {
 		c := value[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}

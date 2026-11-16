@@ -135,7 +135,7 @@ func snapshotViaCache(window objc.ID, path string) error {
 		return errSnapshotUnavailable
 	}
 	raw := append([]byte(path), 0)
-	nsPath := objc.Send[objc.ID](objc.ID(objc.GetClass("NSString")), objc.RegisterName("stringWithUTF8String:"), unsafe.Pointer(&raw[0]))
+	nsPath := objc.Send[objc.ID](objc.ID(objc.GetClass("NSString")), objc.RegisterName("stringWithUTF8String:"), unsafe.Pointer(&raw[0])) // #nosec G103 -- NSString synchronously copies the nonempty NUL-terminated path slice.
 	if nsPath == 0 || !objc.Send[bool](data, objc.RegisterName("writeToFile:atomically:"), nsPath, true) {
 		return errSnapshotUnavailable
 	}

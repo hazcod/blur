@@ -13,7 +13,6 @@ import (
 	"github.com/hazcod/blur/internal/knowledge/derive"
 	"github.com/hazcod/blur/internal/model"
 	"github.com/hazcod/blur/internal/power"
-	"github.com/hazcod/blur/internal/today"
 )
 
 func TestFormatReportDuration(t *testing.T) {
@@ -75,7 +74,7 @@ func TestActivityReportRangeValidationMatchesClientLimits(t *testing.T) {
 }
 
 func TestDesktopNavigationKeepsPrimaryDestinationsInStableOrder(t *testing.T) {
-	want := []string{"Today", "Ask", "Search", "Library", "Time", "Settings"}
+	want := []string{"Today", "Ask", "Library", "Tasks", "Preferences", "Time", "Settings"}
 	got := desktopPages()
 	if len(got) != len(want) {
 		t.Fatalf("desktopPages() = %v, want %v", got, want)
@@ -88,27 +87,48 @@ func TestDesktopNavigationKeepsPrimaryDestinationsInStableOrder(t *testing.T) {
 }
 
 func TestAskProcessingDisclosureIsLocalAndUserInitiated(t *testing.T) {
-	copy := askProcessingDisclosure(LocalAISettings{Provider: ProviderOllama})
-	for _, phrase := range []string{"when you ask", "matching local sources", "your question", "only your question when no sources match", "this device", "not sent to remote providers"} {
+	copy := askProcessingDisclosure(LocalAISettings{Enabled: true, Provider: ProviderOllama})
+	for _, phrase := range []string{"when you ask", "matching local sources", "your question", "applicable writing rules", "relevant explicit preferences", "this device", "not sent to remote providers"} {
 		if !strings.Contains(strings.ToLower(copy), strings.ToLower(phrase)) {
 			t.Fatalf("Ask disclosure %q omits %q", copy, phrase)
 		}
 	}
-	remote := askProcessingDisclosure(LocalAISettings{Provider: ProviderOpenAICompatible, RemoteAskEnabled: true})
-	for _, phrase := range []string{"matching local sources", "your question", "only your question when no sources match", "configured OpenAI-compatible endpoint", "may retain requests"} {
+	remote := askProcessingDisclosure(LocalAISettings{Enabled: true, Provider: ProviderOpenAICompatible, RemoteAskEnabled: true})
+	for _, phrase := range []string{"bounded saved passages", "your question", "search or ask", "configured OpenAI-compatible endpoint", "may retain requests"} {
 		if !strings.Contains(strings.ToLower(remote), strings.ToLower(phrase)) {
 			t.Fatalf("remote Ask disclosure %q omits %q", remote, phrase)
 		}
 	}
-	remoteOff := askProcessingDisclosure(LocalAISettings{Provider: ProviderOpenAICompatible})
+	remoteOff := askProcessingDisclosure(LocalAISettings{Enabled: true, Provider: ProviderOpenAICompatible})
 	if !strings.Contains(strings.ToLower(remoteOff), "stay on this device") || !strings.Contains(strings.ToLower(remoteOff), "unless you separately allow") {
 		t.Fatalf("remote Ask off disclosure is unclear: %q", remoteOff)
 	}
 }
 
+func TestAskProcessingDisclosureWhenAIIsOff(t *testing.T) {
+	copy := askProcessingDisclosure(LocalAISettings{})
+	for _, phrase := range []string{"AI is off", "saved sources", "without a model", "Settings"} {
+		if !strings.Contains(copy, phrase) {
+			t.Fatal("offline source lookup is not explained", copy)
+		}
+	}
+	if strings.Contains(copy, "sends") {
+		t.Fatal("disabled AI disclosure claims a model transmission", copy)
+	}
+}
+
+func TestPrivacyOverviewExplainsCaptureAndLibraryBoundaries(t *testing.T) {
+	copy := strings.ToLower(privacyOverviewCopy())
+	for _, phrase := range []string{"never captures its own interface", "separate local-only setting", "corrected or dismissed"} {
+		if !strings.Contains(copy, phrase) {
+			t.Fatalf("privacy overview %q omits %q", copy, phrase)
+		}
+	}
+}
+
 func TestRemoteAskConsentCopyMatchesSavedState(t *testing.T) {
 	off := remoteAskConsentCopy(false)
-	for _, phrase := range []string{"is off", "up to eight", "only when you ask", "may retain"} {
+	for _, phrase := range []string{"is off", "up to eight", "search and answers", "may retain"} {
 		if !strings.Contains(strings.ToLower(off), strings.ToLower(phrase)) {
 			t.Fatalf("remote Ask off copy %q omits %q", off, phrase)
 		}
@@ -299,8 +319,11 @@ func TestMemoryInvalidationClearsVisibleEvidenceAndCancelsLoads(t *testing.T) {
 }
 
 func TestAskErrorMessageGivesUsefulLocalRecovery(t *testing.T) {
-	if got := askErrorMessage(assistant.ErrContext); got != "No matching local sources were found. Try a different question." {
-		t.Fatalf("no-evidence guidance = %q", got)
+	if got := askErrorMessage(assistant.ErrAskUnavailable); got != "This question needs an answer model. Enable local AI in Settings, then try again. You can still search saved sources without AI." {
+		t.Fatalf("missing model recovery = %q", got)
+	}
+	if got := askErrorMessage(assistant.ErrContext); got != "Blur couldn't safely prepare this question and its local context. Try a shorter question or run it again." {
+		t.Fatalf("context recovery = %q", got)
 	}
 	if got := askErrorMessage(assistant.ErrTokenBudget); got != "That question and its matching evidence are too large. Try a shorter question." {
 		t.Fatalf("budget guidance = %q", got)
@@ -317,6 +340,9 @@ func TestAskErrorMessageGivesUsefulLocalRecovery(t *testing.T) {
 }
 
 func TestAskErrorMessageGivesProviderNeutralRemoteRecovery(t *testing.T) {
+	if got := askErrorMessage(assistant.ErrAskUnavailable, ProviderOpenAICompatible); got != "AI is not ready for this question. Review the provider and Remote Ask permissions in Settings. You can still search saved sources without AI." {
+		t.Fatalf("missing remote admission recovery = %q", got)
+	}
 	if got := askErrorMessage(model.ErrCompatibleUnavailable, ProviderOpenAICompatible); got != "The configured AI endpoint is unavailable. Check its address and connection in Settings." {
 		t.Fatalf("compatible endpoint recovery = %q", got)
 	}
@@ -342,7 +368,7 @@ func TestLocalAIDataFlowCopySeparatesLocalAskFromRemoteNotes(t *testing.T) {
 		t.Fatalf("remote AI disclosure implies captured sources leave the device: %q", remote)
 	}
 	consented := localAIDataFlowCopy(true, ProviderOpenAICompatible, true)
-	for _, phrase := range []string{"up to eight matching captured sources", "explicitly ask", "may retain requests"} {
+	for _, phrase := range []string{"up to eight matching sources", "search or ask", "bounded saved passages", "may retain requests"} {
 		if !strings.Contains(strings.ToLower(consented), strings.ToLower(phrase)) {
 			t.Fatalf("consented remote AI disclosure %q omits %q", consented, phrase)
 		}
@@ -357,7 +383,7 @@ func TestDeleteAllPrivacyActionRequiresSecondConfirmationAndStatesScope(t *testi
 		t.Fatalf("confirmed delete-all action = %q", got)
 	}
 	copy := deleteAllConfirmationCopy()
-	for _, required := range []string{"notes", "knowledge library entries", "captured sources", "derived recap items", "AI settings remain", "cannot be undone"} {
+	for _, required := range []string{"notes", "tasks", "reminders", "Library entries", "captured sources", "derived items", "cancels Blur notifications", "AI settings remain", "cannot be undone"} {
 		if !strings.Contains(strings.ToLower(copy), strings.ToLower(required)) {
 			t.Fatalf("delete-all confirmation copy %q omits %q", copy, required)
 		}
@@ -377,7 +403,7 @@ func TestRetentionControlsRequireConfirmationAndExplainDeletionScope(t *testing.
 	if got := retentionApplyLabel(0); got != "Turn off automatic pruning" {
 		t.Fatalf("disabled retention action = %q", got)
 	}
-	for _, required := range []string{"captured sources", "derived recap items", "cannot be undone", "upgrade date"} {
+	for _, required := range []string{"captured sources", "typed notes", "voice notes", "transcripts", "derived recap items", "cannot be undone", "upgrade date"} {
 		copy := strings.ToLower(retentionConfirmationCopy(30))
 		if !strings.Contains(copy, strings.ToLower(required)) {
 			t.Fatalf("retention confirmation %q omits %q", copy, required)
@@ -392,20 +418,6 @@ func TestQuickNoteControlIsMultiline(t *testing.T) {
 	input := quickNoteInput("first line\nsecond line", func(string) {})
 	if _, ok := any(input).(*ui.TextViewView); !ok {
 		t.Fatalf("quick note input has type %T, want native multiline editor", input)
-	}
-}
-
-func TestTodayComposerStaysAheadOfRecapContent(t *testing.T) {
-	dateControls := ui.Label("date controls")
-	composer := ui.Label("quick note")
-	recap := ui.Label("recap")
-	got := todayContentViews(dateControls, composer, []ui.View{recap}, true)
-	if len(got) != 3 || got[0] != dateControls || got[1] != composer || got[2] != recap {
-		t.Fatalf("today content order = %#v, want date controls, composer, recap", got)
-	}
-	withoutComposer := todayContentViews(dateControls, composer, []ui.View{recap}, false)
-	if len(withoutComposer) != 2 || withoutComposer[0] != dateControls || withoutComposer[1] != recap {
-		t.Fatalf("today content without note permission = %#v, want date controls, recap", withoutComposer)
 	}
 }
 
@@ -436,9 +448,9 @@ func TestPrivacyOverviewKeepsStorageAndReviewBoundariesVisible(t *testing.T) {
 	copy := strings.ToLower(privacyOverviewCopy())
 	for _, phrase := range []string{
 		"encrypted locally before they enter the durable store",
-		"tasks need confirmation",
-		"without sending messages or scheduling notifications",
-		"library entries are created only from details you enter",
+		"tasks and reminders need an explicit request or confirmation",
+		"scheduled notifications include the reminder text",
+		"inferred memories include sources and can be corrected or dismissed",
 	} {
 		if !strings.Contains(copy, phrase) {
 			t.Fatalf("privacy overview %q omits %q", copy, phrase)
@@ -581,7 +593,7 @@ func TestDesktopWithoutEncryptedStorageStatesCaptureAndSavingAreOff(t *testing.T
 	if d.client != nil || d.capture != nil {
 		t.Fatal("unconfigured desktop retained a client or capture controller")
 	}
-	if d.status != "Encrypted local storage is unavailable. Blur has not started capture or saved anything." {
+	if !strings.Contains(d.status, "Local encrypted storage could not be opened") || !strings.Contains(d.status, "did not start capture or save anything") || d.startupDiagnostic == "" {
 		t.Fatalf("setup status = %q", d.status)
 	}
 }
@@ -758,7 +770,7 @@ func TestSearchEmptyStateDistinguishesInitialNoMatchesLoadingAndFailure(t *testi
 		want      string
 	}{
 		{"initial", false, false, false, 0, "Search uses exact local terms and does not need AI."},
-		{"no matches", false, true, false, 0, "No matches. Try a shorter phrase or an exact word."},
+		{"no matches", false, true, false, 0, "No matching saved memory found."},
 		{"loading", true, false, false, 0, ""},
 		{"failed", false, true, true, 0, ""},
 		{"has results", false, true, false, 1, ""},
@@ -828,13 +840,6 @@ func TestLibraryRetryAppearsOnlyAfterAnInitialLoadFailure(t *testing.T) {
 				t.Fatalf("canRetryLibraryLoad(...) = %t, want %t", got, test.want)
 			}
 		})
-	}
-}
-
-func TestOpenLoopLinesExposeOnlyNonEmptyRecapItems(t *testing.T) {
-	got := openLoopLines([]today.OpenLoop{{Text: "Waiting for the launch date"}, {Text: ""}})
-	if len(got) != 1 || got[0] != "Waiting for the launch date" {
-		t.Fatalf("openLoopLines() = %#v", got)
 	}
 }
 

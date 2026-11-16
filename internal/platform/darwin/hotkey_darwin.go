@@ -21,22 +21,28 @@ const (
 	eventHotKeyPressed = 5
 	hotkeySignature    = 0x424C5552 // 'BLUR'
 	hotkeyIdentifier   = 1
+	meetingHotkeyID    = 2
 )
 
 type eventTypeSpec struct{ eventClass, eventKind uint32 }
 
 var quickHotkey struct {
-	mu        sync.Mutex
-	loaded    bool
-	loadErr   error
-	register  func(keyCode, modifiers uint32, id uint64, target uintptr, options uint32, out *uintptr) int32
-	unregist  func(ref uintptr) int32
-	target    func() uintptr
-	install   func(target, handler uintptr, count uint32, types *eventTypeSpec, userData uintptr, out *uintptr) int32
-	handlerOK bool
-	handlerFn uintptr
-	ref       uintptr
-	onPress   func()
+	mu             sync.Mutex
+	loaded         bool
+	loadErr        error
+	register       func(keyCode, modifiers uint32, id uint64, target uintptr, options uint32, out *uintptr) int32
+	unregist       func(ref uintptr) int32
+	target         func() uintptr
+	install        func(target, handler uintptr, count uint32, types *eventTypeSpec, userData uintptr, out *uintptr) int32
+	parameter      func(event uintptr, name, kind uint32, actualKind *uint32, size uint32, actualSize *uint32, value *uint64) int32
+	handlerOK      bool
+	handlerFn      uintptr
+	ref            uintptr
+	onPress        func()
+	meetingRef     uintptr
+	onMeetingPress func()
+	quickSpec      string
+	meetingSpec    string
 }
 
 func loadHotkeyAPI() error {
@@ -52,7 +58,7 @@ func loadHotkeyAPI() error {
 		quickHotkey.loadErr = ErrHotkeyUnavailable
 		return quickHotkey.loadErr
 	}
-	for _, name := range []string{"RegisterEventHotKey", "UnregisterEventHotKey", "GetApplicationEventTarget", "InstallEventHandler"} {
+	for _, name := range []string{"RegisterEventHotKey", "UnregisterEventHotKey", "GetApplicationEventTarget", "InstallEventHandler", "GetEventParameter"} {
 		if _, err := purego.Dlsym(lib, name); err != nil {
 			quickHotkey.loadErr = ErrHotkeyUnavailable
 			return quickHotkey.loadErr
@@ -62,6 +68,7 @@ func loadHotkeyAPI() error {
 	purego.RegisterLibFunc(&quickHotkey.unregist, lib, "UnregisterEventHotKey")
 	purego.RegisterLibFunc(&quickHotkey.target, lib, "GetApplicationEventTarget")
 	purego.RegisterLibFunc(&quickHotkey.install, lib, "InstallEventHandler")
+	purego.RegisterLibFunc(&quickHotkey.parameter, lib, "GetEventParameter")
 	return nil
 }
 
@@ -70,9 +77,20 @@ func loadHotkeyAPI() error {
 // An empty spec removes the shortcut. Re-registering replaces the previous
 // one; on failure no shortcut is left registered. Call on the main thread.
 func RegisterQuickAskHotkey(spec string, onPress func()) error {
+	return registerBlurHotkey(hotkeyIdentifier, spec, onPress)
+}
+
+// RegisterMeetingHotkey independently registers a workspace-opening shortcut.
+// It never starts recording. Registration conflicts return ErrHotkeyUnavailable
+// while preserving the other shortcut. Call on the AppKit main thread.
+func RegisterMeetingHotkey(spec string, onPress func()) error {
+	return registerBlurHotkey(meetingHotkeyID, spec, onPress)
+}
+
+func registerBlurHotkey(identifier uint32, spec string, onPress func()) error {
 	quickHotkey.mu.Lock()
 	defer quickHotkey.mu.Unlock()
-	unregisterQuickAskHotkeyLocked()
+	unregisterBlurHotkeyLocked(identifier)
 	if spec == "" {
 		return nil
 	}
@@ -80,18 +98,26 @@ func RegisterQuickAskHotkey(spec string, onPress func()) error {
 	if !ok || onPress == nil {
 		return ErrHotkeyUnavailable
 	}
+	otherSpec := quickHotkey.meetingSpec
+	if identifier == meetingHotkeyID {
+		otherSpec = quickHotkey.quickSpec
+	}
+	otherCode, otherModifiers, otherOK := hotkey.Parse(otherSpec)
+	if otherOK && code == otherCode && modifiers == otherModifiers {
+		return ErrHotkeyUnavailable
+	}
 	if err := loadHotkeyAPI(); err != nil {
 		return err
 	}
 	if !quickHotkey.handlerOK {
-		quickHotkey.handlerFn = purego.NewCallback(func(_, _, _ uintptr) uintptr {
-			quickHotkey.mu.Lock()
-			press := quickHotkey.onPress
-			quickHotkey.mu.Unlock()
-			if press != nil {
-				press()
+		quickHotkey.handlerFn = purego.NewCallback(func(_, event, _ uintptr) uintptr {
+			var identifier uint64
+			var actualSize uint32
+			if quickHotkey.parameter(event, 0x2d2d2d2d, 0x686b6964, nil, 8, &actualSize, &identifier) == 0 && actualSize == 8 && dispatchBlurHotkey(identifier) {
+				return 0
 			}
-			return 0 // noErr: handled
+			var notHandled int32 = -9874 // eventNotHandledErr
+			return uintptr(uint32(notHandled))
 		})
 		types := eventTypeSpec{eventClass: eventClassKeyboard, eventKind: eventHotKeyPressed}
 		var handlerRef uintptr
@@ -102,29 +128,67 @@ func RegisterQuickAskHotkey(spec string, onPress func()) error {
 		quickHotkey.handlerOK = true
 	}
 	var ref uintptr
-	id := uint64(hotkeySignature) | uint64(hotkeyIdentifier)<<32
+	id := uint64(hotkeySignature) | uint64(identifier)<<32
 	if status := quickHotkey.register(code, modifiers, id, quickHotkey.target(), 0, &ref); status != 0 || ref == 0 {
 		slog.Warn("global shortcut could not be registered", "result", "failed")
 		return ErrHotkeyUnavailable
 	}
-	quickHotkey.ref = ref
-	quickHotkey.onPress = onPress
+	if identifier == meetingHotkeyID {
+		quickHotkey.meetingRef, quickHotkey.onMeetingPress, quickHotkey.meetingSpec = ref, onPress, spec
+	} else {
+		quickHotkey.ref, quickHotkey.onPress, quickHotkey.quickSpec = ref, onPress, spec
+	}
 	return nil
+}
+
+func dispatchBlurHotkey(identifier uint64) bool {
+	if uint32(identifier) != hotkeySignature {
+		return false
+	}
+	quickHotkey.mu.Lock()
+	var press func()
+	switch uint32(identifier >> 32) {
+	case hotkeyIdentifier:
+		press = quickHotkey.onPress
+	case meetingHotkeyID:
+		press = quickHotkey.onMeetingPress
+	}
+	quickHotkey.mu.Unlock()
+	if press == nil {
+		return false
+	}
+	press()
+	return true
 }
 
 // UnregisterQuickAskHotkey removes the global shortcut, if any.
 func UnregisterQuickAskHotkey() {
 	quickHotkey.mu.Lock()
 	defer quickHotkey.mu.Unlock()
-	unregisterQuickAskHotkeyLocked()
+	unregisterBlurHotkeyLocked(hotkeyIdentifier)
 }
 
-func unregisterQuickAskHotkeyLocked() {
+// UnregisterMeetingHotkey removes only the meeting workspace shortcut.
+func UnregisterMeetingHotkey() {
+	quickHotkey.mu.Lock()
+	defer quickHotkey.mu.Unlock()
+	unregisterBlurHotkeyLocked(meetingHotkeyID)
+}
+
+func unregisterBlurHotkeyLocked(identifier uint32) {
+	if identifier == meetingHotkeyID {
+		if quickHotkey.meetingRef != 0 && quickHotkey.unregist != nil {
+			quickHotkey.unregist(quickHotkey.meetingRef)
+		}
+		quickHotkey.meetingRef, quickHotkey.onMeetingPress, quickHotkey.meetingSpec = 0, nil, ""
+		return
+	}
 	if quickHotkey.ref != 0 && quickHotkey.unregist != nil {
 		quickHotkey.unregist(quickHotkey.ref)
 	}
 	quickHotkey.ref = 0
 	quickHotkey.onPress = nil
+	quickHotkey.quickSpec = ""
 }
 
 // ActivateApplication brings Blur to the foreground so a window opened from a

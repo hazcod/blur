@@ -238,7 +238,7 @@ func (a *Adapter) ensureStarted(parent context.Context) error {
 	signals := make(chan *dbus.Signal, 32)
 	for _, spec := range atspiSubscriptions() {
 		if err := conn.AddMatchSignalContext(ctx, dbus.WithMatchInterface(spec.iface), dbus.WithMatchMember(spec.member)); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			connCancel()
 			return platform.ErrInvalidLease
 		}
@@ -251,7 +251,7 @@ func (a *Adapter) ensureStarted(parent context.Context) error {
 				_ = conn.Object(a11yRegistry, a11yRegistryPath).CallWithContext(ctx, a11yRegistryIface+".DeregisterEvent", 0, prior.eventType, "").Err
 			}
 			conn.RemoveSignal(signals)
-			conn.Close()
+			_ = conn.Close()
 			connCancel()
 			return platform.ErrInvalidLease
 		}

@@ -20,7 +20,7 @@ func CopyToPasteboard(text string) error {
 	}
 	nsString := func(value string) objc.ID {
 		raw := append([]byte(value), 0)
-		return objc.Send[objc.ID](objc.ID(objc.GetClass("NSString")), objc.RegisterName("stringWithUTF8String:"), unsafe.Pointer(&raw[0]))
+		return objc.Send[objc.ID](objc.ID(objc.GetClass("NSString")), objc.RegisterName("stringWithUTF8String:"), unsafe.Pointer(&raw[0])) // #nosec G103 -- NSString synchronously copies the nonempty NUL-terminated UTF-8 slice.
 	}
 	value, kind := nsString(text), nsString("public.utf8-plain-text")
 	if value == 0 || kind == 0 {

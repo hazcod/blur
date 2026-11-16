@@ -142,7 +142,7 @@ func TestMCPCommandClientUsesOnlyTheStoredReadOnlyGrant(t *testing.T) {
 	if err := owner.StartWithGrant(ctx, grant); err != nil {
 		t.Fatal(err)
 	}
-	defer owner.Stop()
+	defer func(stop func() error) { _ = stop() }(owner.Stop)
 	rpc, err := mcpClientFromSecret(ctx, secrets, transport, endpoint)
 	if err != nil {
 		t.Fatal(err)

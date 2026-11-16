@@ -1,9 +1,28 @@
 package today
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestTaskReceiptsRequireConfirmedTodosAndValidTaskIDs(t *testing.T) {
+	at := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	snapshot, err := Build(Input{Date: "2026-11-12", Zone: "UTC", GeneratedAt: at, GenerationID: "fixture", Evidence: []Evidence{{SourceID: "source", At: at, Todo: "Review Atlas", TodoMarker: MarkerTODO}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.TodoCandidates[0].TaskID = strings.Repeat("a", 32)
+	if snapshot.Validate() == nil {
+		t.Fatal("an unconfirmed suggestion claimed a created task")
+	}
+	item := snapshot.TodoCandidates[0]
+	item.Confirmed, item.TaskID = true, "not-a-task-id"
+	snapshot.TodoCandidates, snapshot.ConfirmedTodos = nil, []Todo{item}
+	if snapshot.Validate() == nil {
+		t.Fatal("a malformed task receipt was accepted")
+	}
+}
 
 func TestBuildGroupsDeterministicallyAndOnlyUsesExplicitTodoMarkers(t *testing.T) {
 	zone := time.FixedZone("local", 2*60*60)

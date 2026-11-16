@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/capture"
-	"github.com/hazcod/blur/internal/deletion"
 	"github.com/hazcod/blur/internal/storage/durable"
 )
 
@@ -20,16 +19,11 @@ const MaxSegmentsPerRun = 200
 // Sink is the store surface the importer writes through. Observations go
 // through the normal put path so indexes and derived state update.
 type Sink interface {
+	RecoverSourceDeletion(context.Context) error
 	GetObservation(ctx context.Context, id string) (capture.SanitizedObservation, bool, error)
-	PutObservationAt(ctx context.Context, o capture.SanitizedObservation, at time.Time) error
-	Tombstones(ctx context.Context) ([]durable.Tombstone, error)
+	ImportObservation(ctx context.Context, o capture.SanitizedObservation, at time.Time) (bool, error)
+	ObservationDeletionCovers(context.Context, string, time.Time) (bool, error)
 	RecordTombstone(ctx context.Context, t durable.Tombstone) error
-}
-
-// NoteSaver is optionally implemented by the store so imported user notes also
-// update the Today projection.
-type NoteSaver interface {
-	SaveNote(ctx context.Context, o capture.SanitizedObservation, at time.Time) error
 }
 
 // OriginTracker is optionally implemented by the store. Imported content IDs
@@ -41,7 +35,7 @@ type OriginTracker interface {
 
 // Deleter applies tombstones through the deletion service.
 type Deleter interface {
-	DeleteSource(ctx context.Context, sourceID string) (int, error)
+	DeleteSourceThrough(ctx context.Context, sourceID string, cutoff time.Time) (int, error)
 	DeleteBefore(ctx context.Context, cutoff time.Time) (int, error)
 }
 
@@ -139,6 +133,12 @@ func (im *Importer) Run(ctx context.Context) (res Result, err error) {
 					im.Changing()
 				}
 				changing = true
+				// A previous attempt may have committed an erasure intent and
+				// left the store gated. Recover before tombstone writes or source
+				// preflight, within the same client publication window.
+				if err := im.Store.RecoverSourceDeletion(ctx); err != nil {
+					return res, err
+				}
 			}
 			if err := im.importSegment(ctx, target.Key, device, file, &res); err != nil {
 				if ctx.Err() != nil {
@@ -248,10 +248,6 @@ func (im *Importer) importSegment(ctx context.Context, key []byte, device string
 		}
 		res.Tombstones++
 	}
-	log, err := im.Store.Tombstones(ctx)
-	if err != nil {
-		return err
-	}
 	now := time.Now()
 	if im.Now != nil {
 		now = im.Now()
@@ -266,7 +262,11 @@ func (im *Importer) importSegment(ctx context.Context, key []byte, device string
 			continue
 		}
 		o := observations[i]
-		if durable.TombstoneCovers(log, o.ContentID(), r.At) {
+		covered, err := im.Store.ObservationDeletionCovers(ctx, o.ContentID(), r.At)
+		if err != nil {
+			return err
+		}
+		if covered {
 			res.Skipped++
 			continue
 		}
@@ -282,29 +282,17 @@ func (im *Importer) importSegment(ctx context.Context, key []byte, device string
 		}
 		puts = append(puts, pending{o, at})
 	}
-	// Record origin before writing: a crash in between only means the segment
-	// is retried, never that imported content is exported back.
-	if tracker, ok := im.Store.(OriginTracker); ok && len(puts) > 0 {
-		ids := make([]string, len(puts))
-		for i, p := range puts {
-			ids[i] = p.o.ContentID()
-		}
-		if err := tracker.MarkImported(ctx, ids); err != nil {
-			return err
-		}
-	}
 	for _, p := range puts {
 		o, at := p.o, p.at
-		if saver, ok := im.Store.(NoteSaver); ok && o.AppID() == "sh.blur.notes" && o.Domain() == "local" {
-			if saver.SaveNote(ctx, o, at) == nil {
-				res.Observations++
-				continue
-			}
-		}
-		if err := im.Store.PutObservationAt(ctx, o, at); err != nil {
+		admitted, err := im.Store.ImportObservation(ctx, o, at)
+		if err != nil {
 			return err
 		}
-		res.Observations++
+		if admitted {
+			res.Observations++
+		} else {
+			res.Skipped++
+		}
 	}
 	return nil
 }
@@ -322,6 +310,6 @@ func (im *Importer) applyTombstone(ctx context.Context, r Record) error {
 		_, err := im.Deleter.DeleteBefore(ctx, r.At)
 		return err
 	}
-	_, err := im.Deleter.DeleteSource(deletion.WithoutTombstone(ctx), r.SourceID)
+	_, err := im.Deleter.DeleteSourceThrough(ctx, r.SourceID, r.At)
 	return err
 }

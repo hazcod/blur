@@ -19,7 +19,7 @@ func TestUnixTransportPrivatePeerCheckedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func(close func() error) { _ = close() }(listener.Close)
 	info, err := os.Lstat(endpoint.Address)
 	if err != nil || info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("socket mode/type = %v, err=%v", info, err)
@@ -28,12 +28,12 @@ func TestUnixTransportPrivatePeerCheckedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func(close func() error) { _ = close() }(client.Close)
 	server, err := listener.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer func(close func() error) { _ = close() }(server.Close)
 	if err := client.Send(ctx, []byte("bounded frame")); err != nil {
 		t.Fatal(err)
 	}

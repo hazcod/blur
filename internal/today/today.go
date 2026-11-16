@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/hazcod/blur/internal/tasks"
 )
 
 var ErrInvalid = errors.New("today: invalid snapshot input")
@@ -90,6 +92,7 @@ type Todo struct {
 	Text      string   `json:"text"`
 	SourceIDs []string `json:"source_ids"`
 	Confirmed bool     `json:"confirmed"`
+	TaskID    string   `json:"task_id,omitempty"`
 }
 
 type OpenLoop struct {
@@ -132,14 +135,17 @@ type Completeness struct {
 // Snapshot is an immutable-by-contract value. Call Clone at mutable API
 // boundaries; Build returns independent slices and strings.
 type Snapshot struct {
-	Date           string       `json:"date"`
-	Zone           string       `json:"zone"`
-	GeneratedAt    time.Time    `json:"generated_at"`
-	GenerationID   string       `json:"generation_id"`
-	ActiveSubjects []Subject    `json:"active_subjects"`
-	RecentChanges  []Change     `json:"recent_changes"`
-	ConfirmedTodos []Todo       `json:"confirmed_todos"`
-	TodoCandidates []Todo       `json:"todo_candidates"`
+	Date           string    `json:"date"`
+	Zone           string    `json:"zone"`
+	GeneratedAt    time.Time `json:"generated_at"`
+	GenerationID   string    `json:"generation_id"`
+	ActiveSubjects []Subject `json:"active_subjects"`
+	RecentChanges  []Change  `json:"recent_changes"`
+	ConfirmedTodos []Todo    `json:"confirmed_todos"`
+	TodoCandidates []Todo    `json:"todo_candidates"`
+	// DismissedTodos are source-linked user decisions, not visible tasks.
+	// Keeping them with the snapshot lets source erasure remove them together.
+	DismissedTodos []Todo       `json:"dismissed_todos,omitempty"`
 	OpenLoops      []OpenLoop   `json:"open_loops"`
 	Questions      []Question   `json:"questions,omitempty"`
 	TimeSplit      []TimeSplit  `json:"time_split"`
@@ -208,6 +214,7 @@ func WithoutSource(snapshot Snapshot, sourceID string) (Snapshot, error) {
 	out.RecentChanges = filterChanges(out.RecentChanges, sourceID)
 	out.ConfirmedTodos = filterTodos(out.ConfirmedTodos, sourceID)
 	out.TodoCandidates = filterTodos(out.TodoCandidates, sourceID)
+	out.DismissedTodos = filterTodos(out.DismissedTodos, sourceID)
 	out.OpenLoops = filterOpenLoops(out.OpenLoops, sourceID)
 	questions := out.Questions[:0]
 	for _, item := range out.Questions {
@@ -489,7 +496,7 @@ func Build(in Input) (Snapshot, error) {
 }
 
 func (s Snapshot) Validate() error {
-	if !validDate(s.Date) || !validText(s.Zone, 128) || s.GeneratedAt.IsZero() || !validID(s.GenerationID) || len(s.ActiveSubjects) > MaxSubjects || len(s.RecentChanges) > MaxChanges || len(s.ConfirmedTodos) > MaxTodos || len(s.TodoCandidates) > MaxTodos || len(s.OpenLoops) > MaxOpenLoops || len(s.Questions) > MaxQuestions || len(s.TimeSplit) > MaxTimeSplits || len(s.SourceIDs) > MaxSources {
+	if !validDate(s.Date) || !validText(s.Zone, 128) || s.GeneratedAt.IsZero() || !validID(s.GenerationID) || len(s.ActiveSubjects) > MaxSubjects || len(s.RecentChanges) > MaxChanges || len(s.ConfirmedTodos) > MaxTodos || len(s.TodoCandidates) > MaxTodos || len(s.DismissedTodos) > MaxTodos || len(s.OpenLoops) > MaxOpenLoops || len(s.Questions) > MaxQuestions || len(s.TimeSplit) > MaxTimeSplits || len(s.SourceIDs) > MaxSources {
 		return ErrInvalid
 	}
 	location, err := time.LoadLocation(s.Zone)
@@ -522,9 +529,12 @@ func (s Snapshot) Validate() error {
 			return ErrInvalid
 		}
 	}
-	for _, set := range [][]Todo{s.ConfirmedTodos, s.TodoCandidates} {
+	for _, set := range [][]Todo{s.ConfirmedTodos, s.TodoCandidates, s.DismissedTodos} {
 		for _, x := range set {
 			if !validID(x.ID) || !validText(x.Text, MaxTextBytes) || !validLinkedIDs(x.SourceIDs, indexed) {
+				return ErrInvalid
+			}
+			if x.TaskID != "" && (!x.Confirmed || !tasks.ValidID(x.TaskID)) {
 				return ErrInvalid
 			}
 		}
@@ -537,6 +547,16 @@ func (s Snapshot) Validate() error {
 	for _, x := range s.TodoCandidates {
 		if x.Confirmed {
 			return ErrInvalid
+		}
+	}
+	for i, x := range s.DismissedTodos {
+		if x.Confirmed || x.TaskID != "" {
+			return ErrInvalid
+		}
+		for j := 0; j < i; j++ {
+			if s.DismissedTodos[j].ID == x.ID {
+				return ErrInvalid
+			}
 		}
 	}
 	for _, x := range s.OpenLoops {
@@ -705,7 +725,7 @@ func validChangeOrigin(origin ChangeOrigin) bool {
 	return origin == "" || origin == ChangeOriginUser || origin == ChangeOriginActivity
 }
 func validEvidence(e Evidence) bool {
-	return validID(e.SourceID) && !e.At.IsZero() && validOptionalID(e.SubjectID) && validOptionalText(e.Subject) && validOptionalText(e.Change) && validChangeOrigin(e.ChangeOrigin) && validOptionalText(e.Todo) && validOptionalText(e.OpenLoop) && validMarker(e.TodoMarker) && !(e.TodoConfirmed && e.TodoDismissed)
+	return validID(e.SourceID) && !e.At.IsZero() && validOptionalID(e.SubjectID) && validOptionalText(e.Subject) && validOptionalText(e.Change) && validChangeOrigin(e.ChangeOrigin) && validOptionalText(e.Todo) && validOptionalText(e.OpenLoop) && validMarker(e.TodoMarker) && (!e.TodoConfirmed || !e.TodoDismissed)
 }
 func cloneEvidence(e Evidence) Evidence {
 	e.SourceID = strings.Clone(e.SourceID)

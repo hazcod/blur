@@ -105,21 +105,36 @@ already-open desktop store owner; its CLI process never opens the database.
 | Trigger hidden screenshot, OCR or network fallback | No screenshot, OCR, clipboard, keystroke, or hidden capture listener is wired. Note AI and Ask are separate explicit actions with bounded inputs; Ask uses loopback Ollama by default, while sending captured evidence to a remote compatible endpoint requires a separate persisted opt-in that is cleared when endpoint/model changes. Remote providers require HTTPS and user-authored notes are processed only when saved. Unavailable adapters return disabled/error states. | Local and remote model processes are separate trust boundaries and can retain request logs/model state. Remote providers may retain note and explicitly consented Ask requests under their own policies. Future changes could add paths; review and CI need to preserve explicit opt-in and no-fallback controls. |
 | Use dependency/native code to cross the cgo boundary | The runtime store graph uses bbolt and x/sys; cgo-disabled cross-builds and the repository audit reject selected Cgo files or `import "C"` in non-standard dependencies for shipped targets. The 2026-11-07 `govulncheck` run found no known vulnerabilities. | This does not establish supply-chain provenance, signed artifacts, license policy, JavaScript dependency posture, freshness of future advisory data, or future package safety. |
 
-## macOS App Sandbox (default)
+## macOS direct-download process boundary
 
-`make macos-app` (default `MACOS_SANDBOX=1`; `MACOS_SANDBOX=0` builds unsandboxed) signs the desktop app with the App Sandbox
-(`platform/macos/Blur.sandbox.entitlements`). It mitigates a compromised or
-buggy Blur process (or a hostile page/model output reaching it) reading or
-writing the rest of the user's home directory: the process is confined to its
-container (`~/Library/Containers/com.hazcod.blur`), outbound network is limited
-to the client entitlement, and only user-picked folders (sync) are otherwise
-writable. It does not weaken or replace the encrypted store, Keychain key, or
-local-API grant model, and it is not a defence against same-user processes that
-can already read the container. The sandbox does not remove the need for the
-macOS Accessibility (TCC) permission, which is still required for capture and
-is tied to the bundle ID and signing identity; Blur cannot grant it.
+Direct-download builds use `MACOS_SANDBOX=0`, including their Foundation Models
+helper. Apple lists assistive Accessibility APIs as incompatible with App
+Sandbox; sandboxed Terminal reads can fail despite granted Accessibility
+permission. This is documented in [Apple's sandbox guidance](https://developer.apple.com/documentation/security/protecting-user-data-with-app-sandbox)
+and [DTS's matching Terminal case](https://developer.apple.com/forums/thread/794253).
+The user approved the direct-download policy change on 2026-11-13.
 
-Residual risk: the entitlements carry a temporary exception,
+The app is no longer confined by App Sandbox: a compromised process can access
+ordinary files available to the user. macOS privacy controls, the encrypted
+store, Keychain key protection, redaction, exclusions and local-API grants still
+apply. Accessibility permission is still required, tied to the bundle ID and
+signing identity; Blur cannot grant it. Builds retain the exact certificate and
+designated requirement for an existing user app.
+
+Startup reuses an existing `~/Library/Containers/com.hazcod.blur/Data/Library/Application Support/Blur`
+directory in place so memory and settings survive the policy change. An
+unreadable or invalid existing container fails closed rather than opening a
+second database. Fresh installs without that directory use ordinary
+`~/Library/Application Support/Blur`. Desktop and MCP share the same resolver.
+No store copy or mtime-based replacement occurs during unsandboxed startup.
+Sandbox compatibility migration is gated by the running executable's signed
+entitlement, read with Security.framework; inherited environment variables or a
+container-shaped HOME cannot enable it. Unknown entitlement state does not
+authorize migration.
+
+Explicit `MACOS_SANDBOX=1` compatibility builds use
+`platform/macos/Blur.sandbox.entitlements`; cross-app AX capture remains
+unsupported in that configuration. Those entitlements carry a temporary exception,
 `com.apple.security.temporary-exception.files.home-relative-path.read-only`
 for `/Library/Application Support/Blur/` and `/Library/Logs/Blur/`, so a
 sandboxed launch can copy a pre-sandbox store into the container. Migration is
@@ -128,8 +143,7 @@ the container's (an unsandboxed run kept writing it) or the container has none,
 the legacy store and preferences replace the container copy through a temporary
 directory and atomic renames; legacy data is only read. While the exception is
 present a compromised process can read those two legacy locations, so it
-remains a development-build exception to remove once unsandboxed builds are no
-longer used.
+is restricted to the explicit compatibility configuration.
 
 `MACOS_SANDBOX_DEV_PATH` adds a second, developer-only exception,
 `com.apple.security.temporary-exception.files.absolute-path.read-write` for one

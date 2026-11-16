@@ -7,14 +7,45 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/localapi"
+	"github.com/hazcod/blur/internal/securestore"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/durable"
 )
+
+func TestReceiverPersistsRepeatedPageVisitWithoutDuplicatingText(t *testing.T) {
+	ctx := context.Background()
+	store, err := durable.OpenDurable(filepath.Join(t.TempDir(), "memory.db"), securestore.OfflineFixtureKey(), durable.CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(close func() error) { _ = close() }(store.Close)
+	first := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	visit := first.AddDate(0, 0, 2)
+	for _, at := range []time.Time{first, visit} {
+		r, _, wire := receiverFixture(t, at, true, &receiverSink{encrypted: true})
+		r.sink = store
+		if err := r.Accept(ctx, wire); err != nil {
+			t.Fatalf("authenticated repeated page rejected: %v", err)
+		}
+	}
+	page, err := store.ListObservationWindow(ctx, storage.ObservationWindowRequest{Start: visit, End: visit.Add(time.Hour), Limit: 5, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 1 || !page.CapturedAt[0].Equal(visit) {
+		t.Fatalf("Safari visit invisible: %+v %v", page, err)
+	}
+	all, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 5, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(all.Observations) != 1 || !all.CapturedAt[0].Equal(first) {
+		t.Fatalf("Safari text was duplicated or first capture lost: %+v %v", all, err)
+	}
+}
 
 type receiverSink struct {
 	mu        sync.Mutex
@@ -195,5 +226,83 @@ func TestReceiverPauseWaitsForInFlightEncryptedWrite(t *testing.T) {
 	<-paused
 	if err := r.Accept(context.Background(), wire); !errors.Is(err, ErrReceiverPaused) {
 		t.Fatalf("after pause: %v", err)
+	}
+}
+
+func TestReceiverPolicyRejectionPreventsPersistence(t *testing.T) {
+	sink := &receiverSink{encrypted: true}
+	r, _, wire := receiverFixture(t, time.Now().UTC(), true, sink)
+	var checked bool
+	r.policy = func(context.Context, capture.SanitizedObservation, func(context.Context) error) error {
+		checked = true
+		return ErrRejected
+	}
+	err := r.Accept(context.Background(), wire)
+	if !errors.Is(err, ErrRejected) || !checked || len(sink.rows) != 0 {
+		t.Fatalf("excluded Safari page persisted without scope check: checked=%t writes=%d err=%v", checked, len(sink.rows), err)
+	}
+}
+
+func TestReceiverRevalidatesChangedPolicyAfterPageRead(t *testing.T) {
+	now := time.Now().UTC()
+	sink := &receiverSink{encrypted: true}
+	r, _, wire := receiverFixture(t, now, true, sink)
+	read, proceed := make(chan struct{}), make(chan struct{})
+	r.clock = func() time.Time { close(read); <-proceed; return now }
+	var denied atomic.Bool
+	r.policy = func(ctx context.Context, _ capture.SanitizedObservation, write func(context.Context) error) error {
+		if denied.Load() {
+			return ErrRejected
+		}
+		return write(ctx)
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Accept(context.Background(), wire) }()
+	<-read
+	denied.Store(true)
+	close(proceed)
+	if err := <-done; !errors.Is(err, ErrRejected) || len(sink.rows) != 0 {
+		t.Fatalf("policy changed after read but old page persisted: %v", err)
+	}
+}
+
+type duplicatePolicySink struct{ writes, sightings int }
+
+func (*duplicatePolicySink) EncryptedAtRest() bool { return true }
+func (s *duplicatePolicySink) PutObservation(context.Context, capture.SanitizedObservation) error {
+	s.writes++
+	return &storage.StoreError{Code: storage.Duplicate}
+}
+func (s *duplicatePolicySink) RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error {
+	s.sightings++
+	return nil
+}
+
+func TestReceiverPolicyCoversDuplicateSightingAndCanceledCommit(t *testing.T) {
+	r, _, wire := receiverFixture(t, time.Now().UTC(), true, &receiverSink{encrypted: true})
+	sink := &duplicatePolicySink{}
+	r.sink = sink
+	var policyActive bool
+	r.policy = func(ctx context.Context, _ capture.SanitizedObservation, write func(context.Context) error) error {
+		policyActive = true
+		err := write(ctx)
+		if sink.writes != 1 || sink.sightings != 1 || !policyActive {
+			t.Fatal("sighting escaped guarded write callback")
+		}
+		policyActive = false
+		return err
+	}
+	if err := r.Accept(context.Background(), wire); err != nil {
+		t.Fatal(err)
+	}
+	r, _, wire = receiverFixture(t, time.Now().UTC(), true, &receiverSink{encrypted: true})
+	r.sink = sink
+	r.policy = func(ctx context.Context, _ capture.SanitizedObservation, write func(context.Context) error) error {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		return write(canceled)
+	}
+	if err := r.Accept(context.Background(), wire); !errors.Is(err, context.Canceled) || sink.writes != 1 || sink.sightings != 1 {
+		t.Fatal("canceled prewrite check persisted content or a sighting")
 	}
 }

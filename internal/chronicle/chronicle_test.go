@@ -79,8 +79,8 @@ func TestPackHourBoundsBytesWithoutTruncatingSources(t *testing.T) {
 		}
 	}
 	tooLarge := evidence(99, start, strings.Repeat("x", MaxEvidenceItemBytes+1))
-	if _, err := PackHour(Hour{Start: start, End: start.Add(time.Hour), Evidence: []Evidence{tooLarge}}); err == nil {
-		t.Fatal("oversized evidence item was accepted")
+	if packed, err := PackHour(Hour{Start: start, End: start.Add(time.Hour), Evidence: []Evidence{tooLarge}}); err != nil || len(packed.SourceIDs) != 1 || packed.SourceIDs[0] != tooLarge.Observation.ContentID() {
+		t.Fatalf("large saved source did not participate under its original identity: %+v, %v", packed, err)
 	}
 	tooMany := make([]Evidence, MaxEvidence+1)
 	for i := range tooMany {

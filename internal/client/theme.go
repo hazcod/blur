@@ -267,6 +267,7 @@ const (
 	styleQuickRow        = "interact-row"
 	styleQuickGroup      = "interact-group"
 	styleQuickHairline   = "interact-hairline"
+	styleMeetingAction   = "meeting-overlay-action"
 )
 
 // interactBackdropColor is the quick panel's graphite surface (the rail token).
@@ -301,6 +302,9 @@ func quickPanelRules(options modern.Options) []style.Rule {
 		text(styleQuickRow, q.ink, base+1),
 		text(styleQuickGroup, q.inkMuted, base-1),
 		style.Name(styleQuickHairline).BackgroundColor(q.hairline).BorderWidth(0).Radius(0),
+		style.Name(styleMeetingAction).BackgroundColor(surface).BorderColor(q.hairline).BorderWidth(1).Radius(6),
+		style.Name(styleMeetingAction).State(style.Hovered).BackgroundColor(mixColor(surface, q.ink, .08)),
+		style.Name(styleMeetingAction).State(style.Focused).BorderColor(q.amber),
 	}
 }
 

@@ -18,8 +18,7 @@ func NewWindowsPipeline(source *platformwindows.Adapter, limits Limits, exclusio
 	for i, profile := range profiles {
 		profileCopy[i] = AppProfile{AppID: strings.Clone(profile.AppID), IgnoreRoles: append([]string(nil), profile.IgnoreRoles...)}
 	}
-	exclusions.Apps = append([]string(nil), exclusions.Apps...)
-	exclusions.Domains = append([]string(nil), exclusions.Domains...)
+	exclusions = cloneExclusions(exclusions)
 	return Pipeline{
 		Source: source, Limits: limits, Exclusions: exclusions, Profiles: profileCopy,
 		Read: func(ctx context.Context, probe platform.CaptureProbe, limits Limits) (rawFrame, error) {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -51,10 +52,60 @@ func assertWindowsUserOnlyACL(t *testing.T, path string) {
 	if err != nil || user == nil || user.User.Sid == nil {
 		t.Fatalf("read current user SID: %v", err)
 	}
-	got, want := sd.String(), "D:P(A;OICI;FA;;;"+user.User.Sid.String()+")(A;OICI;FA;;;SY)"
-	index := strings.Index(got, "D:")
-	if index < 0 || got[index:] != want {
-		t.Fatalf("ACL for %q = %q, want protected current-user/system ACL %q", path, got, want)
+	owner, defaulted, err := sd.Owner()
+	if err != nil || defaulted || owner == nil || !owner.Equals(user.User.Sid) {
+		t.Fatalf("ACL for %q has an unexpected owner: %v", path, err)
+	}
+	control, _, err := sd.Control()
+	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+		t.Fatalf("ACL for %q is not protected: %v", path, err)
+	}
+	dacl, defaulted, err := sd.DACL()
+	if err != nil || defaulted || dacl == nil || dacl.AceCount != 2 {
+		t.Fatalf("ACL for %q must grant only the current user and SYSTEM: %v", path, err)
+	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenUser, seenSystem := false, false
+	for i := uint32(0); i < uint32(dacl.AceCount); i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, i, &ace); err != nil || ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask != windows.ACCESS_MASK(0x001f01ff) || ace.Header.AceFlags & ^byte(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE) != 0 {
+			t.Fatalf("ACL for %q contains an unexpected access grant: %v", path, err)
+		}
+		trustee := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		switch {
+		case trustee.Equals(user.User.Sid) && !seenUser:
+			seenUser = true
+		case trustee.Equals(system) && !seenSystem:
+			seenSystem = true
+		default:
+			t.Fatalf("ACL for %q has an unexpected or repeated trustee", path)
+		}
+	}
+	if !seenUser || !seenSystem {
+		t.Fatalf("ACL for %q omitted the current user or SYSTEM", path)
+	}
+}
+
+func TestWindowsPersistentLogReopenAppendsWithoutOverwriting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blur.log")
+	if err := os.WriteFile(path, []byte("previous\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := openWindowsPersistentLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("current\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "previous\ncurrent\n" {
+		t.Fatalf("reopened log = %q, err=%v", got, err)
 	}
 }
 

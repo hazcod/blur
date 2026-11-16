@@ -3,6 +3,7 @@
 package darwin
 
 import (
+	"runtime"
 	"strings"
 
 	"github.com/ebitengine/purego/objc"
@@ -11,6 +12,11 @@ import (
 const nsApplicationActivationPolicyRegular = 0
 
 func withAutoreleasePool(fn func()) {
+	// Cocoa's autorelease-pool stack is thread-local. Keep allocation, the
+	// entire body and the deferred drain on the same native thread even when
+	// the Go scheduler would otherwise migrate this goroutine.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(sel("alloc"))
 	pool = pool.Send(sel("init"))
 	if pool != 0 {

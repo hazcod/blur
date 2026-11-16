@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/model"
 	"github.com/hazcod/blur/internal/power"
 )
@@ -30,6 +31,12 @@ type SummaryRepository interface {
 type SummaryGenerator interface {
 	CountInputTokens(context.Context, Packed) (int, error)
 	Generate(context.Context, Packed, int) (Summary, error)
+}
+
+// summaryByteAdmission checks serialized text bounds before the provider's
+// tokenizer, whose own format validation may reject an oversized request.
+type summaryByteAdmission interface {
+	FitsRequestBytes(Packed) (bool, error)
 }
 
 type BackgroundPolicy interface {
@@ -62,6 +69,7 @@ type Worker struct {
 	activeChanged chan struct{}
 	logger        *slog.Logger
 	deferredLog   sync.Once
+	telemetry     workerTelemetry
 }
 
 func NewWorker(repository SummaryRepository, policy BackgroundPolicy, generator SummaryGenerator, config WorkerConfig) *Worker {
@@ -152,16 +160,46 @@ func (w *Worker) consume() {
 			if closed {
 				return
 			}
-			if _, found, err := w.repository.GetChronicle(w.ctx, job.packed.HourID); err == nil && found {
+			if existing, found, err := w.repository.GetChronicle(w.ctx, job.packed.HourID); err == nil && found && existing.InputReceipt == inputReceipt(job.packed) {
 				w.clearPending(job.packed.HourID)
 				continue
 			} else if err != nil {
 				w.logger.Warn("chronicle job skipped", "result", "existing_summary_check_failed")
+				w.recordAttempt(err)
 				w.clearPending(job.packed.HourID)
 				continue
 			}
-			if err := w.process(w.ctx, job.packed); err != nil && !errors.Is(err, context.Canceled) {
-				w.logJobError(err)
+			receipts := make(map[string]time.Time, len(job.packed.SourceIDs))
+			for {
+				err := w.processAttempt(model.WithBackgroundInferenceGroup(w.ctx, "recaps"), job.packed, receipts)
+				_, canRevalidate := w.repository.(summarySourceReader)
+				if errors.Is(err, model.ErrBackgroundPreempted) && !canRevalidate {
+					err = ErrWorkerUnavailable
+					w.recordAttempt(err)
+				}
+				if errors.Is(err, model.ErrBackgroundPreempted) && w.ctx.Err() == nil {
+					// Retain this bounded active job and its queued membership. A
+					// new attempt rechecks power, source receipts and cancellation.
+					w.mu.Lock()
+					w.telemetry.deferred++
+					w.mu.Unlock()
+					timer := time.NewTimer(250 * time.Millisecond)
+					select {
+					case <-w.ctx.Done():
+					case <-timer.C:
+					}
+					timer.Stop()
+					w.mu.Lock()
+					w.telemetry.deferred--
+					w.mu.Unlock()
+					if w.ctx.Err() == nil {
+						continue
+					}
+				}
+				if err != nil && w.ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+					w.logJobError(err)
+				}
+				break
 			}
 			w.clearPending(job.packed.HourID)
 		}
@@ -179,35 +217,45 @@ func (w *Worker) logJobError(err error) {
 		})
 		return
 	}
-	w.logger.Warn("chronicle job failed", "result", "failed")
+	w.logger.Warn("chronicle job failed", "result", "failed", "code", workerErrorCode(err))
 }
 
 func isProviderUnavailable(err error) bool {
-	return errors.Is(err, model.ErrOllamaUnavailable) || errors.Is(err, model.ErrCompatibleUnavailable)
+	return errors.Is(err, model.ErrOllamaUnavailable) || errors.Is(err, model.ErrAppleUnavailable) || errors.Is(err, model.ErrCompatibleUnavailable)
 }
 
 func (w *Worker) process(parent context.Context, packed Packed) error {
+	return w.processAttempt(parent, packed, nil)
+}
+
+func (w *Worker) processAttempt(parent context.Context, packed Packed, receipts map[string]time.Time) (result error) {
+	if w != nil {
+		w.mu.Lock()
+		w.telemetry.reason = ""
+		w.mu.Unlock()
+		defer func() { w.recordAttempt(result) }()
+	}
 	if err := parent.Err(); err != nil {
 		return err
 	}
 	if w == nil || !w.enabled() || !validPacked(packed) {
 		return ErrWorkerUnavailable
 	}
-	started := time.Now()
-	tokens, err := w.generator.CountInputTokens(parent, packed)
-	if err != nil {
+	input := inputReceipt(packed)
+	if receipts == nil {
+		receipts = make(map[string]time.Time, len(packed.SourceIDs))
+	}
+	if err := w.verifySources(parent, packed, receipts); err != nil {
 		return err
 	}
-	if tokens < 1 || tokens > MaxEvidenceBytes {
-		return ErrWorkerPolicy
-	}
+	started := time.Now()
 	effective, err := w.policy.Effective(parent)
 	if err != nil && !errors.Is(err, power.ErrSystemStateUnavailable) {
 		return err
 	}
 	// Unknown OS power is explicitly resolved by the policy controller to
 	// Balanced; any other policy/configuration error fails closed above.
-	if !effective.AllowBackgroundAI(power.LocalProvider, tokens+MaxChronicleOutputTokens, effective.MaxBackgroundDuration) {
+	if effective.MaxBackgroundAIJobs < 1 || effective.MaxBackgroundTokens <= MaxChronicleOutputTokens {
 		return ErrWorkerPolicy
 	}
 	budget := effective.MaxBackgroundDuration - time.Since(started)
@@ -217,6 +265,43 @@ func (w *Worker) process(parent context.Context, packed Packed) error {
 	ctx, cancel := context.WithTimeout(parent, budget)
 	stop := context.AfterFunc(w.ctx, cancel)
 	defer func() { stop(); cancel() }()
+	capacity, err := model.RuntimeContextLimit(ctx, w.generator, model.ContextTokenLimit)
+	if err != nil {
+		return err
+	}
+	inputLimit := min(MaxEvidenceBytes, effective.MaxBackgroundTokens-MaxChronicleOutputTokens, capacity-MaxChronicleOutputTokens-model.PromptTemplateReserve)
+	if inputLimit < 1 {
+		return ErrWorkerPolicy
+	}
+	for attempt := 0; ; attempt++ {
+		fitsBytes := true
+		if admission, ok := w.generator.(summaryByteAdmission); ok {
+			fitsBytes, err = admission.FitsRequestBytes(packed)
+			if err != nil {
+				return err
+			}
+		}
+		if fitsBytes {
+			tokens, err := w.generator.CountInputTokens(ctx, packed)
+			if err != nil {
+				return err
+			}
+			if tokens < 1 {
+				return ErrWorkerPolicy
+			}
+			if tokens <= inputLimit && effective.AllowBackgroundAI(power.LocalProvider, tokens+MaxChronicleOutputTokens, effective.MaxBackgroundDuration) {
+				break
+			}
+		}
+		if attempt+1 >= maxAdmissionCounts {
+			return ErrWorkerPolicy
+		}
+		var smaller bool
+		packed, smaller = shrinkPacked(packed)
+		if !smaller {
+			return ErrWorkerPolicy
+		}
+	}
 	release, err := w.acquire(ctx, effective.MaxBackgroundAIJobs)
 	if err != nil {
 		return err
@@ -229,9 +314,18 @@ func (w *Worker) process(parent context.Context, packed Packed) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	summary, err = applyCoverage(packed, summary)
+	if err != nil {
+		return err
+	}
 	if err := ValidateSummary(packed, summary); err != nil {
 		return err
 	}
+	if err := w.verifySources(ctx, packed, receipts); err != nil {
+		return err
+	}
+	summary.InputReceipt = input
+	summary.InputSourceIDs = append([]string(nil), packed.SourceIDs...)
 	if err := w.repository.PutChronicle(ctx, summary); err != nil {
 		return err
 	}
@@ -267,3 +361,50 @@ func (w *Worker) acquire(ctx context.Context, limit int) (func(), error) {
 }
 
 func (w *Worker) clearPending(id string) { w.mu.Lock(); delete(w.queued, id); w.mu.Unlock() }
+
+// Production repositories expose immutable sources. Retain saved-first clocks
+// separately from evidence visit clocks, so revisits remain valid while a
+// delete/recreate under the same content ID cannot resume an old packed job.
+type summarySourceReader interface {
+	GetObservationWithCaptureTime(context.Context, string) (capture.SanitizedObservation, time.Time, bool, error)
+}
+
+type summaryEvidenceReader interface {
+	GetSourceEvidenceWithCaptureTime(context.Context, string) (capture.Evidence, time.Time, bool, error)
+}
+
+func (w *Worker) verifySources(ctx context.Context, packed Packed, receipts map[string]time.Time) error {
+	reader, ok := w.repository.(summarySourceReader)
+	evidenceReader, generic := w.repository.(summaryEvidenceReader)
+	if !ok && !generic {
+		return nil
+	}
+	for _, id := range packed.SourceIDs {
+		var source capture.Evidence
+		var at time.Time
+		var found bool
+		var err error
+		if generic {
+			source, at, found, err = evidenceReader.GetSourceEvidenceWithCaptureTime(ctx, id)
+		} else {
+			var observation capture.SanitizedObservation
+			observation, at, found, err = reader.GetObservationWithCaptureTime(ctx, id)
+			if err == nil && found {
+				source, err = capture.ObservationEvidence(observation)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if !found || source.Validate() != nil || source.SourceID() != id || at.IsZero() {
+			return ErrWorkerUnavailable
+		}
+		if original, recorded := receipts[id]; recorded && !original.Equal(at) {
+			return ErrWorkerUnavailable
+		}
+		if receipts != nil {
+			receipts[id] = at
+		}
+	}
+	return ctx.Err()
+}

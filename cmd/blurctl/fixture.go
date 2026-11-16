@@ -65,7 +65,7 @@ func runFixture(args []string, out, errOut io.Writer) int {
 		_, _ = io.WriteString(errOut, "fixture store unavailable\n")
 		return 1
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	ctx := context.Background()
 	var value any
 	switch command {

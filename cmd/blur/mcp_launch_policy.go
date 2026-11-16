@@ -1,5 +1,11 @@
 package main
 
 func mcpLaunchAllowed(mcpOnly bool, args []string) bool {
-	return !mcpOnly || (len(args) == 2 && args[1] == "mcp")
+	if !mcpOnly {
+		return true
+	}
+	if len(args) != 2 {
+		return false
+	}
+	return args[1] == "mcp"
 }

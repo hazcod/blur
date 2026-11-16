@@ -48,6 +48,10 @@ func (l Limits) valid() bool {
 }
 
 type Exclusions struct {
+	// RequiredApps/RequiredDomains form an additional allowlist. When present,
+	// a target must satisfy this guard as well as the user's normal scope.
+	RequiredApps    []string
+	RequiredDomains []string
 	Apps            []string
 	Domains         []string
 	IncludedApps    []string
@@ -65,18 +69,26 @@ func NormalizeExclusions(exclusions Exclusions) (Exclusions, bool) {
 type ErrorCode string
 
 const (
-	InvalidLimits      ErrorCode = "invalid_limits"
-	InvalidExclusions  ErrorCode = "invalid_exclusions"
-	InvalidProfiles    ErrorCode = "invalid_profiles"
-	Unavailable        ErrorCode = "unavailable"
-	ProbeFailed        ErrorCode = "probe_failed"
-	Excluded           ErrorCode = "excluded"
-	InvalidProbe       ErrorCode = "invalid_probe"
-	ReadFailed         ErrorCode = "read_failed"
-	LimitExceeded      ErrorCode = "limit_exceeded"
-	Cancelled          ErrorCode = "cancelled"
-	TimedOut           ErrorCode = "timed_out"
-	InvalidObservation ErrorCode = "invalid_observation"
+	InvalidLimits            ErrorCode = "invalid_limits"
+	InvalidExclusions        ErrorCode = "invalid_exclusions"
+	InvalidProfiles          ErrorCode = "invalid_profiles"
+	Unavailable              ErrorCode = "unavailable"
+	PermissionRequired       ErrorCode = "permission_required"
+	ScreenPermissionRequired ErrorCode = "screen_permission_required"
+	ScreenTextUnavailable    ErrorCode = "screen_text_unavailable"
+	ScreenNotVisible         ErrorCode = "screen_not_visible"
+	BrowserUnavailable       ErrorCode = "browser_content_unavailable"
+	DomainUnknown            ErrorCode = "browser_domain_unknown"
+	NoContent                ErrorCode = "no_content"
+	UserIdle                 ErrorCode = "user_idle"
+	ProbeFailed              ErrorCode = "probe_failed"
+	Excluded                 ErrorCode = "excluded"
+	InvalidProbe             ErrorCode = "invalid_probe"
+	ReadFailed               ErrorCode = "read_failed"
+	LimitExceeded            ErrorCode = "limit_exceeded"
+	Cancelled                ErrorCode = "cancelled"
+	TimedOut                 ErrorCode = "timed_out"
+	InvalidObservation       ErrorCode = "invalid_observation"
 )
 
 type CaptureError struct {
@@ -89,10 +101,10 @@ func (e *CaptureError) Unwrap() error              { return e.cause }
 func captureError(code ErrorCode, err error) error { return &CaptureError{Code: code, cause: err} }
 func contextError(err error) error {
 	if errors.Is(err, context.Canceled) {
-		return captureError(Cancelled, context.Canceled)
+		return captureError(Cancelled, err)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return captureError(TimedOut, context.DeadlineExceeded)
+		return captureError(TimedOut, err)
 	}
 	return nil
 }
@@ -387,6 +399,9 @@ type rawFrame struct {
 	domain         string
 	domainKnown    bool
 	validateDomain func(context.Context, string) error
+	validate       func(context.Context) error
+	visual         func(context.Context, int, visualAdmission) (string, bool, error)
+	browserRegion  visualRegionVerifier
 }
 type rawNode struct {
 	role          string
@@ -404,6 +419,12 @@ type Pipeline struct {
 	Limits     Limits
 	Exclusions Exclusions
 	Profiles   []AppProfile
+	// CurrentExclusions rechecks live preferences at read and publication
+	// boundaries. Persistence must additionally linearize policy with its write.
+	CurrentExclusions func(context.Context) (Exclusions, error)
+	// VisualAdmission linearizes the final native acquisition with preference
+	// changes. The operation is bounded by the existing visual-stage context.
+	VisualAdmission func(context.Context, string, string, func(context.Context) error) error
 }
 
 func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
@@ -411,6 +432,7 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	if !p.Limits.valid() {
 		return empty, captureError(InvalidLimits, nil)
 	}
+	parent := ctx
 	exclusions, ok := canonicalExclusions(p.Exclusions)
 	if !ok {
 		return empty, captureError(InvalidExclusions, nil)
@@ -429,18 +451,43 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	if p.Source == nil || p.Read == nil {
 		return empty, captureError(ReadFailed, nil)
 	}
+	if p.CurrentExclusions != nil {
+		current, err := p.CurrentExclusions(ctx)
+		if err != nil {
+			return empty, captureError(Excluded, err)
+		}
+		exclusions, ok = canonicalExclusions(current)
+		if !ok {
+			return empty, captureError(InvalidExclusions, nil)
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, p.Limits.MaxDuration)
 	defer cancel()
 	report, err := p.Source.Capability(ctx)
 	if ce := contextError(ctx.Err()); ce != nil {
-		return empty, ce
+		return empty, contextError(contextualReadError(ReadStageCapability, ctx.Err()))
+	}
+	if err == nil && report.Validate() == nil && report.ID == "capture" && report.State == platform.PermissionRequired {
+		return empty, captureError(PermissionRequired, nil)
 	}
 	if err != nil || report.Validate() != nil || report.ID != "capture" || report.State != platform.Available {
 		return empty, captureError(Unavailable, nil)
 	}
+	if presence, ok := p.Source.(platform.CapturePresence); ok {
+		idle, err := presence.UserIdle(ctx)
+		if ce := contextError(ctx.Err()); ce != nil {
+			return empty, contextError(contextualReadError(ReadStagePresence, ctx.Err()))
+		}
+		if err != nil {
+			return empty, captureError(Unavailable, nil)
+		}
+		if idle {
+			return empty, captureError(UserIdle, nil)
+		}
+	}
 	probe, err := p.Source.Probe(ctx)
 	if ce := contextError(ctx.Err()); ce != nil {
-		return empty, ce
+		return empty, contextError(contextualReadError(ReadStageProbe, ctx.Err()))
 	}
 	if err != nil {
 		return empty, captureError(ProbeFailed, nil)
@@ -450,7 +497,7 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		return empty, captureError(InvalidProbe, nil)
 	}
 	browser := appidentity.IsBrowserApp(app)
-	domainPolicy := len(exclusions.Domains)+len(exclusions.IncludedDomains) > 0
+	domainPolicy := len(exclusions.Domains)+len(exclusions.IncludedDomains)+len(exclusions.RequiredDomains) > 0
 	mayDiscoverBrowserDomain := browser && domain == "" && domainPolicy
 	if probe.Secure || probe.Elevated || probe.Private || excluded(app, domain, exclusions) ||
 		(!included(app, domain, exclusions) && !mayDiscoverBrowserDomain) {
@@ -461,13 +508,19 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		defer frame.cleanup()
 	}
 	if ce := contextError(ctx.Err()); ce != nil {
+		if acquisitionErr := contextError(err); acquisitionErr != nil && errors.Is(err, ctx.Err()) && ReadIssueForError(acquisitionErr).Valid() {
+			return empty, acquisitionErr
+		}
 		return empty, ce
 	}
 	if err != nil {
 		if ce := contextError(err); ce != nil {
 			return empty, ce
 		}
-		return empty, captureError(ReadFailed, nil)
+		if errors.Is(err, errBrowserContentUnavailable) {
+			return empty, captureError(BrowserUnavailable, nil)
+		}
+		return empty, captureError(ReadFailed, err)
 	}
 	if frame.domainKnown {
 		domain, ok = normalizeDomain(frame.domain)
@@ -477,14 +530,45 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	} else if domain == "" {
 		domain, _ = normalizeDomain(probe.Domain)
 	}
-	if browser && domainPolicy && domain == "" || excluded(app, domain, exclusions) || !included(app, domain, exclusions) {
+	if browser && domainPolicy && domain == "" {
+		return empty, captureError(DomainUnknown, nil)
+	}
+	if excluded(app, domain, exclusions) || !included(app, domain, exclusions) {
 		return empty, captureError(Excluded, nil)
+	}
+	checkPolicy := func(checkCtx context.Context) error {
+		if err := checkCtx.Err(); err != nil {
+			return contextError(err)
+		}
+		if p.CurrentExclusions == nil {
+			return nil
+		}
+		current, err := p.CurrentExclusions(checkCtx)
+		if err != nil {
+			return captureError(Excluded, err)
+		}
+		if !TargetAllowed(current, app, domain) {
+			return captureError(Excluded, nil)
+		}
+		return nil
+	}
+	if err := checkPolicy(ctx); err != nil {
+		return empty, err
 	}
 	nodes, err := validateFrame(frame, p.Limits)
 	if err != nil {
 		return empty, captureError(LimitExceeded, nil)
 	}
+	if frame.validate != nil {
+		if err := frame.validate(ctx); err != nil {
+			if ce := contextError(err); ce != nil {
+				return empty, ce
+			}
+			return empty, captureError(Excluded, nil)
+		}
+	}
 	var b strings.Builder
+	visualFallbackNeeded := false
 	remaining := p.Limits.MaxBytes
 	for _, node := range nodes {
 		if ce := contextError(ctx.Err()); ce != nil {
@@ -493,7 +577,7 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		if node.sensitive || node.value == nil || ignoredAXRole(app, node.role, profiles) {
 			continue
 		}
-		if domainPolicy && frame.validateDomain != nil {
+		if (domainPolicy || frame.domainKnown) && frame.validateDomain != nil {
 			if err := frame.validateDomain(ctx, domain); err != nil {
 				if ce := contextError(err); ce != nil {
 					return empty, ce
@@ -503,14 +587,25 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		}
 		separator := 0
 		if b.Len() > 0 {
-			if remaining == 0 {
-				return empty, captureError(LimitExceeded, nil)
+			if remaining <= 1 {
+				// Keep validated content already read. Continuation owns any remaining
+				// text; reporting a read failure here discarded useful evidence.
+				frame.truncated = true
+				break
 			}
 			remaining--
 			separator = 1
 		}
 		value, readErr := node.value(ctx, remaining)
 		if ce := contextError(ctx.Err()); ce != nil {
+			if acquisitionErr := contextError(readErr); acquisitionErr != nil && errors.Is(readErr, ctx.Err()) && ReadIssueForError(acquisitionErr).Valid() {
+				issue := ReadIssueForError(acquisitionErr)
+				if frame.visual != nil && recoverableVisualAXTextIssue(issue) && parent.Err() == nil {
+					visualFallbackNeeded = true
+					break
+				}
+				return empty, acquisitionErr
+			}
 			return empty, ce
 		}
 		if errors.Is(readErr, errAXValueTruncated) {
@@ -518,9 +613,16 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 			readErr = nil
 		}
 		if readErr != nil {
-			return empty, captureError(ReadFailed, nil)
+			// A complete, policy-validated AX tree can still have unreadable text
+			// values in apps with flaky AX providers. The guarded visual path repeats
+			// the privacy/focus checks before OCR, so use it only for text-value errors.
+			if frame.visual != nil && recoverableVisualAXTextIssue(ReadIssueForError(readErr)) {
+				visualFallbackNeeded = true
+				break
+			}
+			return empty, captureError(ReadFailed, readErr)
 		}
-		if domainPolicy && frame.validateDomain != nil {
+		if (domainPolicy || frame.domainKnown) && frame.validateDomain != nil {
 			if err := frame.validateDomain(ctx, domain); err != nil {
 				if ce := contextError(err); ce != nil {
 					return empty, ce
@@ -543,6 +645,82 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		remaining -= len(value)
 		b.WriteString(value)
 	}
+	if frame.validate != nil {
+		if err := frame.validate(ctx); err != nil {
+			if ce := contextError(err); ce != nil {
+				return empty, ce
+			}
+			return empty, captureError(Excluded, nil)
+		}
+	}
+	if (strings.TrimSpace(b.String()) == "" || visualFallbackNeeded) && frame.visual != nil {
+		// Visual recognition is a separate bounded stage; never extend the AX
+		// deadline or detach the original caller's cancellation.
+		// Whole-window OCR would include browser tabs, URL paths and other chrome
+		// excluded by the verified AX WebArea reader. No pixel fallback until an
+		// exact page crop has equivalent authority.
+		if browser && frame.browserRegion == nil {
+			return empty, captureError(BrowserUnavailable, nil)
+		}
+		if !visualFrameSafe(frame, nodes) {
+			return empty, captureError(Excluded, nil)
+		}
+		visualCtx, visualCancel := context.WithTimeout(parent, MaxVisualDuration)
+		defer visualCancel()
+		ctx = visualCtx
+		verify := func() error {
+			if err := checkPolicy(ctx); err != nil {
+				return err
+			}
+			if err := frame.validate(ctx); err != nil {
+				if ce := contextError(err); ce != nil {
+					return ce
+				}
+				return captureError(Excluded, nil)
+			}
+			if frame.validateDomain != nil && (domainPolicy || frame.domainKnown) {
+				if err := frame.validateDomain(ctx, domain); err != nil {
+					if ce := contextError(err); ce != nil {
+						return ce
+					}
+					return captureError(Excluded, nil)
+				}
+			}
+			return nil
+		}
+		if err := verify(); err != nil {
+			return empty, err
+		}
+		admit := func(checkCtx context.Context, read func(context.Context) error) error {
+			if err := checkPolicy(checkCtx); err != nil {
+				return err
+			}
+			if p.VisualAdmission != nil {
+				return p.VisualAdmission(checkCtx, app, domain, read)
+			}
+			return read(checkCtx)
+		}
+		text, _, err := frame.visual(ctx, p.Limits.MaxBytes, admit)
+		if ce := contextError(ctx.Err()); ce != nil {
+			return empty, ce
+		}
+		if err != nil {
+			return empty, visualCaptureError(err)
+		}
+		if err := verify(); err != nil {
+			return empty, err
+		}
+		if !utf8.ValidString(text) || len(text) > p.Limits.MaxBytes {
+			return empty, captureError(LimitExceeded, nil)
+		}
+		b.Reset()
+		b.WriteString(text)
+		// OCR represents visible text only and can omit/misrecognize characters.
+		frame.truncated = true
+	}
+	if err := checkPolicy(ctx); err != nil {
+		return empty, err
+	}
 	observation, err := SanitizeObservation(app, domain, b.String(), p.Limits.MaxBytes)
 	if err != nil {
 		return empty, err
@@ -554,7 +732,14 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	if err := observation.Validate(); err != nil {
 		return empty, err
 	}
+	if strings.TrimSpace(observation.Text()) == "" {
+		return empty, captureError(NoContent, nil)
+	}
 	return observation, nil
+}
+
+func recoverableVisualAXTextIssue(issue ReadIssue) bool {
+	return issue.Stage == ReadStageText || issue.Stage == ReadStageRange
 }
 
 // A byte cap may bisect a redaction placeholder or leave a partial labelled
@@ -665,11 +850,25 @@ func canonicalExclusions(e Exclusions) (Exclusions, bool) {
 		}
 		out.IncludedDomains = append(out.IncludedDomains, domain)
 	}
+	for _, raw := range e.RequiredApps {
+		app, ok := normalizeAppID(raw)
+		if !ok || app == "" {
+			return Exclusions{}, false
+		}
+		out.RequiredApps = append(out.RequiredApps, app)
+	}
+	for _, raw := range e.RequiredDomains {
+		domain, ok := normalizeDomain(raw)
+		if !ok || domain == "" {
+			return Exclusions{}, false
+		}
+		out.RequiredDomains = append(out.RequiredDomains, domain)
+	}
 	return out, true
 }
 func identifier(s string) bool {
 	for _, r := range s {
-		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '.' && r != '-' && r != '_' {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '-' && r != '_' {
 			return false
 		}
 	}
@@ -692,6 +891,18 @@ func excluded(app, domain string, e Exclusions) bool {
 // included applies the positive allowlist only in default-disabled mode. A
 // matching app or domain is sufficient; deny rules are checked first.
 func included(app, domain string, e Exclusions) bool {
+	if len(e.RequiredApps)+len(e.RequiredDomains) > 0 {
+		admitted := false
+		for _, required := range e.RequiredApps {
+			admitted = admitted || app == required
+		}
+		for _, required := range e.RequiredDomains {
+			admitted = admitted || domain == required || strings.HasSuffix(domain, "."+required)
+		}
+		if !admitted {
+			return false
+		}
+	}
 	if !e.DefaultDisabled {
 		return true
 	}
@@ -774,4 +985,29 @@ func contentID(o SanitizedObservation) string {
 		h.Write(n[:])
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func cloneExclusions(e Exclusions) Exclusions {
+	e.Apps = append([]string(nil), e.Apps...)
+	e.Domains = append([]string(nil), e.Domains...)
+	e.IncludedApps = append([]string(nil), e.IncludedApps...)
+	e.IncludedDomains = append([]string(nil), e.IncludedDomains...)
+	e.RequiredApps = append([]string(nil), e.RequiredApps...)
+	e.RequiredDomains = append([]string(nil), e.RequiredDomains...)
+	return e
+}
+
+// MaxVisualDuration is separate from the 750ms Accessibility read budget.
+const MaxVisualDuration = 3 * time.Second
+
+func visualFrameSafe(frame rawFrame, nodes []*rawNode) bool {
+	if frame.truncated || frame.validate == nil || len(nodes) == 0 {
+		return false
+	}
+	for _, node := range nodes {
+		if node.sensitive || node.role == "" || node.role == "AXUnknown" {
+			return false
+		}
+	}
+	return true
 }

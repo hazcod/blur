@@ -92,7 +92,7 @@ func materializeTodayActivity(ctx context.Context, date, zoneName string, existi
 		}
 		label, groupValue := activityLabel(segment)
 		id := projectionID("subject", groupValue)
-		fmt.Fprintf(fingerprint, "%s\x00%s\x00%s\x00%d\x00", segment.ID, id, segment.WallStart.UTC().Format(time.RFC3339Nano), segment.Duration)
+		_, _ = fmt.Fprintf(fingerprint, "%s\x00%s\x00%s\x00%d\x00", segment.ID, id, segment.WallStart.UTC().Format(time.RFC3339Nano), segment.Duration)
 		for _, sourceID := range segment.SourceIDs {
 			sourceBuffer = append(sourceBuffer[:0], sourceID...)
 			_, _ = fingerprint.Write(sourceBuffer)
@@ -349,6 +349,8 @@ func displayAppName(appID string) string {
 		return "Slack"
 	case "com.apple.safari":
 		return "Safari"
+	case "com.kagi.kagimacos":
+		return "Orion"
 	case "com.google.chrome":
 		return "Chrome"
 	case "com.microsoft.vscode":
@@ -474,6 +476,7 @@ func resolveZoneName(tzEnv, localtimePath string, now time.Time) string {
 		}
 	}
 	if target, err := os.Readlink(localtimePath); err == nil {
+		target = strings.ReplaceAll(target, `\`, "/")
 		const marker = "zoneinfo/"
 		if i := strings.LastIndex(target, marker); i >= 0 {
 			if name := target[i+len(marker):]; name != "" && name != "Local" {

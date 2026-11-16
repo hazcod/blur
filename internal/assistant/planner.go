@@ -1,10 +1,12 @@
 package assistant
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/search"
 )
@@ -86,9 +88,10 @@ func startsWith(ws []word, seq ...string) bool {
 // exact-search terms, on top of questionStopWords.
 var planStopWords = map[string]struct{}{
 	"with": {}, "this": {}, "that": {}, "these": {}, "those": {}, "been": {}, "be": {}, "am": {}, "are": {}, "got": {}, "get": {},
-	"any": {}, "anything": {}, "something": {}, "nothing": {}, "yet": {}, "up": {}, "out": {}, "into": {}, "there": {},
+	"any": {}, "anything": {}, "something": {}, "nothing": {}, "yet": {}, "up": {}, "out": {}, "into": {}, "there": {}, "talking": {},
 	"than": {}, "then": {}, "some": {}, "just": {}, "also": {}, "app": {}, "site": {}, "website": {}, "so": {}, "far": {},
 	"today": {}, "yesterday": {}, "tonight": {}, "earlier": {}, "recently": {}, "lately": {}, "ago": {}, "now": {}, "currently": {},
+	"latest": {}, "newest": {}, "recent": {}, "current": {},
 	"moment": {}, "right": {}, "last": {}, "past": {}, "previous": {}, "morning": {}, "afternoon": {}, "evening": {},
 	"week": {}, "month": {}, "hour": {}, "hours": {}, "minute": {}, "minutes": {}, "day": {}, "days": {},
 	"time": {}, "spent": {}, "spend": {}, "long": {}, "much": {}, "many": {},
@@ -118,7 +121,8 @@ type appEntry struct{ id, name string }
 var builtinApps = map[string]appEntry{
 	"whatsapp": {"net.whatsapp.WhatsApp", "WhatsApp"}, "slack": {"com.tinyspeck.slackmacgap", "Slack"},
 	"safari": {"com.apple.Safari", "Safari"}, "chrome": {"com.google.Chrome", "Chrome"}, "google chrome": {"com.google.Chrome", "Chrome"},
-	"mail": {"com.apple.mail", "Mail"}, "apple mail": {"com.apple.mail", "Mail"},
+	"orion": {"com.kagi.kagimacos", "Orion"},
+	"mail":  {"com.apple.mail", "Mail"}, "apple mail": {"com.apple.mail", "Mail"},
 	"notes": {"com.apple.Notes", "Notes"}, "apple notes": {"com.apple.Notes", "Notes"},
 	"messages": {"com.apple.MobileSMS", "Messages"}, "imessage": {"com.apple.MobileSMS", "Messages"},
 	"telegram": {"ru.keepcoder.Telegram", "Telegram"}, "signal": {"org.whispersystems.signal-desktop", "Signal"},
@@ -442,6 +446,43 @@ func detectCaptureKind(ws []word) bool {
 	return false
 }
 
+// detectWholeDocumentRequest is deliberately explicit. Broadening ordinary
+// questions such as "what does this page say?" would make routine recall slow
+// and could join evidence from unrelated visits. Explicit summary requests and
+// clear "what is this page about?" requests expand to the whole source; detail
+// questions continue to retrieve matching passages.
+func detectWholeDocumentRequest(ws []word) bool {
+	summary := hasWord(ws,
+		"summarize", "summarise", "summary", "résume", "resume", "résumer", "resumer",
+		"overview", "recap", "gist", "takeaway", "takeaways", "breakdown", "walkthrough",
+	) || hasSeq(ws, "key", "points") || hasSeq(ws, "main", "idea") || hasSeq(ws, "main", "takeaway")
+	action := summary || hasWord(ws,
+		"analyze", "analyse", "analyser", "review", "explain", "describe", "outline",
+		"walk", "inspect", "digest",
+	)
+	complete := hasWord(ws, "whole", "entire", "full", "complete", "all", "everything", "entirety", "completely", "tout", "toute", "tous", "toutes")
+	document := hasWord(ws, "page", "webpage", "website", "site", "article", "document", "doc", "source", "file", "report", "transcript", "text", "content", "email", "thread", "conversation")
+	aboutSubject := hasWord(ws, "page", "webpage", "website", "site", "article", "document", "doc", "source", "file", "report", "text", "content")
+	aboutQuestion := aboutSubject && hasWord(ws, "what", "what's", "what’s") && hasWord(ws, "is", "was", "are", "were", "what's", "what’s") && hasWord(ws, "about")
+	if hasSeq(ws, "full", "path") && !summary {
+		return false // “full path” is a property request, not a whole-file request.
+	}
+	return document && (summary || action && (complete || hasWord(ws, "document", "doc", "page", "webpage", "article", "source", "file", "report", "transcript", "email", "thread", "conversation")) || aboutQuestion)
+}
+
+func isWholeDocumentGrammarWord(word string) bool {
+	switch word {
+	case "summarize", "summarise", "summary", "résume", "resume", "résumer", "resumer",
+		"analyze", "analyse", "analyser", "review", "explain", "describe", "outline",
+		"overview", "recap", "gist", "takeaway", "takeaways", "breakdown", "walkthrough", "key", "point", "points", "idea", "walk", "inspect", "digest", "captured",
+		"whole", "entire", "full", "complete", "all", "everything", "entirety", "completely", "tout", "toute", "tous", "toutes",
+		"page", "webpage", "website", "site", "article", "document", "doc", "source", "file", "report", "transcript", "text", "content", "email", "thread", "conversation":
+		return true
+	default:
+		return false
+	}
+}
+
 func detectRecapPattern(ws []word) bool {
 	for _, who := range []string{"i", "we"} {
 		switch {
@@ -454,13 +495,99 @@ func detectRecapPattern(ws []word) bool {
 	return hasSeq(ws, "what", "happened") || (startsWith(ws, "how", "was", "my") && hasWord(ws, "day", "morning", "afternoon", "week", "evening"))
 }
 
+// detectOutstandingSubject recognizes project-scoped follow-up questions that
+// ask for unresolved work, so they retrieve saved project knowledge and open
+// tasks instead of treating the intent word as a search topic.
+func detectOutstandingSubject(ws []word) string {
+	prefixes := [][]string{
+		{"what's", "outstanding", "for"}, {"what’s", "outstanding", "for"}, {"whats", "outstanding", "for"}, {"what", "is", "outstanding", "for"},
+		{"what's", "outstanding", "with"}, {"what’s", "outstanding", "with"}, {"whats", "outstanding", "with"}, {"what", "is", "outstanding", "with"},
+		{"what's", "outstanding", "on"}, {"what’s", "outstanding", "on"}, {"whats", "outstanding", "on"}, {"what", "is", "outstanding", "on"},
+		{"what", "is", "outstanding", "at"}, {"what", "are", "outstanding", "for"}, {"what", "are", "outstanding", "with"},
+		{"what", "are", "outstanding", "on"}, {"what", "are", "outstanding", "at"}, {"what", "remains", "outstanding", "for"},
+		{"what", "are", "the", "outstanding", "items", "for"}, {"what", "is", "still", "pending", "with"},
+		{"anything", "left", "to", "do", "for"}, {"anything", "still", "open", "for"},
+		{"anything", "outstanding", "for"}, {"any", "outstanding", "items", "for"},
+		{"what", "follow", "ups", "are", "still", "open", "for"}, {"what", "follow", "ups", "are", "open", "for"},
+		{"what", "do", "i", "still", "owe"}, {"what", "do", "we", "still", "owe"},
+		{"what", "do", "i", "owe"}, {"what", "do", "we", "owe"},
+		{"what", "are", "we", "waiting", "for", "from"}, {"what", "are", "we", "waiting", "on", "from"}, {"what", "are", "we", "still", "waiting", "on", "from"},
+		{"what", "are", "we", "still", "waiting", "for", "from"}, {"what", "am", "i", "waiting", "for", "from"},
+		{"where", "did", "we", "leave", "things", "with"}, {"where", "did", "i", "leave", "things", "with"},
+		{"what's", "still", "open", "for"}, {"what’s", "still", "open", "for"}, {"whats", "still", "open", "for"},
+		{"what", "is", "still", "open", "for"}, {"what", "is", "left", "for"},
+		{"what", "is", "left", "to", "do", "for"}, {"what", "remains", "for"},
+		{"what", "remains", "to", "do", "for"}, {"what", "still", "needs", "doing", "for"},
+		{"what", "do", "i", "need", "to", "do", "for"}, {"what", "should", "i", "do", "for"},
+		{"what", "do", "i", "have", "to", "do", "for"}, {"what", "do", "i", "still", "need", "to", "do", "for"},
+		{"what", "have", "i", "got", "to", "do", "for"},
+		{"what", "should", "we", "do", "for"}, {"what", "do", "we", "need", "to", "do", "for"},
+		{"what", "are", "the", "next", "steps", "for"},
+		{"what's", "on", "my", "plate", "for"}, {"what’s", "on", "my", "plate", "for"}, {"whats", "on", "my", "plate", "for"},
+		{"what", "is", "on", "my", "plate", "for"}, {"what", "tasks", "do", "i", "have", "for"},
+		{"what", "are", "my", "tasks", "for"}, {"which", "tasks", "are", "still", "open", "for"},
+		{"any", "pending", "work", "for"}, {"what's", "the", "next", "step", "for"}, {"what’s", "the", "next", "step", "for"},
+		{"whats", "the", "next", "step", "for"}, {"what", "is", "the", "next", "step", "for"},
+		{"what", "needs", "follow", "up", "for"}, {"what", "are", "the", "open", "items", "for"},
+		{"what", "are", "we", "waiting", "on", "for"}, {"what", "is", "pending", "for"},
+		{"any", "blockers", "for"}, {"what", "are", "the", "blockers", "for"},
+		{"what", "still", "needs", "attention", "for"},
+	}
+	for _, prefix := range prefixes {
+		if startsWith(ws, prefix...) && len(ws) > len(prefix) {
+			return strings.TrimSpace(strings.Join(wordStrings(ws[len(prefix):]), " "))
+		}
+	}
+	// Keep project open-work recognition tolerant of ordinary paraphrases.
+	// Searching a fixed list of complete sentence prefixes sent phrases like
+	// “open loops”, “what's on the table”, and “what are we blocked on” through
+	// general capture search, where an unrelated sign-in page could win.
+	for i := len(ws) - 1; i > 0; i-- {
+		switch ws[i].s {
+		case "for", "with", "on", "from", "at":
+		default:
+			continue
+		}
+		if i == len(ws)-1 {
+			continue
+		}
+		prefix, subject := ws[:i], ws[i+1:]
+		if hasOutstandingCue(prefix) && !hasSeq(ws, "open", "source") && !hasWord(ws, "balance", "balances", "invoice", "invoices", "payment", "payments", "bill", "bills", "debt", "amount") {
+			return strings.TrimSpace(strings.Join(wordStrings(subject), " "))
+		}
+	}
+	return ""
+}
+
+func hasOutstandingCue(ws []word) bool {
+	return hasWord(ws, "open", "outstanding", "pending", "remaining", "remain", "left", "unresolved", "blocked", "blocker", "blockers") ||
+		hasSeq(ws, "open", "loop") || hasSeq(ws, "open", "loops") ||
+		hasSeq(ws, "next", "step") || hasSeq(ws, "next", "steps") ||
+		hasSeq(ws, "follow", "up") || hasSeq(ws, "follow", "ups") ||
+		hasSeq(ws, "on", "my", "plate") || hasSeq(ws, "on", "the", "table") ||
+		hasSeq(ws, "have", "to", "do") || hasSeq(ws, "need", "to", "do") ||
+		hasWord(ws, "owe") || hasSeq(ws, "waiting", "for") || hasSeq(ws, "waiting", "on")
+}
+
+func wordStrings(ws []word) []string {
+	words := make([]string, len(ws))
+	for i, w := range ws {
+		words[i] = w.s
+	}
+	return words
+}
+
+func IsOutstandingQuestion(question string) bool {
+	return detectOutstandingSubject(splitWords(question)) != ""
+}
+
 func hasSummaryWord(ws []word) bool {
 	return hasWord(ws, "recap", "summary", "summarize", "summarise", "summarized", "summarised")
 }
 
 // entityPrefixes introduce a question about a person, project, or thing.
 var entityPrefixes = [][]string{
-	{"who", "is"}, {"who", "s"}, {"who's"}, {"who", "are"}, {"what", "do", "you", "know", "about"},
+	{"what", "or", "who", "is"}, {"who", "is"}, {"who", "s"}, {"who's"}, {"who", "are"}, {"what", "do", "you", "know", "about"},
 	{"what", "do", "you", "remember", "about"}, {"tell", "me", "about"}, {"do", "you", "know"}, {"do", "you", "remember"},
 }
 
@@ -475,11 +602,226 @@ func detectEntity(q string, ws []word) string {
 	return ""
 }
 
+// factualPossessiveSubject keeps a named subject separate from the attribute
+// being asked about. A saved fact about Mira can ground "Mira's deadline"
+// without already containing that deadline. The probe still requires the
+// subject to match local evidence and keeps the complete original question.
+func factualPossessiveSubject(q string, ws []word) string {
+	subject, _ := factualPossessiveSubjectAndAttribute(q, ws)
+	return subject
+}
+
+func factualPossessiveSubjectAndAttribute(q string, ws []word) (string, string) {
+	for _, prefix := range [][]string{
+		{"what", "is"}, {"what", "are"}, {"what's"}, {"what’s"},
+		{"who", "is"}, {"who", "are"}, {"who's"}, {"who’s"},
+		{"when", "is"}, {"when", "are"}, {"when's"}, {"when’s"},
+		{"where", "is"}, {"where", "are"}, {"where's"}, {"where’s"},
+	} {
+		if !startsWith(ws, prefix...) {
+			continue
+		}
+		start := len(prefix)
+		// Bound the subject to four words, and require an attribute after it.
+		for i := start; i < len(ws)-1 && i < start+4; i++ {
+			for _, suffix := range []string{"'s", "’s"} {
+				if !strings.HasSuffix(ws[i].s, suffix) {
+					continue
+				}
+				subject := strings.TrimSpace(q[ws[start].start : ws[i].end-len(suffix)])
+				if len(subject) <= 128 && strings.ContainsFunc(subject, unicode.IsLetter) {
+					attribute := strings.TrimSpace(q[ws[i].end:ws[len(ws)-1].end])
+					return subject, attribute
+				}
+				return "", ""
+			}
+		}
+		return "", ""
+	}
+	return "", ""
+}
+
+var namedAttributeSynonymGroups = [][]string{
+	{"deployment", "deploy", "rollout", "release", "launch"},
+	{"deadline", "due", "date", "target", "schedule", "scheduled", "timeline", "planned", "planning", "today", "tomorrow", "tonight", "week", "month", "year", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"},
+	{"owner", "own", "owns", "responsible", "responsibility", "lead", "leads", "leader", "manager", "handles"},
+	{"job", "occupation", "role", "title", "position", "profession", "leader", "lead", "leads", "manager", "supervisor"},
+	{"team", "group", "squad", "department", "organization", "org"},
+}
+
+func namedAttributeIsUnsupported(question string, evidence []Evidence) bool {
+	subject, attribute := factualPossessiveSubjectAndAttribute(question, splitWords(question))
+	if attribute == "" {
+		return false
+	}
+	terms, err := planTerms(attribute, nil, false)
+	if err != nil || len(terms) == 0 {
+		return false
+	}
+	for _, item := range evidence {
+		for _, statement := range namedAttributeStatements(item.Text) {
+			statementTerms := make(map[string]struct{})
+			for _, token := range splitWords(statement) {
+				statementTerms[token.s] = struct{}{}
+			}
+			if !evidenceContainsSubject(statementTerms, subject) {
+				continue
+			}
+			checkedGroups := make(map[string]struct{})
+			allMatched := true
+			for _, term := range terms {
+				group := namedAttributeSynonyms(term)
+				key := group[0]
+				if _, checked := checkedGroups[key]; checked {
+					continue
+				}
+				checkedGroups[key] = struct{}{}
+				matched := false
+				for _, synonym := range group {
+					if _, ok := statementTerms[synonym]; ok {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					allMatched = false
+					break
+				}
+			}
+			if allMatched {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func namedAttributeMissingCopy(question string) string {
+	subject, attribute := factualPossessiveSubjectAndAttribute(question, splitWords(question))
+	if subject == "" || attribute == "" {
+		return InsufficientEvidenceText
+	}
+	return "I found related information about " + subject + ", but not the " + attribute + "."
+}
+
+func namedAttributeSynonyms(term string) []string {
+	for _, synonyms := range namedAttributeSynonymGroups {
+		if slices.Contains(synonyms, term) {
+			return synonyms
+		}
+	}
+	return []string{term}
+}
+
+func evidenceContainsSubject(terms map[string]struct{}, subject string) bool {
+	for _, subjectTerm := range splitWords(subject) {
+		if _, ok := terms[subjectTerm.s]; ok {
+			continue
+		}
+		if _, ok := terms[subjectTerm.s+"'s"]; !ok {
+			if _, ok := terms[subjectTerm.s+"’s"]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func namedAttributeStatements(text string) []string {
+	var statements []string
+	start := 0
+	for offset, r := range text {
+		width := utf8.RuneLen(r)
+		boundary := r == '?' || r == '!' || r == ';' || r == '\n' || r == '\r'
+		if r == '.' {
+			next := offset + width
+			if next == len(text) {
+				boundary = true
+			} else {
+				nextRune, _ := utf8.DecodeRuneInString(text[next:])
+				boundary = unicode.IsSpace(nextRune)
+			}
+		}
+		if boundary {
+			if statement := strings.TrimSpace(text[start:offset]); statement != "" {
+				statements = append(statements, statement)
+			}
+			start = offset + width
+		}
+	}
+	if statement := strings.TrimSpace(text[start:]); statement != "" {
+		statements = append(statements, statement)
+	}
+	return statements
+}
+
+// memoryLookupCandidate does not change the general plan unless local
+// retrieval actually finds evidence. It never turns a request to write or
+// explain something into a memory lookup.
+func memoryLookupCandidate(plan Plan, apps []KnownApp) (Plan, bool) {
+	if IsCreationRequest(plan.Question) {
+		return Plan{}, false
+	}
+	ws := splitWords(plan.Question)
+	subject := factualPossessiveSubject(plan.Question, ws)
+	if subject == "" {
+		subject = detectEntity(plan.Question, ws)
+	}
+	if subject == "" {
+		for _, prefix := range [][]string{{"what", "or", "who", "is"}, {"who", "or", "what", "is"}, {"what", "is"}, {"what", "s"}, {"what's"}, {"what", "are"}} {
+			if startsWith(ws, prefix...) && len(ws) > len(prefix) {
+				subject = plan.Question[ws[len(prefix)].start:ws[len(ws)-1].end]
+				break
+			}
+		}
+	}
+	kind := KindEntity
+	if subject == "" && len(ws) > 0 && len(ws) <= 4 {
+		if !hasWord(ws, "what", "who", "how", "why", "when", "where", "can", "could", "should", "do", "does", "did", "is", "are") {
+			subject = plan.Question
+			// A bare topic phrase such as "latest security news" asks for
+			// matching history; it is not a Library entity name.
+			kind = KindLookup
+		}
+	}
+	if subject == "" && len(ws) > 0 {
+		// Factual questions can name a project without saying "my". Probe
+		// their topic locally; finding no evidence preserves the general route.
+		switch ws[0].s {
+		case "what", "who", "which", "where", "when", "why", "how":
+			subject, kind = plan.Question, KindLookup
+		}
+	}
+	if !strings.ContainsFunc(subject, unicode.IsLetter) {
+		return Plan{}, false
+	}
+	_, _, _, consumed := matchApps(plan.Question, ws, apps)
+	terms, err := planTerms(subject, consumed, !plan.Scope.IsZero())
+	if err != nil || len(terms) == 0 {
+		return Plan{}, false
+	}
+	meaningful := false
+	for _, term := range terms {
+		meaningful = meaningful || strings.ContainsFunc(term, unicode.IsLetter)
+	}
+	if !meaningful {
+		return Plan{}, false
+	}
+	plan.Kind, plan.Terms, plan.MatchOnly = kind, terms, true
+	if kind == KindEntity {
+		plan.Entity = truncateUTF8(strings.TrimSpace(subject), 128)
+	}
+	return plan, true
+}
+
 // IsFollowUp reports whether a question reads as a short continuation of the
 // previous one ("and in Slack?", "what about yesterday?", "who said that?")
 // rather than a fresh question, so the service may inherit scope and apps
 // from the previous turn.
 func IsFollowUp(question string) bool {
+	if IsGroundedFollowUp(question) {
+		return true
+	}
 	ws := splitWords(strings.TrimSpace(question))
 	if len(ws) == 0 || len(ws) > 8 {
 		return false
@@ -510,12 +852,100 @@ func IsFollowUp(question string) bool {
 	return len(ws) <= 6 && hasWord(ws, "it", "that", "those", "them", "they", "he", "she", "there")
 }
 
+// IsGroundedFollowUp recognises bounded references to the preceding answer.
+// Explicit new text or a new named subject must keep its own request route.
+func IsGroundedFollowUp(question string) bool {
+	return classifyGroundedFollowup(question) != followupNone
+}
+
+type groundedFollowupKind uint8
+
+const (
+	followupNone groundedFollowupKind = iota
+	followupAnswer
+	followupSubject
+)
+
+func classifyGroundedFollowup(question string) groundedFollowupKind {
+	q := strings.TrimRight(strings.TrimSpace(question), ".!?")
+	if strings.ContainsAny(q, ":\n\r;\"?!") {
+		return followupNone
+	}
+	// Dots inside domains, decimal numbers, or abbreviations are topic
+	// content. A dot separating words starts new supplied content instead.
+	runes := []rune(q)
+	for i, r := range runes {
+		if r == '.' && (i == 0 || i+1 == len(runes) || (!unicode.IsLetter(runes[i-1]) && !unicode.IsDigit(runes[i-1])) || (!unicode.IsLetter(runes[i+1]) && !unicode.IsDigit(runes[i+1]))) {
+			return followupNone
+		}
+	}
+	q = strings.ToLower(strings.Join(strings.Fields(q), " "))
+	for _, prefix := range []string{"and ", "also ", "then ", "please ", "can you ", "could you ", "would you ", "please "} {
+		q = strings.TrimSpace(strings.TrimPrefix(q, prefix))
+	}
+	ws := splitWords(q)
+	if len(ws) == 0 || len(ws) > 12 {
+		return followupNone
+	}
+	// A short attribute continuation can omit the question words: "and his
+	// email" still refers to the previously established person or project.
+	if len(ws) >= 2 && len(ws) <= 5 && (ws[0].s == "his" || ws[0].s == "her" || ws[0].s == "their" || ws[0].s == "its") &&
+		!hasWord(ws, "save", "delete", "remove", "send", "schedule", "create", "cancel", "complete", "run", "open", "launch", "publish", "buy", "pay") {
+		return followupSubject
+	}
+	// A transformation verb plus an answer reference carries arbitrary style
+	// vocabulary. Bounded predicates avoid an ever-growing adjective list.
+	if startsWith(ws, "make") {
+		objectEnd := 0
+		for _, object := range [][]string{{"make", "it"}, {"make", "that"}, {"make", "this"}, {"make", "your", "answer"}, {"make", "the", "answer"}} {
+			if startsWith(ws, object...) {
+				objectEnd = len(object)
+				break
+			}
+		}
+		if objectEnd > 0 && len(ws) > objectEnd && len(ws)-objectEnd <= 6 && !hasWord(ws[objectEnd:], "save", "store", "note", "notes", "task", "tasks", "reminder", "reminders", "schedule", "send", "delete", "remove", "forget", "remember", "capture", "click", "open", "launch", "quit", "restart", "upload", "publish", "execute", "run", "call", "buy", "pay", "happen", "here") {
+			return followupAnswer
+		}
+		return followupNone
+	}
+	for _, prefix := range [][]string{
+		{"summarize", "that"}, {"summarise", "that"}, {"summarize", "it"}, {"summarise", "it"}, {"summarize", "this"}, {"summarise", "this"},
+		{"explain", "that"}, {"explain", "it"}, {"explain", "this"}, {"explain", "your", "answer"},
+		{"rewrite", "that"}, {"rewrite", "it"}, {"rephrase", "that"}, {"rephrase", "it"},
+		{"what", "does", "that", "mean"}, {"what", "does", "it", "mean"},
+		{"who", "said", "that"}, {"where", "did", "that", "come", "from"},
+		{"what", "are", "the", "sources"}, {"show", "the", "sources"},
+	} {
+		if startsWith(ws, prefix...) {
+			// A new noun after a demonstrative is not an answer reference:
+			// "Explain that compiler error" is its own request.
+			if (prefix[0] == "explain" || prefix[0] == "summarize" || prefix[0] == "summarise" || prefix[0] == "rewrite" || prefix[0] == "rephrase") && len(prefix) == 2 && len(ws) > 2 {
+				switch ws[2].s {
+				case "in", "with", "more", "again", "briefly", "simply", "as", "for", "using":
+				default:
+					return followupNone
+				}
+			}
+			return followupAnswer
+		}
+	}
+	// Personal pronouns are references only in a factual question. This does
+	// not capture independent writing requests such as "write her a poem".
+	if startsWith(ws, "what") || startsWith(ws, "who") || startsWith(ws, "when") || startsWith(ws, "where") || startsWith(ws, "why") || startsWith(ws, "how") {
+		if hasWord(ws, "she", "he", "her", "his", "their", "they", "them") {
+			return followupSubject
+		}
+	}
+	return followupNone
+}
+
 func planTerms(q string, consumed map[string]struct{}, scopeFound bool) ([]string, error) {
 	terms, err := search.NormalizeTokens(q, MaxQuestionBytes)
 	if err != nil {
 		return nil, ErrContext
 	}
 	var out []string
+	var sourceTypeTerms []string
 	for _, term := range terms {
 		if _, stop := questionStopWords[term]; stop {
 			continue
@@ -526,6 +956,13 @@ func planTerms(q string, consumed map[string]struct{}, scopeFound bool) ([]strin
 		if _, used := consumed[term]; used {
 			continue
 		}
+		// A source-type noun such as "email" is a useful fallback for a
+		// source-only question, but it should not become a required exact
+		// token when the user also supplied the real topic ("integrity emails").
+		if term == "email" || term == "emails" {
+			sourceTypeTerms = append(sourceTypeTerms, term)
+			continue
+		}
 		if _, day := weekdayWords[term]; day && scopeFound {
 			continue
 		}
@@ -533,6 +970,9 @@ func planTerms(q string, consumed map[string]struct{}, scopeFound bool) ([]strin
 		if len(out) == search.MaxTerms {
 			break
 		}
+	}
+	if len(out) == 0 {
+		out = sourceTypeTerms
 	}
 	return out, nil
 }

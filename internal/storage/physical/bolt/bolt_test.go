@@ -439,7 +439,7 @@ func TestCloseAndReopenPreservesCommittedOpaqueBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() after Close() error = %v", err)
 	}
-	defer reopened.Close()
+	defer func(close func() error) { _ = close() }(reopened.Close)
 	if err := reopened.View(context.Background(), func(tx Reader) error {
 		value, found, err := tx.Get([]byte("reopen-key"))
 		if err != nil || !found || !bytes.Equal(value, []byte{0x00, 0x80, 0xff}) {
@@ -514,9 +514,92 @@ func TestTransactionsValidateAndBoundOpaqueInputs(t *testing.T) {
 	}
 }
 
+func TestTransactionBudgetClassification(t *testing.T) {
+	db, _ := openTestDB(t)
+	if err := db.View(context.Background(), func(tx Reader) error {
+		for n := 0; n <= MaxTransactionOps; n++ {
+			if _, _, err := tx.Get([]byte("missing")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); !errors.Is(err, ErrBudget) || !errors.Is(err, ErrInvalidTx) {
+		t.Fatal("budget outcome was not preserved", err)
+	}
+	if err := db.Update(context.Background(), func(tx Writer) error { return tx.Put(nil, []byte("invalid")) }); !errors.Is(err, ErrInvalidTx) || errors.Is(err, ErrBudget) {
+		t.Fatal("malformed operation was treated as budget exhaustion", err)
+	}
+}
+
+func TestLargeReadBudgetPreservesByteAndWriteLimits(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	if err := db.ViewWithReadLimit(ctx, MaxReadTransactionOps, func(reader Reader) error {
+		for i := 0; i < 1500; i++ {
+			if _, _, err := reader.Get([]byte("missing")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal("month metadata scan was rejected", err)
+	}
+	if err := db.ViewWithReadLimit(ctx, MaxReadTransactionOps, func(reader Reader) error {
+		for i := 0; i <= MaxReadTransactionOps; i++ {
+			if _, _, err := reader.Get([]byte("missing")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); !errors.Is(err, ErrBudget) {
+		t.Fatal("large read exceeded its operation ceiling", err)
+	}
+	if err := db.Update(ctx, func(writer Writer) error {
+		for i := 0; i <= MaxTransactionOps; i++ {
+			if _, err := writer.Has([]byte("missing")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); !errors.Is(err, ErrBudget) {
+		t.Fatal("read budget expanded a write transaction", err)
+	}
+	if err := db.Update(ctx, func(writer Writer) error {
+		return writer.Put([]byte("large"), bytes.Repeat([]byte{'x'}, MaxValueBytes))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ViewWithReadLimit(ctx, MaxReadTransactionOps, func(reader Reader) error {
+		for i := 0; i < 4; i++ {
+			value, _, err := reader.Get([]byte("large"))
+			clear(value)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}); !errors.Is(err, ErrBudget) {
+		t.Fatal("large read exceeded its byte ceiling", err)
+	}
+	if err := db.ViewWithReadLimit(ctx, MaxReadTransactionOps+1, func(Reader) error { return nil }); !errors.Is(err, ErrInvalid) {
+		t.Fatal("unbounded read admitted", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	if err := db.ViewWithReadLimit(canceled, MaxReadTransactionOps, func(reader Reader) error {
+		if _, _, err := reader.Get([]byte("missing")); err != nil {
+			return err
+		}
+		cancel()
+		_, _, err := reader.Get([]byte("missing"))
+		return err
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatal("in-flight metadata read ignored cancellation", err)
+	}
+}
+
 func TestTransactionsRejectNilContextAndClosedDatabase(t *testing.T) {
 	db, _ := openTestDB(t)
-	if err := db.View(nil, func(Reader) error { return nil }); !errors.Is(err, ErrInvalid) {
+	if err := db.View(nil, func(Reader) error { return nil }); !errors.Is(err, ErrInvalid) { //nolint:staticcheck // Exercise the API contract for a nil context.
 		t.Fatalf("View(nil context) error = %v, want ErrInvalid", err)
 	}
 	if err := db.Update(context.Background(), nil); !errors.Is(err, ErrInvalid) {
@@ -655,7 +738,7 @@ func TestCrashRecoveryReturnsOnlyStateBeforeOrAfterCommit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open() after crash recovery error = %v", err)
 			}
-			defer recovered.Close()
+			defer func(close func() error) { _ = close() }(recovered.Close)
 			wantCommitted := phase == "after"
 			if err := recovered.View(context.Background(), func(tx Reader) error {
 				value, found, err := tx.Get([]byte("crash-key"))
@@ -691,7 +774,7 @@ func TestCrashWorker(t *testing.T) {
 				fmt.Fprintln(os.Stderr, "worker write failed")
 				os.Exit(2)
 			}
-			fmt.Fprintln(os.Stdout, "READY")
+			_, _ = fmt.Fprintln(os.Stdout, "READY")
 			select {}
 		})
 		return
@@ -700,7 +783,7 @@ func TestCrashWorker(t *testing.T) {
 		fmt.Fprintln(os.Stderr, "worker commit failed")
 		os.Exit(2)
 	}
-	fmt.Fprintln(os.Stdout, "READY")
+	_, _ = fmt.Fprintln(os.Stdout, "READY")
 	select {}
 }
 
@@ -731,7 +814,7 @@ func TestEncryptedRecordsLeaveNoPlaintextInFilesOrErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 	metadata := recordcodec.RecordMetadata{StoreID: "0123456789abcdef0123456789abcdef", SchemaVersion: 1, Namespace: "observations", Key: "synthetic-9107", Revision: 1}
 	envelope, err := codec.Seal(metadata, []byte(sentinel))
 	if err != nil {
@@ -791,7 +874,7 @@ func BenchmarkUpdateOpaqueRecord(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer db.Close()
+	defer func(close func() error) { _ = close() }(db.Close)
 	ctx := context.Background()
 	const keyPrefix = "synthetic-key-"
 	key := make([]byte, len(keyPrefix)+8)

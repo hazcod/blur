@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hazcod/blur/internal/model/modeltest"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/assistant"
@@ -20,32 +23,39 @@ import (
 	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/knowledge"
 	"github.com/hazcod/blur/internal/knowledge/derive"
+	"github.com/hazcod/blur/internal/localapi"
 	"github.com/hazcod/blur/internal/notes"
 	"github.com/hazcod/blur/internal/search"
+	"github.com/hazcod/blur/internal/securestore"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/durable"
+	"github.com/hazcod/blur/internal/tasks"
 	"github.com/hazcod/blur/internal/today"
 )
 
 type testData struct {
-	today         today.Snapshot
-	found         bool
-	query         search.ExactQuery
-	queries       []search.ExactQuery
-	page          search.ExactPage
-	pages         []search.ExactPage
-	searchCalls   int
-	readSourceIDs []string
-	knowledge     knowledge.Page
-	confirmedDate string
-	confirmedID   string
-	answeredID    string
-	answer        string
-	dismissedID   string
-	observations  map[string]capture.SanitizedObservation
-	activity      []activity.Segment
-	activityDates []string
-	savedToday    today.Snapshot
-	savedTodaySet bool
-	todayWrites   int
+	today                     today.Snapshot
+	found                     bool
+	query                     search.ExactQuery
+	queries                   []search.ExactQuery
+	page                      search.ExactPage
+	pages                     []search.ExactPage
+	searchCalls               int
+	readSourceIDs             []string
+	observationWindowRequests []storage.ObservationWindowRequest
+	knowledge                 knowledge.Page
+	confirmedDate             string
+	confirmedID               string
+	answeredID                string
+	answer                    string
+	dismissedID               string
+	observations              map[string]capture.SanitizedObservation
+	observationAt             map[string]time.Time
+	activity                  []activity.Segment
+	activityDates             []string
+	savedToday                today.Snapshot
+	savedTodaySet             bool
+	todayWrites               int
 }
 
 type testKnowledgeData struct {
@@ -77,6 +87,28 @@ func (r testChronicles) DeleteChronicle(_ context.Context, id string) error {
 }
 func (r testChronicles) DeleteAllChronicles(context.Context) error { clear(r); return nil }
 
+type pagedTestChronicles struct{ rows []chronicle.Summary }
+
+func (r pagedTestChronicles) PutChronicle(context.Context, chronicle.Summary) error { return nil }
+func (r pagedTestChronicles) GetChronicle(context.Context, string) (chronicle.Summary, bool, error) {
+	return chronicle.Summary{}, false, nil
+}
+func (r pagedTestChronicles) ListChronicles(_ context.Context, start, end time.Time, after string, limit int) ([]chronicle.Summary, string, error) {
+	var rows []chronicle.Summary
+	for _, row := range r.rows {
+		if row.Start.Before(start) || !row.Start.Before(end) || after != "" && row.HourID <= after {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) > limit {
+		return rows[:limit], rows[limit-1].HourID, nil
+	}
+	return rows, "", nil
+}
+func (r pagedTestChronicles) DeleteChronicle(context.Context, string) error { return nil }
+func (r pagedTestChronicles) DeleteAllChronicles(context.Context) error     { return nil }
+
 type evidenceBudgetProbe struct{}
 
 func (evidenceBudgetProbe) CountInputTokens(_ context.Context, evidence []derive.Evidence) (int, error) {
@@ -97,6 +129,56 @@ func (d *testKnowledgeData) PutKnowledgeEntity(_ context.Context, entity knowled
 func (d *testKnowledgeData) PutKnowledgeEntityFromSource(_ context.Context, entity knowledge.Entity, sourceID string) error {
 	d.entity, d.sourcePutID = knowledge.Clone(entity), sourceID
 	return d.err
+}
+
+func TestHandleMCPReadPagesLibrarySubjectDetails(t *testing.T) {
+	ctx := context.Background()
+	store, err := durable.OpenDurable(filepath.Join(t.TempDir(), "mcp-wiki.db"), securestore.OfflineFixtureKey(), durable.CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+	entity := knowledge.Entity{ID: "project-northstar", Kind: knowledge.Project, Name: "Northstar", State: knowledge.Confirmed,
+		Aliases: []string{"North Star"},
+		Facts: []knowledge.Fact{
+			{ID: "fact-one", Text: "The project uses Go.", State: knowledge.Confirmed, Sources: []knowledge.Source{{UserAuthored: true}}},
+			{ID: "fact-two", Text: "Mira owns rollback decisions.", State: knowledge.Confirmed, Sources: []knowledge.Source{{UserAuthored: true}}},
+		},
+		OpenLoops: []knowledge.OpenLoop{{ID: "loop-one", Text: "Confirm launch date.", State: knowledge.Proposed, Sources: []knowledge.Source{{UserAuthored: true}}}},
+	}
+	if err := store.PutKnowledgeEntity(ctx, entity); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(store)
+	defer client.Close()
+	wire, err := client.HandleMCPRead(ctx, localapi.RPCGetWikiPage, json.RawMessage(`{"id":"project-northstar","offset":1,"limit":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output struct {
+		Found  bool `json:"found"`
+		Entity struct {
+			Name    string   `json:"name"`
+			Aliases []string `json:"aliases"`
+		} `json:"entity"`
+		Details []struct {
+			Type    string             `json:"type"`
+			Text    string             `json:"text"`
+			Sources []knowledge.Source `json:"sources"`
+		} `json:"details"`
+		NextOffset int  `json:"next_offset"`
+		HasMore    bool `json:"has_more"`
+	}
+	if json.Unmarshal(wire, &output) != nil || !output.Found || output.Entity.Name != "Northstar" || len(output.Entity.Aliases) != 1 || len(output.Details) != 1 || output.Details[0].Type != "fact" || output.Details[0].Text != "Mira owns rollback decisions." || len(output.Details[0].Sources) != 1 || !output.Details[0].Sources[0].UserAuthored || output.NextOffset != 2 || !output.HasMore {
+		t.Fatalf("Library page = %s", wire)
+	}
+	if _, err := client.HandleMCPRead(ctx, localapi.RPCGetWikiPage, json.RawMessage(`{"id":"bad id","offset":0,"limit":1}`)); err == nil {
+		t.Fatal("invalid Library subject ID was accepted")
+	}
 }
 
 func TestSuggestKnowledgeFromChronicleRequiresAnExplicitLocalProvider(t *testing.T) {
@@ -176,7 +258,7 @@ func TestSuggestKnowledgeFromChronicleUsesOnlySelectedLocalRecapSourcesOnDemand(
 	}
 	hourID := "hour:20261106T13Z"
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(modeltest.LocalOllama("qwen3:4b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		var body struct {
 			Messages []struct{ Role, Content string } `json:"messages"`
@@ -187,9 +269,9 @@ func TestSuggestKnowledgeFromChronicleUsesOnlySelectedLocalRecapSourcesOnDemand(
 		if len(body.Messages) != 2 || !strings.Contains(body.Messages[1].Content, selected.Text()) || strings.Contains(body.Messages[1].Content, other.Text()) {
 			t.Errorf("model received evidence outside selected recap: %+v", body.Messages)
 		}
-		proposal := fmt.Sprintf(`{"suggestions":[{"kind":"project","name":"Northstar","fact":"The project is written in Go.","source_id":%q}]}`, selected.ContentID())
+		proposal := `{"suggestions":[{"kind":"project","name":"Northstar","fact":"The project is written in Go.","source_id":"e1"}]}`
 		_, _ = fmt.Fprintf(w, `{"message":{"content":%q},"done":true,"prompt_eval_count":80,"eval_count":24}`, proposal)
-	}))
+	})))
 	defer server.Close()
 	service := notes.NewService(nil, nil, time.Now)
 	extractor, err := notes.NewOllamaExtractor(server.URL, "qwen3:4b")
@@ -278,7 +360,7 @@ func TestDeleteAllRequiresConfiguredBulkDeleterAndContext(t *testing.T) {
 	if count, err := client.DeleteAll(ctx); err != nil || count != 12 || deleter.calls != 1 || deleter.gotCtx != ctx {
 		t.Fatalf("DeleteAll() = (%d, %v), calls=%d, context=%v; want (12, nil), 1, same context", count, err, deleter.calls, deleter.gotCtx)
 	}
-	if _, err := client.DeleteAll(nil); err == nil {
+	if _, err := client.DeleteAll(nil); err == nil { //nolint:staticcheck // Verify that the API rejects a nil context.
 		t.Fatal("DeleteAll(nil) unexpectedly succeeded")
 	}
 	if deleter.calls != 1 {
@@ -314,10 +396,37 @@ func (d *testData) SearchExact(_ context.Context, q search.ExactQuery) (search.E
 	d.searchCalls++
 	d.query = q
 	d.queries = append(d.queries, q)
+	page := d.page
 	if d.searchCalls <= len(d.pages) {
-		return d.pages[d.searchCalls-1], nil
+		page = d.pages[d.searchCalls-1]
 	}
-	return d.page, nil
+	filtered := make([]search.IndexHit, 0, len(page.Hits))
+	for _, hit := range page.Hits {
+		observation := d.observations[hit.SourceID]
+		excluded := false
+		for _, app := range q.ExcludeAppIDs {
+			if strings.EqualFold(observation.AppID(), app) {
+				excluded = true
+			}
+		}
+		if excluded {
+			continue
+		}
+		if !q.CapturedStart.IsZero() {
+			at := d.observationAt[hit.SourceID]
+			inScope := !at.IsZero() && !at.Before(q.CapturedStart) && at.Before(q.CapturedEnd)
+			for _, id := range q.ScopeSourceIDs {
+				inScope = inScope || id == hit.SourceID
+			}
+			if !inScope {
+				continue
+			}
+			hit.CapturedAt = at
+		}
+		filtered = append(filtered, hit)
+	}
+	page.Hits = filtered
+	return page, nil
 }
 func (d *testData) ListKnowledge(_ context.Context, _ knowledge.PageRequest) (knowledge.Page, error) {
 	return d.knowledge, nil
@@ -326,6 +435,63 @@ func (d *testData) GetObservation(_ context.Context, id string) (capture.Sanitiz
 	d.readSourceIDs = append(d.readSourceIDs, id)
 	o, ok := d.observations[id]
 	return o, ok, nil
+}
+
+func (d *testData) ListObservationWindow(_ context.Context, request storage.ObservationWindowRequest) (storage.ObservationWindow, error) {
+	d.observationWindowRequests = append(d.observationWindowRequests, request)
+	if !storage.ValidObservationWindow(request) {
+		return storage.ObservationWindow{}, &storage.StoreError{Code: storage.Invalid}
+	}
+	type candidate struct {
+		id string
+		at time.Time
+	}
+	var candidates []candidate
+	for id := range d.observations {
+		at := d.observationAt[id]
+		if at.IsZero() || at.Before(request.Start) || !at.Before(request.End) {
+			continue
+		}
+		observation := d.observations[id]
+		if request.AppID != "" && observation.AppID() != request.AppID || request.Domain != "" && observation.Domain() != request.Domain {
+			continue
+		}
+		excluded := false
+		for _, app := range request.ExcludeAppIDs {
+			excluded = excluded || observation.AppID() == app
+		}
+		if excluded {
+			continue
+		}
+		if !request.BeforeCapturedAt.IsZero() && (!at.Before(request.BeforeCapturedAt) && (!at.Equal(request.BeforeCapturedAt) || id >= request.BeforeSourceID)) {
+			continue
+		}
+		candidates = append(candidates, candidate{id: id, at: at})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].at.Equal(candidates[j].at) {
+			return candidates[i].at.After(candidates[j].at)
+		}
+		return candidates[i].id > candidates[j].id
+	})
+	page := storage.ObservationWindow{Observations: make([]capture.SanitizedObservation, 0, request.Limit), CapturedAt: make([]time.Time, 0, request.Limit)}
+	for _, item := range candidates {
+		if len(page.Observations) >= request.Limit {
+			page.HasMore = true
+			break
+		}
+		observation := d.observations[item.id]
+		used := len(observation.Text()) + len(observation.AppID()) + len(observation.Domain())
+		if used > request.MaxBytes-page.Bytes {
+			page.HasMore = true
+			break
+		}
+		page.Observations = append(page.Observations, observation)
+		page.CapturedAt = append(page.CapturedAt, item.at)
+		page.Bytes += used
+		page.NextCapturedAt, page.NextSourceID = item.at, item.id
+	}
+	return page, nil
 }
 
 func (d *testData) ListActivitySegmentsForDates(_ context.Context, dates []string, limit int) ([]activity.Segment, error) {
@@ -382,6 +548,39 @@ func TestTodayReturnsExplicitEmptyStateWhenNoSnapshotExists(t *testing.T) {
 	}
 	if got.State != "empty" || got.Date != "2026-11-05" || got.CaptureState != "not_configured" {
 		t.Fatalf("unexpected empty state: %+v", got)
+	}
+}
+
+func TestTodayShowsRecentEncryptedCapturesWithoutMaterializedRecap(t *testing.T) {
+	zone, err := time.LoadLocation(localZoneName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().In(zone)
+	date := now.Format("2006-01-02")
+	at := time.Date(now.Year(), now.Month(), now.Day(), 10, 15, 0, 0, zone)
+	first, err := capture.SanitizeObservation("com.example.editor", "", "A saved paragraph about the deployment plan.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := capture.SanitizeObservation("com.hazcod.blur", "", "A previous Ask query from Blur.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &testData{
+		observations:  map[string]capture.SanitizedObservation{first.ContentID(): first, second.ContentID(): second},
+		observationAt: map[string]time.Time{first.ContentID(): at, second.ContentID(): at.Add(time.Minute)},
+	}
+	got, err := NewClient(d).Today(date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "ready" || len(got.RecentCaptures) != 1 {
+		t.Fatalf("Today without a materialized recap = state %q, captures %+v", got.State, got.RecentCaptures)
+	}
+	item := got.RecentCaptures[0]
+	if item.SourceID != first.ContentID() || item.AppID != "com.example.editor" || item.Text != first.Text() || !item.CapturedAt.Equal(at) {
+		t.Fatalf("recent capture = %+v", item)
 	}
 }
 
@@ -594,11 +793,363 @@ func TestHandleMCPReadReturnsOnlyBoundedSanitizedMemory(t *testing.T) {
 	if err := json.Unmarshal(got, &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Results) != 1 || len(response.Results[0].Text) > 2048 || !response.Results[0].Truncated || !response.Truncated {
+	if len(response.Results) != 2 || len(response.Results[0].Text) > 2048 || !response.Results[0].Truncated || !response.Truncated {
 		t.Fatalf("MCP response was not bounded/truncated: count=%d textBytes=%d itemTruncated=%t responseTruncated=%t", len(response.Results), len(response.Results[0].Text), response.Results[0].Truncated, response.Truncated)
 	}
-	if data.query.TopK != 3 || data.query.MaxRows != 3 || len(data.readSourceIDs) != 1 || data.readSourceIDs[0] != first.ContentID() {
+	if data.query.TopK != 3 || data.query.MaxRows != 3 || len(data.readSourceIDs) != 2 || data.readSourceIDs[0] != first.ContentID() || data.readSourceIDs[1] != second.ContentID() {
 		t.Fatalf("MCP read escaped candidate/source budget: query=%+v hydrated=%v", data.query, data.readSourceIDs)
+	}
+}
+
+func TestHandleMCPReadReturnsPaginatedFullCaptureText(t *testing.T) {
+	observation, err := capture.SanitizeObservation("com.example.editor", "local", "alpha beta gamma delta", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := &testData{observations: map[string]capture.SanitizedObservation{observation.ContentID(): observation}}
+	client := NewClient(data)
+	first, err := client.HandleMCPRead(context.Background(), localapi.RPCGetSnapshots, json.RawMessage(`{"source_ids":["`+observation.ContentID()+`"],"max_bytes_per_source":8}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page mcpSnapshotResponse
+	if err := json.Unmarshal(first, &page); err != nil || len(page.Snapshots) != 1 {
+		t.Fatalf("first snapshot page = %s, err=%v", first, err)
+	}
+	chunk := page.Snapshots[0]
+	if chunk.Content != "alpha be" || chunk.OffsetBytes != 0 || chunk.NextOffsetBytes != 8 || chunk.Complete {
+		t.Fatalf("first snapshot chunk = %+v", chunk)
+	}
+	second, err := client.HandleMCPRead(context.Background(), localapi.RPCGetSnapshots, json.RawMessage(`{"source_ids":["`+observation.ContentID()+`"],"offsets":{"`+observation.ContentID()+`":8},"max_bytes_per_source":8}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(second, &page); err != nil || len(page.Snapshots) != 1 || page.Snapshots[0].Content != "ta gamma" || page.Snapshots[0].NextOffsetBytes != 16 || page.Snapshots[0].Complete {
+		t.Fatalf("second snapshot page = %s, err=%v", second, err)
+	}
+	last, err := client.HandleMCPRead(context.Background(), localapi.RPCGetSnapshots, json.RawMessage(`{"source_ids":["`+observation.ContentID()+`"],"offsets":{"`+observation.ContentID()+`":16},"max_bytes_per_source":8}`))
+	if err != nil || json.Unmarshal(last, &page) != nil || len(page.Snapshots) != 1 || page.Snapshots[0].Content != " delta" || !page.Snapshots[0].Complete {
+		t.Fatalf("final snapshot page = %s, err=%v", last, err)
+	}
+	if len(data.readSourceIDs) != 3 {
+		t.Fatalf("source reads = %v, want one per page", data.readSourceIDs)
+	}
+}
+
+func TestHandleMCPReadRejectsInvalidSnapshotOffsetsAndIDs(t *testing.T) {
+	client := NewClient(&testData{})
+	for _, raw := range []string{
+		`{"source_ids":["not-a-source"]}`,
+		`{"source_ids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"offsets":{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb":1}}`,
+		`{"source_ids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"max_bytes_per_source":3}`,
+	} {
+		if _, err := client.HandleMCPRead(context.Background(), localapi.RPCGetSnapshots, json.RawMessage(raw)); err == nil {
+			t.Errorf("accepted invalid snapshot request %s", raw)
+		}
+	}
+}
+
+func TestHandleMCPReadReturnsSourceLinkedChronicle(t *testing.T) {
+	start := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	const hourID = "hour:20261115T10Z"
+	source, err := capture.SanitizeObservation("com.example.chat", "local", "Discussed the database migration rollout.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := chronicle.Summary{HourID: hourID, Start: start, End: start.Add(time.Hour), Text: "Reviewed the database migration rollout.", SourceIDs: []string{source.ContentID()}}
+	data := &testData{observations: map[string]capture.SanitizedObservation{source.ContentID(): source}}
+	client := NewClient(data)
+	client.chronicles = testChronicles{hourID: summary}
+	wire, err := client.HandleMCPRead(context.Background(), localapi.RPCGetChronicle, json.RawMessage(`{"hour_id":"`+hourID+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Found     bool      `json:"found"`
+		HourID    string    `json:"hour_id"`
+		Summary   string    `json:"summary"`
+		SourceIDs []string  `json:"source_ids"`
+		Start     time.Time `json:"start"`
+		End       time.Time `json:"end"`
+	}
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Found || got.HourID != hourID || got.Summary != summary.Text || len(got.SourceIDs) != 1 || got.SourceIDs[0] != source.ContentID() || !got.Start.Equal(start) || !got.End.Equal(start.Add(time.Hour)) {
+		t.Fatalf("chronicle response = %+v", got)
+	}
+}
+
+func TestHandleMCPReadListsSourceLinkedChroniclesByRange(t *testing.T) {
+	start := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	first, err := capture.SanitizeObservation("com.example.chat", "local", "Discussed the database migration rollout.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := capture.SanitizeObservation("com.example.editor", "local", "Updated the migration plan.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []chronicle.Summary{
+		{HourID: "hour:20261115T10Z", Start: start, End: start.Add(time.Hour), Text: "Reviewed the database migration rollout.", SourceIDs: []string{first.ContentID()}},
+		{HourID: "hour:20261115T11Z", Start: start.Add(time.Hour), End: start.Add(2 * time.Hour), Text: "Updated the migration plan.", SourceIDs: []string{second.ContentID()}},
+	}
+	client := NewClient(&testData{})
+	client.chronicles = pagedTestChronicles{rows: rows}
+	request := `{"start":"2026-11-15T10:00:00Z","end":"2026-11-15T13:00:00Z","limit":1}`
+	wire, err := client.HandleMCPRead(context.Background(), localapi.RPCListChronicles, json.RawMessage(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Items []struct {
+			HourID    string   `json:"hour_id"`
+			Summary   string   `json:"summary"`
+			SourceIDs []string `json:"source_ids"`
+		} `json:"items"`
+		Next      string `json:"next"`
+		Truncated bool   `json:"truncated"`
+	}
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 || got.Items[0].HourID != rows[0].HourID || got.Items[0].Summary != rows[0].Text || len(got.Items[0].SourceIDs) != 1 || got.Items[0].SourceIDs[0] != first.ContentID() || got.Next != rows[0].HourID || !got.Truncated {
+		t.Fatalf("chronicle range response = %+v", got)
+	}
+	request = `{"start":"2026-11-15T10:00:00Z","end":"2026-11-15T13:00:00Z","after":"` + got.Next + `","limit":1}`
+	wire, err = client.HandleMCPRead(context.Background(), localapi.RPCListChronicles, json.RawMessage(request))
+	got = struct {
+		Items []struct {
+			HourID    string   `json:"hour_id"`
+			Summary   string   `json:"summary"`
+			SourceIDs []string `json:"source_ids"`
+		} `json:"items"`
+		Next      string `json:"next"`
+		Truncated bool   `json:"truncated"`
+	}{}
+	if err != nil || json.Unmarshal(wire, &got) != nil || len(got.Items) != 1 || got.Items[0].HourID != rows[1].HourID || got.Next != "" || got.Truncated {
+		t.Fatalf("chronicle continuation = %+v err=%v wire=%s", got, err, wire)
+	}
+}
+
+func TestHandleMCPReadRejectsInvalidChronicleRangesAndEvidence(t *testing.T) {
+	client := NewClient(&testData{})
+	client.chronicles = pagedTestChronicles{}
+	for _, raw := range []string{
+		`{}`,
+		`{"start":"2026-11-16T00:00:00Z","end":"2026-11-15T00:00:00Z","limit":1}`,
+		`{"start":"2026-10-01T00:00:00Z","end":"2026-11-15T00:00:00Z","limit":1}`,
+		`{"start":"2026-11-15T00:00:00Z","end":"2026-11-16T00:00:00Z","after":"not-an-hour","limit":1}`,
+		`{"start":"2026-11-15T00:00:00Z","end":"2026-11-16T00:00:00Z","limit":9}`,
+		`{"start":"2026-11-15T00:00:00Z","end":"2026-11-16T00:00:00Z","limit":1,"extra":true}`,
+	} {
+		if _, err := client.HandleMCPRead(context.Background(), localapi.RPCListChronicles, json.RawMessage(raw)); err == nil {
+			t.Errorf("accepted invalid chronicle range %s", raw)
+		}
+	}
+	start := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	client.chronicles = pagedTestChronicles{rows: []chronicle.Summary{{
+		HourID: "hour:20261115T10Z", Start: start, End: start.Add(time.Hour), Text: "A recap with an invalid source reference.", SourceIDs: []string{"bad-source"},
+	}}}
+	if _, err := client.HandleMCPRead(context.Background(), localapi.RPCListChronicles, json.RawMessage(`{"start":"2026-11-15T10:00:00Z","end":"2026-11-15T12:00:00Z","limit":2}`)); err == nil {
+		t.Fatal("accepted recap with invalid source provenance")
+	}
+}
+
+func TestHandleMCPReadReturnsRecentWorkingMemoryWithVerifiedSources(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	recent, err := capture.SanitizeObservation("com.tinyspeck.slackmacgap", "", "#security-news\nCVE-2026-1234 affects Chrome; install the update.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blurUI, err := capture.SanitizeObservation("com.hazcod.blur", "", "Blur settings are open.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := capture.SanitizeObservation("com.example.editor", "", "Yesterday's draft.", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := &testData{
+		observations:  map[string]capture.SanitizedObservation{recent.ContentID(): recent, blurUI.ContentID(): blurUI, old.ContentID(): old},
+		observationAt: map[string]time.Time{recent.ContentID(): now.Add(-time.Hour), blurUI.ContentID(): now.Add(-time.Minute), old.ContentID(): now.Add(-8 * time.Hour)},
+	}
+	client := NewClient(data)
+	client.askNow = func() time.Time { return now }
+	wire, err := client.HandleMCPRead(context.Background(), localapi.RPCGetWorkingMemory, json.RawMessage(`{"hours":4,"limit":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Start string `json:"start"`
+		End   string `json:"end"`
+		Items []struct {
+			SourceID   string    `json:"source_id"`
+			AppID      string    `json:"app_id"`
+			Content    string    `json:"content"`
+			CapturedAt time.Time `json:"captured_at"`
+		} `json:"items"`
+		Truncated       bool `json:"truncated"`
+		IndexingPending bool `json:"indexing_pending"`
+	}
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 || got.Items[0].SourceID != recent.ContentID() || got.Items[0].AppID != recent.AppID() || !strings.Contains(got.Items[0].Content, "#security-news") || !got.Items[0].CapturedAt.Equal(now.Add(-time.Hour)) || got.End != now.Add(time.Nanosecond).Format(time.RFC3339Nano) {
+		t.Fatalf("working memory = %+v", got)
+	}
+	if len(data.observationWindowRequests) != 1 {
+		t.Fatalf("working memory made %d storage reads", len(data.observationWindowRequests))
+	}
+	request := data.observationWindowRequests[0]
+	if !request.Start.Equal(now.Add(-4*time.Hour)) || !request.End.Equal(now.Add(time.Nanosecond)) || request.Limit != 5 || len(request.ExcludeAppIDs) != 1 || request.ExcludeAppIDs[0] != "com.hazcod.blur" {
+		t.Fatalf("working memory scope = %+v", request)
+	}
+}
+
+func TestHandleMCPReadBoundsWorkingMemoryRequest(t *testing.T) {
+	client := NewClient(&testData{})
+	for _, raw := range []string{`{}`, `{"hours":0}`, `{"hours":7}`, `{"hours":2,"limit":9}`, `{"hours":2,"unknown":true}`} {
+		if _, err := client.HandleMCPRead(context.Background(), localapi.RPCGetWorkingMemory, json.RawMessage(raw)); err == nil {
+			t.Errorf("accepted invalid working-memory request %s", raw)
+		}
+	}
+}
+
+func TestWorkingMemoryExcerptKeepsUTF8HeadAndTail(t *testing.T) {
+	text := strings.Repeat("日本語の技術ページ。", 180) + "UNIQUE_END_OF_PAGE"
+	excerpt, truncated := workingMemoryExcerpt(text)
+	if !truncated || !utf8.ValidString(excerpt) || len(excerpt) > maxMCPWorkingExcerpt || !strings.HasPrefix(excerpt, "日本語") || !strings.Contains(excerpt, "middle omitted") || !strings.HasSuffix(excerpt, "UNIQUE_END_OF_PAGE") {
+		t.Fatalf("working memory excerpt length=%d truncated=%t content=%q", len(excerpt), truncated, excerpt)
+	}
+}
+
+func TestHandleMCPReadRejectsMalformedChronicleRequestAndEvidence(t *testing.T) {
+	client := NewClient(&testData{})
+	client.chronicles = testChronicles{}
+	for _, raw := range []string{`{}`, `{"hour_id":"day:20261115"}`, `{"hour_id":"hour:20261115T10Z","other":true}`} {
+		if _, err := client.HandleMCPRead(context.Background(), localapi.RPCGetChronicle, json.RawMessage(raw)); err == nil {
+			t.Errorf("accepted chronicle request %s", raw)
+		}
+	}
+	client.chronicles = testChronicles{"hour:20261115T10Z": {HourID: "hour:20261115T10Z", Start: time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC), End: time.Date(2026, 11, 15, 11, 0, 0, 0, time.UTC), Text: "unsupported", SourceIDs: []string{"not-a-source"}}}
+	if _, err := client.HandleMCPRead(context.Background(), localapi.RPCGetChronicle, json.RawMessage(`{"hour_id":"hour:20261115T10Z"}`)); err == nil {
+		t.Fatal("accepted chronicle with an invalid source reference")
+	}
+}
+
+func TestHandleMCPReadReturnsRecentActivityWithCaptureSources(t *testing.T) {
+	now := time.Date(2026, 11, 15, 14, 0, 0, 0, time.Local)
+	sourceID := strings.Repeat("a", 64)
+	olderStart := now.Add(-2 * time.Hour)
+	newerStart := now.Add(-30 * time.Minute)
+	segments := []activity.Segment{
+		{ID: strings.Repeat("1", 32), WallStart: olderStart, WallEnd: olderStart.Add(20 * time.Minute), Duration: int64(20 * time.Minute), AppID: "com.example.editor", Topic: "Release notes", SourceIDs: []string{sourceID}},
+		{ID: strings.Repeat("2", 32), WallStart: newerStart, WallEnd: newerStart.Add(10 * time.Minute), Duration: int64(10 * time.Minute), AppID: "com.example.chat", Topic: "Security news", SourceIDs: []string{sourceID}},
+	}
+	data := &testData{activity: segments}
+	client := NewClient(data)
+	client.askNow = func() time.Time { return now }
+	wire, err := client.HandleMCPRead(context.Background(), localapi.RPCGetRecentActivity, json.RawMessage(`{"days_back":1,"limit":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Segments []struct {
+			AppID     string    `json:"app_id"`
+			Topic     string    `json:"topic"`
+			Start     time.Time `json:"start"`
+			SourceIDs []string  `json:"source_ids"`
+		} `json:"segments"`
+		Truncated bool `json:"truncated"`
+	}
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Segments) != 2 || got.Segments[0].AppID != "com.example.chat" || got.Segments[0].Topic != "Security news" || !got.Segments[0].Start.Equal(newerStart) || len(got.Segments[0].SourceIDs) != 1 || got.Segments[1].AppID != "com.example.editor" || got.Truncated {
+		t.Fatalf("recent activity = %+v", got)
+	}
+	if len(data.activityDates) == 0 {
+		t.Fatal("recent activity did not query local activity partitions")
+	}
+}
+
+func TestHandleMCPReadBoundsRecentActivityRequest(t *testing.T) {
+	client := NewClient(&testData{})
+	for _, raw := range []string{`{"days_back":8}`, `{"days_back":1,"limit":9}`, `{"days_back":1,"unknown":true}`} {
+		if _, err := client.HandleMCPRead(context.Background(), localapi.RPCGetRecentActivity, json.RawMessage(raw)); err == nil {
+			t.Errorf("accepted recent activity request %s", raw)
+		}
+	}
+}
+
+func TestHandleMCPReadSearchesEntityMemoryWithSourceLinks(t *testing.T) {
+	const sourceID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	entity := knowledge.Entity{ID: "mira-person", Kind: knowledge.Person, Name: "Mira", Aliases: []string{"Mira L."}, State: knowledge.Confirmed, Facts: []knowledge.Fact{{ID: "rollback-owner", Text: "Mira owns rollback decisions.", State: knowledge.Confirmed, Sources: []knowledge.Source{{ID: sourceID}}}}}
+	client := NewClient(&testData{knowledge: knowledge.Page{Entities: []knowledge.Entity{entity}}})
+	wire, err := client.HandleMCPRead(context.Background(), localapi.RPCSearchWiki, json.RawMessage(`{"query":"Mira rollback","limit":3}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Entities  []knowledge.Entity `json:"entities"`
+		Truncated bool               `json:"truncated"`
+	}
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Entities) != 1 || got.Entities[0].Name != "Mira" || len(got.Entities[0].Facts) != 1 || got.Entities[0].Facts[0].Text != "Mira owns rollback decisions." || got.Entities[0].Facts[0].Sources[0].ID != sourceID || got.Truncated {
+		t.Fatalf("Wiki search response = %+v", got)
+	}
+}
+
+func TestHandleMCPReadBoundsWikiSearchRequest(t *testing.T) {
+	client := NewClient(&testData{})
+	for _, raw := range []string{`{"query":""}`, `{"query":"mira","limit":9}`, `{"query":"mira","unknown":true}`} {
+		if _, err := client.HandleMCPRead(context.Background(), localapi.RPCSearchWiki, json.RawMessage(raw)); err == nil {
+			t.Errorf("accepted Wiki search request %s", raw)
+		}
+	}
+}
+
+func TestHandleMCPReadListsOpenTasksWithSourceLinks(t *testing.T) {
+	ctx := context.Background()
+	store, err := durable.OpenDurable(filepath.Join(t.TempDir(), "mcp-tasks.db"), securestore.OfflineFixtureKey(), durable.CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	task := tasks.Item{ID: strings.Repeat("b", 32), Revision: 1, Title: "Buy eggs", State: tasks.Open, CreatedAt: now, UpdatedAt: now, UserAuthored: true}
+	if err := store.PutTask(ctx, task, 0); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(store)
+	client.askNow = func() time.Time { return now }
+	wire, err := client.HandleMCPRead(ctx, localapi.RPCListTasks, json.RawMessage(`{"state":"open","limit":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Items []struct {
+			ID           string `json:"id"`
+			Title        string `json:"title"`
+			State        string `json:"state"`
+			UserAuthored bool   `json:"user_authored"`
+		} `json:"items"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := json.Unmarshal(wire, &got); err != nil || len(got.Items) != 1 || got.Items[0].ID != task.ID || got.Items[0].Title != task.Title || got.Items[0].State != string(tasks.Open) || !got.Items[0].UserAuthored || got.HasMore {
+		t.Fatalf("task-list response = %s, err=%v", wire, err)
+	}
+}
+
+func TestHandleMCPReadBoundsTaskListRequest(t *testing.T) {
+	client := NewClient(&testData{})
+	for _, raw := range []string{`{"state":"unknown"}`, `{"limit":9}`, `{"after":"not-an-id"}`, `{"unknown":true}`} {
+		if _, err := client.HandleMCPRead(context.Background(), localapi.RPCListTasks, json.RawMessage(raw)); err == nil {
+			t.Errorf("accepted task-list request %s", raw)
+		}
 	}
 }
 
@@ -733,7 +1284,7 @@ func TestAskMemoryUsesConfiguredLoopbackOllamaAndCitesLocalSource(t *testing.T) 
 		t.Fatal(err)
 	}
 	called := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(modeltest.LocalOllama("fixture-model", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		var request struct {
 			Messages []struct {
@@ -749,9 +1300,17 @@ func TestAskMemoryUsesConfiguredLoopbackOllamaAndCitesLocalSource(t *testing.T) 
 			t.Errorf("local Ask omitted bounded evidence context: %+v", request.Messages)
 			return
 		}
+		if strings.Contains(request.Messages[0].Content, "alternate search") && strings.Contains(request.Messages[0].Content, "Rank saved evidence") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": map[string]string{"content": `{"queries":["launch decision","launch plan"],"matches":[{"ref":"S1","score":0.98}]}`}, "done": true, "prompt_eval_count": 40, "eval_count": 15})
+			return
+		}
+		if strings.Contains(request.Messages[0].Content, "Rank saved evidence") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": map[string]string{"content": `{"matches":[{"ref":"S1","score":0.98}]}`}, "done": true, "prompt_eval_count": 40, "eval_count": 15})
+			return
+		}
 		content, _ := json.Marshal(assistant.ModelAnswer{Text: "The decision was Tuesday.", SourceIDs: []string{observation.ContentID()}})
 		_ = json.NewEncoder(w).Encode(map[string]any{"message": map[string]string{"content": string(content)}, "done": true, "prompt_eval_count": 40, "eval_count": 15})
-	}))
+	})))
 	defer server.Close()
 	settingsPath := filepath.Join(t.TempDir(), "local-ai.json")
 	controller := newLocalAIController(settingsPath, notes.NewService(nil, nil, nil))
@@ -798,6 +1357,14 @@ func TestRemoteAskRequiresExplicitConsentAndUsesBoundedLocalEvidence(t *testing.
 			t.Errorf("remote Ask did not receive the bounded retrieved evidence: %+v", request.Messages)
 			return
 		}
+		if strings.Contains(request.Messages[0].Content, "alternate search") && strings.Contains(request.Messages[0].Content, "Rank saved evidence") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": `{"queries":["launch decision","launch plan"],"matches":[{"ref":"S1","score":0.98}]}`}}}})
+			return
+		}
+		if strings.Contains(request.Messages[0].Content, "Rank saved evidence") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": `{"matches":[{"ref":"S1","score":0.98}]}`}}}})
+			return
+		}
 		content, _ := json.Marshal(assistant.ModelAnswer{Text: "The decision was Tuesday.", SourceIDs: []string{observation.ContentID()}})
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": string(content)}}}})
 	}))
@@ -818,11 +1385,12 @@ func TestRemoteAskRequiresExplicitConsentAndUsesBoundedLocalEvidence(t *testing.
 	bytes := len(observation.Text()) + len(observation.AppID()) + len(observation.Domain())
 	data := &testData{page: search.ExactPage{Hits: []search.IndexHit{{SourceID: observation.ContentID(), Score: 1, Bytes: bytes}}}, observations: map[string]capture.SanitizedObservation{observation.ContentID(): observation}}
 	client := NewClient(data).WithLocalAI(controller)
-	if client.CanAskMemory() {
-		t.Fatal("remote Ask became available without separate evidence-egress consent")
+	if !client.CanAskMemory() {
+		t.Fatal("local evidence lookup requires remote consent")
 	}
-	if _, err := client.AskMemory(context.Background(), "What was our launch decision?"); !errors.Is(err, assistant.ErrAskUnavailable) {
-		t.Fatalf("remote Ask without consent = %v, want unavailable", err)
+	local, err := client.AskMemory(context.Background(), "What was our launch decision?")
+	if err != nil || !local.Direct || local.General || local.SentItems != 0 || local.SentBytes != 0 || !strings.Contains(local.Answer.Text, observation.Text()) || len(local.Sources) != 1 || local.Sources[0].SourceID != observation.ContentID() {
+		t.Fatalf("unconsented provider should leave local source lookup available: %+v, err=%v", local, err)
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("unconsented remote Ask issued %d network requests", requests.Load())
@@ -842,7 +1410,7 @@ func TestRemoteAskRequiresExplicitConsentAndUsesBoundedLocalEvidence(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests.Load() != 1 || result.Answer.Text != "The decision was Tuesday." || len(result.Sources) != 1 || result.Sources[0].SourceID != observation.ContentID() {
+	if requests.Load() != 2 || result.Answer.Text != "The decision was Tuesday." || len(result.Sources) != 1 || result.Sources[0].SourceID != observation.ContentID() {
 		t.Fatalf("consented remote Ask result = %+v; requests = %d", result, requests.Load())
 	}
 	changedEndpoint := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
@@ -942,13 +1510,13 @@ func TestAskMemoryIsCancelledAndSignalsWhenMemoryIsChanging(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := make(chan struct{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(modeltest.LocalOllama("fixture-model", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started <- struct{}{}
 		select {
 		case <-r.Context().Done():
 		case <-time.After(time.Second):
 		}
-	}))
+	})))
 	defer server.Close()
 	controller := newLocalAIController(filepath.Join(t.TempDir(), "local-ai.json"), notes.NewService(nil, nil, nil))
 	defer controller.Close()
@@ -1237,10 +1805,17 @@ func TestResolveZoneName(t *testing.T) {
 		t.Fatalf("TZ env: %q", got)
 	}
 	link := filepath.Join(t.TempDir(), "localtime")
-	if err := os.Symlink("/var/db/timezone/zoneinfo/Asia/Tokyo", link); err != nil {
+	// Use a platform-native target spelling: Windows Readlink returns backslashes.
+	target := filepath.Join(t.TempDir(), "zoneinfo", "Asia", "Tokyo")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolveZoneName("", link, now); got != "Asia/Tokyo" {
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Logf("symlink fixture unavailable: %v", err)
+	} else if got := resolveZoneName("", link, now); got != "Asia/Tokyo" {
 		t.Fatalf("symlink: %q", got)
 	}
 	got := resolveZoneName("", "/nonexistent", now)
@@ -1256,6 +1831,17 @@ func TestResolveZoneName(t *testing.T) {
 	}
 	if _, err := loadZone("bogus"); err == nil {
 		t.Fatal("bogus zone accepted")
+	}
+}
+
+func TestResolveZoneNameFromWindowsZoneinfoSymlink(t *testing.T) {
+	link := filepath.Join(t.TempDir(), "localtime")
+	if err := os.Symlink(`C:\zoneinfo\Asia\Tokyo`, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	if got := resolveZoneName("", link, now); got != "Asia/Tokyo" {
+		t.Fatalf("Windows zoneinfo target resolved to %q", got)
 	}
 }
 

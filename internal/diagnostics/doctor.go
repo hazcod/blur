@@ -81,7 +81,7 @@ func safeName(name string) bool {
 	}
 	for i := range name {
 		c := name[i]
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
 			return false
 		}
 	}

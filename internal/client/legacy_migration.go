@@ -63,17 +63,6 @@ func fileModTime(path string) (time.Time, bool) {
 	return info.ModTime(), true
 }
 
-// sandboxed reports whether the process runs in an App Sandbox container. The
-// sandbox sets APP_SANDBOX_CONTAINER_ID only for some launch paths (not for
-// LaunchServices/open), so a HOME inside ~/Library/Containers also counts.
-func sandboxed() bool {
-	if os.Getenv(sandboxContainerEnv) != "" {
-		return true
-	}
-	home, err := os.UserHomeDir()
-	return err == nil && legacyHomeFromContainer(home) != ""
-}
-
 // legacyHomeFromContainer derives the real home from a sandbox container home
 // (<home>/Library/Containers/<id>/Data). It is the last-resort fallback.
 func legacyHomeFromContainer(containerHome string) string {
@@ -121,7 +110,7 @@ func copyLegacyStore(legacyDir, containerDir string, random io.Reader) (int, err
 	if err := os.Mkdir(staging, 0o700); err != nil {
 		return 0, err
 	}
-	defer os.RemoveAll(staging)
+	defer func() { _ = os.RemoveAll(staging) }()
 	var names []string
 	hasStore := false
 	for _, entry := range entries {
@@ -165,7 +154,7 @@ func copyRegularFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func(close func() error) { _ = close() }(in.Close)
 	info, err := in.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return errors.Join(err, fs.ErrInvalid)

@@ -21,7 +21,7 @@ func userTempDir() string {
 	var confstr func(name int32, buf unsafe.Pointer, length uintptr) uintptr
 	purego.RegisterLibFunc(&confstr, lib, "confstr")
 	var buf [1024]byte
-	n := confstr(csDarwinUserTempDir, unsafe.Pointer(&buf[0]), uintptr(len(buf)))
+	n := confstr(csDarwinUserTempDir, unsafe.Pointer(&buf[0]), uintptr(len(buf))) // #nosec G103 -- fixed native API fills this live Go buffer within its explicit size.
 	if n < 2 || n > uintptr(len(buf)) {
 		return ""
 	}

@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	MaxCompatibleOutputTokens = 384
+	MaxCompatibleOutputTokens = 1536
 	maxCompatibleRequestBytes = 32 << 10
 	maxCompatibleResponse     = 64 << 10
 	compatibleTimeout         = 45 * time.Second
@@ -67,7 +67,7 @@ func NewOpenAICompatible(endpoint, modelName, apiKey string) (*OpenAICompatible,
 		return nil, ErrCompatibleConfig
 	}
 	local := loopbackHost(parsed.Hostname())
-	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && local) {
+	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !local) {
 		return nil, ErrCompatibleConfig
 	}
 	if !local && apiKey == "" {
@@ -159,7 +159,7 @@ func (m *OpenAICompatible) Generate(ctx context.Context, system, user string, ma
 		}
 		return "", ErrCompatibleUnavailable
 	}
-	defer response.Body.Close()
+	defer func(close func() error) { _ = close() }(response.Body.Close)
 	if response.StatusCode != http.StatusOK {
 		return "", ErrCompatibleUnavailable
 	}
