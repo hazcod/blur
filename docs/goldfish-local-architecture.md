@@ -340,8 +340,42 @@ strings, SQL or tool descriptions; INFERRED marks deductions.
 
 ### What Blur takes from this (plan 2026-11-16)
 
-A realistic recall scenario harness; stored, source-linked day and ISO-week
-rollups generated only by the local background provider; bounded `read_session`,
-`list_wiki` and `get_time_report` reads; and retrieval ranking/routing fixes
-proven by the harness. Remaining gaps are tracked in
+Merged on 2026-11-16 (branch `feature/goldfish-recall-parity`): a realistic
+recall scenario harness (15 natural-language scenarios × no-model and
+fake-generator modes, all passing); stored, source-linked day and ISO-week
+rollups generated only by the local background provider; `read_session`,
+`list_wiki`, `get_time_report` and `get_promises` reads; planner routing for
+recency, day parts, conversation recaps, speaker questions, pronoun follow-ups
+and stored-location cues; majority-term ranking with login-chrome demotion and
+chronological multi-day recaps; no-model extractive whole-page answers,
+bare-hour reminders and task-creation phrasings; a 32-character minimum-content
+filter on every write path with per-source sighting counts; a focused-element
+breadcrumb per capture; and persistent, deletion-fenced question history.
+
+### Remaining gaps (2026-11-16)
+
+Inside the recall goal:
+
+- Normalized body text with learned, per-surface boilerplate stripping: Blur
+  still indexes the raw sanitized capture and only drops Accessibility chrome
+  by role. Repeated sidebars and navigation can still outrank substantive text
+  for rare terms.
+- Inferred commitments: open loops are user-authored or explicit markers;
+  nothing yet reads captured prose for promises with confidence, horizon and
+  quoted closure evidence.
+- Entity detection only recognises capitalised names or Library matches at
+  retrieval time; the planner cannot consult the Library, so lowercase names
+  ("what did dima say") do not become a subject.
+- Month and year rollups, and rule-based project time in `get_time_report`.
+- Semantic recall covers only the optional local index; raw captures are
+  lexical, as in Goldfish, but Blur has no vector index over Library pages.
+- The live Accessibility breadcrumb path, long-session voice capture and
+  cross-app native acceptance remain unverified until a native acceptance run.
+- Background visibility: rollup counters joined the Settings panel; voice,
+  meeting and open-loop jobs still report nothing there.
+
+Outside the goal (not started): morning/evening briefs and contextual nudges,
+inline writing assistance and learned writing rules, time-rule editing UI,
+attention items from observed calendars and mail, chat threads/inbox, and
+ChatGPT/Claude history import. Details per area are in
 `docs/goldfish-feature-parity.md`.
