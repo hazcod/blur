@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/localapi"
+	"github.com/hazcod/blur/internal/storage"
+	"github.com/hazcod/blur/internal/storage/durable"
 )
 
 type sightingFields struct {
@@ -120,21 +122,81 @@ func TestMCPReadsReportThreeThenFourSightings(t *testing.T) {
 	expect(4, later)
 }
 
-type failingSightingData struct{ Data }
-
-func (failingSightingData) ObservationSightingStats(context.Context, string) (int64, time.Time, bool, error) {
-	return 0, time.Time{}, false, errors.New("corrupt")
+type statsErrData struct {
+	Data
+	err error
 }
 
-func TestMCPSightingUnreadableMetadataOmitsFieldsKeepsCapture(t *testing.T) {
-	c := &Client{data: failingSightingData{}}
-	count, last, err := c.mcpSighting(context.Background(), "id", time.Now())
-	if err != nil || count != 0 || last != "" {
-		t.Fatalf("got %d %q %v", count, last, err)
+func (d statsErrData) ObservationSightingStats(context.Context, string) (int64, time.Time, bool, error) {
+	return 0, time.Time{}, false, d.err
+}
+
+func TestMCPSightingDegradesOnlyOnDamagedMetadata(t *testing.T) {
+	for _, damaged := range []error{durable.ErrCorrupt, durable.ErrSightingUnknown} {
+		c := &Client{data: statsErrData{err: damaged}}
+		count, last, err := c.mcpSighting(context.Background(), "id", time.Now())
+		if err != nil || count != 0 || last != "" {
+			t.Fatalf("%v: got %d %q %v", damaged, count, last, err)
+		}
+	}
+	for _, broken := range []error{errors.New("disk i/o error"), durable.ErrUnavailable, &storage.StoreError{Code: storage.Closed}} {
+		c := &Client{data: statsErrData{err: broken}}
+		if _, _, err := c.mcpSighting(context.Background(), "id", time.Now()); err == nil {
+			t.Fatalf("%v was masked", broken)
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	c := &Client{data: statsErrData{err: durable.ErrCorrupt}}
 	if _, _, err := c.mcpSighting(ctx, "id", time.Now()); err == nil {
 		t.Fatal("cancellation must still propagate")
+	}
+}
+
+type selectiveStatsStore struct {
+	*durable.Store
+	corrupt string
+	broken  bool
+}
+
+func (s selectiveStatsStore) ObservationSightingStats(ctx context.Context, id string) (int64, time.Time, bool, error) {
+	if s.broken {
+		return 0, time.Time{}, false, errors.New("disk i/o error")
+	}
+	if id == s.corrupt {
+		return 0, time.Time{}, false, durable.ErrCorrupt
+	}
+	return s.Store.ObservationSightingStats(ctx, id)
+}
+
+func TestMCPReadsReportDegradedItemsAndFailOnBrokenStore(t *testing.T) {
+	corpus := newScenarioCorpus(t)
+	app := "com.example.degraded"
+	first := corpus.now.Add(-30 * time.Minute)
+	good := sessionTestCapture(t, corpus, app, "healthy capture text that is longer than the minimum", first)
+	bad := sessionTestCapture(t, corpus, app, "damaged capture text that is longer than the minimum", first.Add(time.Minute))
+	ids := fmt.Sprintf(`{"source_ids":[%q,%q]}`, good.ContentID(), bad.ContentID())
+	wm := `{"hours":2,"limit":8}`
+	sess := fmt.Sprintf(`{"app":%q,"from":%d,"to":%d}`, app, first.Add(-time.Hour).Unix(), corpus.now.Add(time.Hour).Unix())
+	original := corpus.client.data
+	defer func() { corpus.client.data = original }()
+	corpus.client.data = selectiveStatsStore{Store: corpus.store, corrupt: bad.ContentID()}
+	for method, params := range map[string]string{localapi.RPCGetSnapshots: ids, localapi.RPCGetWorkingMemory: wm, localapi.RPCReadSession: sess} {
+		raw, err := corpus.client.HandleMCPRead(context.Background(), method, json.RawMessage(params))
+		if err != nil {
+			t.Fatalf("%s: damaged item failed the whole call: %v", method, err)
+		}
+		var env struct {
+			Unavailable int `json:"sighting_unavailable"`
+		}
+		if json.Unmarshal(raw, &env) != nil || env.Unavailable != 1 {
+			t.Fatalf("%s: sighting_unavailable = %d in %s", method, env.Unavailable, raw)
+		}
+	}
+	corpus.client.data = selectiveStatsStore{Store: corpus.store, broken: true}
+	for method, params := range map[string]string{localapi.RPCGetSnapshots: ids, localapi.RPCGetWorkingMemory: wm, localapi.RPCReadSession: sess} {
+		if _, err := corpus.client.HandleMCPRead(context.Background(), method, json.RawMessage(params)); err == nil {
+			t.Fatalf("%s: broken store was masked", method)
+		}
 	}
 }

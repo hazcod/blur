@@ -2,6 +2,7 @@ package durable
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -88,7 +89,7 @@ func TestLegacySourceDerivesCountAndLastSeenFromChainThenContinues(t *testing.T)
 	}
 }
 
-func TestCorruptCountRecordFallsBackToChain(t *testing.T) {
+func TestCorruptCountRecordFailsReadAsCorruptAndRepairsOnNextSighting(t *testing.T) {
 	ctx := context.Background()
 	s, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x64), CreateNew)
 	if err != nil {
@@ -108,13 +109,89 @@ func TestCorruptCountRecordFallsBackToChain(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	count, last, found, err := s.ObservationSightingStats(ctx, o.ContentID())
-	if err != nil || !found || count != 2 || !last.Equal(first.Add(time.Hour)) {
-		t.Fatalf("corrupt fallback = %d %s %t %v", count, last, found, err)
+	if _, _, _, err := s.ObservationSightingStats(ctx, o.ContentID()); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("damaged record must read as corrupt, got %v", err)
 	}
+	repairs := SightingRepairs()
 	recordTestSighting(t, s, o, first.Add(2*time.Hour))
-	if count, _, _, _ = s.ObservationSightingStats(ctx, o.ContentID()); count != 3 {
-		t.Fatalf("repaired count = %d", count)
+	if SightingRepairs() != repairs+1 {
+		t.Fatal("repair not counted")
+	}
+	count, last, _, err := s.ObservationSightingStats(ctx, o.ContentID())
+	if err != nil || count != 3 || !last.Equal(first.Add(2*time.Hour)) {
+		t.Fatalf("repaired = %d %s %v", count, last, err)
+	}
+}
+
+func TestLegacyDerivationIsPersistedSoSecondReadWalksNoChain(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x65), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(close func() error) { _ = close() }(s.Close)
+	o, _ := capture.SanitizeObservation("editor.app", "example.com", "Legacy capture read twice by the memory tools.", 512)
+	first := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	if err := s.PutObservationAt(ctx, o, first); err != nil {
+		t.Fatal(err)
+	}
+	recordTestSighting(t, s, o, first.Add(time.Hour))
+	recordTestSighting(t, s, o, first.Add(2*time.Hour))
+	dropSightingCountRecord(t, s, o.ContentID())
+	before := sightingChainWalks.Load()
+	if count, _, _, err := s.ObservationSightingStats(ctx, o.ContentID()); err != nil || count != 3 {
+		t.Fatalf("first read = %d %v", count, err)
+	}
+	walks := sightingChainWalks.Load()
+	if walks == before {
+		t.Fatal("first read should derive from the chain")
+	}
+	for i := 0; i < 3; i++ {
+		if count, _, _, err := s.ObservationSightingStats(ctx, o.ContentID()); err != nil || count != 3 {
+			t.Fatalf("later read = %d %v", count, err)
+		}
+	}
+	if sightingChainWalks.Load() != walks {
+		t.Fatalf("later reads walked the chain %d times", sightingChainWalks.Load()-walks)
+	}
+}
+
+func TestOverlongSightingChainReportsUnknownAndPersistsNothing(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x66), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(close func() error) { _ = close() }(s.Close)
+	o, _ := capture.SanitizeObservation("editor.app", "example.com", "Capture with a sighting chain beyond the cap.", 512)
+	first := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	if err := s.PutObservationAt(ctx, o, first); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 4; i++ {
+		recordTestSighting(t, s, o, first.Add(time.Duration(i)*time.Hour))
+	}
+	dropSightingCountRecord(t, s, o.ContentID())
+	old := maxSightingChainHops
+	maxSightingChainHops = 2
+	defer func() { maxSightingChainHops = old }()
+	if _, _, _, err := s.ObservationSightingStats(ctx, o.ContentID()); !errors.Is(err, ErrSightingUnknown) {
+		t.Fatalf("over cap must be unknown, got %v", err)
+	}
+	// A further sighting must not persist an undercount either.
+	recordTestSighting(t, s, o, first.Add(9*time.Hour))
+	if _, _, _, err := s.ObservationSightingStats(ctx, o.ContentID()); !errors.Is(err, ErrSightingUnknown) {
+		t.Fatalf("over cap must stay unknown after a sighting, got %v", err)
+	}
+	var has bool
+	if err := s.Update(ctx, func(tx *Tx) error {
+		tx.mu.Lock()
+		defer tx.mu.Unlock()
+		var rerr error
+		_, has, rerr = tx.readIndexValueLocked(observationSightingNS, sightingCountKey(o.ContentID()), 256)
+		return rerr
+	}); err != nil || has {
+		t.Fatalf("a count record was persisted for an over-cap chain: %t %v", has, err)
 	}
 }
 

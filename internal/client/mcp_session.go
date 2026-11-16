@@ -58,6 +58,10 @@ type mcpSessionResponse struct {
 	Next            string              `json:"next,omitempty"`
 	IndexingPending bool                `json:"indexing_pending,omitempty"`
 	CoverageLimited bool                `json:"coverage_limited,omitempty"`
+
+	// SightingUnavailable counts captures whose sighting_count was omitted
+	// because their sighting metadata is damaged.
+	SightingUnavailable int `json:"sighting_unavailable,omitempty"`
 }
 
 func decodeMCPSessionParams(raw []byte) (mcpSessionParams, error) {
@@ -309,6 +313,12 @@ func (c *Client) readMCPSession(ctx context.Context, epoch uint64, params mcpSes
 		response.HasMore = true
 		response.Next = response.Captures[len(response.Captures)-1].SourceID
 	}
+	for _, item := range response.Captures {
+		if item.SightingCount == 0 {
+			response.SightingUnavailable++
+		}
+	}
+	noteSightingUnavailable(response.SightingUnavailable)
 	return c.publishMCPParity(ctx, epoch, response, localapi.MaxRPCSnapshotResponseBytes)
 }
 

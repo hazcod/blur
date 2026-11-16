@@ -87,6 +87,10 @@ type mcpSnapshotItem struct {
 type mcpSnapshotResponse struct {
 	Snapshots []mcpSnapshotItem `json:"snapshots"`
 	Truncated bool              `json:"truncated"`
+
+	// SightingUnavailable counts captures whose sighting fields were omitted
+	// because their sighting metadata is damaged.
+	SightingUnavailable int `json:"sighting_unavailable,omitempty"`
 }
 
 type mcpChronicleParams struct {
@@ -168,6 +172,10 @@ type mcpWorkingMemoryResponse struct {
 	Items           []mcpWorkingMemoryItem `json:"items"`
 	Truncated       bool                   `json:"truncated"`
 	IndexingPending bool                   `json:"indexing_pending,omitempty"`
+
+	// SightingUnavailable counts items whose sighting fields were omitted
+	// because their sighting metadata is damaged.
+	SightingUnavailable int `json:"sighting_unavailable,omitempty"`
 }
 
 type mcpActivityParams struct {
@@ -719,12 +727,16 @@ func (c *Client) readMCPWorkingMemory(ctx context.Context, epoch uint64, params 
 		if err != nil {
 			return nil, err
 		}
+		if sightings == 0 {
+			response.SightingUnavailable++
+		}
 		response.Items = append(response.Items, mcpWorkingMemoryItem{
 			SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(),
 			CapturedAt: at.UTC(), Content: content, Truncated: clipped || source.Truncated(),
 			SightingCount: sightings, LastSeenAt: lastSeen,
 		})
 	}
+	noteSightingUnavailable(response.SightingUnavailable)
 	encoded, err := json.Marshal(response)
 	if err != nil || len(encoded) > maxMCPReadOutputBytes {
 		clear(encoded)
@@ -1332,6 +1344,9 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 		if item.SightingCount, item.LastSeenAt, err = c.mcpSighting(ctx, id, at); err != nil {
 			return nil, err
 		}
+		if item.SightingCount == 0 {
+			response.SightingUnavailable++
+		}
 		response.Snapshots = append(response.Snapshots, item)
 		used += mcpSightingFieldsBytes + len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.Content) + 192
 		if used > localapi.MaxRPCSnapshotResponseBytes {
@@ -1341,6 +1356,7 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	noteSightingUnavailable(response.SightingUnavailable)
 	var encoded []byte
 	var marshalErr error
 	if !c.PublishMemoryRead(epoch, func() { encoded, marshalErr = json.Marshal(response) }) {
