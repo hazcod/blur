@@ -68,7 +68,8 @@ type Evidence struct {
 	Text                  string
 	MatchStart            int // byte span of the best semantic passage; zero End uses full text
 	MatchEnd              int
-	Layer                 Layer // LayerSource (zero), LayerHour, or LayerDigest
+	Layer                 Layer    // LayerSource (zero), LayerHour, LayerDay, LayerWeek, or LayerDigest
+	SourceIDs             []string // capture sources a derived day or week recap summarizes; provenance only
 	Origin                EvidenceOrigin
 	CapturedAt            time.Time // capture time, or the start of an hour/digest span
 	EndAt                 time.Time // end of an hour/digest span; zero for raw captures
@@ -410,8 +411,9 @@ func truncateUTF8(value string, maxBytes int) string {
 	return value[:end]
 }
 
-// layerOrder puts digests before hour summaries before raw captures, keeping
-// retrieval rank within each layer. It returns the input when already ordered.
+// layerOrder puts digests before week and day recaps before hour summaries
+// before raw captures, keeping retrieval rank within each layer. It returns
+// the input when already ordered.
 func layerOrder(evidence []Evidence) []Evidence {
 	if sort.SliceIsSorted(evidence, func(i, j int) bool { return evidence[i].Layer > evidence[j].Layer }) {
 		return evidence
@@ -425,6 +427,10 @@ func layerName(l Layer) string {
 	switch l {
 	case LayerHour:
 		return "hour"
+	case LayerDay:
+		return "day"
+	case LayerWeek:
+		return "week"
 	case LayerDigest:
 		return "digest"
 	}

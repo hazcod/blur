@@ -287,7 +287,7 @@ func (c *localAIController) replaceChronicleWorkerLocked() *chronicle.Worker {
 	if settings.Enabled && settings.BackgroundSummaries && !c.needsRepair && isLocalCompletionProvider(effectiveProvider(settings)) && c.chronicleRepo != nil && c.chroniclePolicy != nil {
 		generator, err := newConfiguredChronicleGenerator(settings)
 		if err == nil {
-			c.chronicleWorker = chronicle.NewWorker(c.chronicleRepo, c.chroniclePolicy, generator, chronicle.WorkerConfig{Enabled: true, Provider: power.LocalProvider})
+			c.chronicleWorker = chronicle.NewWorker(c.chronicleRepo, c.chroniclePolicy, generator, chronicle.WorkerConfig{Enabled: true, Provider: power.LocalProvider, Zone: localZoneName})
 		}
 	}
 	if c.chronicleFeed != nil {

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -1214,7 +1215,7 @@ func TestRetrieveAdaptsSanitizedSearchHitsToAssistantEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != (assistant.Evidence{SourceID: observation.ContentID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text()}) {
+	if len(got) != 1 || !reflect.DeepEqual(got[0], assistant.Evidence{SourceID: observation.ContentID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text()}) {
 		t.Fatalf("retrieved assistant evidence=%+v", got)
 	}
 	if d.query.TopK != assistant.MaxEvidenceSources || d.query.MaxRows != assistant.MaxEvidenceSources*16 {
