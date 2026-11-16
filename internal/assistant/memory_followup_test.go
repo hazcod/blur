@@ -234,3 +234,75 @@ func TestFactualFollowupPreservesExplicitDomainWithDots(t *testing.T) {
 		t.Fatal("domain punctuation lost factual reference", got, r.freshPlan, err)
 	}
 }
+
+func capturedEvidence(id, app string, at time.Time) Evidence {
+	return Evidence{SourceID: id, AppID: "com.tinyspeck.slackmacgap", AppName: app, Text: "Dima: the retest is on Thursday", CapturedAt: at}
+}
+
+type clockedGroundedRetriever struct {
+	*groundedRetriever
+	now time.Time
+}
+
+func (r clockedGroundedRetriever) AskTime() time.Time { return r.now }
+
+func citedOnlyHistory(id string) []Turn {
+	return []Turn{{Question: "what did the retest say", Answer: "Dima mentioned a retest.", SourceIDs: []string{id}, Plan: Plan{Kind: KindLookup, Terms: []string{"retest"}, Question: "what did the retest say"}}}
+}
+
+// The previous answer named no subject (its plan had no Entity), so a pronoun
+// follow-up used to stop at "Who are you referring to?". It now re-reads the
+// sources that answer cited.
+func TestPronounFollowupResolvesThroughCitedSourcesWhenThePlanHadNoEntity(t *testing.T) {
+	id := strings.Repeat("d", 64)
+	for _, q := range []string{"what else did she say", "when did he say that", "what did they say"} {
+		t.Run(q, func(t *testing.T) {
+			r := &groundedRetriever{fresh: Retrieval{Evidence: []Evidence{{SourceID: id, Text: "Dima: the retest is on Thursday. FRESH_SOURCE"}}}}
+			g := &testGenerator{answer: ModelAnswer{Text: "Dima mentioned it.", SourceIDs: []string{id}}}
+			got, err := NewService(r, g, testCounter{tokens: 10}, 8192).WithPersonalContext(true).AskWithHistory(context.Background(), q, citedOnlyHistory(id))
+			if err != nil || strings.Contains(got.Answer.Text, "Who are you referring to") || r.freshCalls != 1 || len(r.ids) != 1 || r.ids[0] != id {
+				t.Fatalf("pronoun follow-up did not use cited sources: result=%+v fresh=%d ids=%v err=%v", got, r.freshCalls, r.ids, err)
+			}
+			if r.freshPlan.SubjectFollowup {
+				t.Fatalf("a subject-less follow-up must read the cited sources, not run a subject lookup: %+v", r.freshPlan)
+			}
+		})
+	}
+}
+
+func TestPronounFollowupWithNothingCitedStillAsksWhoIsMeant(t *testing.T) {
+	history := citedOnlyHistory("")
+	history[0].SourceIDs = nil
+	r := &groundedRetriever{}
+	got, err := NewService(r, &testGenerator{}, testCounter{tokens: 10}, 8192).AskWithHistory(context.Background(), "when did he say that", history)
+	if err != nil || !strings.Contains(got.Answer.Text, "Who are you referring to") || r.freshCalls != 0 {
+		t.Fatalf("an unanchored pronoun must still ask who is meant: %+v calls=%d err=%v", got, r.freshCalls, err)
+	}
+}
+
+func TestWhenFollowupWithoutAGeneratorAnswersCaptureTimesAndCitesThem(t *testing.T) {
+	loc := brussels(t)
+	id, other := strings.Repeat("d", 64), strings.Repeat("e", 64)
+	at := time.Date(2026, 11, 15, 13, 47, 0, 0, time.UTC) // 14:47 in Brussels
+	g := &groundedRetriever{fresh: Retrieval{Evidence: []Evidence{capturedEvidence(id, "Slack", at), capturedEvidence(other, "Slack", at.Add(-48*time.Hour))}}}
+	r := clockedGroundedRetriever{groundedRetriever: g, now: time.Date(2026, 11, 16, 15, 30, 0, 0, loc)}
+	got, err := NewService(r, nil, nil, 8192).AskWithHistory(context.Background(), "when did he say that?", citedOnlyHistory(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Direct || got.General || got.Answer.InsufficientEvidence || !strings.Contains(got.Answer.Text, "Captured Sunday 15 November at 14:47 in Slack") {
+		t.Fatalf("capture time answer = %+v", got.Answer)
+	}
+	if len(got.Answer.SourceIDs) != 1 || got.Answer.SourceIDs[0] != id || len(got.Sources) != 1 {
+		t.Fatalf("the cited source must be the one asked about: %+v sources=%d", got.Answer, len(got.Sources))
+	}
+}
+
+func TestWhenFollowupWithAGeneratorStillUsesTheModel(t *testing.T) {
+	id := strings.Repeat("d", 64)
+	r := &groundedRetriever{fresh: Retrieval{Evidence: []Evidence{capturedEvidence(id, "Slack", time.Date(2026, 11, 15, 13, 47, 0, 0, time.UTC))}}}
+	g := &testGenerator{answer: ModelAnswer{Text: "On Sunday.", SourceIDs: []string{id}}}
+	if _, err := NewService(r, g, testCounter{tokens: 10}, 8192).WithPersonalContext(true).AskWithHistory(context.Background(), "when did he say that", citedOnlyHistory(id)); err != nil || g.calls != 1 {
+		t.Fatalf("model was skipped: calls=%d err=%v", g.calls, err)
+	}
+}
