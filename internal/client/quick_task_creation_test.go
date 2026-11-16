@@ -1,8 +1,11 @@
 package client
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/hazcod/blur/internal/intent"
 )
 
 func TestQuickTaskCreationPhrasings(t *testing.T) {
@@ -48,5 +51,23 @@ func TestQuickTaskCreationBoundsTitleOnRuneBoundary(t *testing.T) {
 	kind, body := classifyQuickInput("add a task: " + strings.Repeat("é", 400))
 	if kind != quickInputTask || len(body) > 512 || strings.ContainsRune(body, '�') || len(body)%2 != 0 {
 		t.Fatalf("kind=%v len=%d", kind, len(body))
+	}
+}
+
+func TestTaskCreationReceiptNamesTheCreatedTask(t *testing.T) {
+	corpus := newScenarioCorpus(t)
+	ctx := context.Background()
+	resolved, err := corpus.client.ResolveEntry(ctx, "add task: renew the Brussels parking permit", EntryState{}, "Europe/Brussels")
+	if err != nil || resolved.Action.Kind != intent.Task || resolved.Action.Text != "renew the Brussels parking permit" {
+		t.Fatalf("not resolved as a task: %+v %v", resolved.Action, err)
+	}
+	result, err := corpus.client.CreateTask(ctx, resolved.Action.Text, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The quick panel shows this exact composition as the confirmation.
+	receipt := taskResultCopy(result) + " " + result.Item.Title
+	if !strings.Contains(receipt, "Task saved.") || !strings.Contains(receipt, "renew the Brussels parking permit") {
+		t.Fatalf("confirmation does not name the task: %q", receipt)
 	}
 }

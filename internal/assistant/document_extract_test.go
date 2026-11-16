@@ -63,3 +63,27 @@ func TestExcerptIsUTF8Safe(t *testing.T) {
 		}
 	}
 }
+
+func TestExcerptThresholdSizesNeverDropTextSilently(t *testing.T) {
+	for _, size := range []int{1399, 1400, 1401, 1450, 1600, 1601} {
+		for _, filler := range []string{"x", "é"} {
+			for _, lead := range []string{"", "x"} {
+				doc := lead + strings.Repeat(filler, size)
+				doc = doc[:size]
+				for !utf8.ValidString(doc) {
+					doc = doc[:len(doc)-1]
+				}
+				head, tail, whole := endsOf(doc).excerpt()
+				if len(doc) <= excerptHeadBytes+excerptTailBytes {
+					if !whole || head != doc || tail != "" {
+						t.Fatalf("size %d %q lead %q: complete document not returned whole (whole=%v head=%d)", size, filler, lead, whole, len(head))
+					}
+					continue
+				}
+				if whole || !strings.HasPrefix(doc, head) || !strings.HasSuffix(doc, tail) || len(head) == 0 || len(tail) == 0 || len(head) > excerptHeadBytes || len(tail) > excerptTailBytes || !utf8.ValidString(head) || !utf8.ValidString(tail) {
+					t.Fatalf("size %d %q lead %q: bad head/tail split whole=%v head=%d tail=%d", size, filler, lead, whole, len(head), len(tail))
+				}
+			}
+		}
+	}
+}

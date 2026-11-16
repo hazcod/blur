@@ -21,8 +21,10 @@ type documentEnds struct {
 
 func (e *documentEnds) add(text string) {
 	e.total += len(text)
-	if len(e.head) < excerptHeadBytes+excerptSentenceBy {
-		room := excerptHeadBytes + excerptSentenceBy - len(e.head)
+	// The head buffer must hold the whole-document threshold so that any
+	// document reported as whole is held completely.
+	if limit := excerptHeadBytes + excerptTailBytes; len(e.head) < limit {
+		room := limit - len(e.head)
 		if room > len(text) {
 			room = len(text)
 		}
@@ -34,16 +36,12 @@ func (e *documentEnds) add(text string) {
 	}
 }
 
-// excerpt returns the labelled-free extract: the first excerptHeadBytes and the
-// last excerptTailBytes of the document, both cut on rune boundaries and, when
-// a sentence end lies within excerptSentenceBy bytes of the cut, on that end.
+// excerpt returns the first excerptHeadBytes and the last excerptTailBytes of
+// the document, both cut on rune boundaries and, when a sentence end lies
+// within excerptSentenceBy bytes of the cut, on that end. A document of at
+// most excerptHeadBytes+excerptTailBytes bytes is returned whole.
 func (e *documentEnds) excerpt() (head, tail string, whole bool) {
 	if e.total <= excerptHeadBytes+excerptTailBytes {
-		if e.total <= len(e.head) {
-			return strings.TrimSpace(e.head[:e.total]), "", true
-		}
-		// The head buffer is shorter than the document only when it is larger
-		// than the whole budget, so this cannot happen; stay safe regardless.
 		return strings.TrimSpace(e.head), "", true
 	}
 	head = e.head[:excerptHeadBytes]
