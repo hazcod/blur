@@ -56,6 +56,20 @@ func (r *rollupRepo) PutChronicleRollup(_ context.Context, v Rollup) error {
 	r.rollups[v.ID] = v
 	return nil
 }
+func (r *rollupRepo) MarkChronicleRollupDirty(_ context.Context, id, zone string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.rollups[id]
+	if !ok {
+		var err error
+		if v, err = NewRollupPlaceholder(id, zone); err != nil {
+			return err
+		}
+	}
+	v.Dirty = true
+	r.rollups[id] = v
+	return nil
+}
 func (r *rollupRepo) GetChronicleRollup(_ context.Context, id string) (Rollup, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

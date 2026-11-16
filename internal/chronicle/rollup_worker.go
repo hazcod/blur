@@ -415,21 +415,9 @@ func (w *Worker) markWeekDirty(ctx context.Context, repo RollupRepository, day R
 	if !ok {
 		return ErrInvalid
 	}
-	id := WeekRollupID(key)
-	week, found, err := repo.GetChronicleRollup(ctx, id)
-	if err != nil {
-		return err
-	}
-	if !found {
-		week, err = NewRollupPlaceholder(id, day.Zone)
-		if err != nil {
-			return err
-		}
-	} else if week.Dirty {
-		return nil
-	}
-	week.Dirty = true
-	return repo.PutChronicleRollup(ctx, week)
+	// A store-side flag flip: never a read-modify-write of the whole week, which
+	// could put back text that was cleared in between.
+	return repo.MarkChronicleRollupDirty(ctx, WeekRollupID(key), day.Zone)
 }
 
 // generateRollupText applies the same local-only background policy as hourly

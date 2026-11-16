@@ -352,6 +352,14 @@ func (r sourceVerifiedRepository) ListChronicleRollups(ctx context.Context, leve
 	return inner.ListChronicleRollups(ctx, level, start, end, after, limit)
 }
 
+func (r sourceVerifiedRepository) MarkChronicleRollupDirty(ctx context.Context, id, zone string) error {
+	inner, ok := r.rollups()
+	if !ok {
+		return chronicle.ErrWorkerUnavailable
+	}
+	return inner.MarkChronicleRollupDirty(ctx, id, zone)
+}
+
 func (r sourceVerifiedRepository) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup) error {
 	inner, ok := r.rollups()
 	if !ok {

@@ -88,6 +88,18 @@ func (s *Store) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup)
 	}
 	defer clear(encoded)
 	return s.Update(ctx, func(tx *Tx) error {
+		old, found, err := tx.readRollup(rollup.ID)
+		if err != nil {
+			return err
+		}
+		// Compare-and-set: the caller derived this rollup from the revision it
+		// read. If an input changed or was erased since, the stored record
+		// already reflects that (it is dirty, and its text may have been
+		// cleared). A stale write must never replace it, so it is discarded and
+		// the next pass regenerates from current inputs.
+		if rollup.Revision != old.Revision {
+			return nil
+		}
 		// A rollup may only cite sources that still exist at write time, so a
 		// source erased while it was being generated is never re-linked.
 		admission := &chronicleAdmissionReader{Reader: tx.writer}
@@ -102,25 +114,9 @@ func (s *Store) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup)
 			}
 		}
 		admission.close()
-		old, found, err := tx.readRollup(rollup.ID)
-		if err != nil {
-			return err
-		}
 		if !found {
 			rollup.Revision = 0
 			return tx.writeRollup(rollup, nil)
-		}
-		// Compare-and-set: the caller generated this rollup from the revision
-		// it read. If an hour recap changed since, the rollup is stored but
-		// stays dirty so the next pass regenerates it.
-		if !rollup.Dirty && rollup.Revision != old.Revision {
-			rollup.Dirty = true
-		}
-		rollup.Revision = old.Revision
-		if rollup.Dirty {
-			// Marking dirty (for example a week after its day regenerated)
-			// also makes any in-flight generation of this rollup stale.
-			rollup.Revision++
 		}
 		return tx.writeRollup(rollup, &old)
 	})
@@ -293,6 +289,32 @@ func (tx *Tx) markChronicleDayDirty(hourStart time.Time) error {
 	rollup.Dirty = true
 	rollup.Revision++ // even when already dirty: an in-flight generation is now stale
 	return tx.writeRollup(rollup, &old)
+}
+
+// MarkChronicleRollupDirty flags a rollup as needing regeneration without
+// touching its content, and advances its revision so an in-flight generation
+// of it cannot be stored. A missing rollup becomes a dirty placeholder in zone.
+func (s *Store) MarkChronicleRollupDirty(ctx context.Context, id, zone string) error {
+	if ctx == nil || !validRollupID(id) {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	placeholder, err := chronicle.NewRollupPlaceholder(id, zone)
+	if err != nil {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	return s.Update(ctx, func(tx *Tx) error {
+		rollup, found, err := tx.readRollup(id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return tx.writeRollup(placeholder, nil)
+		}
+		old := rollup
+		rollup.Dirty = true
+		rollup.Revision++
+		return tx.writeRollup(rollup, &old)
+	})
 }
 
 // invalidateRollupsCoveringHour discards the generated text of every day and

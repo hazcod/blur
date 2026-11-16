@@ -61,6 +61,9 @@ type RollupRepository interface {
 	PutChronicleRollup(context.Context, Rollup) error
 	GetChronicleRollup(context.Context, string) (Rollup, bool, error)
 	ListChronicleRollups(context.Context, string, time.Time, time.Time, string, int) ([]Rollup, string, error)
+	// MarkChronicleRollupDirty flags a rollup for regeneration, creating a
+	// dirty placeholder in the zone when absent. It changes nothing else.
+	MarkChronicleRollupDirty(ctx context.Context, id, zone string) error
 }
 
 // RollupPrompt is the complete local model request for one rollup. Evidence in

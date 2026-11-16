@@ -155,8 +155,8 @@ func TestDurableWorkerKeepsDirtyWhenAnHourArrivesDuringGeneration(t *testing.T) 
 	f.gen.onGenerate = func() { f.hour(15, 23, "Late evening hour saved mid-generation.", "") }
 	f.process()
 	day := f.rollup("day:2026-11-15")
-	if !day.Dirty || len(day.ChildIDs) != 1 {
-		t.Fatalf("a recap written during generation was lost: %+v", day)
+	if !day.Dirty || day.Text != "" {
+		t.Fatalf("a recap written during generation was lost or a stale generation was stored: %+v", day)
 	}
 	f.process()
 	day = f.rollup("day:2026-11-15")
@@ -193,5 +193,56 @@ func TestDurableErasureOfInputOnlySourceClearsDayAndWeekText(t *testing.T) {
 	day, week := f.rollup("day:2026-11-15"), f.rollup("week:2026-W46")
 	if day.Text == "" || day.Dirty || len(day.ChildIDs) != 1 || week.Text == "" || week.Dirty {
 		t.Fatalf("rollups did not regenerate from the remaining hour: day=%+v week=%+v", day, week)
+	}
+}
+
+func TestDurableStaleGenerationNeverRestoresErasedContent(t *testing.T) {
+	f := newDurableRollupFixture(t)
+	private := f.capture("private capture that only fed an hour recap", time.Date(2026, 11, 15, 9, 2, 0, 0, time.UTC))
+	f.hour(15, 9, "Hour built partly from a private capture.", private)
+	f.hour(15, 14, "Unrelated hour.", "")
+	// The hour is erased while the model is writing a day recap that includes it.
+	f.gen.onGenerate = func() {
+		if err := f.store.DeleteObservationRecord(context.Background(), private); err != nil {
+			t.Error(err)
+		}
+	}
+	f.process()
+	for _, id := range []string{"day:2026-11-15", "week:2026-W46"} {
+		r := f.rollup(id)
+		if r.Text != "" || len(r.SourceIDs) != 0 || len(r.ChildIDs) != 0 || r.InputHash != "" || !r.Dirty {
+			t.Fatalf("%s holds content from a generation that raced an erasure: %+v", id, r)
+		}
+	}
+	// The next pass regenerates from the hour that remains.
+	f.process()
+	if day := f.rollup("day:2026-11-15"); day.Text == "" || day.Dirty || len(day.ChildIDs) != 1 {
+		t.Fatalf("day did not regenerate from the remaining hour: %+v", day)
+	}
+}
+
+func TestDurableWeekClearedDuringDayGenerationStaysCleared(t *testing.T) {
+	f := newDurableRollupFixture(t)
+	first, _ := f.hour(15, 9, "First hour.", "")
+	f.process()
+	if f.rollup("week:2026-W46").Text == "" {
+		t.Fatal("setup: week was not generated")
+	}
+	// A new hour makes the day stale; while it regenerates, the source behind
+	// the old day and week is erased, clearing both.
+	f.hour(15, 14, "Second hour.", "")
+	f.gen.onGenerate = func() {
+		if err := f.store.DeleteObservationRecord(context.Background(), first); err != nil {
+			t.Error(err)
+		}
+	}
+	f.process()
+	week := f.rollup("week:2026-W46")
+	if week.Text != "" || len(week.SourceIDs) != 0 || len(week.ChildIDs) != 0 || !week.Dirty {
+		t.Fatalf("marking the week dirty restored cleared content: %+v", week)
+	}
+	f.process()
+	if week := f.rollup("week:2026-W46"); week.Text == "" || week.Dirty || len(week.SourceIDs) != 1 {
+		t.Fatalf("week did not regenerate from the surviving hour: %+v", week)
 	}
 }
