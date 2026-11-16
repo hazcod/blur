@@ -321,7 +321,10 @@ func parseClock(clock string) (int, int, bool) {
 		if strings.EqualFold(match[3], "pm") {
 			hour += 12
 		}
-	} else if hour > 23 || match[2] == "" && hour > 0 && hour <= 12 {
+	} else if match[2] == "" && hour >= 1 && hour <= 6 {
+		// A bare small hour is an afternoon or evening time; 7-12 stay morning.
+		hour += 12
+	} else if hour > 23 {
 		return 0, 0, false
 	}
 	return hour, minute, true

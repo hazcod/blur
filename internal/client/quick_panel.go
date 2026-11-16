@@ -15,6 +15,7 @@ import (
 	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/intent"
 	"github.com/hazcod/blur/internal/profile"
+	"github.com/hazcod/blur/internal/tasks"
 	"github.com/hazcod/blur/internal/today"
 )
 
@@ -271,6 +272,8 @@ func classifyQuickInput(input string) (quickInputKind, string) {
 		return quickInputTask, strings.TrimSpace(text[len("task:"):])
 	case strings.HasPrefix(lower, "todo:"):
 		return quickInputTask, strings.TrimSpace(text[len("todo:"):])
+	case strings.HasPrefix(lower, "to-do:"):
+		return quickInputTask, strings.TrimSpace(text[len("to-do:"):])
 	case strings.HasPrefix(lower, "reminder:"):
 		body := strings.TrimSpace(text[len("reminder:"):])
 		if body == "" {
@@ -286,6 +289,9 @@ func classifyQuickInput(input string) (quickInputKind, string) {
 	}
 	if strings.HasPrefix(lower, "remember that ") {
 		return quickInputAsk, text
+	}
+	if body, ok := quickTaskCreation(text, lower); ok {
+		return quickInputTask, body
 	}
 	if lower == "remind me" || strings.HasPrefix(lower, "remind me to ") || strings.HasPrefix(lower, "remind me in ") ||
 		strings.HasPrefix(lower, "remind me at ") || strings.HasPrefix(lower, "remind me on ") ||
@@ -749,4 +755,44 @@ func (d *desktop) watchQuickPanelPointer() {
 	widget.AddEventController(controller)
 	d.quickPanelPointerWidget, d.quickPanelPointerController = widget, controller
 	d.quickPanelPointerArmed = desktopQuickPanelPointerInside(d.app)
+}
+
+var quickTaskListSuffixes = []string{" to my todo list", " to my to-do list", " to my task list"}
+
+// quickTaskCreation recognizes unambiguous task-creation phrasings that do
+// not use the short "task:" prefix. The text must be non-empty after trimming;
+// it is cut to tasks.MaxTitleBytes at a rune boundary.
+func quickTaskCreation(text, lower string) (string, bool) {
+	body := ""
+	if strings.HasSuffix(strings.TrimSpace(text), "?") || len(lower) != len(text) {
+		return "", false // a question is never a creation command
+	}
+	switch {
+	case strings.HasPrefix(lower, "add a task:"), strings.HasPrefix(lower, "add task:"), strings.HasPrefix(lower, "new task:"):
+		body = text[strings.Index(text, ":")+1:]
+	case strings.HasPrefix(lower, "add a task "), strings.HasPrefix(lower, "add task "), strings.HasPrefix(lower, "new task "):
+		body = text[strings.Index(lower, "task ")+len("task "):]
+		if rest := strings.ToLower(strings.TrimSpace(body)); rest == "list" || strings.HasPrefix(rest, "list ") || strings.HasPrefix(rest, "lists ") {
+			return "", false
+		}
+	case strings.HasPrefix(lower, "add "):
+		for _, suffix := range quickTaskListSuffixes {
+			if strings.HasSuffix(lower, suffix) && len(lower) > len("add ")+len(suffix)-1 {
+				body = text[len("add ") : len(text)-len(suffix)]
+				break
+			}
+		}
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", false
+	}
+	if len(body) > tasks.MaxTitleBytes {
+		cut := tasks.MaxTitleBytes
+		for cut > 0 && !utf8.RuneStart(body[cut]) {
+			cut--
+		}
+		body = strings.TrimSpace(body[:cut])
+	}
+	return body, body != ""
 }

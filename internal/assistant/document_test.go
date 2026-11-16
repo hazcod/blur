@@ -168,3 +168,32 @@ func TestWholeDocumentAskRejectsUnverifiedModelCitation(t *testing.T) {
 		t.Fatalf("unverified whole-document answer escaped validation: %+v", result)
 	}
 }
+
+func TestWholeDocumentAskWithoutModelReturnsLabelledExcerptOfBothEnds(t *testing.T) {
+	family, edition, publication := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	intro := "OPENING_MARK. " + strings.Repeat("Architecture and migration notes. ", 12000)
+	tail := " Closing thought: CLOSING_MARK."
+	prov := func(i, count int64, start, end int) DocumentProvenance {
+		return DocumentProvenance{EditionID: edition, FamilyID: family, Publication: publication, PartIndex: i, PartCount: count, TotalBytes: int64(len(intro) + len(tail)), Start: int64(start), End: int64(end)}
+	}
+	parts := []Evidence{
+		{SourceID: strings.Repeat("1", 64), AppID: "com.example.Browser", Domain: "docs.example.test", Text: intro, Document: prov(0, 2, 0, len(intro))},
+		{SourceID: strings.Repeat("2", 64), AppID: "com.example.Browser", Domain: "docs.example.test", Text: tail, Document: prov(1, 2, len(intro), len(intro)+len(tail))},
+	}
+	retriever := &documentTestRetriever{parts: parts, candidates: []Evidence{parts[0]}, byID: map[string]Evidence{parts[0].SourceID: parts[0], parts[1].SourceID: parts[1]}}
+	service := NewService(retriever, nil, nil, 2048)
+	result, err := service.Ask(context.Background(), "Summarize the page about architecture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := result.Answer.Text
+	if result.Answer.InsufficientEvidence || !result.CoverageLimited || len(result.Sources) != 1 || result.Sources[0].SourceID != parts[0].SourceID {
+		t.Fatalf("unexpected result flags or citation: %+v", result)
+	}
+	if !strings.Contains(text, "OPENING_MARK") || !strings.Contains(text, "CLOSING_MARK") || !strings.Contains(text, "No AI model is configured") {
+		t.Fatalf("excerpt lost an end or its model-less label: %q", text)
+	}
+	if len(text) > 1200+400+400 {
+		t.Fatalf("excerpt not bounded: %d bytes", len(text))
+	}
+}

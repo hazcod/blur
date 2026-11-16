@@ -159,7 +159,7 @@ func (c *Client) resolveEntry(parent context.Context, input string, state EntryS
 	// Project-scoped outstanding-work questions have a dedicated structured
 	// retriever. Route them before intent inference so a generic topic search
 	// cannot turn an incidental project page into purported open work.
-	if assistant.IsOutstandingQuestion(input) {
+	if creation, _ := classifyQuickInput(input); creation != quickInputTask && assistant.IsOutstandingQuestion(input) {
 		stage = "outstanding_work"
 		result.Action = intent.Action{Kind: intent.Ask, Text: input, Mode: "memory"}
 		return result, nil
@@ -320,7 +320,7 @@ func (c *Client) resolveEntry(parent context.Context, input string, state EntryS
 			explicit = true
 		}
 	}
-	if kind == quickInputReminder || kind == quickInputFact || kind == quickInputRule {
+	if kind == quickInputReminder || kind == quickInputFact || kind == quickInputRule || kind == quickInputTask {
 		explicit = true
 	}
 	if !explicit && intent.Question(input) && entryReadOnlyQuestion(input) {
@@ -342,7 +342,7 @@ func (c *Client) resolveEntry(parent context.Context, input string, state EntryS
 			return result, nil
 		}
 	}
-	if _, ok := parseTaskQuery(input, c.askClock()); ok {
+	if _, ok := parseTaskQuery(input, c.askClock()); ok && kind != quickInputTask {
 		explicit = true
 		kind = quickInputAsk
 	}

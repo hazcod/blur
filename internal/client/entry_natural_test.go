@@ -59,7 +59,7 @@ func TestNewPersonalCommitmentReplacesPendingReminderInsteadOfBecomingItsClock(t
 	defer c.Close()
 	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
 	c.askNow = func() time.Time { return now }
-	resolved, err := c.ResolveEntry(context.Background(), "remind me tomorrow at 5 to call the dentist", EntryState{}, "UTC")
+	resolved, err := c.ResolveEntry(context.Background(), "remind me tomorrow at 25 to call the dentist", EntryState{}, "UTC")
 	if err != nil || resolved.Draft == nil || resolved.Draft.Missing != "time" {
 		t.Fatal(resolved, err)
 	}

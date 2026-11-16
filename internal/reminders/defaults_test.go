@@ -119,7 +119,7 @@ func TestDefaultsDoNotRepairInvalidOrConflictingExplicitTiming(t *testing.T) {
 	for _, spec := range []string{
 		"in 0m", "in -5m", "in 1.5m", "in 999999999999h", "in 999999d", "in 5ms",
 		"in 5m at 9am", "in 5m tomorrow", "tomorrow in 5m", "in 5m or 10m",
-		"today at 9am", "tomorrow at 5", "tomorrow at 24:00", "tomorrow at 13pm",
+		"today at 9am", "tomorrow at 25", "tomorrow at 24:00", "tomorrow at 13pm",
 		"this Monday", "on 2025-11-20", "tomorrow morning afternoon", "next week", "on 03/04",
 	} {
 		draft, err := Parse("remind me "+spec+" to get eggs", now, "Europe/Brussels")
