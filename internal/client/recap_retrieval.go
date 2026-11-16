@@ -121,7 +121,7 @@ func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.
 	candidates = append(candidates, raw...)
 	// Sign-in screens are chrome; hour recaps and other captures in the same
 	// window are the substance when any exist.
-	candidates = demoteAuthenticationPages(candidates)
+	candidates = demoteAuthenticationPages(plan.Question, candidates)
 	var leading []assistant.Evidence
 	rollupLimited := false
 	if len(rollups) > 0 {

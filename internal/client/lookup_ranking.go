@@ -6,10 +6,13 @@ import (
 	"math/bits"
 	"slices"
 	"sort"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/hazcod/blur/internal/appidentity"
 	"github.com/hazcod/blur/internal/assistant"
+	"github.com/hazcod/blur/internal/meetings"
 	"github.com/hazcod/blur/internal/search"
 	"github.com/hazcod/blur/internal/storage"
 )
@@ -90,6 +93,9 @@ type lookupRankInput struct {
 	rarity []float64
 	// capturedAt resolves a capture time for hits the index did not date.
 	capturedAt func(search.IndexHit) time.Time
+	// demote marks hits that are chrome rather than substance (sign-in pages).
+	// Marked hits are dropped before the pool is cut, unless nothing else is left.
+	demote func(search.IndexHit) bool
 	// limit caps the ranked pool; zero keeps every hit.
 	limit int
 }
@@ -141,6 +147,17 @@ func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHi
 		}
 		return ranked[i].SourceID < ranked[j].SourceID
 	})
+	if in.demote != nil {
+		kept := make([]search.IndexHit, 0, len(ranked))
+		for _, hit := range ranked {
+			if !in.demote(hit) {
+				kept = append(kept, hit)
+			}
+		}
+		if len(kept) > 0 {
+			ranked = kept
+		}
+	}
 	if in.limit > 0 && len(ranked) > in.limit {
 		ranked = ranked[:in.limit]
 	}
@@ -153,8 +170,48 @@ func termsRelaxed(mask uint32, termCount int) bool {
 	return mask != 0 && bits.OnesCount32(mask) < min(termCount, search.MaxTerms)
 }
 
-func isConversationalSource(appID, domain string) bool {
-	return appID == meetingsAppID || appidentity.IsMessagingApp(appID) || appidentity.IsMessagingApp(domain)
+// isConversationalSource reports a capture of people talking: a chat or mail
+// app, or a spoken transcript. A user's own meeting note is not speech.
+func isConversationalSource(appID, domain string, spokenTranscript bool) bool {
+	if appID == meetingsAppID {
+		return spokenTranscript
+	}
+	return appidentity.IsMessagingApp(appID) || appidentity.IsMessagingApp(domain)
+}
+
+var loginCueWords = map[string]bool{"login": true, "logins": true, "signin": true, "okta": true, "sso": true, "authentication": true}
+
+// questionHasLoginCue reports a question that is about signing in, where
+// sign-in screens are the substance and must not be demoted.
+func questionHasLoginCue(question string) bool {
+	var ordered []string
+	var word strings.Builder
+	flush := func() {
+		if word.Len() > 0 {
+			ordered = append(ordered, word.String())
+			word.Reset()
+		}
+	}
+	for _, r := range strings.ToLower(question) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			word.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	for i, w := range ordered {
+		if loginCueWords[w] {
+			return true
+		}
+		if i+1 < len(ordered) {
+			switch w + " " + ordered[i+1] {
+			case "sign in", "log in", "password page", "sign on":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // lookupEntityMask is the bit set of query terms that spell the plan's entity.
@@ -186,12 +243,60 @@ func (c *Client) termDocumentFrequency(ctx context.Context, term string) (int, e
 	return max(page.Rows, len(page.Hits)), nil
 }
 
-// rankLookupPool merges all-terms and majority-term candidates into one pool
-// capped at pool hits, requires the plan's entity, and orders it with
-// rankLookupHits.
+// lookupSourceFacts is what ranking and demotion read from a candidate source.
+type lookupSourceFacts struct {
+	conversational bool
+	authentication bool
+}
+
+type meetingRecordKindReader interface {
+	MeetingRecordKindForSource(context.Context, string) (meetings.RecordKind, bool, error)
+}
+
+// readLookupFacts reads each candidate once, bounded by the same aggregate byte
+// ceiling that hydration uses. Candidates past the budget carry no facts and are
+// treated as ordinary captures. No metadata-only reader exists, so the read
+// that supplies the app identity also supplies the page text for demotion.
+func (c *Client) readLookupFacts(ctx context.Context, hits []search.IndexHit) (map[string]lookupSourceFacts, error) {
+	facts := make(map[string]lookupSourceFacts, len(hits))
+	used := 0
+	kinds, _ := c.data.(meetingRecordKindReader)
+	for _, hit := range hits {
+		if hit.Bytes < 1 || hit.Bytes > MaxSearchBytes-used {
+			continue
+		}
+		source, found, err := storage.ReadSourceEvidence(ctx, c.data, hit.SourceID)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		used += hit.Bytes
+		spoken := false
+		if source.AppID() == meetingsAppID && kinds != nil {
+			kind, live, err := kinds.MeetingRecordKindForSource(ctx, hit.SourceID)
+			if err != nil {
+				return nil, err
+			}
+			spoken = live && kind == meetings.TranscriptFinal
+		}
+		facts[hit.SourceID] = lookupSourceFacts{
+			conversational: isConversationalSource(source.AppID(), source.Domain(), spoken),
+			authentication: looksLikeAuthenticationPage(source.Text()),
+		}
+	}
+	return facts, nil
+}
+
+// rankLookupPool merges all-terms and majority-term candidates into one pool,
+// requires the plan's entity, ranks it with rankLookupHits, drops sign-in pages
+// that only partly match (unless the question is about signing in) and only
+// then cuts the pool, so demoted chrome cannot crowd out substantive candidates.
 func (c *Client) rankLookupPool(ctx context.Context, plan assistant.Plan, terms []string, exact, partial []search.IndexHit, pool int) ([]search.IndexHit, error) {
-	hits := filterLookupEntity(append(append([]search.IndexHit(nil), exact...), partial...), lookupEntityMask(plan.Entity, terms))
-	in := lookupRankInput{entityMask: lookupEntityMask(plan.Entity, terms), speech: questionHasSpeechVerb(plan.Question), limit: pool}
+	entityMask := lookupEntityMask(plan.Entity, terms)
+	hits := filterLookupEntity(append(append([]search.IndexHit(nil), exact...), partial...), entityMask)
+	in := lookupRankInput{entityMask: entityMask, speech: questionHasSpeechVerb(plan.Question), limit: pool}
 	if len(partial) > 0 && len(hits) > 1 {
 		in.rarity = make([]float64, len(terms))
 		for i, term := range terms {
@@ -202,16 +307,25 @@ func (c *Client) rankLookupPool(ctx context.Context, plan assistant.Plan, terms 
 			in.rarity[i] = lookupTermRarity(df, lookupRarityTotal)
 		}
 	}
-	if in.speech && len(hits) > 1 {
-		conversational := make(map[string]bool, len(hits))
+	demoting := !questionHasLoginCue(plan.Question)
+	relaxed := func(hit search.IndexHit) bool { return termsRelaxed(hit.MatchedTerms, len(terms)) }
+	if len(hits) > 1 && (in.speech || demoting) {
+		var read []search.IndexHit
 		for _, hit := range hits {
-			source, found, err := storage.ReadSourceEvidence(ctx, c.data, hit.SourceID)
-			if err != nil {
-				return nil, err
+			if in.speech || relaxed(hit) {
+				read = append(read, hit)
 			}
-			conversational[hit.SourceID] = found && isConversationalSource(source.AppID(), source.Domain())
 		}
-		in.isMessaging = func(id string) bool { return conversational[id] }
+		facts, err := c.readLookupFacts(ctx, read)
+		if err != nil {
+			return nil, err
+		}
+		if in.speech {
+			in.isMessaging = func(id string) bool { return facts[id].conversational }
+		}
+		if demoting {
+			in.demote = func(hit search.IndexHit) bool { return relaxed(hit) && facts[hit.SourceID].authentication }
+		}
 	}
 	if len(hits) > 1 {
 		in.capturedAt = func(hit search.IndexHit) time.Time {

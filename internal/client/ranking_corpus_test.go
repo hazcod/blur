@@ -2,11 +2,13 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/hazcod/blur/internal/assistant"
+	"github.com/hazcod/blur/internal/capture"
 )
 
 func corpusLabels(c *scenarioCorpus, evidence []assistant.Evidence) []string {
@@ -35,8 +37,22 @@ func TestLookupRetrievalRanksTheRelaxedMessagingCaptureFirstAndFlagsRelaxedTerms
 	if slices.Contains(labels, "okta-login") {
 		t.Fatalf("a sign-in page that only shares two words must be demoted: %v", labels)
 	}
-	if !retrieval.Diagnosis.TermsRelaxed || !retrieval.Evidence[0].TermsRelaxed {
-		t.Fatalf("a two-of-three-terms match must be flagged: diagnosis=%+v first=%+v", retrieval.Diagnosis, retrieval.Evidence[0])
+	if !retrieval.Evidence[0].TermsRelaxed {
+		t.Fatalf("a two-of-three-terms match must be flagged: first=%+v", retrieval.Evidence[0])
+	}
+	// The diagnosis follows what was actually packed, so it is set by the answer.
+	for _, mode := range []scenarioMode{modeNoModel, modeFakeGen} {
+		result, err := c.ask(ctx, mode, "what did Dima say about the pentest retest?", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.TermsRelaxed {
+			t.Fatalf("%s: a packed two-of-three-terms match must set Result.TermsRelaxed", mode)
+		}
+	}
+	allTerms, err := c.ask(ctx, modeNoModel, "where is the API key for venice stored again?", nil)
+	if err != nil || allTerms.TermsRelaxed {
+		t.Fatalf("an all-terms answer must not be relaxed: relaxed=%t err=%v", allTerms.TermsRelaxed, err)
 	}
 	// The Notion page with all three terms is still retrieved, but not flagged.
 	for _, item := range retrieval.Evidence {
@@ -161,5 +177,79 @@ func TestWindowEvidenceDropsLoginChromeWhenSubstantiveCapturesExist(t *testing.T
 	}
 	if labels := corpusLabels(c, got.Evidence); !slices.Contains(labels, "okta-login") {
 		t.Fatalf("a window that holds only the sign-in page must keep it, got %v", labels)
+	}
+}
+
+func TestExplicitLoginQuestionKeepsTheSignInPage(t *testing.T) {
+	c := newScenarioCorpus(t)
+	ctx := context.Background()
+	day := time.Date(2026, 11, 15, 0, 0, 0, 0, c.loc)
+	scope := assistant.Scope{Start: day, End: day.AddDate(0, 0, 1), Label: "yesterday", Explicit: true}
+	for _, question := range []string{"what did I capture on the Okta sign-in page yesterday", "what did I capture on the login page yesterday"} {
+		plan := assistant.Plan{Kind: assistant.KindCapture, Scope: scope, Question: question}
+		retrieval, err := c.client.RetrievePlan(ctx, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if labels := corpusLabels(c, retrieval.Evidence); !slices.Contains(labels, "okta-login") {
+			t.Fatalf("%q: an explicit sign-in question must keep the sign-in page, got %v", question, labels)
+		}
+	}
+	// A recap names a window; asking about the login page keeps it as well.
+	recap := assistant.Plan{Kind: assistant.KindRecap, Scope: scope, Question: "recap the okta sign-in page yesterday"}
+	retrieval, err := c.client.RetrievePlan(ctx, recap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labels := corpusLabels(c, retrieval.Evidence); !slices.Contains(labels, "okta-login") {
+		t.Fatalf("recap about the sign-in page lost it: %v", labels)
+	}
+	// A lookup naming the sign-in page keeps a partial sign-in match.
+	lookup, err := assistant.PlanQuestion("what did Dima say on the okta login pentest page?", c.now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.client.RetrievePlan(ctx, lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labels := corpusLabels(c, got.Evidence); !slices.Contains(labels, "okta-login") {
+		t.Fatalf("a lookup that asks about the login page must keep partial sign-in matches: %v", labels)
+	}
+}
+
+func TestCaptureEvidenceDemotesBeforeTheCutSoTheListIsNotThin(t *testing.T) {
+	c := newScenarioCorpus(t)
+	ctx := context.Background()
+	// Yesterday's newest captures are sign-in screens. A cut to six before
+	// demotion would leave a thin list; demoting first must still return six.
+	day := time.Date(2026, 11, 15, 0, 0, 0, 0, c.loc)
+	for i := 0; i < 4; i++ {
+		observation, err := capture.SanitizeObservation("com.example.Browser", "login.example.com", fmt.Sprintf("Sign in to account %d\nPassword\nRemember me\nVerification code", i), capture.MaxObservationTextBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.store.PutObservationAt(ctx, observation, day.Add(20*time.Hour+time.Duration(i)*time.Minute).UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan := assistant.Plan{Kind: assistant.KindCapture, Scope: assistant.Scope{Start: day, End: day.AddDate(0, 0, 1), Label: "yesterday", Explicit: true}, Question: "what did I capture yesterday"}
+	start, end, _, _ := c.client.planWindow(plan)
+	segments, err := c.client.windowSegments(ctx, start, end, MaxActivityReportSegments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, _, _, err := c.client.captureEvidence(ctx, plan, start, end, filterSegments(segments, plan), 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := corpusLabels(c, items)
+	if slices.Contains(labels, "okta-login") || len(labels) != 6 {
+		t.Fatalf("got %v, want six substantive captures and no sign-in page", labels)
+	}
+	for _, item := range items {
+		if looksLikeAuthenticationPage(item.Text) {
+			t.Fatalf("sign-in screen %q survived demotion", item.Text)
+		}
 	}
 }

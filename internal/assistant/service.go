@@ -70,6 +70,7 @@ type Result struct {
 	GenerationIssue       string
 	CoverageLimited       bool // recap retrieval or model context omitted/excerpted saved evidence
 	IndexingPending       bool
+	TermsRelaxed          bool // a packed item matches only some of the question's words
 	Answer                Answer
 	Sources               []Evidence
 	InputTokens           int
@@ -544,7 +545,9 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 		sources = append(sources, source)
 	}
 	targets := citedTargets(answer.SourceIDs, append(append([]TargetRef(nil), personal.Targets...), retrieval.Targets...))
+	retrieval.Diagnosis.TermsRelaxed = packedTermsRelaxed(evidence, packed.SourceIDs)
 	return Result{
+		TermsRelaxed:      retrieval.Diagnosis.TermsRelaxed,
 		CoverageLimited:   memoryCoverageLimited(plan, retrieval.Diagnosis, packed),
 		ConversationTurns: conversationTurns, ConversationTruncated: conversationTruncated,
 		IndexingPending: retrieval.Diagnosis.IndexingPending,

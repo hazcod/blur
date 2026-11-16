@@ -106,7 +106,7 @@ type Diagnosis struct {
 	ModelFree                  bool          // the answer was produced without a model
 	CaptureIssue               string        // closed capture-health category; never source/error text
 	Chronological              bool          // a recap over more than 24 hours is packed oldest first
-	TermsRelaxed               bool          // a packed lookup match contains only some of the question's terms
+	TermsRelaxed               bool          // an item actually packed for the answer matches only some of the question's terms (set after packing)
 	ScopeWidened               time.Duration // a recency question found nothing in its window and looked this far back instead
 }
 

@@ -594,12 +594,6 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 		}
 	}
 	retrieval.Diagnosis.IndexingPending = retrieval.Diagnosis.IndexingPending || searchPending
-	for _, item := range retrieval.Evidence[:min(len(retrieval.Evidence), assistant.MaxEvidenceItems)] {
-		if item.TermsRelaxed {
-			retrieval.Diagnosis.TermsRelaxed = true
-			break
-		}
-	}
 	for _, item := range retrieval.Evidence {
 		if item.Layer == assistant.LayerSource {
 			retrieval.Diagnosis.SourcesInScope = max(retrieval.Diagnosis.SourcesInScope, len(retrieval.Evidence))
@@ -665,9 +659,18 @@ func syntheticID(parts ...string) string {
 // captureEvidence is recencyEvidence for capture questions, with sign-in screens
 // demoted whenever the window holds a substantive capture. Both the model path
 // and the direct answer path read it, so neither lists login chrome as activity.
+// Demotion runs on a wider candidate list and the cut to limit comes after it,
+// so sign-in screens cannot crowd substantive captures out of the answer.
 func (c *Client) captureEvidence(ctx context.Context, plan assistant.Plan, start, end time.Time, scoped []activity.Segment, limit int) ([]assistant.Evidence, time.Duration, []activity.Segment, error) {
-	items, widened, segments, err := c.recencyEvidence(ctx, plan, start, end, scoped, limit)
-	return demoteAuthenticationPages(items), widened, segments, err
+	if questionHasLoginCue(plan.Question) {
+		return c.recencyEvidence(ctx, plan, start, end, scoped, limit)
+	}
+	items, widened, segments, err := c.recencyEvidence(ctx, plan, start, end, scoped, min(limit*captureDemotionFactor, maxRecentCandidates))
+	if err != nil {
+		return nil, widened, segments, err
+	}
+	items = demoteAuthenticationPages(plan.Question, items)
+	return items[:min(len(items), limit)], widened, segments, nil
 }
 
 func (c *Client) lookupEvidence(ctx context.Context, plan assistant.Plan, bounded bool, windowSegs, scoped []activity.Segment, diagnosis ...*assistant.Diagnosis) ([]assistant.Evidence, bool, error) {
@@ -707,7 +710,6 @@ func (c *Client) lookupEvidenceWithExpansion(ctx context.Context, plan assistant
 		if err != nil {
 			return nil, pending, err
 		}
-		evidence = demoteRelaxedAuthenticationPages(evidence)
 	}
 	if plan.WholeDocument && len(evidence) == 0 {
 		start, end, _, _ := c.planWindow(plan)
@@ -852,6 +854,14 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 				return search.ExactPage{}, err
 			}
 			page, err := c.data.SearchExact(ctx, search.ExactQuery{Terms: terms, AppID: f.app, Domain: f.domain, ExcludeAppIDs: []string{appidentity.BundleID}, CapturedStart: start, CapturedEnd: end, ScopeSourceIDs: scopeSources, MinTermMatches: minMatches, PartialOnly: pass == 1, TopK: pool, MaxRows: maxRows, MaxBytes: search.MaxIndexBytes})
+			if pass == 1 && errors.Is(err, search.ErrIndexBudget) {
+				// The majority-term pass is an optional widening. When it cannot
+				// prove its top results inside the row budget, keep the all-terms
+				// hits and report the coverage gap instead of failing the question.
+				merged.CoverageLimited = true
+				merged.HasMore = true
+				break
+			}
 			if err != nil {
 				return search.ExactPage{}, err
 			}
