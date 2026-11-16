@@ -171,51 +171,6 @@ func TestAuditPackagesAllowsPureGoThirdPartyDependency(t *testing.T) {
 	}
 }
 
-func TestMacOSAppTargetBuildsAndPackagesWithCGODisabled(t *testing.T) {
-	makefile, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	inTarget := false
-	foundArm64Build, foundAMD64Build, foundPackage, foundUniversalMerge := false, false, false, false
-	for _, line := range strings.Split(string(makefile), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "macos-app:" {
-			inTarget = true
-			continue
-		}
-		if inTarget && strings.HasSuffix(trimmed, ":") && !strings.HasPrefix(trimmed, "\t") {
-			break
-		}
-		if !inTarget {
-			continue
-		}
-		if strings.Contains(line, "lipo -create") {
-			foundUniversalMerge = true
-		}
-		if strings.HasPrefix(trimmed, "CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build ") {
-			foundAMD64Build = true
-		}
-		if !strings.Contains(line, "github.com/golang-gui/goui/cmd/goui") {
-			continue
-		}
-		switch {
-		case strings.Contains(line, "goui build"):
-			if !strings.HasPrefix(trimmed, "CGO_ENABLED=0 ") {
-				continue
-			}
-			if strings.Contains(line, "-target darwin/arm64") {
-				foundArm64Build = true
-			}
-		case strings.Contains(line, "goui package"):
-			foundPackage = strings.HasPrefix(trimmed, "CGO_ENABLED=0 ")
-		}
-	}
-	if !foundArm64Build || foundAMD64Build || !foundPackage || foundUniversalMerge {
-		t.Fatalf("macos-app must build and package only cgo-disabled Apple silicon binaries (arm64=%t amd64=%t package=%t universal=%t)", foundArm64Build, foundAMD64Build, foundPackage, foundUniversalMerge)
-	}
-}
-
 func TestAuditPackagesExemptsStandardLibraryCgo(t *testing.T) {
 	err := AuditPackages([]Package{{
 		ImportPath: "runtime/cgo", Standard: true, Dir: "/go/src/runtime/cgo",

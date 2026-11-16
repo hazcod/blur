@@ -1,4 +1,4 @@
-.PHONY: version release-snapshot test race vet build vulncheck cross-build physical-cross-build cross-test-compile no-cgo-audit portable-packages safari-extension-test safari-extension-build macos-app macos-app-sandbox-check macos-app-safari-unsigned macos-app-safari-signed run-macos
+.PHONY: version release-snapshot test race vet build vulncheck cross-build physical-cross-build cross-test-compile no-cgo-audit portable-packages safari-extension-test safari-extension-build macos-app macos-app-stable macos-app-sandbox-check macos-app-safari-unsigned macos-app-safari-signed run-macos
 
 # Release version metadata, injected as main.version/commit/date. A leading "v"
 # is stripped so tag v1.2.3 reports 1.2.3; untagged builds report e.g. 1.2.3-4-gabc-dirty.
@@ -95,6 +95,8 @@ endif
 SAFARI_EXTENSION_DERIVED_DATA ?= dist/safari-extension-derived
 SAFARI_EXTENSION_PRODUCT = $(SAFARI_EXTENSION_DERIVED_DATA)/Build/Products/Release/BlurSafariCapture.appex
 SAFARI_EXTENSION_INFO = $(SAFARI_EXTENSION_PRODUCT)/Contents/Info.plist
+MACOS_SANDBOX_DEV_PATH ?=
+MACOS_SANDBOX_ENTITLEMENTS ?= platform/macos/Blur.sandbox.entitlements
 
 safari-extension-build:
 	DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" xcodebuild -quiet -project platform/macos/BlurSafariCapture.xcodeproj -scheme BlurSafariCapture -configuration Release -sdk macosx -destination 'generic/platform=macOS' -derivedDataPath "$(SAFARI_EXTENSION_DERIVED_DATA)" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO BLUR_APP_GROUP_ID="$(BLUR_APP_GROUP_ID)" BLUR_KEYCHAIN_ACCESS_GROUP="$(BLUR_KEYCHAIN_ACCESS_GROUP)" build
@@ -119,105 +121,12 @@ safari-extension-test:
 	DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" swiftc -typecheck -target arm64-apple-macosx13.0 platform/macos/SafariExtension/ExtensionHandler.swift
 	plutil -lint platform/macos/SafariExtension/Info.plist platform/macos/Blur.entitlements platform/macos/SafariExtension/Extension.entitlements
 
-# Build the native macOS bundle used for Finder/Dock identity and permissions.
-# The package command consumes the exact binary produced above; it never rebuilds.
-MACOS_APP ?= $(HOME)/Downloads/Blur.app
-MACOS_APP_STAGING = $(dir $(MACOS_APP)).$(basename $(notdir $(MACOS_APP))).staging.app
-MACOS_SAFARI_APP ?= dist/darwin-arm64/Blur-Safari-unsigned.app
-MACOS_SAFARI_SIGNED_APP ?= dist/darwin-arm64/Blur-Safari.app
-MACOS_SAFARI_STAGING_APP = $(abspath $(dir $(MACOS_SAFARI_SIGNED_APP)))/.$(basename $(notdir $(MACOS_SAFARI_SIGNED_APP))).staging.app
-MACOS_BINARY ?= $(dir $(MACOS_APP)).blur-build
-MACOS_BINARY_ARM64 ?= $(MACOS_BINARY).arm64
-MACOS_BUNDLE_ID ?= com.hazcod.blur
-MACOS_MINIMUM_SYSTEM_VERSION ?= 13.0
-MACOS_CODESIGN_IDENTITY ?= $(shell go run ./cmd/macos-signing-identity -app "$(MACOS_APP)" 2>/dev/null)
-MACOS_HOST_PROVISIONING_PROFILE ?=
-MACOS_EXTENSION_PROVISIONING_PROFILE ?=
-BLUR_APP_GROUP_ID ?=
-BLUR_KEYCHAIN_ACCESS_GROUP ?=
-MACOS_LDFLAGS = -X github.com/hazcod/blur/internal/platform/darwin.SafariAppGroupID=$(BLUR_APP_GROUP_ID) -X github.com/hazcod/blur/internal/platform/darwin.SafariKeychainAccessGroup=$(BLUR_KEYCHAIN_ACCESS_GROUP) $(VERSION_LDFLAGS)
-# Reuse the existing bundle's unambiguous signer or a sole local identity. The
-# ad-hoc fallback keeps unsigned OSS/dev environments buildable, but macOS may
-# treat each changed ad-hoc build as a new Accessibility permission subject.
-# Extra codesign flags. Local builds skip the Apple timestamp server; release
-# builds pass `--options runtime --timestamp` for Hardened Runtime notarization.
-MACOS_CODESIGN_EXTRA_FLAGS ?= --timestamp=none
-MACOS_CODESIGN_FLAGS = --force $(if $(strip $(MACOS_CODESIGN_IDENTITY)),--sign "$(MACOS_CODESIGN_IDENTITY)",--sign -)
-# App Sandbox (default on; MACOS_SANDBOX=0 builds an unsandboxed app). When the Safari App Group / Keychain group are configured
-# they are merged into a generated plist next to the build binary (never inside
-# the bundle); otherwise the checked-in sandbox entitlements are signed as-is.
-MACOS_SANDBOX ?= 1
-# Developer hook only: a non-empty absolute directory is added to the merged
-# entitlements as a read-write temporary exception so a dev build can write UI
-# snapshots there (the container Data directory is unreadable from a shell).
-# Empty by default; never set it for builds you use or distribute.
-MACOS_SANDBOX_DEV_PATH ?=
-MACOS_SANDBOX_ENTITLEMENTS ?= platform/macos/Blur.sandbox.entitlements
-MACOS_SANDBOX_ENTITLEMENTS_MERGED = $(MACOS_BINARY).entitlements
-MACOS_SANDBOX_ENTITLEMENTS_EFFECTIVE = $(if $(strip $(BLUR_APP_GROUP_ID)$(BLUR_KEYCHAIN_ACCESS_GROUP)$(MACOS_SANDBOX_DEV_PATH)),$(MACOS_SANDBOX_ENTITLEMENTS_MERGED),$(MACOS_SANDBOX_ENTITLEMENTS))
-MACOS_ENTITLEMENT_FLAGS = $(if $(filter 1,$(MACOS_SANDBOX)),--entitlements "$(MACOS_SANDBOX_ENTITLEMENTS_EFFECTIVE)")
+# The active macOS app lives in this worktree until its implementation is
+# integrated. Keep every app-bundle entry point on that source: the older root
+# checkout cannot open its encrypted memory. Recursive make preserves command-line
+# options such as MACOS_CODESIGN_IDENTITY and propagates build failures.
+macos-app: macos-app-stable
 
-macos-app:
-	@if test -z "$(MACOS_CODESIGN_IDENTITY)"; then echo "Using ad-hoc signing; macOS may require Accessibility approval again after rebuilds. Set MACOS_CODESIGN_IDENTITY for a stable local identity."; fi
-	CGO_ENABLED=0 go run -mod=mod github.com/golang-gui/goui/cmd/goui build -target darwin/arm64 -ldflags '$(MACOS_LDFLAGS)' -o $(MACOS_BINARY_ARM64)
-	cp "$(MACOS_BINARY_ARM64)" "$(MACOS_BINARY)"
-	lipo "$(MACOS_BINARY)" -verify_arch arm64
-	rm -rf "$(MACOS_APP_STAGING)"
-	CGO_ENABLED=0 go run -mod=mod github.com/golang-gui/goui/cmd/goui package -target darwin/arm64 -format app -binary "$(MACOS_BINARY_ARM64)" -o "$(MACOS_APP_STAGING)"
-	install -m 755 "$(MACOS_BINARY)" "$(MACOS_APP_STAGING)/Contents/MacOS/blur"
-	/usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $(MACOS_MINIMUM_SYSTEM_VERSION)" "$(MACOS_APP_STAGING)/Contents/Info.plist"
-	plutil -lint "$(MACOS_APP_STAGING)/Contents/Info.plist"
-	@if test "$(MACOS_SANDBOX)" = 1; then \
-		echo "Signing with the App Sandbox entitlements (default; MACOS_SANDBOX=0 disables); data lives in ~/Library/Containers/$(MACOS_BUNDLE_ID)."; \
-		if test -n "$(strip $(BLUR_APP_GROUP_ID)$(BLUR_KEYCHAIN_ACCESS_GROUP)$(MACOS_SANDBOX_DEV_PATH))"; then \
-			set -e; rm -f "$(MACOS_SANDBOX_ENTITLEMENTS_MERGED)"; cp "$(MACOS_SANDBOX_ENTITLEMENTS)" "$(MACOS_SANDBOX_ENTITLEMENTS_MERGED)"; \
-			if test -n "$(BLUR_APP_GROUP_ID)"; then \
-				/usr/libexec/PlistBuddy -c "Add :com.apple.security.application-groups array" -c "Add :com.apple.security.application-groups:0 string $(BLUR_APP_GROUP_ID)" "$(MACOS_SANDBOX_ENTITLEMENTS_MERGED)"; \
-			fi; \
-			if test -n "$(BLUR_KEYCHAIN_ACCESS_GROUP)"; then \
-				/usr/libexec/PlistBuddy -c "Add :keychain-access-groups array" -c "Add :keychain-access-groups:0 string $(BLUR_KEYCHAIN_ACCESS_GROUP)" "$(MACOS_SANDBOX_ENTITLEMENTS_MERGED)"; \
-			fi; \
-			if test -n "$(MACOS_SANDBOX_DEV_PATH)"; then \
-				echo "WARNING: dev-only sandbox exception: read-write $(MACOS_SANDBOX_DEV_PATH)/ (do not use or distribute this build)"; \
-				/usr/libexec/PlistBuddy -c "Add :com.apple.security.temporary-exception.files.absolute-path.read-write array" -c "Add :com.apple.security.temporary-exception.files.absolute-path.read-write:0 string $(patsubst %/,%,$(MACOS_SANDBOX_DEV_PATH))/" "$(MACOS_SANDBOX_ENTITLEMENTS_MERGED)"; \
-			fi; \
-			plutil -lint "$(MACOS_SANDBOX_ENTITLEMENTS_MERGED)"; \
-		else plutil -lint "$(MACOS_SANDBOX_ENTITLEMENTS)"; fi; \
-	fi
-	codesign $(MACOS_CODESIGN_FLAGS) $(MACOS_ENTITLEMENT_FLAGS) --identifier "$(MACOS_BUNDLE_ID)" $(MACOS_CODESIGN_EXTRA_FLAGS) "$(MACOS_APP_STAGING)"
-	codesign --verify --deep --strict "$(MACOS_APP_STAGING)"
-	rm -rf "$(MACOS_APP)"
-	mv "$(MACOS_APP_STAGING)" "$(MACOS_APP)"
-	codesign --verify --deep --strict "$(MACOS_APP)"
-
-# Fails unless the built bundle is signed with the App Sandbox entitlement.
-macos-app-sandbox-check:
-	@codesign -d --entitlements :- "$(MACOS_APP)" 2>/dev/null | grep -q '<key>com.apple.security.app-sandbox</key><true/>' || { echo "$(MACOS_APP) is not signed with com.apple.security.app-sandbox" >&2; exit 1; }
-	@echo "$(MACOS_APP) is App Sandbox signed"
-
-# Embeds the compiled extension for bundle-layout inspection only. It is not
-# signed or installable in Safari; release packaging must sign both bundles
-# with matching, registered App Group and Keychain entitlements.
-macos-app-safari-unsigned:
-	@test -n "$(BLUR_APP_GROUP_ID)" -a -n "$(BLUR_KEYCHAIN_ACCESS_GROUP)" || { echo "set BLUR_APP_GROUP_ID and BLUR_KEYCHAIN_ACCESS_GROUP for Safari bundle assembly" >&2; exit 2; }
-	$(MAKE) macos-app MACOS_APP="$(MACOS_SAFARI_APP)" MACOS_BINARY=dist/darwin-arm64/blur-safari-unsigned
-	$(MAKE) safari-extension-build
-	mkdir -p "$(MACOS_SAFARI_APP)/Contents/PlugIns"
-	ditto "$(SAFARI_EXTENSION_PRODUCT)" "$(MACOS_SAFARI_APP)/Contents/PlugIns/BlurSafariCapture.appex"
-	@echo "Assembled unsigned bundle at $(MACOS_SAFARI_APP); it must be signed with matching entitlements before Safari can load it."
-
-# Build to a fresh staging path, validate both provisioning profiles, sign the
-# extension before the containing app, verify both signatures, then publish by
-# same-volume rename. Nothing overwrites an existing artifact.
-macos-app-safari-signed:
-	@test "$$(uname -s)" = Darwin || { echo "Safari signing requires macOS" >&2; exit 2; }
-	@test "$(suffix $(MACOS_SAFARI_SIGNED_APP))" = .app || { echo "MACOS_SAFARI_SIGNED_APP must end in .app" >&2; exit 2; }
-	@test -n "$(MACOS_CODESIGN_IDENTITY)" -a -n "$(BLUR_APP_GROUP_ID)" -a -n "$(BLUR_KEYCHAIN_ACCESS_GROUP)" || { echo "set MACOS_CODESIGN_IDENTITY, BLUR_APP_GROUP_ID, and BLUR_KEYCHAIN_ACCESS_GROUP" >&2; exit 2; }
-	@test -n "$(MACOS_HOST_PROVISIONING_PROFILE)" -a -n "$(MACOS_EXTENSION_PROVISIONING_PROFILE)" || { echo "set both macOS provisioning profile paths; each must authorize its bundle ID, team certificate, and configured Keychain access group" >&2; exit 2; }
-	@test ! -e "$(MACOS_SAFARI_SIGNED_APP)" -a ! -e "$(MACOS_SAFARI_STAGING_APP)" || { echo "refusing to overwrite an existing signed or staging bundle" >&2; exit 2; }
-	$(MAKE) macos-app-safari-unsigned MACOS_SAFARI_APP="$(MACOS_SAFARI_STAGING_APP)" MACOS_BINARY="$(MACOS_SAFARI_STAGING_APP)-binary" BLUR_APP_GROUP_ID="$(BLUR_APP_GROUP_ID)" BLUR_KEYCHAIN_ACCESS_GROUP="$(BLUR_KEYCHAIN_ACCESS_GROUP)"
-	CGO_ENABLED=0 go run ./cmd/blur-sign -app "$(MACOS_SAFARI_STAGING_APP)" -identity "$(MACOS_CODESIGN_IDENTITY)" -app-group "$(BLUR_APP_GROUP_ID)" -keychain-access-group "$(BLUR_KEYCHAIN_ACCESS_GROUP)" -host-profile "$(MACOS_HOST_PROVISIONING_PROFILE)" -extension-profile "$(MACOS_EXTENSION_PROVISIONING_PROFILE)"
-	mv "$(MACOS_SAFARI_STAGING_APP)" "$(MACOS_SAFARI_SIGNED_APP)"
-
-run-macos: macos-app
-	open -a "$(MACOS_APP)"
+macos-app-stable macos-app-sandbox-check macos-app-safari-unsigned macos-app-safari-signed run-macos:
+	@test -f "$(CURDIR)/.worktrees/durable-memory-core/Makefile" || { echo "The active macOS worktree is unavailable; refusing to replace Blur with older source." >&2; exit 2; }
+	$(MAKE) -C "$(CURDIR)/.worktrees/durable-memory-core" $@
