@@ -861,6 +861,10 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 		return assistant.Result{}, err
 	}
 	defer finishAsk()
+	// Taken once the ask is registered (a deletion before this point is
+	// rejected by registration; one after bumps the epoch), so the question
+	// history write below is fenced against deletions.
+	historyEpoch, historyStable := c.BeginMemoryRead()
 	var result assistant.Result
 	if text, calculated := assistant.Calculate(question); calculated {
 		result = assistant.Result{Answer: assistant.Answer{Text: text}, Direct: true, General: true, Plan: assistant.Plan{Question: question}}
@@ -879,6 +883,9 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 	defer c.aiPolicyMu.RUnlock()
 	if err := askCtx.Err(); err != nil {
 		return assistant.Result{}, err
+	}
+	if historyStable {
+		c.recordAskedQuestion(askCtx, historyEpoch, question, result)
 	}
 	return result, nil
 }

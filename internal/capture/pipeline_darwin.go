@@ -217,6 +217,7 @@ func readDarwinAX(ctx context.Context, source *darwin.Adapter, probe platform.Ca
 	// The focused-window proxy is owned by the first frame node. Its identity is
 	// captured separately for per-value revalidation without exposing a title.
 	rootElement := frame.nativeRootID
+	frame.focus = darwinFocusReader(source, probe, rootElement)
 	wrapAXValues(frame.roots, func(ctx context.Context, max int, value func(context.Context, int) (string, error)) (string, error) {
 		var text string
 		verifyErr := source.WithVerifiedTarget(ctx, probe.TargetID, func(ctx context.Context, pid int32) error {
@@ -614,15 +615,6 @@ func (n *nativeAXNode) sensitive(ctx context.Context, role string) (bool, error)
 	// Secure input is a separate property; editability alone is not secrecy.
 	n.guardSensitive.Store(true)
 	return false, nil
-}
-
-func isSecureTextRole(role string) bool {
-	switch strings.TrimPrefix(role, "AX") {
-	case "SecureTextField", "SecureTextArea", "PasswordField":
-		return true
-	default:
-		return false
-	}
 }
 
 func (n *nativeAXNode) verifyTextSensitivity(ctx context.Context) error {

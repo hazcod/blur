@@ -80,8 +80,9 @@ type mcpSnapshotItem struct {
 	DocumentTotalBytes *int64 `json:"document_total_bytes,omitempty"`
 
 	// Sighting fields: how often identical content was seen.
-	SightingCount int64  `json:"sighting_count,omitempty"`
-	LastSeenAt    string `json:"last_seen_at,omitempty"`
+	SightingCount  int64  `json:"sighting_count,omitempty"`
+	LastSeenAt     string `json:"last_seen_at,omitempty"`
+	mcpFocusFields        // focused-element breadcrumb (mcp_focus.go)
 }
 
 type mcpSnapshotResponse struct {
@@ -162,8 +163,9 @@ type mcpWorkingMemoryItem struct {
 	Truncated  bool      `json:"truncated"`
 
 	// Sighting fields: how often identical content was seen.
-	SightingCount int64  `json:"sighting_count,omitempty"`
-	LastSeenAt    string `json:"last_seen_at,omitempty"`
+	SightingCount  int64  `json:"sighting_count,omitempty"`
+	LastSeenAt     string `json:"last_seen_at,omitempty"`
+	mcpFocusFields        // focused-element breadcrumb (mcp_focus.go)
 }
 
 type mcpWorkingMemoryResponse struct {
@@ -734,9 +736,11 @@ func (c *Client) readMCPWorkingMemory(ctx context.Context, epoch uint64, params 
 			SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(),
 			CapturedAt: at.UTC(), Content: content, Truncated: clipped || source.Truncated(),
 			SightingCount: sightings, LastSeenAt: lastSeen,
+			mcpFocusFields: focusFieldsOf(source), // focused-element breadcrumb
 		})
 	}
 	noteSightingUnavailable(response.SightingUnavailable)
+	trimWorkingMemoryFocus(&response) // breadcrumb yields to the byte budget
 	encoded, err := json.Marshal(response)
 	if err != nil || len(encoded) > maxMCPReadOutputBytes {
 		clear(encoded)
@@ -1334,6 +1338,7 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 		if !at.IsZero() {
 			item.CapturedAt = at.UTC().Format(time.RFC3339Nano)
 		}
+		item.mcpFocusFields = focusFieldsOf(evidence) // focused-element breadcrumb
 		if provenance, multipart := evidence.Provenance(); multipart {
 			item.DocumentID = provenance.EditionID
 			item.PartIndex = &provenance.PartIndex
