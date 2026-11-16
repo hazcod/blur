@@ -340,7 +340,10 @@ func (tx *Tx) eraseSourceStep(journal *sourceErasure) (bool, error) {
 		complete, err = tx.removeChroniclesForSourceBatch(sourceID)
 	case 6:
 		err = tx.removeSemanticSource(sourceID)
-		complete = true
+		if err == nil {
+			// Question history cites sources; drop this one from every question.
+			complete, err = tx.removeQuestionHistorySourceBatch(sourceID)
+		}
 	case 7:
 		tx.mu.Lock()
 		unlinkErr := tx.removeMeetingSourceLocked(sourceID)

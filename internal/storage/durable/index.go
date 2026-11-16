@@ -580,6 +580,9 @@ func (tx *Tx) deleteObservationRecord(sourceID string) error {
 	if err := tx.removeSemanticSource(sourceID); err != nil {
 		return err
 	}
+	if err := tx.removeQuestionHistorySource(sourceID); err != nil {
+		return err
+	}
 	if err := tx.removeEnrichmentSource(sourceID); err != nil {
 		return err
 	}

@@ -851,6 +851,7 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 	if c == nil || c.data == nil || ctx == nil {
 		return assistant.Result{}, ErrNotConfigured
 	}
+	historyEpoch, _ := c.BeginMemoryRead() // fences the question-history write
 	opCtx, done, err := c.beginOperation(ctx, askOperationTimeout(question))
 	if err != nil {
 		return assistant.Result{}, err
@@ -880,6 +881,7 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 	if err := askCtx.Err(); err != nil {
 		return assistant.Result{}, err
 	}
+	c.recordAskedQuestion(askCtx, historyEpoch, question, result)
 	return result, nil
 }
 
