@@ -851,7 +851,6 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 	if c == nil || c.data == nil || ctx == nil {
 		return assistant.Result{}, ErrNotConfigured
 	}
-	historyEpoch, _ := c.BeginMemoryRead() // fences the question-history write
 	opCtx, done, err := c.beginOperation(ctx, askOperationTimeout(question))
 	if err != nil {
 		return assistant.Result{}, err
@@ -862,6 +861,10 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 		return assistant.Result{}, err
 	}
 	defer finishAsk()
+	// Taken once the ask is registered (a deletion before this point is
+	// rejected by registration; one after bumps the epoch), so the question
+	// history write below is fenced against deletions.
+	historyEpoch, _ := c.BeginMemoryRead()
 	var result assistant.Result
 	if text, calculated := assistant.Calculate(question); calculated {
 		result = assistant.Result{Answer: assistant.Answer{Text: text}, Direct: true, General: true, Plan: assistant.Plan{Question: question}}
