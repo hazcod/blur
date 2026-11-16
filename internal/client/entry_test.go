@@ -125,7 +125,7 @@ func TestEntryClarificationCreatesOneReminderAndFollowupsEditAndCancel(t *testin
 	defer service.Close()
 	c.reminders = service
 	state := EntryState{}
-	resolved, err := c.ResolveEntry(ctx, "remind me tomorrow at 5 to review the PR", state, "UTC")
+	resolved, err := c.ResolveEntry(ctx, "remind me tomorrow at 25 to review the PR", state, "UTC")
 	if err != nil || resolved.Draft == nil || resolved.Draft.Missing != "time" {
 		t.Fatal(resolved, err)
 	}

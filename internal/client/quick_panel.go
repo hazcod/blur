@@ -757,7 +757,7 @@ func (d *desktop) watchQuickPanelPointer() {
 	d.quickPanelPointerArmed = desktopQuickPanelPointerInside(d.app)
 }
 
-var quickTaskListSuffixes = []string{" to my todo list", " to my to-do list", " to my task list", " to my tasks"}
+var quickTaskListSuffixes = []string{" to my todo list", " to my to-do list", " to my task list"}
 
 // quickTaskCreation recognizes unambiguous task-creation phrasings that do
 // not use the short "task:" prefix. The text must be non-empty after trimming;
