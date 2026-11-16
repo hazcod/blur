@@ -321,6 +321,63 @@ func (r sourceVerifiedRepository) PutChronicle(ctx context.Context, summary chro
 	return err
 }
 
+// Rollup access is an optional storage capability. Reads pass straight through;
+// a rollup write is fenced exactly like an hourly recap write.
+func (r sourceVerifiedRepository) rollups() (chronicle.RollupRepository, bool) {
+	inner, ok := r.inner.(chronicle.RollupRepository)
+	return inner, ok
+}
+
+func (r sourceVerifiedRepository) ListChronicles(ctx context.Context, start, end time.Time, after string, limit int) ([]chronicle.Summary, string, error) {
+	inner, ok := r.rollups()
+	if !ok {
+		return nil, "", chronicle.ErrWorkerUnavailable
+	}
+	return inner.ListChronicles(ctx, start, end, after, limit)
+}
+
+func (r sourceVerifiedRepository) GetChronicleRollup(ctx context.Context, id string) (chronicle.Rollup, bool, error) {
+	inner, ok := r.rollups()
+	if !ok {
+		return chronicle.Rollup{}, false, chronicle.ErrWorkerUnavailable
+	}
+	return inner.GetChronicleRollup(ctx, id)
+}
+
+func (r sourceVerifiedRepository) ListChronicleRollups(ctx context.Context, level string, start, end time.Time, after string, limit int) ([]chronicle.Rollup, string, error) {
+	inner, ok := r.rollups()
+	if !ok {
+		return nil, "", chronicle.ErrWorkerUnavailable
+	}
+	return inner.ListChronicleRollups(ctx, level, start, end, after, limit)
+}
+
+func (r sourceVerifiedRepository) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup) error {
+	inner, ok := r.rollups()
+	if !ok {
+		return chronicle.ErrWorkerUnavailable
+	}
+	epoch, stable := r.client.BeginMemoryRead()
+	if !stable {
+		return ErrMemoryChanging
+	}
+	for _, id := range rollup.SourceIDs {
+		_, found, err := storage.ReadSourceEvidence(ctx, r.sources, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			slog.Debug("chronicle rollup dropped", "result", "source_gone")
+			return ErrMemoryChanging
+		}
+	}
+	var err error
+	if !r.client.PublishMemoryRead(epoch, func() { err = inner.PutChronicleRollup(ctx, rollup) }) {
+		return ErrMemoryChanging
+	}
+	return err
+}
+
 // GetObservationWithCaptureTime preserves the actual encrypted source-reader
 // capability through the production repository adapter. Capture time is the
 // saved-first clock, independent of the hour evidence's possible visit time.

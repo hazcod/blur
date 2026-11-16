@@ -109,6 +109,9 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 		if err := tx.PutIndexRecord(chronicleNS, summary.HourID, encoded); err != nil {
 			return err
 		}
+		if err := tx.markChronicleDayDirty(summary.Start); err != nil {
+			return err
+		}
 		if summary.FollowUp != nil {
 			return tx.putChronicleFollowUp(summary, followUpAt)
 		}
@@ -334,7 +337,8 @@ func (s *Store) DeleteAllChronicles(ctx context.Context) error {
 			return err
 		}
 		if len(days) == 0 {
-			return nil
+			// Rollups are derived from the recaps and go with them.
+			return s.DeleteAllChronicleRollups(ctx)
 		}
 		ids, err := s.readChronicleDayContext(ctx, days[0])
 		if err != nil {
@@ -402,7 +406,10 @@ func (tx *Tx) deleteChronicle(id string) error {
 	} else if err := tx.PutIndexRecord(chronicleDayNS, day, mustJSON(ids)); err != nil {
 		return err
 	}
-	return tx.deleteKnowledgeRecord(chronicleNS, id)
+	if err := tx.deleteKnowledgeRecord(chronicleNS, id); err != nil {
+		return err
+	}
+	return tx.markChronicleDayDirty(summary.Start)
 }
 
 func (tx *Tx) addChronicleDay(day string) error {
