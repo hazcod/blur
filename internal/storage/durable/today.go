@@ -29,6 +29,10 @@ func (s *Store) PutTodaySnapshot(ctx context.Context, snapshot today.Snapshot) e
 }
 
 func (tx *Tx) putTodaySnapshot(snapshot today.Snapshot) error {
+	return tx.putTodaySnapshotRemovingSource(snapshot, "")
+}
+
+func (tx *Tx) putTodaySnapshotRemovingSource(snapshot today.Snapshot, removedSource string) error {
 	if tx == nil || snapshot.Validate() != nil || !validTodayDate(snapshot.Date) {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
@@ -44,8 +48,28 @@ func (tx *Tx) putTodaySnapshot(snapshot today.Snapshot) error {
 			return ErrCorrupt
 		}
 		oldSources = previous.SourceIDs
+		// Explicit erasure must not restore a dismissed receipt from the
+		// previous projection while primary evidence is still being removed.
+		if removedSource != "" {
+			previous, err = today.WithoutSource(previous, removedSource)
+			if err != nil {
+				clear(oldBytes)
+				return ErrCorrupt
+			}
+		}
+		snapshot, err = retainTodayTaskReceipts(previous, snapshot)
+		if err != nil {
+			clear(oldBytes)
+			return &storage.StoreError{Code: storage.Invalid}
+		}
 	}
 	clear(oldBytes)
+	// A prepared snapshot may outlive a deletion. Check primary membership
+	// once, after retaining user decisions, so full 512-source projections
+	// remain within the transaction budget. This reads only bounded metadata.
+	if err := tx.validateTodaySources(snapshot.SourceIDs); err != nil {
+		return err
+	}
 	oldSet := make(map[string]struct{}, len(oldSources))
 	newSet := make(map[string]struct{}, len(snapshot.SourceIDs))
 	for _, id := range oldSources {
@@ -75,6 +99,48 @@ func (tx *Tx) putTodaySnapshot(snapshot today.Snapshot) error {
 	}
 	defer clear(encoded)
 	return tx.PutIndexRecord(todayNamespace, snapshot.Date, encoded)
+}
+
+func (tx *Tx) validateTodaySources(ids []string) error {
+	type membership struct {
+		publication string
+		parts       int64
+	}
+	editions := make(map[string]membership)
+	for _, id := range ids {
+		key := tx.store.logicalKey(groupRecord, kindObservation, "", id)
+		found, err := tx.writer.Has(key)
+		clear(key)
+		if err != nil {
+			return mapStorePhysicalError(err)
+		}
+		if found {
+			continue
+		}
+		mapping, found, err := tx.store.captureIndexPartReader(tx.writer, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrSourceDeleted
+		}
+		live, known := editions[mapping.EditionID]
+		if !known {
+			edition, summary, found, err := tx.store.captureLiveReader(tx.writer, mapping.EditionID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return ErrSourceDeleted
+			}
+			live = membership{publication: edition.Publication, parts: summary.PartCount()}
+			editions[mapping.EditionID] = live
+		}
+		if live.publication != mapping.Publication || mapping.Index >= live.parts {
+			return ErrSourceDeleted
+		}
+	}
+	return nil
 }
 
 func (tx *Tx) readIndexValue(namespace, id string, maxBytes int) ([]byte, bool, error) {
@@ -157,59 +223,67 @@ func (tx *Tx) updateTodaySourceDate(sourceID, date string, add bool) error {
 }
 
 func (tx *Tx) removeTodaySource(sourceID string) error {
+	_, err := tx.removeTodaySourceBatch(sourceID, maxTodaySourceDates)
+	return err
+}
+
+func (tx *Tx) removeTodaySourceBatch(sourceID string, limit int) (bool, error) {
 	encoded, found, err := tx.readIndexValue(todaySourceNamespace, sourceID, 2048)
 	if err != nil || !found {
-		return err
+		return !found, err
 	}
 	var dates []string
 	if json.Unmarshal(encoded, &dates) != nil || len(dates) > maxTodaySourceDates {
 		clear(encoded)
-		return ErrCorrupt
+		return false, ErrCorrupt
 	}
 	clear(encoded)
 	for i, date := range dates {
+		if i >= limit {
+			break
+		}
 		if !validTodayDate(date) || i > 0 && dates[i-1] >= date {
-			return ErrCorrupt
+			return false, ErrCorrupt
 		}
 		snapshotBytes, found, err := tx.readIndexValue(todayNamespace, date, today.MaxSnapshotBytes)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !found {
 			if err := tx.updateTodaySourceDate(sourceID, date, false); err != nil {
-				return err
+				return false, err
 			}
 			continue
 		}
 		var snapshot today.Snapshot
 		if json.Unmarshal(snapshotBytes, &snapshot) != nil || snapshot.Date != date || snapshot.Validate() != nil {
 			clear(snapshotBytes)
-			return ErrCorrupt
+			return false, ErrCorrupt
 		}
 		clear(snapshotBytes)
 		cleaned, err := today.WithoutSource(snapshot, sourceID)
 		if err != nil {
-			return ErrCorrupt
+			return false, ErrCorrupt
 		}
 		if todaySnapshotEmpty(cleaned) {
 			if err := tx.deleteKnowledgeRecord(todayNamespace, date); err != nil {
-				return err
+				return false, err
 			}
 			if err := tx.updateTodaySourceDate(sourceID, date, false); err != nil {
-				return err
+				return false, err
 			}
 			continue
 		}
-		if err := tx.putTodaySnapshot(cleaned); err != nil {
-			return err
+		if err := tx.putTodaySnapshotRemovingSource(cleaned, sourceID); err != nil {
+			return false, err
 		}
 	}
-	return nil
+	return len(dates) <= limit, nil
 }
 
 func todaySnapshotEmpty(snapshot today.Snapshot) bool {
 	return len(snapshot.SourceIDs) == 0 && len(snapshot.ActiveSubjects) == 0 && len(snapshot.RecentChanges) == 0 &&
-		len(snapshot.ConfirmedTodos) == 0 && len(snapshot.TodoCandidates) == 0 && len(snapshot.OpenLoops) == 0 &&
+		len(snapshot.ConfirmedTodos) == 0 && len(snapshot.TodoCandidates) == 0 && len(snapshot.DismissedTodos) == 0 && len(snapshot.OpenLoops) == 0 &&
 		len(snapshot.Questions) == 0 && len(snapshot.TimeSplit) == 0
 }
 
@@ -251,7 +325,7 @@ func (s *Store) GetTodaySnapshot(ctx context.Context, date string) (today.Snapsh
 		if err := json.Unmarshal(plain[5:], &out); err != nil || out.Date != date || out.Validate() != nil {
 			return ErrCorrupt
 		}
-		return nil
+		return s.filterNoteDocumentTodayReader(reader, &out)
 	})
 	if err != nil {
 		return today.Snapshot{}, false, err

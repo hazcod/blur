@@ -1,4 +1,4 @@
-// Package notes captures concise user-authored evidence and turns it into
+// Package notes captures bounded user-authored evidence and turns it into
 // bounded, source-linked proposals. Model output is never activated directly.
 package notes
 
@@ -13,12 +13,14 @@ import (
 	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/model"
 )
 
 const (
-	MaxNoteBytes     = 16 << 10
-	MaxProposals     = 8
-	MaxProposalBytes = 512
+	MaxNoteBytes        = capture.MaxObservationTextBytes
+	MaxProposals        = 8
+	MaxProposalBytes    = 512
+	maxNoteExtractCalls = 128
 )
 
 var ErrInvalid = errors.New("notes: invalid note")
@@ -56,11 +58,13 @@ type Extractor interface {
 type ProcessingState string
 
 const (
-	ProcessingDeterministic ProcessingState = "deterministic"
-	ProcessingModel         ProcessingState = "model_processed"
-	ProcessingUnavailable   ProcessingState = "model_unavailable"
-	ProcessingInvalidOutput ProcessingState = "invalid_output"
-	ProcessingBudget        ProcessingState = "model_budget_exceeded"
+	ProcessingDeterministic          ProcessingState = "deterministic"
+	ProcessingModel                  ProcessingState = "model_processed"
+	ProcessingUnavailable            ProcessingState = "model_unavailable"
+	ProcessingInvalidOutput          ProcessingState = "invalid_output"
+	ProcessingBudget                 ProcessingState = "model_budget_exceeded"
+	ProcessingSuggestionsUnavailable ProcessingState = "suggestions_unavailable"
+	ProcessingQueued                 ProcessingState = "model_queued"
 )
 
 type Result struct {
@@ -116,6 +120,18 @@ func (s *Service) AIConfigured() bool {
 }
 
 func (s *Service) Add(ctx context.Context, text string) (Result, error) {
+	return s.add(ctx, text, true)
+}
+
+// AddReceipt acknowledges encrypted source persistence and deterministic
+// suggestions without invoking the configured extractor. It starts no work
+// after returning. Callers may notify consent-gated background task/Library
+// workers using the returned SourceID; Add remains the synchronous extraction API.
+func (s *Service) AddReceipt(ctx context.Context, text string) (Result, error) {
+	return s.add(ctx, text, false)
+}
+
+func (s *Service) add(ctx context.Context, text string, extract bool) (Result, error) {
 	if s == nil || s.repository == nil || ctx == nil || ctx.Err() != nil || len(text) == 0 || len(text) > MaxNoteBytes || !utf8.ValidString(text) || strings.TrimSpace(text) == "" || strings.ContainsRune(text, 0) {
 		return Result{}, ErrInvalid
 	}
@@ -124,12 +140,44 @@ func (s *Service) Add(ctx context.Context, text string) (Result, error) {
 		return Result{}, ErrInvalid
 	}
 	observation, err := capture.SanitizeObservation("sh.blur.notes", "local", text, MaxNoteBytes)
-	if err != nil {
+	if err != nil || observation.Truncated() {
 		return Result{}, ErrInvalid
 	}
-	if err := s.repository.SaveNote(ctx, observation, at); err != nil {
+	if documents, ok := s.repository.(interface {
+		SaveNoteDocument(context.Context, capture.SanitizedObservation, time.Time) (capture.SanitizedObservation, error)
+	}); ok {
+		observation, err = documents.SaveNoteDocument(ctx, observation, at)
+		if err != nil {
+			return Result{}, err
+		}
+	} else if err := s.repository.SaveNote(ctx, observation, at); err != nil {
 		return Result{}, err
 	}
+	result, generation, _ := s.prepare(ctx, observation, at, extract)
+	if extract {
+		// Cancellation alone cannot retire an uncooperative provider. Serialize
+		// model-derived persistence with SetExtractor, preserving only local
+		// deterministic suggestions if its generation has already changed.
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		if result.Processing == ProcessingModel && (s.modelCtx != generation || generation.Err() != nil || ctx.Err() != nil) {
+			result.Processing = ProcessingUnavailable
+			result.Proposals, _ = deterministic(observation.Text(), observation.ContentID(), at)
+		}
+	}
+	if len(result.Proposals) > 0 {
+		if err := s.repository.SaveProposals(ctx, observation.ContentID(), result.Proposals); err != nil {
+			result.Processing = ProcessingUnavailable
+			if !extract {
+				result.Processing = ProcessingSuggestionsUnavailable
+			}
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) prepare(ctx context.Context, observation capture.SanitizedObservation, at time.Time, extract bool) (Result, context.Context, error) {
+	var deferred error
 	proposals, valid := deterministic(observation.Text(), observation.ContentID(), at)
 	state := ProcessingDeterministic
 	if !valid {
@@ -139,13 +187,17 @@ func (s *Service) Add(ctx context.Context, text string) (Result, error) {
 	s.mu.RLock()
 	extractor, modelCtx := s.extractor, s.modelCtx
 	s.mu.RUnlock()
-	if extractor != nil {
+	if extract && extractor != nil && ctx.Err() == nil && modelCtx.Err() == nil {
 		modelRequestCtx, cancel := context.WithCancel(ctx)
 		stop := context.AfterFunc(modelCtx, cancel)
-		model, modelErr := extractor.Extract(modelRequestCtx, observation)
+		remainingCalls := maxNoteExtractCalls
+		suggestions, modelErr := extractNoteSuggestions(modelRequestCtx, extractor, observation, &remainingCalls)
 		stop()
 		cancel()
 		if modelErr != nil {
+			if errors.Is(modelErr, model.ErrBackgroundPreempted) {
+				deferred = modelErr
+			}
 			if errors.Is(modelErr, ErrModelBudget) {
 				state = ProcessingBudget
 			} else {
@@ -153,12 +205,12 @@ func (s *Service) Add(ctx context.Context, text string) (Result, error) {
 			}
 		} else {
 			var ok bool
-			model, ok = validateModelOutput(model)
+			suggestions, ok = validateModelOutput(suggestions)
 			if !ok {
 				state = ProcessingInvalidOutput
 			} else {
 				state = ProcessingModel
-				for _, proposal := range model {
+				for _, proposal := range suggestions {
 					if proposal.Kind == Question && !meetingContext(observation.Text()) {
 						continue
 					}
@@ -174,12 +226,90 @@ func (s *Service) Add(ctx context.Context, text string) (Result, error) {
 	if len(proposals) > MaxProposals {
 		proposals = proposals[:MaxProposals]
 	}
-	if len(proposals) > 0 {
-		if err := s.repository.SaveProposals(ctx, observation.ContentID(), proposals); err != nil {
-			return Result{SourceID: observation.ContentID(), CreatedAt: at, Proposals: proposals, Processing: ProcessingUnavailable}, nil
+	return Result{SourceID: observation.ContentID(), CreatedAt: at, Proposals: proposals, Processing: state}, modelCtx, deferred
+}
+
+// extractNoteSuggestions retries a context-budget refusal by splitting the
+// already-sanitized note at UTF-8/newline boundaries. The saved source is
+// never replaced by these temporary model inputs; prepare() rebinds accepted
+// proposals to the original source ID and timestamp.
+func extractNoteSuggestions(ctx context.Context, extractor Extractor, observation capture.SanitizedObservation, remainingCalls *int) ([]Proposal, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if remainingCalls == nil || *remainingCalls <= 0 {
+		return nil, ErrModelBudget
+	}
+	if budgeted, ok := extractor.(interface{ MaxNoteInputBytes() int }); ok {
+		maxInput := budgeted.MaxNoteInputBytes()
+		if maxInput <= 0 || (len(observation.Text())+maxInput-1)/maxInput > *remainingCalls {
+			return nil, ErrModelBudget
 		}
 	}
-	return Result{SourceID: observation.ContentID(), CreatedAt: at, Proposals: proposals, Processing: state}, nil
+	proposals, err := extractor.Extract(ctx, observation)
+	if !errors.Is(err, ErrModelBudget) {
+		*remainingCalls--
+	}
+	if err == nil || !errors.Is(err, ErrModelBudget) {
+		return proposals, err
+	}
+	leftText, rightText, ok := splitNoteText(observation.Text())
+	if !ok {
+		return nil, err
+	}
+	left, err := capture.SanitizeObservation(observation.AppID(), observation.Domain(), leftText, MaxNoteBytes)
+	if err != nil {
+		return nil, ErrInvalid
+	}
+	right, err := capture.SanitizeObservation(observation.AppID(), observation.Domain(), rightText, MaxNoteBytes)
+	if err != nil {
+		return nil, ErrInvalid
+	}
+	first, err := extractNoteSuggestions(ctx, extractor, left, remainingCalls)
+	if err != nil {
+		return nil, err
+	}
+	if len(first) >= MaxProposals {
+		return first[:MaxProposals], nil
+	}
+	second, err := extractNoteSuggestions(ctx, extractor, right, remainingCalls)
+	if err != nil {
+		return nil, err
+	}
+	for _, proposal := range second {
+		first = appendUnique(first, proposal)
+		if len(first) == MaxProposals {
+			break
+		}
+	}
+	return first, nil
+}
+
+func splitNoteText(text string) (string, string, bool) {
+	if len(text) < 2 {
+		return "", "", false
+	}
+	middle := len(text) / 2
+	for middle > 0 && middle < len(text) && !utf8.RuneStart(text[middle]) {
+		middle--
+	}
+	if middle == 0 || middle >= len(text) {
+		return "", "", false
+	}
+	minBoundary, maxBoundary := len(text)/4, len(text)*3/4
+	leftNewline := strings.LastIndexByte(text[minBoundary:middle], '\n')
+	if leftNewline >= 0 {
+		middle = minBoundary + leftNewline + 1
+	} else if relative := strings.IndexByte(text[middle:maxBoundary], '\n'); relative >= 0 {
+		middle += relative + 1
+	}
+	for middle > 0 && middle < len(text) && !utf8.RuneStart(text[middle]) {
+		middle--
+	}
+	if middle <= 0 || middle >= len(text) {
+		return "", "", false
+	}
+	return text[:middle], text[middle:], true
 }
 
 func meetingContext(text string) bool {
@@ -197,11 +327,19 @@ func deterministic(text, sourceID string, at time.Time) ([]Proposal, bool) {
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		var candidate string
+		kind := Task
+		lower := strings.ToLower(line)
 		switch {
-		case strings.HasPrefix(line, "- [ ]"):
+		case strings.HasPrefix(lower, "- [ ]"):
 			candidate = strings.TrimSpace(strings.TrimPrefix(line, "- [ ]"))
-		case strings.HasPrefix(strings.ToLower(line), "todo:"):
+		case strings.HasPrefix(lower, "todo:"):
 			candidate = strings.TrimSpace(line[len("todo:"):])
+		case strings.HasPrefix(lower, "reminder:"):
+			kind = Reminder
+			candidate = strings.TrimSpace(line[len("reminder:"):])
+		case strings.HasPrefix(lower, "remind me to "):
+			kind = Reminder
+			candidate = strings.TrimSpace(line[len("remind me to "):])
 		}
 		if candidate == "" {
 			continue
@@ -209,7 +347,7 @@ func deterministic(text, sourceID string, at time.Time) ([]Proposal, bool) {
 		if len(candidate) > MaxProposalBytes || !validProposalText(candidate) {
 			return nil, false
 		}
-		p := Proposal{Kind: Task, Text: candidate, SourceID: sourceID, CreatedAt: at}
+		p := Proposal{Kind: kind, Text: candidate, SourceID: sourceID, CreatedAt: at}
 		p.ID = proposalID(sourceID, p.Kind, p.Text)
 		out = appendUnique(out, p)
 		if len(out) >= MaxProposals {

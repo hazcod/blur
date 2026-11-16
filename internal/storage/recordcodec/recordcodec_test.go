@@ -98,12 +98,12 @@ func TestOpenRejectsWrongKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer writer.Close()
+	defer func(close func() error) { _ = close() }(writer.Close)
 	reader, err := NewCodec(testKey(0x12))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Close()
+	defer func(close func() error) { _ = close() }(reader.Close)
 
 	envelope, err := writer.Seal(testMetadata(), []byte("synthetic protected payload"))
 	if err != nil {
@@ -120,7 +120,7 @@ func TestOpenAuthenticatesNamespaceKeyAndRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	metadata := testMetadata()
 	envelope, err := codec.Seal(metadata, []byte("authenticated synthetic record"))
@@ -149,7 +149,7 @@ func TestOpenRejectsEverySingleByteBitFlip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	original, err := codec.Seal(testMetadata(), []byte("tamper detection fixture"))
 	if err != nil {
@@ -172,7 +172,7 @@ func TestOpenRejectsUnsupportedEnvelopeVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	envelope, err := codec.Seal(testMetadata(), []byte("version fixture"))
 	if err != nil {
@@ -189,7 +189,7 @@ func TestOpenRejectsEveryTruncatedPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	envelope, err := codec.Seal(testMetadata(), []byte("truncation fixture"))
 	if err != nil {
@@ -208,7 +208,7 @@ func TestCodecRejectsOversizeInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	if _, err := codec.Seal(testMetadata(), make([]byte, MaxPlaintextBytes+1)); !errors.Is(err, ErrOversize) {
 		t.Fatalf("Seal(oversize) error = %v, want ErrOversize", err)
@@ -223,7 +223,7 @@ func TestCodecRejectsInvalidUTF8Metadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	metadata := testMetadata()
 	metadata.Namespace = string([]byte{'o', 'b', 0xff, 's'})
@@ -240,7 +240,7 @@ func TestCodecRejectsInvalidKeysAndMetadataBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	for name, metadata := range map[string]RecordMetadata{
 		"empty store id":  {SchemaVersion: 1, Namespace: "records", Key: "k", Revision: 1},
@@ -270,7 +270,7 @@ func TestCodecCopiesKeyInputAndClearsOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer peer.Close()
+	defer func(close func() error) { _ = close() }(peer.Close)
 
 	envelope, err := codec.Seal(testMetadata(), []byte("key-copy fixture"))
 	if err != nil {
@@ -296,7 +296,7 @@ func TestCodecFormattingAndJSONDoNotExposeKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	secretHex := hex.EncodeToString(key)
 	for _, formatted := range []string{
@@ -318,7 +318,7 @@ func TestCodecFormattingRedactsValuesCopiesAndCommonVerbs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer codec.Close()
+	defer func(close func() error) { _ = close() }(codec.Close)
 
 	value := *codec
 	copyValue := value

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,26 @@ func TestDefaultLimitsAreValidAndBounded(t *testing.T) {
 	got := DefaultLimits()
 	if !got.valid() || got.MaxBytes > 256<<10 || got.MaxNodes > 2048 || got.MaxDepth > 32 || got.MaxDuration > time.Second {
 		t.Fatalf("unsafe or invalid production limits: %+v", got)
+	}
+}
+
+func TestCapturePreservesTypedNativeReadFailureWithoutSourceText(t *testing.T) {
+	for _, atValue := range []bool{false, true} {
+		p := Pipeline{
+			Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t"}},
+			Limits: limits(),
+			Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+				cause := fmt.Errorf("private terminal command: %w", NativeReadError(ReadStageWindow, -25204))
+				if !atValue {
+					return rawFrame{}, cause
+				}
+				return rawFrame{roots: []*rawNode{{boundedValue: true, declaredBytes: -1, value: func(context.Context, int) (string, error) { return "", cause }}}}, nil
+			},
+		}
+		_, err := p.Capture(context.Background())
+		if got := ReadIssueForError(err); got != (ReadIssue{Stage: ReadStageWindow, Status: -25204}) || strings.Contains(err.Error(), "private terminal") {
+			t.Fatalf("value=%v issue=%+v err=%v", atValue, got, err)
+		}
 	}
 }
 func reader(text string, calls *int) readBounded {
@@ -132,7 +153,7 @@ func TestRemainingByteBudgetAndOversizeFailure(t *testing.T) {
 		return rawFrame{roots: []*rawNode{mk("ab"), {declaredBytes: 0, value: func(context.Context, int) (string, error) { budgets = append(budgets, -1); return "", nil }}}}, nil
 	}
 	obs, err = p.Capture(context.Background())
-	if err == nil || obs.text != "" || len(budgets) != 1 {
+	if err != nil || obs.text != "ab" || !obs.Truncated() || len(budgets) != 1 {
 		t.Fatalf("separator with no room: obs=%+v budgets=%v err=%v", obs, budgets, err)
 	}
 	p.Limits.MaxBytes = 5
@@ -502,8 +523,11 @@ func TestReaderDeadlineIsReportedAsCaptureTimeout(t *testing.T) {
 }
 
 func TestRawFrameCannotSerializeContent(t *testing.T) {
-	encoded, err := json.Marshal(rawFrame{roots: []*rawNode{{declaredBytes: 6, value: func(context.Context, int) (string, error) { return "secret", nil }}}})
-	if err != nil || string(encoded) != "{}" {
+	frame := rawFrame{roots: []*rawNode{{declaredBytes: 6, value: func(context.Context, int) (string, error) { return "secret", nil }}}}
+	encoded, err := json.Marshal(struct {
+		Frame any `json:"frame"`
+	}{Frame: frame})
+	if err != nil || string(encoded) != `{"frame":{}}` {
 		t.Fatalf("raw frame JSON: %q %v", encoded, err)
 	}
 }
@@ -527,5 +551,38 @@ func TestMalformedMetadataAndValueFailClosed(t *testing.T) {
 	obs, err := p.Capture(context.Background())
 	if err == nil || obs.text != "" {
 		t.Fatalf("malformed value: %+v %v", obs, err)
+	}
+}
+
+func TestCaptureRetainsReadTextWhenNextNodeExhaustsByteBudget(t *testing.T) {
+	secondReads := 0
+	p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "large", AppID: "editor.app"}}, Limits: Limits{MaxBytes: 8, MaxNodes: 2, MaxDepth: 1, MaxDuration: time.Second}, Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+		return rawFrame{roots: []*rawNode{
+			{boundedValue: true, declaredBytes: -1, value: func(context.Context, int) (string, error) { return "abcdefgh", nil }},
+			{boundedValue: true, declaredBytes: -1, value: func(context.Context, int) (string, error) { secondReads++; return "tail", nil }},
+		}}, nil
+	}}
+	o, err := p.Capture(context.Background())
+	if err != nil || o.Text() != "abcdefgh" || !o.Truncated() || secondReads != 0 {
+		t.Fatalf("byte limit discarded valid evidence: bytes=%d truncated=%t secondReads=%d err=%v", len(o.Text()), o.Truncated(), secondReads, err)
+	}
+}
+
+func TestRequiredFixtureScopeCannotBeOverriddenByOrdinaryAppAllowlist(t *testing.T) {
+	for _, knownDomain := range []bool{true, false} {
+		t.Run(fmt.Sprint(knownDomain), func(t *testing.T) {
+			textReads, metadataReads := 0, 0
+			domain := ""
+			if knownDomain {
+				domain = "personal.example"
+			}
+			p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "window", AppID: "com.google.chrome", Domain: domain}}, Limits: limits(), Exclusions: Exclusions{DefaultDisabled: true, IncludedApps: []string{"com.google.chrome"}, RequiredDomains: []string{"blur-fixture.localhost"}}, Read: func(context.Context, platform.CaptureProbe, Limits) (rawFrame, error) {
+				metadataReads++
+				return rawFrame{domainKnown: true, domain: "personal.example", roots: []*rawNode{{declaredBytes: -1, boundedValue: true, value: func(context.Context, int) (string, error) { textReads++; return "personal content", nil }}}}, nil
+			}}
+			if _, err := p.Capture(context.Background()); err == nil || textReads != 0 || knownDomain && metadataReads != 0 {
+				t.Fatal("fixture capture escaped its required scope", knownDomain, textReads, metadataReads, err)
+			}
+		})
 	}
 }

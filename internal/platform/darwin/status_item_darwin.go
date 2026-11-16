@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,8 @@ type statusMenuTarget uint8
 const (
 	statusTargetNone statusMenuTarget = iota
 	statusTargetInteract
+	statusTargetMeeting
+	statusTargetMeetingStop
 	statusTargetSettings
 	statusTargetCapture
 	statusTargetPause
@@ -58,14 +61,25 @@ type statusMenuItem struct {
 var (
 	errMenuBarItemUnavailable = errors.New("darwin: menu bar item unavailable")
 	statusBarItem             objc.ID
+	statusBarMenu             objc.ID
+	statusMenuTrackingTimer   objc.ID
+	statusMenuCommandHeld     bool
 	statusCaptureItem         objc.ID
+	statusMeetingItem         objc.ID
+	statusMeetingStopItem     objc.ID
+	statusOpenMeeting         func()
+	statusMeetingControls     MeetingMenuControls
+	statusMeetingRecording    bool
 	statusCaptureToggleItem   objc.ID
 	statusPauseItem           objc.ID
 	statusStateTitle          string
+	statusCaptureDetail       string
 	statusPausedUntil         time.Time
 	statusPauseFor            func(time.Duration)
 	statusQuit                func()
 	statusBarButton           objc.ID
+	statusBarBaseImage        objc.ID
+	statusBarRecordingImage   objc.ID
 	statusBar                 objc.ID
 	statusCaptureRunning      bool
 	statusCaptureActiveApp    bool
@@ -116,7 +130,7 @@ func menuBarItems(captureRunning bool, pausedUntil, now time.Time, pauseAvailabl
 		{title: captureStateTitle(captureRunning, pausedUntil, now)},
 		{separator: true},
 		{title: "Interact", selector: "openInteract:", target: statusTargetInteract, enabled: true},
-		{title: "Settings…", selector: "openSettings:", target: statusTargetSettings, enabled: true},
+		{title: "Settings", selector: "openSettings:", target: statusTargetSettings, enabled: true},
 		{separator: true},
 		{title: "Pause for", enabled: true, hidden: !captureRunning || !pauseAvailable, submenu: pauseSubmenu()},
 		{title: action, selector: "toggleCapture:", target: statusTargetCapture, enabled: true},
@@ -125,11 +139,84 @@ func menuBarItems(captureRunning bool, pausedUntil, now time.Time, pauseAvailabl
 	}
 }
 
+func meetingMenuTitle(recording bool) string {
+	if recording {
+		return "Pause recording"
+	}
+	if statusMeetingControls.Active && statusMeetingControls.Paused {
+		return "Resume recording"
+	}
+	return "Voice notes"
+}
+
+func menuBarItemsWithMeetings(captureRunning bool, pausedUntil, now time.Time, pauseAvailable bool) []statusMenuItem {
+	items := menuBarItems(captureRunning, pausedUntil, now, pauseAvailable)
+	items[0].title = menuBarStatusTitle(statusMeetingRecording, captureRunning, statusCaptureActiveApp, pausedUntil, now)
+	meeting := statusMenuItem{title: meetingMenuTitle(statusMeetingRecording), selector: "openMeeting:", target: statusTargetMeeting, enabled: statusOpenMeeting != nil && !statusMeetingControls.Busy}
+	stop := statusMenuItem{title: "Stop recording", selector: "stopMeeting:", target: statusTargetMeetingStop, enabled: statusMeetingControls.Stop != nil && !statusMeetingControls.Busy, hidden: !statusMeetingControls.Active}
+	items = append(items, statusMenuItem{}, statusMenuItem{})
+	copy(items[5:], items[3:])
+	items[3] = meeting
+	items[4] = stop
+	return items
+}
+
+// ConfigureMeetingMenu sets the workspace action independently of capture/menu
+// reconstruction. Call on the AppKit main thread; the action owns recording policy.
+func ConfigureMeetingMenu(open func(), recording bool, controls ...MeetingMenuControls) error {
+	statusOpenMeeting, statusMeetingRecording = open, recording
+	statusMeetingControls = MeetingMenuControls{Active: recording}
+	if len(controls) > 0 {
+		statusMeetingControls = controls[0]
+	}
+	iconErr := refreshStatusIcon()
+	refreshStatusCaptureTitle()
+	if statusMeetingItem == 0 {
+		return iconErr
+	}
+	title := foundation.ToNSString(meetingMenuTitle(recording)).ID
+	objc.Send[objc.ID](statusMeetingItem, objc.RegisterName("setTitle:"), title)
+	releaseNativeObject(title)
+	objc.Send[objc.ID](statusMeetingItem, objc.RegisterName("setEnabled:"), boolToObjCBool(open != nil && !statusMeetingControls.Busy))
+	if statusMeetingStopItem != 0 {
+		objc.Send[objc.ID](statusMeetingStopItem, objc.RegisterName("setHidden:"), boolToObjCBool(!statusMeetingControls.Active))
+		objc.Send[objc.ID](statusMeetingStopItem, objc.RegisterName("setEnabled:"), boolToObjCBool(statusMeetingControls.Stop != nil && !statusMeetingControls.Busy))
+	}
+	return iconErr
+}
+
 func menuBarIconAlpha(captureRunning bool) float64 {
 	if captureRunning {
 		return 1
 	}
 	return 0.48
+}
+
+func menuBarCapturePresentation(running, activeApp bool, pausedUntil, now time.Time, detail ...string) (float64, string) {
+	title := captureStateTitle(running, pausedUntil, now)
+	// Omit the argument entirely for the compact menu. An explicitly requested
+	// empty detail still describes why an active capture worker has no content.
+	if running && len(detail) > 0 {
+		if detail[0] != "" {
+			title += "; " + detail[0]
+		} else if !activeApp {
+			title += "; waiting for readable content"
+		}
+	}
+	return menuBarIconAlpha(running), title
+}
+
+func menuBarStatusTitle(recording, running, activeApp bool, pausedUntil, now time.Time, detail ...string) string {
+	_, title := menuBarCapturePresentation(running, activeApp, pausedUntil, now, detail...)
+	if !recording {
+		return title
+	}
+	if running {
+		title = strings.Replace(title, "Capture is on", "Capturing", 1)
+	} else {
+		title = strings.Replace(title, "Capture is paused", "Capture paused", 1)
+	}
+	return "Recording - " + title
 }
 
 // ConfigureMenuBarItem creates or removes Blur's native AppKit status item.
@@ -174,7 +261,7 @@ func ConfigureMenuBarItem(enabled bool, openQuickCapture, openSettings, toggleCa
 		discardItem()
 		return errMenuBarItemUnavailable
 	}
-	built, ok := addStatusMenuItems(menu, objc.ID(itemClass), objc.ID(menuClass), menuBarItems(statusCaptureRunning, statusPausedUntil, time.Now(), statusPauseFor != nil), actionTarget)
+	built, ok := addStatusMenuItems(menu, objc.ID(itemClass), objc.ID(menuClass), menuBarItemsWithMeetings(statusCaptureRunning, statusPausedUntil, time.Now(), statusPauseFor != nil), actionTarget)
 	if !ok {
 		releaseNativeObject(menu)
 		discardItem()
@@ -204,21 +291,26 @@ func ConfigureMenuBarItem(enabled bool, openQuickCapture, openSettings, toggleCa
 	} else {
 		objc.Send[objc.ID](image, objc.RegisterName("setSize:"), foundation.NSSize{Width: statusMenuIconPointSize, Height: statusMenuIconPointSize})
 		objc.Send[objc.ID](image, objc.RegisterName("setTemplate:"), false)
-		objc.Send[objc.ID](button, objc.RegisterName("setImage:"), image)
-		releaseNativeObject(image) // the button retains its copy
+		statusBarBaseImage = image // keep a private original for pause/stop restoration
+		statusBarRecordingImage = newRecordingStatusIcon(image)
 		nativeTooltip := foundation.ToNSString("Blur").ID
 		objc.Send[objc.ID](button, objc.RegisterName("setToolTip:"), nativeTooltip)
 		releaseNativeObject(nativeTooltip)
 	}
-	objc.Send[objc.ID](button, objc.RegisterName("setAlphaValue:"), menuBarIconAlpha(statusCaptureActiveApp))
+	objc.Send[objc.ID](button, objc.RegisterName("setAlphaValue:"), menuBarStatusIconAlpha(statusCaptureRunning, statusMeetingRecording))
+	objc.Send[objc.ID](menu, objc.RegisterName("setDelegate:"), actionTarget)
 	objc.Send[objc.ID](item, objc.RegisterName("setMenu:"), menu)
+	statusBarMenu = menu // owned by the status item
 	releaseNativeObject(menu)
 	statusBar, statusBarItem, statusCaptureItem, statusCaptureToggleItem, statusPauseItem, statusBarButton = bar, item, built.state, built.toggle, built.pause, button
-	statusStateTitle = captureStateTitle(statusCaptureRunning, statusPausedUntil, time.Now())
-	return nil
+	statusMeetingItem = built.meeting
+	statusMeetingStopItem = built.meetingStop
+	statusStateTitle = ""
+	refreshStatusState()
+	return refreshStatusIcon()
 }
 
-type builtStatusItems struct{ state, toggle, pause objc.ID }
+type builtStatusItems struct{ state, toggle, pause, meeting, meetingStop objc.ID }
 
 // addStatusMenuItems appends descriptors (and nested submenus) to menu.
 func addStatusMenuItems(menu, itemClass, menuClass objc.ID, descriptors []statusMenuItem, actionTarget objc.ID) (builtStatusItems, bool) {
@@ -235,7 +327,7 @@ func addStatusMenuItems(menu, itemClass, menuClass objc.ID, descriptors []status
 		}
 		if !descriptor.separator {
 			switch descriptor.target {
-			case statusTargetInteract, statusTargetSettings, statusTargetCapture, statusTargetPause, statusTargetQuit:
+			case statusTargetInteract, statusTargetMeeting, statusTargetMeetingStop, statusTargetSettings, statusTargetCapture, statusTargetPause, statusTargetQuit:
 				objc.Send[objc.ID](menuItem, objc.RegisterName("setTarget:"), actionTarget)
 			}
 			objc.Send[objc.ID](menuItem, objc.RegisterName("setEnabled:"), boolToObjCBool(descriptor.enabled))
@@ -267,11 +359,15 @@ func addStatusMenuItems(menu, itemClass, menuClass objc.ID, descriptors []status
 				}
 			case "toggleCapture:":
 				built.toggle = menuItem
+			case "openMeeting:":
+				built.meeting = menuItem
+			case "stopMeeting:":
+				built.meetingStop = menuItem
 			}
 		}
 		objc.Send[objc.ID](menu, objc.RegisterName("addItem:"), menuItem)
 		if !descriptor.separator {
-			if descriptor.selector == "" || descriptor.selector == "toggleCapture:" || len(descriptor.submenu) > 0 {
+			if descriptor.selector == "" || descriptor.selector == "toggleCapture:" || descriptor.selector == "openMeeting:" || descriptor.selector == "stopMeeting:" || len(descriptor.submenu) > 0 {
 				objc.Send[objc.ID](menuItem, objc.RegisterName("retain")) // kept by the package-level handle
 			}
 			releaseNativeObject(menuItem)
@@ -293,6 +389,12 @@ func getStatusMenuTarget(openQuickCapture, openSettings, toggleCapture func(), p
 				dispatchStatusInteract()
 			},
 		}, {
+			Cmd: objc.RegisterName("openMeeting:"),
+			Fn:  func(_ objc.ID, _ objc.SEL, _ objc.ID) { dispatchStatusMeeting() },
+		}, {
+			Cmd: objc.RegisterName("stopMeeting:"),
+			Fn:  func(_ objc.ID, _ objc.SEL, _ objc.ID) { dispatchStatusMeetingStop() },
+		}, {
 			Cmd: objc.RegisterName("openSettings:"),
 			Fn:  func(_ objc.ID, _ objc.SEL, _ objc.ID) { dispatchStatusSettings() },
 		}, {
@@ -303,6 +405,32 @@ func getStatusMenuTarget(openQuickCapture, openSettings, toggleCapture func(), p
 			Fn: func(_ objc.ID, _ objc.SEL, sender objc.ID) {
 				if sender != 0 {
 					dispatchStatusPause(objc.Send[int](sender, objc.RegisterName("tag")))
+				}
+			},
+		}, {
+			Cmd: objc.RegisterName("menuWillOpen:"),
+			Fn: func(_ objc.ID, _ objc.SEL, menu objc.ID) {
+				if menu == statusBarMenu && menu != 0 {
+					startStatusMenuTracking()
+				}
+			},
+		}, {
+			Cmd: objc.RegisterName("menuDidClose:"),
+			Fn: func(_ objc.ID, _ objc.SEL, menu objc.ID) {
+				if menu == statusBarMenu && menu != 0 {
+					stopStatusMenuTracking()
+					refreshStatusCaptureTitle()
+				}
+			},
+		}, {
+			Cmd: objc.RegisterName("refreshCaptureDetail:"),
+			Fn: func(_ objc.ID, _ objc.SEL, timer objc.ID) {
+				if timer == statusMenuTrackingTimer && timer != 0 {
+					held := CommandKeyHeld()
+					if held != statusMenuCommandHeld {
+						statusMenuCommandHeld = held
+						refreshStatusCaptureTitle()
+					}
 				}
 			},
 		}, {
@@ -338,6 +466,18 @@ func dispatchStatusInteract() {
 
 // Keep the old internal name as a thin alias for existing callers.
 func dispatchStatusQuickCapture() { dispatchStatusInteract() }
+
+func dispatchStatusMeeting() {
+	if statusOpenMeeting != nil {
+		invokeStatusCallback("Voice notes", statusOpenMeeting)
+	}
+}
+
+func dispatchStatusMeetingStop() {
+	if statusMeetingControls.Active && !statusMeetingControls.Busy && statusMeetingControls.Stop != nil {
+		invokeStatusCallback("Stop recording", statusMeetingControls.Stop)
+	}
+}
 
 func dispatchStatusSettings() {
 	if statusOpenSettings != nil {
@@ -384,12 +524,16 @@ func invokeStatusCallback(name string, callback func()) {
 
 // UpdateMenuBarCaptureState updates the status text without recreating AppKit objects.
 // Call on the main OS thread.
-func UpdateMenuBarCaptureState(captureRunning, activeAppCapturing bool, pausedUntil time.Time) {
+func UpdateMenuBarCaptureState(captureRunning, activeAppCapturing bool, pausedUntil time.Time, detail ...string) {
 	runningChanged := statusCaptureRunning != captureRunning
 	activeChanged := statusCaptureActiveApp != activeAppCapturing
 	statusCaptureRunning = captureRunning
 	statusCaptureActiveApp = activeAppCapturing
 	statusPausedUntil = pausedUntil
+	statusCaptureDetail = ""
+	if len(detail) > 0 {
+		statusCaptureDetail = detail[0]
+	}
 	if statusCaptureItem == 0 {
 		return
 	}
@@ -402,23 +546,33 @@ func UpdateMenuBarCaptureState(captureRunning, activeAppCapturing bool, pausedUn
 		objc.Send[objc.ID](statusCaptureToggleItem, objc.RegisterName("setTitle:"), nativeAction)
 		releaseNativeObject(nativeAction)
 	}
-	if activeChanged && statusBarButton != 0 {
-		objc.Send[objc.ID](statusBarButton, objc.RegisterName("setAlphaValue:"), menuBarIconAlpha(activeAppCapturing))
-	}
+
 	refreshStatusState()
 	if runningChanged || activeChanged {
-		slog.Info("menu bar capture indicator changed", "worker_running", captureRunning, "active_app_capturing", activeAppCapturing)
+		slog.Debug("menu bar capture indicator changed", "worker_running", captureRunning, "active_app_capturing", activeAppCapturing)
 	}
 }
 
 func refreshStatusState() {
+	_ = refreshStatusIcon()
 	if statusCaptureItem == 0 {
 		return
 	}
 	if statusPauseItem != 0 {
 		objc.Send[objc.ID](statusPauseItem, objc.RegisterName("setHidden:"), boolToObjCBool(!statusCaptureRunning || statusPauseFor == nil))
 	}
-	title := captureStateTitle(statusCaptureRunning, statusPausedUntil, time.Now())
+	refreshStatusCaptureTitle()
+}
+
+func refreshStatusCaptureTitle() {
+	if statusCaptureItem == 0 {
+		return
+	}
+	var detail []string
+	if statusMenuCommandHeld {
+		detail = []string{statusCaptureDetail}
+	}
+	title := menuBarStatusTitle(statusMeetingRecording, statusCaptureRunning, statusCaptureActiveApp, statusPausedUntil, time.Now(), detail...)
 	if title == statusStateTitle {
 		return
 	}
@@ -426,6 +580,35 @@ func refreshStatusState() {
 	nativeText := foundation.ToNSString(title).ID
 	defer releaseNativeObject(nativeText)
 	objc.Send[objc.ID](statusCaptureItem, objc.RegisterName("setTitle:"), nativeText)
+}
+
+// A menu runs a nested tracking loop, which does not deliver local NSEvent
+// monitors. Read only the current modifier flags while that menu is open.
+// No key events or background monitoring are retained.
+func startStatusMenuTracking() {
+	stopStatusMenuTracking()
+	statusMenuCommandHeld = CommandKeyHeld()
+	refreshStatusCaptureTitle()
+	timer := objc.Send[objc.ID](objc.ID(objc.GetClass("NSTimer")), objc.RegisterName("timerWithTimeInterval:target:selector:userInfo:repeats:"),
+		float64(1.0/30), statusTargetObject, objc.RegisterName("refreshCaptureDetail:"), objc.ID(0), true)
+	if timer == 0 {
+		return
+	}
+	objc.Send[objc.ID](timer, objc.RegisterName("retain"))
+	statusMenuTrackingTimer = timer
+	runLoop := objc.Send[objc.ID](objc.ID(objc.GetClass("NSRunLoop")), objc.RegisterName("mainRunLoop"))
+	mode := foundation.ToNSString("NSEventTrackingRunLoopMode").ID
+	objc.Send[objc.ID](runLoop, objc.RegisterName("addTimer:forMode:"), timer, mode)
+	releaseNativeObject(mode)
+}
+
+func stopStatusMenuTracking() {
+	if statusMenuTrackingTimer != 0 {
+		objc.Send[objc.ID](statusMenuTrackingTimer, objc.RegisterName("invalidate"))
+		releaseNativeObject(statusMenuTrackingTimer)
+		statusMenuTrackingTimer = 0
+	}
+	statusMenuCommandHeld = false
 }
 
 func selectorOrZero(name string) objc.SEL {
@@ -443,6 +626,11 @@ func boolToObjCBool(value bool) uintptr {
 }
 
 func removeMenuBarItem() {
+	stopStatusMenuTracking()
+	if statusBarMenu != 0 {
+		objc.Send[objc.ID](statusBarMenu, objc.RegisterName("setDelegate:"), objc.ID(0))
+		statusBarMenu = 0
+	}
 	if statusBar != 0 && statusBarItem != 0 {
 		objc.Send[objc.ID](statusBar, objc.RegisterName("removeStatusItem:"), statusBarItem)
 		releaseNativeObject(statusBarItem)
@@ -450,6 +638,12 @@ func removeMenuBarItem() {
 	releaseNativeObject(statusCaptureItem)
 	releaseNativeObject(statusCaptureToggleItem)
 	releaseNativeObject(statusPauseItem)
+	releaseNativeObject(statusMeetingItem)
+	releaseNativeObject(statusMeetingStopItem)
+	releaseNativeObject(statusBarBaseImage)
+	releaseNativeObject(statusBarRecordingImage)
+	statusBarBaseImage, statusBarRecordingImage = 0, 0
+	statusMeetingItem, statusMeetingStopItem = 0, 0
 	statusBar, statusBarItem, statusCaptureItem, statusCaptureToggleItem, statusPauseItem, statusBarButton = 0, 0, 0, 0, 0, 0
 	statusStateTitle = ""
 	statusQuickCapture, statusOpenSettings, statusToggleCapture, statusPauseFor, statusQuit = nil, nil, nil, nil, nil

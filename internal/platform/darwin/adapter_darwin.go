@@ -19,6 +19,7 @@ import (
 var _ platform.CaptureSource = (*Adapter)(nil)
 var _ platform.CaptureSuspender = (*Adapter)(nil)
 var _ platform.CapturePermissionRequester = (*Adapter)(nil)
+var _ platform.CapturePresence = (*Adapter)(nil)
 
 // Adapter provides passive Darwin accessibility capture. Capability is checked
 // non-interactively; explicit capture startup may request native permission guidance.
@@ -28,6 +29,7 @@ type Adapter struct {
 	currentTarget       func() (string, int32, error)
 	subscribeActivation func(chan<- struct{}) (func(), error)
 	watchFocus          func(int32, chan<- struct{}) (func(), error)
+	idleSeconds         func() (float64, error)
 	targetMu            sync.Mutex
 	currentID           string
 	currentApp          string
@@ -44,6 +46,7 @@ func New() *Adapter {
 	return &Adapter{
 		trusted: nativeAccessibilityTrusted, requestPermission: nativeAccessibilityPrompt, currentTarget: nativeFrontmostTarget,
 		subscribeActivation: nativeActivationSubscription, watchFocus: nativeFocusSubscription,
+		idleSeconds: nativeIdleSeconds,
 	}
 }
 
@@ -253,7 +256,7 @@ func validBundleID(id string) bool {
 		return false
 	}
 	for _, r := range id {
-		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
 			return false
 		}
 	}
@@ -357,7 +360,7 @@ func readFrontmostTarget() (string, int32, error) {
 		return "", 0, errors.New("frontmost app identifier unavailable")
 	}
 	var output [129]byte
-	if a.stringCopy(bundle, uintptr(unsafe.Pointer(&output[0])), int64(len(output)), cfUTF8Encoding) == 0 {
+	if a.stringCopy(bundle, uintptr(unsafe.Pointer(&output[0])), int64(len(output)), cfUTF8Encoding) == 0 { // #nosec G103 -- CoreFoundation writes synchronously into the fixed-size output buffer and receives its exact capacity.
 		return "", 0, errors.New("frontmost app identifier unavailable")
 	}
 	n := 0
@@ -481,7 +484,7 @@ func loadFrontmostAPI() {
 
 func cString(s string) ([]byte, uintptr) {
 	b := append([]byte(s), 0)
-	return b, uintptr(unsafe.Pointer(&b[0]))
+	return b, uintptr(unsafe.Pointer(&b[0])) // #nosec G103 -- The returned nonempty NUL-terminated slice owns the pointer; FFI callers retain it through runtime.KeepAlive.
 }
 
 func (a frontmostAPI) getClassName(name string) uintptr {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +13,50 @@ import (
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/knowledge"
 )
+
+func TestKnowledgeUnmergeCannotRestoreErasedEvidence(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0xf7), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(close func() error) { _ = close() }(s.Close)
+	removed, _ := capture.SanitizeObservation("chat.app", "local", "Evidence to erase", 1024)
+	kept, _ := capture.SanitizeObservation("chat.app", "local", "Independent evidence", 1024)
+	for _, o := range []capture.SanitizedObservation{removed, kept} {
+		if err := s.PutObservation(ctx, o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"merge-source", "merge-target"} {
+		entity := knowledge.Entity{ID: id, Name: "Project " + id, Kind: knowledge.Project, State: knowledge.Confirmed}
+		for n, source := range []string{removed.ContentID(), kept.ContentID()} {
+			entity.Facts = append(entity.Facts, knowledge.Fact{ID: fmt.Sprintf("%s-fact-%d", id, n), Text: fmt.Sprintf("Statement %s %d", id, n), State: knowledge.Confirmed, Sources: []knowledge.Source{{ID: source}}})
+		}
+		if err := s.PutKnowledgeEntity(ctx, entity); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.MergeKnowledge(ctx, "merge-source", "merge-target"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteObservationRecord(ctx, removed.ContentID()); err != nil {
+		t.Fatal(err)
+	}
+	backup, found, err := s.readIndexValue(ctx, knowledgeMergeNS, "merge-source", 2*knowledge.MaxEntityBytes+1024)
+	if err != nil || !found || bytes.Contains(backup, []byte(removed.ContentID())) {
+		t.Fatal("erased evidence remained in merge history", found, err)
+	}
+	if err := s.UnmergeKnowledge(ctx, "merge-source", "merge-target"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"merge-source", "merge-target"} {
+		entity, found, err := s.GetKnowledgeEntity(ctx, id)
+		if err != nil || !found || len(entity.Facts) != 1 || entity.Facts[0].Sources[0].ID != kept.ContentID() {
+			t.Fatal("unmerge restored erased provenance", id, entity.Facts, found, err)
+		}
+	}
+}
 
 func TestKnowledgeIsEncryptedIndexedPagedAndReopenable(t *testing.T) {
 	ctx := context.Background()
@@ -51,7 +96,7 @@ func TestKnowledgeIsEncryptedIndexedPagedAndReopenable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	e, found, err := s.GetKnowledgeEntity(ctx, "entity-a")
 	if err != nil || !found || e.Facts[0].Sources[0].ID != repeatHex("a") {
 		t.Fatalf("reopened entity=%+v found=%v err=%v", e, found, err)
@@ -64,7 +109,7 @@ func TestKnowledgeAliasCollisionCorrectionMergeAndUnmerge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	a := knowledge.Entity{ID: "a", Kind: knowledge.Person, Name: "Ada", Aliases: []string{"Ada Lovelace"}, State: knowledge.Confirmed}
 	b := knowledge.Entity{ID: "b", Kind: knowledge.Person, Name: "Augusta", Aliases: []string{"Ada Lovelace"}, State: knowledge.Confirmed}
 	if err := s.PutKnowledgeEntity(ctx, a); err != nil {
@@ -118,7 +163,7 @@ func TestDeleteAllKnowledgeRemovesEntitiesAliasesAndMergeLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	for _, entity := range []knowledge.Entity{
 		{ID: "person-a", Kind: knowledge.Person, Name: "Ada", Aliases: []string{"Ada Lovelace"}, State: knowledge.Confirmed},
 		{ID: "person-b", Kind: knowledge.Person, Name: "Augusta", State: knowledge.Confirmed},
@@ -160,7 +205,7 @@ func TestDeleteAllKnowledgeWaitsForInFlightKnowledgeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	if err := s.PutKnowledgeEntity(ctx, knowledge.Entity{ID: "person", Kind: knowledge.Person, Name: "Ada", State: knowledge.Confirmed}); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +245,7 @@ func TestKnowledgeMutationFailsClosedDuringDeleteFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	s.state.knowledgeMu.Lock()
 	err = s.PutKnowledgeEntity(context.Background(), knowledge.Entity{ID: "late", Kind: knowledge.Person, Name: "Late", State: knowledge.Confirmed})
 	s.state.knowledgeMu.Unlock()
@@ -218,7 +263,7 @@ func TestKnowledgeSourceDeletionRemovesLinkedClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	e := knowledge.Entity{ID: "project", Kind: knowledge.Project, Name: "Project", State: knowledge.Confirmed,
 		Facts:     []knowledge.Fact{{ID: "f1", Text: "evidence-backed", State: knowledge.Deterministic, Sources: []knowledge.Source{{ID: repeatHex("b")}}}},
 		OpenLoops: []knowledge.OpenLoop{{ID: "l1", Text: "follow up", State: knowledge.Proposed, Sources: []knowledge.Source{{ID: repeatHex("b")}}}}, ActivitySourceIDs: []string{repeatHex("b")}}
@@ -240,7 +285,7 @@ func TestDeleteObservationRecordAtomicallyQuarantinesKnowledgeClaims(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	source, err := capture.SanitizeObservation("editor.app", "docs.example", "source text", 1024)
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +316,7 @@ func TestPutKnowledgeEntityFromSourceChecksLiveEvidenceAtomically(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	source, err := capture.SanitizeObservation("editor.app", "local", "Northstar is written in Go.", 1024)
 	if err != nil {
 		t.Fatal(err)
@@ -303,7 +348,7 @@ func TestPutKnowledgeEntityFromSourcePreservesExistingDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	source, err := capture.SanitizeObservation("editor.app", "local", "Northstar is written in Go.", 1024)
 	if err != nil {
 		t.Fatal(err)
@@ -338,7 +383,7 @@ func TestDeleteObservationRecordRollbackRestoresSourceAndKnowledge(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	source, err := capture.SanitizeObservation("editor.app", "docs.example", "source text", 1024)
 	if err != nil {
 		t.Fatal(err)
@@ -376,7 +421,7 @@ func TestKnowledgeDeleteRemovesEntityAndExactAliases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func(close func() error) { _ = close() }(s.Close)
 	e := knowledge.Entity{ID: "delete-me", Kind: knowledge.Topic, Name: "Ephemeral topic", Aliases: []string{"Temporary"}, State: knowledge.Confirmed}
 	if err := s.PutKnowledgeEntity(ctx, e); err != nil {
 		t.Fatal(err)

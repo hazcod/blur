@@ -65,7 +65,7 @@ func writeStartupTrace(path, stage string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(close func() error) { _ = close() }(file.Close)
 	if err := file.Chmod(0o600); err != nil {
 		return err
 	}
@@ -106,7 +106,7 @@ func writeStartupError(path string, startupErr error) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(close func() error) { _ = close() }(file.Close)
 	if err := file.Chmod(0o600); err != nil {
 		return err
 	}

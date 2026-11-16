@@ -3,7 +3,6 @@ package privacy
 import (
 	"net/url"
 	"regexp"
-	"sort"
 	"strings"
 	"unicode"
 )
@@ -201,66 +200,12 @@ func Redact(input string) (string, []Count) {
 	replace(pem, "PRIVATE_KEY", nil)
 	if auth.MatchString(input) {
 		input = auth.ReplaceAllStringFunc(input, func(match string) string {
-			colon := strings.IndexByte(match, ':')
-			if colon >= 0 && exactPlaceholder(strings.TrimSpace(match[colon+1:]), "AUTHORIZATION") {
-				return match
-			}
-			counts["AUTHORIZATION"]++
-			return placeholder("AUTHORIZATION")
+			return redactAuthorizationMatch(match, counts)
 		})
 	}
 	if webURL.MatchString(input) {
 		input = webURL.ReplaceAllStringFunc(input, func(raw string) string {
-			parseRaw := strings.Replace(raw, placeholder("URL_CREDENTIAL"), "%5BREDACTED%3AURL_CREDENTIAL%5D", 1)
-			u, err := url.Parse(parseRaw)
-			if err != nil || u.Host == "" {
-				if sensitiveMalformedURL(raw) {
-					counts["MALFORMED_URL"]++
-					return placeholder("MALFORMED_URL")
-				}
-				return raw
-			}
-			q, queryErr := url.ParseQuery(u.RawQuery)
-			if queryErr != nil {
-				if sensitiveMalformedURL(raw) {
-					counts["MALFORMED_URL"]++
-					return placeholder("MALFORMED_URL")
-				}
-				return raw
-			}
-			changed := false
-			if u.User != nil {
-				_, hasPassword := u.User.Password()
-				if !exactPlaceholder(u.User.Username(), "URL_CREDENTIAL") || hasPassword {
-					u.User = url.User(placeholder("URL_CREDENTIAL"))
-					counts["URL_CREDENTIAL"]++
-					changed = true
-				}
-			}
-			for key, vals := range q {
-				decodedKey, decodeErr := decodeURLComponent(key)
-				if decodeErr != nil {
-					counts["MALFORMED_URL"]++
-					return placeholder("MALFORMED_URL")
-				}
-				if sensitiveQueryKey(decodedKey) {
-					if len(vals) != 1 || !exactPlaceholder(vals[0], "URL_QUERY") {
-						for _, v := range vals {
-							if !exactPlaceholder(v, "URL_QUERY") {
-								counts["URL_QUERY"]++
-							}
-						}
-						q.Set(key, placeholder("URL_QUERY"))
-						changed = true
-					}
-				}
-			}
-			if changed {
-				u.RawQuery = q.Encode()
-				out := strings.ReplaceAll(u.String(), "%5BREDACTED%3AURL_CREDENTIAL%5D", placeholder("URL_CREDENTIAL"))
-				return strings.ReplaceAll(out, "%5BREDACTED%3AURL_QUERY%5D", placeholder("URL_QUERY"))
-			}
-			return raw
+			return redactURLMatch(raw, counts)
 		})
 	}
 	maskLabels := func(segment string) string {
@@ -269,35 +214,14 @@ func Redact(input string) (string, []Count) {
 				return
 			}
 			segment = re.ReplaceAllStringFunc(segment, func(match string) string {
-				parts := re.FindStringSubmatch(match)
-				if len(parts) != 4 {
-					return match
-				}
-				rule := labelRule(parts[1])
-				if exactPlaceholder(parts[3], rule) {
-					return match
-				}
-				counts[rule]++
-				if json {
-					return "\"" + parts[1] + "\"" + parts[2] + "\"" + placeholder(rule) + "\""
-				}
-				return parts[1] + parts[2] + "\"" + placeholder(rule) + "\""
+				return redactQuotedMatch(match, re, json, counts)
 			})
 		}
 		maskQuoted(jsonLabel, true)
 		maskQuoted(quotedLabel, false)
 		if label.MatchString(segment) {
 			segment = label.ReplaceAllStringFunc(segment, func(match string) string {
-				parts := label.FindStringSubmatch(match)
-				if len(parts) != 4 {
-					return match
-				}
-				rule := labelRule(parts[1])
-				if exactPlaceholder(strings.TrimSpace(parts[3]), rule) {
-					return match
-				}
-				counts[rule]++
-				return parts[1] + parts[2] + placeholder(rule)
+				return redactLabelMatch(match, counts)
 			})
 		}
 		return segment
@@ -320,16 +244,7 @@ func Redact(input string) (string, []Count) {
 	replace(ssn, "SSN", validSSN)
 	replace(card, "CARD", validCard)
 	replace(iban, "IBAN", validIBAN)
-	rules := make([]string, 0, len(counts))
-	for rule := range counts {
-		rules = append(rules, rule)
-	}
-	sort.Strings(rules)
-	out := make([]Count, 0, len(rules))
-	for _, rule := range rules {
-		out = append(out, Count{Rule: rule, Count: counts[rule]})
-	}
-	return input, out
+	return input, sortedCounts(counts)
 }
 
 func validSSN(s string) bool {
@@ -378,7 +293,7 @@ func validIBAN(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !unicode.IsDigit(r) && !(r >= 'A' && r <= 'Z') {
+		if !unicode.IsDigit(r) && (r < 'A' || r > 'Z') {
 			return false
 		}
 	}

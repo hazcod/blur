@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -169,6 +170,129 @@ func TestAuditPackagesAllowsPureGoThirdPartyDependency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AuditPackages() error = %v, want nil", err)
 	}
+}
+
+func TestMacOSAppTargetBuildsAndPackagesWithCGODisabled(t *testing.T) {
+	makefile, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkMacOSCGORecipes(string(makefile)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMacOSAppRecipeAuditRejectsCGOOrMissingRecursiveBuildStages(t *testing.T) {
+	makefile, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := string(makefile)
+	for _, test := range []struct{ name, before, after string }{
+		{"tool cgo", "CGO_ENABLED=0 GOOS=darwin GOARCH=$$(go env GOHOSTARCH) go build", "CGO_ENABLED=1 GOOS=darwin GOARCH=$$(go env GOHOSTARCH) go build"},
+		{"arm64 cgo", `CGO_ENABLED=0 "$(MACOS_GOUI)" build`, `CGO_ENABLED=1 "$(MACOS_GOUI)" build`},
+		{"amd64 cgo", "CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build", "CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build"},
+		{"package cgo", `CGO_ENABLED=0 "$(MACOS_GOUI)" package`, `CGO_ENABLED=1 "$(MACOS_GOUI)" package`},
+		{"arm64 target", `build -target darwin/arm64 -ldflags`, `build -target darwin/amd64 -ldflags`},
+		{"tools dependency", "macos-app-arm64: macos-app-build-tools", "macos-app-arm64:"},
+		{"amd64 dependency", "macos-app-compile: macos-app-arm64 macos-app-amd64 macos-app-native", "macos-app-compile: macos-app-arm64 macos-app-native"},
+		{"recursive invocation", `$(MAKE) --no-print-directory -j "$(MACOS_BUILD_JOBS)" macos-app-compile`, `echo macos-app-compile`},
+		{"universal merge", `lipo -create "$(MACOS_BINARY_ARM64)" "$(MACOS_BINARY_AMD64)"`, `lipo -create "$(MACOS_BINARY_ARM64)"`},
+		{"universal install", `install -m 755 "$(MACOS_BINARY)" "$(MACOS_APP_STAGING)/Contents/MacOS/blur"`, `install -m 755 "$(MACOS_BINARY_ARM64)" "$(MACOS_APP_STAGING)/Contents/MacOS/blur"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(original, test.before) {
+				t.Fatalf("mutation no longer matches actual Make recipe: %q", test.before)
+			}
+			mutated := strings.Replace(original, test.before, test.after, 1)
+			if err := checkMacOSCGORecipes(mutated); err == nil {
+				t.Fatal("accepted unsafe/incomplete macOS build mutation")
+			}
+		})
+	}
+}
+
+// Follow the actual recursive stage graph rather than requiring the old serial
+// recipe to contain every command. The goui CLI is compiled once with cgo off;
+// its build and package invocations must also keep cgo disabled.
+func checkMacOSCGORecipes(makefile string) error {
+	type target struct {
+		dependencies string
+		recipes      []string
+	}
+	targets := make(map[string]*target)
+	var current *target
+	for _, line := range strings.Split(makefile, "\n") {
+		if strings.HasPrefix(line, "	") {
+			if current != nil {
+				current.recipes = append(current.recipes, strings.TrimSpace(line))
+			}
+			continue
+		}
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		current = nil
+		name, dependencies, ok := strings.Cut(line, ":")
+		if !ok || name == "" || strings.ContainsAny(name, " 	=$") || strings.HasPrefix(dependencies, "=") {
+			continue
+		}
+		current = &target{dependencies: dependencies}
+		targets[name] = current
+	}
+	requireRecipe := func(name, prefix string, fragments ...string) error {
+		item := targets[name]
+		if item != nil {
+			for _, recipe := range item.recipes {
+				if !strings.HasPrefix(recipe, prefix) {
+					continue
+				}
+				valid := true
+				for _, fragment := range fragments {
+					valid = valid && strings.Contains(recipe, fragment)
+				}
+				if valid {
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("macOS target %s is missing its cgo-disabled build/package contract: %s", name, prefix)
+	}
+	for name, dependencies := range map[string][]string{
+		"macos-app-compile": {"macos-app-arm64", "macos-app-amd64", "macos-app-native"},
+		"macos-app-arm64":   {"macos-app-build-tools"},
+	} {
+		item := targets[name]
+		if item == nil {
+			return fmt.Errorf("missing macOS build target %s", name)
+		}
+		for _, dependency := range dependencies {
+			found := false
+			for _, field := range strings.Fields(item.dependencies) {
+				found = found || field == dependency
+			}
+			if !found {
+				return fmt.Errorf("macOS target %s does not build dependency %s", name, dependency)
+			}
+		}
+	}
+	for _, check := range []struct {
+		target, prefix string
+		fragments      []string
+	}{
+		{"macos-app-build-tools", "CGO_ENABLED=0 GOOS=darwin GOARCH=$$(go env GOHOSTARCH) go build ", []string{`-o "$(MACOS_GOUI)"`, "github.com/golang-gui/goui/cmd/goui"}},
+		{"macos-app-arm64", `CGO_ENABLED=0 "$(MACOS_GOUI)" build `, []string{"-target darwin/arm64", `-o "$(MACOS_BINARY_ARM64)"`}},
+		{"macos-app-amd64", "CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build ", []string{`-o "$(MACOS_BINARY_AMD64)"`, "./cmd/blur"}},
+		{"macos-app", `$(MAKE) --no-print-directory -j "$(MACOS_BUILD_JOBS)" macos-app-compile `, nil},
+		{"macos-app", `CGO_ENABLED=0 "$(MACOS_GOUI)" package `, []string{"-target darwin/arm64", "-format app", `-o "$(MACOS_APP_STAGING)"`}},
+		{"macos-app", `lipo -create "$(MACOS_BINARY_ARM64)" "$(MACOS_BINARY_AMD64)" -output "$(MACOS_BINARY)"`, nil},
+		{"macos-app", `install -m 755 "$(MACOS_BINARY)" "$(MACOS_APP_STAGING)/Contents/MacOS/blur"`, nil},
+	} {
+		if err := requireRecipe(check.target, check.prefix, check.fragments...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func TestAuditPackagesExemptsStandardLibraryCgo(t *testing.T) {

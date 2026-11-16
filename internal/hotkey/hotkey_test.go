@@ -44,3 +44,10 @@ func TestValidAndLabel(t *testing.T) {
 		t.Fatal("Label wrong")
 	}
 }
+
+func TestMeetingShortcutIsDistinctAndNamed(t *testing.T) {
+	code, modifiers, ok := Parse("ctrl+alt+m")
+	if !ok || code != 46 || modifiers != ModControl|ModOption || Label("ctrl+alt+m") != "⌃⌥M" {
+		t.Fatal("dedicated meeting shortcut is not supported")
+	}
+}

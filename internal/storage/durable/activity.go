@@ -175,48 +175,61 @@ func (tx *Tx) trackActivitySource(sourceID, segmentID string) (bool, error) {
 }
 
 func (tx *Tx) removeActivitySource(sourceID string) error {
+	_, err := tx.removeActivitySourceBatch(sourceID, maxSegmentsPerSource)
+	return err
+}
+
+func (tx *Tx) removeActivitySourceBatch(sourceID string, limit int) (bool, error) {
 	encoded, found, err := tx.readIndexValue(activitySourceNamespace, sourceID, 8192)
 	if err != nil || !found {
-		return err
+		return !found, err
 	}
 	var ids []string
 	if json.Unmarshal(encoded, &ids) != nil || len(ids) > maxSegmentsPerSource {
 		clear(encoded)
-		return ErrCorrupt
+		return false, ErrCorrupt
 	}
 	clear(encoded)
 	for i, id := range ids {
+		if i >= limit {
+			break
+		}
 		if !validOpaqueID(id) || i > 0 && ids[i-1] >= id {
-			return ErrCorrupt
+			return false, ErrCorrupt
 		}
 		segmentBytes, found, err := tx.readIndexValue(activityNamespace, id, maxActivityRecordBytes)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !found {
-			return ErrCorrupt
+			return false, ErrCorrupt
 		}
 		var segment activity.Segment
 		if json.Unmarshal(segmentBytes, &segment) != nil || segment.ID != id || segment.Validate() != nil {
 			clear(segmentBytes)
-			return ErrCorrupt
+			return false, ErrCorrupt
 		}
 		clear(segmentBytes)
+		linked := false
+		for _, id := range segment.SourceIDs {
+			linked = linked || id == sourceID
+		}
+		if !linked {
+			return false, ErrCorrupt
+		}
 		if err := tx.removeActivityDay(segment); err != nil {
-			return err
+			return false, err
 		}
 		for _, otherSource := range segment.SourceIDs {
-			if otherSource != sourceID {
-				if err := tx.untrackActivitySource(otherSource, id); err != nil {
-					return err
-				}
+			if err := tx.untrackActivitySource(otherSource, id); err != nil {
+				return false, err
 			}
 		}
 		if err := tx.deleteKnowledgeRecord(activityNamespace, id); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return tx.deleteKnowledgeRecord(activitySourceNamespace, sourceID)
+	return len(ids) <= limit, nil
 }
 
 func (tx *Tx) untrackActivitySource(sourceID, segmentID string) error {

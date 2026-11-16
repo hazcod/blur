@@ -45,6 +45,7 @@ func TestBrowserProfilesExcludeAddressAndTabChrome(t *testing.T) {
 	}
 	for _, app := range []string{
 		"com.apple.safari", "com.google.chrome", "org.mozilla.firefox", "com.microsoft.edgemac",
+		"com.kagi.kagimacos", "com.google.chrome.for.testing",
 		"google-chrome", "chromium", "firefox", "brave-browser", "microsoft-edge",
 		"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe", "librewolf.exe",
 	} {

@@ -36,7 +36,7 @@ func (nativeSystemStateSource) ReadSystemState(ctx context.Context) (SystemState
 	if err != nil {
 		return SystemState{}, ErrSystemStateUnavailable
 	}
-	defer conn.Close()
+	defer func(close func() error) { _ = close() }(conn.Close)
 	var profile dbus.Variant
 	err = conn.Object(powerProfilesService, powerProfilesPath).
 		CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, powerProfilesInterface, "ActiveProfile").Store(&profile)

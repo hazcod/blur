@@ -35,7 +35,11 @@ func TestBrowserDomainRulesRejectBeforeReadingPageText(t *testing.T) {
 			obs, err := p.Capture(context.Background())
 			if tc.blocked {
 				var typed *CaptureError
-				if !errors.As(err, &typed) || typed.Code != Excluded || values != 0 {
+				want := Excluded
+				if !tc.domainKnown {
+					want = DomainUnknown
+				}
+				if !errors.As(err, &typed) || typed.Code != want || values != 0 {
 					t.Fatalf("err=%v value reads=%d; want excluded before text", err, values)
 				}
 				return
@@ -65,7 +69,11 @@ func TestIncludedBrowserDomainIsEvaluatedAfterHostDiscovery(t *testing.T) {
 			obs, err := p.Capture(context.Background())
 			if !tc.allowed {
 				var typed *CaptureError
-				if !errors.As(err, &typed) || typed.Code != Excluded || reads != 0 {
+				want := Excluded
+				if !tc.domainKnown {
+					want = DomainUnknown
+				}
+				if !errors.As(err, &typed) || typed.Code != want || reads != 0 {
 					t.Fatalf("err=%v value reads=%d; want excluded before text", err, reads)
 				}
 				return

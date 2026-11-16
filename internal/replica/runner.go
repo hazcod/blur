@@ -46,15 +46,15 @@ func (r *Runner) Start(parent context.Context) {
 		defer close(r.done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		r.Sync(ctx)
+		_, _ = r.Sync(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				r.Sync(ctx)
+				_, _ = r.Sync(ctx)
 			case <-r.poke:
-				r.Sync(ctx)
+				_, _ = r.Sync(ctx)
 			}
 		}
 	}()
@@ -98,7 +98,7 @@ func (r *Runner) Sync(ctx context.Context) (Result, error) {
 		}
 	}
 	if r.Writer != nil {
-		if _, ferr := r.Writer.Flush(ctx); ferr != nil && !quiet(ferr) {
+		if ferr := r.flushPages(ctx); ferr != nil && !quiet(ferr) {
 			slog.Warn("replica flush failed", "result", "failed")
 			err = errors.Join(err, ferr)
 		}
@@ -123,7 +123,7 @@ func (r *Runner) FlushNow(ctx context.Context) error {
 	}
 	r.passMu.Lock()
 	defer r.passMu.Unlock()
-	_, err := r.Writer.Flush(ctx)
+	err := r.flushPages(ctx)
 	if r.OnPass != nil {
 		r.OnPass()
 	}
@@ -131,6 +131,21 @@ func (r *Runner) FlushNow(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// Bound one pass like import, then queue an immediate continuation. Do not
+// leave paged privacy deletions behind the normal ten-minute timer. Each
+// committed segment advances its own durable cursor, so cancellation resumes
+// safely and caller shutdown deadlines remain authoritative.
+func (r *Runner) flushPages(ctx context.Context) error {
+	for n := 0; n < MaxSegmentsPerRun; n++ {
+		more, err := r.Writer.Flush(ctx)
+		if err != nil || !more {
+			return err
+		}
+	}
+	r.Poke()
+	return nil
 }
 
 // Close stops the loop and waits for it to exit.

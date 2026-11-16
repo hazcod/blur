@@ -15,7 +15,7 @@ import (
 
 func TestDarwinAdapterReportsEvidenceAndUsesPassiveActivationWait(t *testing.T) {
 	adapter := darwin.New()
-	defer adapter.Close()
+	defer func(close func() error) { _ = close() }(adapter.Close)
 	report, err := adapter.Capability(context.Background())
 	if err != nil || report.ID != "capture" || report.Evidence != "axui_element" || report.Validate() != nil {
 		t.Fatalf("invalid capability report: %+v err=%v", report, err)

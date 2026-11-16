@@ -28,7 +28,11 @@ func TestChronicleFeedCurrentHourIsDeepCopyAndPurged(t *testing.T) {
 	feed.mu.Lock()
 	feed.worker = newTestWorker()
 	feed.mu.Unlock()
-	feed.accept(capturedEvidence{observation: o, at: start.Add(time.Minute)})
+	evidence, err := chronicle.NewEvidence(o, start.Add(time.Minute), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed.accept(capturedEvidence{evidence: evidence, at: start.Add(time.Minute)})
 	hour, ok := feed.CurrentHour()
 	if !ok || len(hour.Evidence) != 1 {
 		t.Fatalf("hour=%+v ok=%v", hour, ok)

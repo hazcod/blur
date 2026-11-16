@@ -3,10 +3,12 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"github.com/hazcod/blur/internal/model/modeltest"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 type testChatRequest struct {
@@ -16,9 +18,10 @@ type testChatRequest struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	} `json:"messages"`
-	Format  string `json:"format"`
-	Stream  bool   `json:"stream"`
-	Options struct {
+	Format    string  `json:"format"`
+	Stream    bool    `json:"stream"`
+	KeepAlive *string `json:"keep_alive"`
+	Options   struct {
 		Temperature float32 `json:"temperature"`
 		NumPredict  int     `json:"num_predict"`
 		NumCtx      int     `json:"num_ctx"`
@@ -27,7 +30,7 @@ type testChatRequest struct {
 
 func TestOllamaGenerateUsesLoopbackJSONChatWithFixedBudgets(t *testing.T) {
 	called := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(modeltest.LocalOllama("qwen3:4b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		if r.Method != http.MethodPost || r.URL.Path != "/api/chat" {
 			t.Fatalf("request target = %s %s", r.Method, r.URL.Path)
@@ -44,7 +47,7 @@ func TestOllamaGenerateUsesLoopbackJSONChatWithFixedBudgets(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"{\"answer\":\"Tuesday\",\"source_ids\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]}"},"done":true,"prompt_eval_count":37,"eval_count":18}`))
-	}))
+	})))
 	defer server.Close()
 
 	generator, err := NewOllama(server.URL, "qwen3:4b")
@@ -58,6 +61,54 @@ func TestOllamaGenerateUsesLoopbackJSONChatWithFixedBudgets(t *testing.T) {
 	}
 	if !called || got.Text != `{"answer":"Tuesday","source_ids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}` || got.InputTokens != 37 || got.OutputTokens != 18 {
 		t.Fatalf("unexpected generation: called=%t result=%+v", called, got)
+	}
+}
+
+func TestOllamaExplicitKeepAliveIsBoundedAndBackgroundKeepsProviderDefault(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		duration time.Duration
+		wire     string
+		invalid  bool
+	}{
+		{name: "background default"},
+		{name: "interactive ten minutes", duration: 10 * time.Minute, wire: "10m0s"},
+		{name: "negative", duration: -time.Second, invalid: true},
+		{name: "unbounded residency rejected", duration: 24 * time.Hour, invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests, chats := 0, 0
+			local := modeltest.LocalOllama("fixture", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				chats++
+				var wire testChatRequest
+				if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+					t.Fatal(err)
+				}
+				if test.duration == 0 {
+					if wire.KeepAlive != nil {
+						t.Error("background request overrode provider residency default")
+					}
+				} else if wire.KeepAlive == nil || *wire.KeepAlive != test.wire {
+					t.Errorf("explicit residency was not forwarded: keep_alive=%v want=%q", wire.KeepAlive, test.wire)
+				}
+				_, _ = w.Write([]byte(`{"done":true,"message":{"content":"ok"}}`))
+			}))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests++; local.ServeHTTP(w, r) }))
+			defer server.Close()
+			generator, err := NewOllama(server.URL, "fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer generator.CloseIdleConnections()
+			_, err = generator.Generate(context.Background(), Request{System: "policy", User: "synthetic", MaxOutputTokens: 8, KeepAlive: test.duration})
+			if test.invalid {
+				if err != ErrOllamaConfig || requests != 0 {
+					t.Fatal("invalid residency contacted the provider", requests, err)
+				}
+			} else if err != nil || chats != 1 {
+				t.Fatal("valid request failed", chats, err)
+			}
+		})
 	}
 }
 
@@ -116,7 +167,7 @@ func TestOllamaResponseLimitAndStrictAnswerShape(t *testing.T) {
 		"trailing":  `{"message":{"content":"{}"},"done":true} {}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+			server := httptest.NewServer(modeltest.LocalOllama("model", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) })))
 			defer server.Close()
 			generator, err := NewOllama(server.URL, "model")
 			if err != nil {

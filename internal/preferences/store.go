@@ -33,10 +33,14 @@ type Config struct {
 	IncludedDomains          []string `json:"included_domains,omitempty"`
 	// QuickAskHotkey is the canonical global shortcut that toggles Quick ask
 	// (see internal/hotkey), or "" for off.
-	QuickAskHotkey string `json:"quick_ask_hotkey,omitempty"`
+	QuickAskHotkey string           `json:"quick_ask_hotkey"`
+	VoiceNotes     VoiceNotesConfig `json:"voice_notes"`
+	LogLevel       string           `json:"log_level,omitempty"`
 }
 
-func DefaultConfig() Config { return Config{CaptureEnabled: true, MenuBarItemEnabled: true} }
+func DefaultConfig() Config {
+	return Config{CaptureEnabled: true, MenuBarItemEnabled: true, QuickAskHotkey: "alt+space", VoiceNotes: DefaultVoiceNotesConfig(), LogLevel: "info"}
+}
 
 type Store struct {
 	mu   sync.Mutex
@@ -59,6 +63,36 @@ func (s *Store) Load(ctx context.Context) (Config, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.loadLocked(ctx)
+}
+
+// WithConfig holds the same mutex as Save across a latest-config check and a
+// bounded protected operation. Successful preference changes are linearized
+// with that operation; no write admitted by the old config can finish after
+// Save returns. The callback must honor ctx and must not call this Store again.
+func (s *Store) WithConfig(ctx context.Context, operation func(Config) error) error {
+	if s == nil || s.path == "" || ctx == nil || operation == nil {
+		return ErrSettingsUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	config, err := s.loadLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return operation(config)
+}
+
+func (s *Store) loadLocked(ctx context.Context) (Config, error) {
+	if err := ctx.Err(); err != nil {
+		return Config{}, err
+	}
 	info, err := os.Lstat(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return DefaultConfig(), nil
@@ -70,7 +104,7 @@ func (s *Store) Load(ctx context.Context) (Config, error) {
 	if err != nil {
 		return Config{}, ErrSettingsUnavailable
 	}
-	defer file.Close()
+	defer func(close func() error) { _ = close() }(file.Close)
 	opened, err := file.Stat()
 	if err != nil || !privateSettingsFile(opened) || !os.SameFile(info, opened) || opened.Size() > maxSettingsBytes {
 		return Config{}, ErrSettingsUnavailable
@@ -87,7 +121,7 @@ func (s *Store) Load(ctx context.Context) (Config, error) {
 		return Config{}, ErrSettingsUnavailable
 	}
 	var fields map[string]json.RawMessage
-	if json.Unmarshal(data, &fields) != nil || len(fields) < 2 || len(fields) > 11 {
+	if json.Unmarshal(data, &fields) != nil || len(fields) < 2 || len(fields) > 13 {
 		return Config{}, ErrSettingsUnavailable
 	}
 	if _, ok := fields["capture_enabled"]; !ok {
@@ -95,6 +129,12 @@ func (s *Store) Load(ctx context.Context) (Config, error) {
 	}
 	if _, ok := fields["menu_bar_item_enabled"]; !ok {
 		return Config{}, ErrSettingsUnavailable
+	}
+	if _, ok := fields["quick_ask_hotkey"]; !ok {
+		// Legacy files omitted both the old default and explicit Off. Those
+		// indistinguishable choices adopt the new default on upgrade. New saves
+		// always write the field, including an empty string for an explicit Off.
+		config.QuickAskHotkey = DefaultConfig().QuickAskHotkey
 	}
 	var trailing any
 	if decoder.Decode(&trailing) != io.EOF {
@@ -116,6 +156,13 @@ func (s *Store) Save(ctx context.Context, config Config) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.saveLocked(ctx, config)
+}
+
+func (s *Store) saveLocked(ctx context.Context, config Config) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	config, ok := normalizeConfig(config)
 	if !ok {
 		return ErrSettingsUnavailable
@@ -131,7 +178,7 @@ func (s *Store) Save(ctx context.Context, config Config) error {
 		return ErrSettingsUnavailable
 	}
 	tempPath := temp.Name()
-	defer os.Remove(tempPath)
+	defer func() { _ = os.Remove(tempPath) }()
 	if err := temp.Chmod(0o600); err != nil {
 		_ = temp.Close()
 		return ErrSettingsUnavailable
@@ -160,7 +207,50 @@ func (s *Store) Save(ctx context.Context, config Config) error {
 	return nil
 }
 
+// Update merges a bounded pure edit into the latest preferences under the same
+// lock as Save and WithConfig. The callback must not reenter this Store.
+func (s *Store) Update(ctx context.Context, edit func(Config) (Config, error)) (Config, error) {
+	if s == nil || s.path == "" || ctx == nil || edit == nil {
+		return Config{}, ErrSettingsUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return Config{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	config, err := s.loadLocked(ctx)
+	if err != nil {
+		return Config{}, err
+	}
+	config, err = edit(config)
+	if err != nil {
+		return Config{}, err
+	}
+	config, ok := normalizeConfig(config)
+	if !ok {
+		return Config{}, ErrSettingsUnavailable
+	}
+	if err := s.saveLocked(ctx, config); err != nil {
+		return Config{}, err
+	}
+	return config, nil
+}
+
 func normalizeConfig(config Config) (Config, bool) {
+	voice, err := NormalizeVoiceNotes(config.VoiceNotes)
+	if err != nil {
+		return Config{}, false
+	}
+	config.VoiceNotes = voice
+	if config.LogLevel == "" {
+		config.LogLevel = "info"
+	}
+	switch config.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return Config{}, false
+	}
+
 	if len(config.ExcludedApps) > maxExclusionEntries || len(config.ExcludedDomains) > maxExclusionEntries ||
 		len(config.IncludedApps) > maxExclusionEntries || len(config.IncludedDomains) > maxExclusionEntries {
 		return Config{}, false

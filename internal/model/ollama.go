@@ -18,11 +18,12 @@ import (
 
 const (
 	ContextTokenLimit        = 8192
-	MaxOutputTokens          = 192
+	MaxOutputTokens          = 192  // default for bounded background derivations
+	MaxCompletionTokens      = 1536 // hard ceiling for explicit answer requests
 	PromptTemplateReserve    = 512
 	MaxRequestBytes          = 32 << 10
 	MaxResponseBytes         = 64 << 10
-	MaxGeneratedContentBytes = 6 << 10
+	MaxGeneratedContentBytes = 12 << 10
 	ollamaTimeout            = 45 * time.Second
 )
 
@@ -37,7 +38,9 @@ type Request struct {
 	System          string
 	User            string
 	Format          string
+	Schema          json.RawMessage
 	MaxOutputTokens int
+	KeepAlive       time.Duration // explicit interactive residency; zero keeps provider default
 }
 
 type Response struct {
@@ -53,12 +56,13 @@ type Ollama struct {
 }
 
 type ollamaRequest struct {
-	Model    string          `json:"model"`
-	Think    *bool           `json:"think,omitempty"`
-	Messages []ollamaMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
-	Format   string          `json:"format,omitempty"`
-	Options  ollamaOptions   `json:"options"`
+	Model     string          `json:"model"`
+	Think     *bool           `json:"think,omitempty"`
+	Messages  []ollamaMessage `json:"messages"`
+	Stream    bool            `json:"stream"`
+	KeepAlive string          `json:"keep_alive,omitempty"`
+	Format    any             `json:"format,omitempty"`
+	Options   ollamaOptions   `json:"options"`
 }
 
 type ollamaMessage struct {
@@ -73,7 +77,10 @@ type ollamaOptions struct {
 }
 
 type ollamaResponse struct {
-	Message struct {
+	Model       string `json:"model"`
+	RemoteHost  string `json:"remote_host"`
+	RemoteModel string `json:"remote_model"`
+	Message     struct {
 		Content string `json:"content"`
 	} `json:"message"`
 	Done            bool `json:"done"`
@@ -121,24 +128,49 @@ func (o *Ollama) CountInputTokens(ctx context.Context, system, user string) (int
 }
 
 func (o *Ollama) Generate(ctx context.Context, input Request) (Response, error) {
-	if o == nil || o.client == nil || ctx == nil || input.MaxOutputTokens < 1 || input.MaxOutputTokens > MaxOutputTokens || input.Format != "" && input.Format != "json" || len(input.System) == 0 || len(input.User) == 0 || !utf8.ValidString(input.System) || !utf8.ValidString(input.User) {
+	if o == nil || o.client == nil || ctx == nil || input.MaxOutputTokens < 1 || input.MaxOutputTokens > MaxCompletionTokens || input.KeepAlive < 0 || input.KeepAlive > 10*time.Minute || input.Format != "" && input.Format != "json" || len(input.System) == 0 || len(input.User) == 0 || !utf8.ValidString(input.System) || !utf8.ValidString(input.User) {
 		return Response{}, ErrOllamaConfig
 	}
 	if err := ctx.Err(); err != nil {
 		return Response{}, err
 	}
-	inputUpperBound := len(input.System) + len(input.User)
+	var format any
+	if input.Format != "" {
+		format = input.Format
+	}
+	if len(input.Schema) > 0 {
+		if input.Format != "" || len(input.Schema) > 4096 {
+			return Response{}, ErrOllamaConfig
+		}
+		var schema map[string]json.RawMessage
+		if json.Unmarshal(input.Schema, &schema) != nil || string(schema["type"]) != `"object"` {
+			return Response{}, ErrOllamaConfig
+		}
+		copy := append(json.RawMessage(nil), input.Schema...)
+		defer clear(copy)
+		format = copy
+	}
+	inputUpperBound := len(input.System) + len(input.User) + len(input.Schema)
 	if inputUpperBound+input.MaxOutputTokens+PromptTemplateReserve > ContextTokenLimit {
 		return Response{}, ErrOllamaBudget
 	}
+	identity, err := o.ResolveCompletionModel(ctx)
+	if err != nil {
+		return Response{}, err
+	}
 	think := false
+	keepAlive := ""
+	if input.KeepAlive > 0 {
+		keepAlive = input.KeepAlive.String()
+	}
 	request := ollamaRequest{
-		Model:    o.model,
-		Think:    &think,
-		Messages: []ollamaMessage{{Role: "system", Content: input.System}, {Role: "user", Content: input.User}},
-		Stream:   false,
-		Format:   input.Format,
-		Options:  ollamaOptions{Temperature: 0, NumPredict: input.MaxOutputTokens, NumCtx: ollamaContextSize(inputUpperBound, input.MaxOutputTokens)},
+		Model:     o.model,
+		Think:     &think,
+		Messages:  []ollamaMessage{{Role: "system", Content: input.System}, {Role: "user", Content: input.User}},
+		Stream:    false,
+		KeepAlive: keepAlive,
+		Format:    format,
+		Options:   ollamaOptions{Temperature: 0, NumPredict: input.MaxOutputTokens, NumCtx: ollamaContextSize(inputUpperBound, input.MaxOutputTokens)},
 	}
 	encoded, err := json.Marshal(request)
 	if err != nil || len(encoded) > MaxRequestBytes {
@@ -158,7 +190,7 @@ func (o *Ollama) Generate(ctx context.Context, input Request) (Response, error) 
 		}
 		return Response{}, ErrOllamaUnavailable
 	}
-	defer response.Body.Close()
+	defer func(close func() error) { _ = close() }(response.Body.Close)
 	if response.StatusCode != http.StatusOK {
 		return Response{}, ErrOllamaUnavailable
 	}
@@ -169,8 +201,17 @@ func (o *Ollama) Generate(ctx context.Context, input Request) (Response, error) 
 	}
 	defer clear(body)
 	var result ollamaResponse
-	if err := decodeOllamaResponse(body, &result); err != nil || !result.Done || len(result.Message.Content) == 0 || len(result.Message.Content) > MaxGeneratedContentBytes || !utf8.ValidString(result.Message.Content) || result.PromptEvalCount < 0 || result.PromptEvalCount > ContextTokenLimit || result.EvalCount < 0 || result.EvalCount > MaxOutputTokens {
+	if err := decodeOllamaResponse(body, &result); err != nil || !result.Done || len(result.Message.Content) == 0 || len(result.Message.Content) > MaxGeneratedContentBytes || !utf8.ValidString(result.Message.Content) || result.PromptEvalCount < 0 || result.PromptEvalCount > ContextTokenLimit || result.EvalCount < 0 || result.EvalCount > input.MaxOutputTokens {
 		return Response{}, ErrOllamaResponse
+	}
+	if result.RemoteHost != "" || result.RemoteModel != "" {
+		return Response{}, ErrOllamaRemoteModel
+	}
+	if result.Model != "" && canonicalOllamaModelName(result.Model) != identity.Name {
+		return Response{}, ErrOllamaResponse
+	}
+	if err := o.VerifyLocalModel(ctx, identity); err != nil {
+		return Response{}, err
 	}
 	return Response{Text: result.Message.Content, InputTokens: result.PromptEvalCount, OutputTokens: result.EvalCount}, nil
 }

@@ -3,10 +3,12 @@ package client
 import (
 	"image/color"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-gui/goui/gui"
+	"github.com/golang-gui/goui/ui"
 	"github.com/hazcod/blur/internal/assistant"
 	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/platform"
@@ -61,17 +63,14 @@ func TestQuickPreviewRejectsAppOnlySubjectAndRecentActivityAsRecap(t *testing.T)
 	}
 }
 
-func TestTodayRecapDoesNotCountAppActivityAsUsefulItems(t *testing.T) {
+func TestTodayEmptyStateDoesNotCountHiddenActivity(t *testing.T) {
 	snapshot := today.Snapshot{
 		ActiveSubjects: []today.Subject{{Label: "Slack"}},
 		RecentChanges:  []today.Change{{Text: "Active in Slack"}},
+		TimeSplit:      []today.TimeSplit{{Label: "Slack", Duration: 15 * time.Minute}},
 	}
-	if todayHasUsefulItems(snapshot) {
-		t.Fatal("app-name activity was treated as a useful Today recap")
-	}
-	snapshot.Questions = []today.Question{{Text: "Who owns the follow-up?"}}
-	if !todayHasUsefulItems(snapshot) {
-		t.Fatal("an unresolved follow-up was not treated as a useful Today item")
+	if todayHasUsefulItems(TodayView{Snapshot: snapshot}, false) {
+		t.Fatal("hidden captured activity suppressed the Today empty state")
 	}
 }
 
@@ -220,6 +219,43 @@ func TestQuickConversationMarksGeneralAnswerAsNotFromSavedMemory(t *testing.T) {
 	}
 }
 
+func TestQuickConversationKeepsCompleteValidatedLongAnswer(t *testing.T) {
+	answer := strings.Repeat("é", 3500) + "\nreturn result\n"
+	turns := appendQuickConversation(nil, "Show the complete implementation", assistant.Result{General: true, Answer: assistant.Answer{Text: answer}})
+	if len(turns) != 1 || turns[0].answer != answer {
+		t.Fatal("a valid complete answer was silently cut in the conversation")
+	}
+}
+
+func TestActionReceiptEndsPriorGeneralConversationContext(t *testing.T) {
+	turns := appendQuickConversation(nil, "Write a code example", assistant.Result{General: true, Answer: assistant.Answer{Text: "Previous code"}})
+	turns = appendQuickAction(turns, "remind me tomorrow at 9am to review it", "Reminder scheduled")
+	if history := quickHistoryTurns(turns); len(history) != 0 {
+		t.Fatal("a follow-up after a task action could refer to stale general conversation", history)
+	}
+	turns = appendQuickConversation(turns, "Explain a compiler", assistant.Result{General: true, Answer: assistant.Answer{Text: "A compiler translates source."}})
+	if history := quickHistoryTurns(turns); len(history) != 1 || !history[0].General || history[0].Answer != "A compiler translates source." {
+		t.Fatal("new general conversation did not start after the action boundary", history)
+	}
+}
+
+func TestQuickGeneralAnswerDisclosesConversationContextAndExcerpts(t *testing.T) {
+	turns := appendQuickConversation(nil, "Make it shorter", assistant.Result{General: true, Answer: assistant.Answer{Text: "A short version."}, ConversationTurns: 1, ConversationTruncated: 1, ConversationOmitted: 2, PreferencesOmitted: 2})
+	meta := quickTurnMeta(turns[0])
+	if !strings.Contains(meta, "1 earlier exchange") || !strings.Contains(meta, "excerpted") || !strings.Contains(meta, "2 earlier exchanges omitted") || !strings.Contains(meta, "2 preferences omitted") {
+		t.Fatal("conversation admission was hidden", meta)
+	}
+}
+
+func TestQuickConversationPreservesSpecificEmptyEvidenceExplanation(t *testing.T) {
+	turns := appendQuickConversation(nil, "What did I do today?", assistant.Result{
+		Answer: assistant.Answer{Text: "Capture is paused, so nothing new has been saved. Resume capture and ask again.", InsufficientEvidence: true},
+	})
+	if len(turns) != 1 || turns[0].answer != "Capture is paused, so nothing new has been saved. Resume capture and ask again." {
+		t.Fatalf("quick answer = %+v, want the retriever's specific explanation", turns)
+	}
+}
+
 func TestQuickPanelHighlightsExcludeUserNotesAndKeepCapturedActivity(t *testing.T) {
 	items := previewChangeTexts([]today.Change{
 		{Text: "what is 2+2", Origin: today.ChangeOriginUser},
@@ -344,17 +380,76 @@ func TestAppReactivationChoosesAWindowToReopen(t *testing.T) {
 		name      string
 		dashboard bool
 		want      string
-	}{{"quick capture", false, "quick"}, {"dashboard", true, "main"}} {
+	}{{"silent launch", false, ""}, {"dashboard", true, "main"}} {
 		t.Run(test.name, func(t *testing.T) {
 			var shown string
 			rechecked := false
-			if err := reopenDesktopOnActivation(test.dashboard, func(id string) error { shown = id; return nil }, func() { rechecked = true }); err != nil {
+			if err := reopenDesktopOnActivation(test.dashboard, false, func(id string) error { shown = id; return nil }, func() { rechecked = true }); err != nil {
 				t.Fatal(err)
 			}
 			if shown != test.want || !rechecked {
 				t.Fatalf("activation showed %q and rechecked=%t, want %q and true", shown, rechecked, test.want)
 			}
 		})
+	}
+}
+
+type quickRevealApp struct {
+	ui.App
+	timers int
+}
+
+func (*quickRevealApp) FindWindow(string) gui.Window         { return nil }
+func (*quickRevealApp) FindWidget(string, string) gui.Widget { return nil }
+func (a *quickRevealApp) TimeoutFunc(time.Duration, func()) *ui.Timer {
+	a.timers++
+	return nil
+}
+
+func TestQuickPanelEmptyComposerRevealsWithoutTimerDelay(t *testing.T) {
+	app := &quickRevealApp{}
+	d := &desktop{app: app, quickPanelPinned: true}
+	d.revealQuickPanel(0, 0)
+	if app.timers != 0 {
+		t.Fatalf("ready composer waited for %d timers before appearing", app.timers)
+	}
+}
+
+func TestAppReactivationPreservesOpenQuickPanelWithDashboardMounted(t *testing.T) {
+	shown, rechecks := "", 0
+	if err := reopenDesktopOnActivation(true, true, func(id string) error {
+		shown = id
+		return nil
+	}, func() { rechecks++ }); err != nil {
+		t.Fatal(err)
+	}
+	if shown != "quick" || rechecks != 1 {
+		t.Fatalf("activation stole focus from open Quick ask: shown=%q permission_rechecks=%d", shown, rechecks)
+	}
+}
+
+// The dashboard handoff must finish the visibility transition synchronously;
+// app activation can arrive before the native window's focus-loss callback.
+type quickDashboardApp struct{ ui.App }
+
+func (*quickDashboardApp) FindWindow(string) gui.Window                { return nil }
+func (*quickDashboardApp) RequestUpdate()                              {}
+func (*quickDashboardApp) Post(fn func())                              { fn() }
+func (*quickDashboardApp) TimeoutFunc(time.Duration, func()) *ui.Timer { return nil }
+
+func TestOpenDashboardClearsQuickVisibilityBeforeReactivation(t *testing.T) {
+	result := &assistant.Result{Answer: assistant.Answer{Text: "Mira owns rollback."}}
+	d := &desktop{
+		app: &quickDashboardApp{}, quickPanelPinned: true, quickPreview: true,
+		quickConversation: []quickConversationTurn{{question: "Who owns rollback?", answer: result.Answer.Text}},
+		askResult:         result,
+	}
+	d.openDashboard()
+	if d.quickPanelPinned || d.quickPreview || !d.dashboardOpen || desktopWindowOnActivation(d.dashboardOpen, d.quickPanelPinned || d.quickPreview) != "main" {
+		t.Fatal("dashboard handoff left Quick ask eligible for reactivation")
+	}
+	if d.page != "Ask" || d.askQuestion != "Who owns rollback?" || d.askResult == nil || d.askResult.Answer.Text != result.Answer.Text {
+		t.Fatal("dashboard handoff lost the latest exchange")
 	}
 }
 
@@ -367,20 +462,20 @@ func TestQuickPanelHeightFitsContent(t *testing.T) {
 		body     float32
 		want     int
 	}{
-		{"empty without notch", 0, false, false, 0, 10 + 36 + 10},
-		{"empty under notch", 36, false, false, 0, 36 + 10 + 36 + 10},
-		{"status line", 0, false, false, 16, 10 + 36 + 6 + 16 + 10},
-		{"pending adds only the bar and a line", 0, true, false, 16, 10 + 36 + 6 + 2 + 6 + 16 + 10},
-		{"short answer grows to fit", 0, false, true, 120, 10 + 36 + 6 + 1 + 6 + 120 + 10},
+		{"empty without notch", 0, false, false, 0, 8 + 32 + 8},
+		{"empty under notch", 36, false, false, 0, 36 + 8 + 32 + 8},
+		{"status line", 0, false, false, 16, 8 + 32 + 6 + 16 + 8},
+		{"pending adds only the bar and a line", 0, true, false, 16, 8 + 32 + 6 + 2 + 6 + 16 + 8},
+		{"short answer grows to fit", 0, false, true, 120, 8 + 32 + 6 + 1 + 6 + 120 + 8},
 		{"tall answer is capped", 0, false, true, 900, quickPanelMaxHeight},
-		{"fractional inset rounds up", 37.5, false, false, 0, 38 + 10 + 36 + 10},
+		{"fractional inset rounds up", 37.5, false, false, 0, 38 + 8 + 32 + 8},
 	} {
 		if got := quickPanelFitHeight(test.inset, test.progress, test.hairline, test.body); got != test.want {
 			t.Errorf("%s: height = %d, want %d", test.name, got, test.want)
 		}
 	}
-	if quickPanelMaxHeight != 340 || quickPanelWidth != 560 {
-		t.Fatalf("panel cap/width = %d/%d, want 340/560", quickPanelMaxHeight, quickPanelWidth)
+	if quickPanelMaxHeight != 300 || quickPanelWidth != 500 {
+		t.Fatalf("panel cap/width = %d/%d, want 300/500", quickPanelMaxHeight, quickPanelWidth)
 	}
 }
 
@@ -401,25 +496,15 @@ func TestPendingAskIsNotAnExpandedAnswer(t *testing.T) {
 	}
 }
 
-func TestQuickPanelEscapeAction(t *testing.T) {
-	for _, test := range []struct {
-		name    string
-		content bool
-		asking  bool
-		since   time.Duration
-		want    quickEscape
-	}{
-		{"first press with content clears", true, false, 0, quickEscapeClear},
-		{"first press while asking clears", false, true, 0, quickEscapeClear},
-		{"empty panel closes", false, false, 0, quickEscapeClose},
-		{"second press within 600ms closes", true, false, 300 * time.Millisecond, quickEscapeClose},
-		{"second press while asking within 600ms closes", true, true, 599 * time.Millisecond, quickEscapeClose},
-		{"slow second press clears again", true, false, 700 * time.Millisecond, quickEscapeClear},
-		{"empty panel after a slow press closes", false, false, 2 * time.Second, quickEscapeClose},
-	} {
-		if got := quickPanelEscapeAction(test.content, test.asking, test.since); got != test.want {
-			t.Errorf("%s: got %v want %v", test.name, got, test.want)
-		}
+func TestQuickPanelEscapeClosesImmediatelyWithoutDiscardingDraft(t *testing.T) {
+	d := &desktop{app: &quickDashboardApp{}, quickPanelPinned: true, quickPreview: true, quickInput: "unfinished draft"}
+	d.quickUI.savedFlash = true
+	d.handleQuickPanelEscape()
+	if d.quickPanelPinned || d.quickPreview || d.quickUI.savedFlash {
+		t.Fatal("Escape left the popup open or waited for a saved confirmation")
+	}
+	if d.quickInput != "unfinished draft" {
+		t.Fatal("Escape discarded the draft instead of closing")
 	}
 }
 
@@ -443,10 +528,11 @@ func TestQuickTurnMeta(t *testing.T) {
 		turn quickConversationTurn
 		want string
 	}{
-		{quickConversationTurn{sources: 3}, "Answered from 3 items sent to the local model"},
-		{quickConversationTurn{sources: 1}, "Answered from 1 item sent to the local model"},
-		{quickConversationTurn{direct: true}, "Answered without a model"},
-		{quickConversationTurn{general: true}, "General answer, no memory used"},
+		{quickConversationTurn{sources: 3}, "Answered from 3 items sent to the answer model"},
+		{quickConversationTurn{sources: 1}, "Answered from 1 item sent to the answer model"},
+		{quickConversationTurn{direct: true}, "Saved evidence shown directly"},
+		{quickConversationTurn{general: true}, "General answer, no saved evidence used"},
+		{quickConversationTurn{action: true, direct: true}, ""},
 		{quickConversationTurn{}, ""},
 	} {
 		if got := quickTurnMeta(test.turn); got != test.want {
@@ -455,9 +541,72 @@ func TestQuickTurnMeta(t *testing.T) {
 	}
 }
 
+func TestQuickTurnMetaDisclosesPartialCaptureSeparately(t *testing.T) {
+	turns := appendQuickConversation(nil, "What did this page say?", assistant.Result{
+		Answer:          assistant.Answer{Text: "The page describes the new design."},
+		Sources:         []assistant.Evidence{{SourceID: "partial-source", Partial: true}},
+		CoverageLimited: true,
+		Plan:            assistant.Plan{Kind: assistant.KindLookup},
+	})
+	if len(turns) != 1 || !turns[0].partialCapture {
+		t.Fatalf("partial-source provenance was not retained in conversation: %+v", turns)
+	}
+	got := quickTurnMeta(turns[0])
+	if !strings.Contains(got, partialCaptureCoverageNotice) {
+		t.Fatalf("partial source was described as generic passage coverage: %q", got)
+	}
+	if strings.Contains(got, selectedPassageCoverageNotice) {
+		t.Fatalf("partial source also received the generic coverage warning: %q", got)
+	}
+}
+
+func TestQuickTranscriptActionEndsWithSavedReceipt(t *testing.T) {
+	d := &desktop{quickConversation: appendQuickAction(nil, "Remember my preferred editor", "Preference saved")}
+	rows := d.quickTranscriptRows()
+	if got, want := len(rows), 3; got != want {
+		t.Fatalf("saved receipt has %d rows, want question, spacing, receipt (%d); no action footer", got, want)
+	}
+	if got := d.quickConversation[0].answer; got != "Preference saved" {
+		t.Fatalf("receipt = %q, want saved confirmation", got)
+	}
+}
+
+func TestQuickTranscriptAnswerEndsWithoutActionFooter(t *testing.T) {
+	d := &desktop{quickConversation: []quickConversationTurn{{question: "What is 2+2?", answer: "4", general: true}}}
+	if got, want := len(d.quickTranscriptRows()), 5; got != want {
+		t.Fatalf("answer has %d rows, want question, answer, and model metadata (%d); no action footer", got, want)
+	}
+}
+
 func TestQuickPanelModeLabelFollowsDetection(t *testing.T) {
-	if quickPanelModeLabel("What did I read?") != "Ask" || quickPanelModeLabel("Call Mira") != "Note" {
-		t.Fatal("mode label should follow quickPanelWantsAnswer")
+	for input, want := range map[string]string{
+		"What did I read?":                "Ask",
+		"Call Mira":                       "Note",
+		"ask: Eiffel Tower height":        "Ask",
+		"note: What did I do today?":      "Note",
+		"remind me to call Mira tomorrow": "Reminder",
+		"remind me what Mira said":        "Ask",
+	} {
+		if got := quickPanelModeLabel(input); got != want {
+			t.Errorf("quickPanelModeLabel(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestQuickPanelExplicitModePrefixesAreRemovedFromPayload(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		kind  quickInputKind
+		text  string
+	}{
+		{" ASK:  Eiffel Tower height ", quickInputAsk, "Eiffel Tower height"},
+		{"note:  Call Mira tomorrow", quickInputNote, "Call Mira tomorrow"},
+		{"reminder: Call Mira tomorrow", quickInputReminder, "Reminder: Call Mira tomorrow"},
+	} {
+		kind, text := classifyQuickInput(test.input)
+		if kind != test.kind || text != test.text {
+			t.Errorf("classifyQuickInput(%q) = (%v, %q), want (%v, %q)", test.input, kind, text, test.kind, test.text)
+		}
 	}
 }
 
@@ -475,7 +624,7 @@ func TestQuickNoteFailureReopensOnlyForQuickNotes(t *testing.T) {
 
 func TestSavedNoteConfirmationSurvivesEmptyInput(t *testing.T) {
 	d := &desktop{quickNotePending: true, quickInput: "Call Mira"}
-	d.quickPanelNoteSaved()
+	d.quickPanelNoteSaved("Call Mira", d.quickUI.draftRevision)
 	if d.quickInput != "" || !d.quickUI.savedFlash || !d.quickPanelHasContent() {
 		t.Fatalf("saved state = input %q flash %v", d.quickInput, d.quickUI.savedFlash)
 	}

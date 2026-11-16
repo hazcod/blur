@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	MaxAnswerBytes           = 4096
+	MaxAnswerBytes           = 8192
 	InsufficientEvidenceText = "I don't have enough evidence in the retrieved sources to answer that."
 )
 
@@ -21,6 +21,13 @@ type ModelAnswer struct {
 	InsufficientEvidence bool     `json:"insufficient_evidence"`
 }
 
+type generatedAnswer struct {
+	Text                 string   `json:"answer"`
+	SourceLabels         []string `json:"source_labels"`
+	SourceIDs            []string `json:"source_ids,omitempty"` // accepted for older providers; never included in the model schema
+	InsufficientEvidence bool     `json:"insufficient_evidence"`
+}
+
 // Answer is safe to present with source links resolved by the caller.
 type Answer struct {
 	Text                 string
@@ -29,7 +36,11 @@ type Answer struct {
 }
 
 func ValidateAnswer(model ModelAnswer, allowedSourceIDs []string) (Answer, error) {
-	if len(model.Text) > MaxAnswerBytes || !utf8.ValidString(model.Text) || strings.ContainsRune(model.Text, 0) || len(allowedSourceIDs) > MaxEvidenceItems {
+	return validateAnswerWithLimit(model, allowedSourceIDs, MaxEvidenceItems)
+}
+
+func validateAnswerWithLimit(model ModelAnswer, allowedSourceIDs []string, itemLimit int) (Answer, error) {
+	if itemLimit < 1 || itemLimit > MaxTranscriptItems || len(model.Text) > MaxAnswerBytes || !utf8.ValidString(model.Text) || strings.ContainsRune(model.Text, 0) || len(allowedSourceIDs) > itemLimit {
 		return Answer{}, ErrAnswer
 	}
 	allowed := make(map[string]struct{}, len(allowedSourceIDs))
@@ -46,7 +57,7 @@ func ValidateAnswer(model ModelAnswer, allowedSourceIDs []string) (Answer, error
 		return Answer{Text: InsufficientEvidenceText, InsufficientEvidence: true}, nil
 	}
 	text := strings.TrimSpace(model.Text)
-	if text == "" || len(model.SourceIDs) == 0 || len(model.SourceIDs) > MaxEvidenceItems {
+	if text == "" || len(model.SourceIDs) == 0 || len(model.SourceIDs) > itemLimit {
 		return Answer{}, ErrAnswer
 	}
 	sources := make([]string, 0, len(model.SourceIDs))

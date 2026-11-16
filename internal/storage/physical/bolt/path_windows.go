@@ -167,6 +167,15 @@ func windowsPathParts(path string) (absolute string, parts []string, root string
 		return "", nil, "", ErrInvalid
 	}
 	absolute = filepath.Clean(absolute)
+	// Windows temp paths can use 8.3 aliases (for example, C:\Users\RUNNER~1).
+	// Normalize existing directory components before handle-relative traversal.
+	// The final component may not exist yet when creating a private directory,
+	// so resolve its parent separately as a fallback.
+	if expanded, ok := expandWindowsPath(absolute); ok {
+		absolute = expanded
+	} else if expandedParent, ok := expandWindowsPath(filepath.Dir(absolute)); ok {
+		absolute = filepath.Join(expandedParent, filepath.Base(absolute))
+	}
 	volume := filepath.VolumeName(absolute)
 	if len(volume) != 2 || volume[1] != ':' || !filepath.IsAbs(absolute) || strings.HasPrefix(absolute, `\\`) {
 		return "", nil, "", ErrInvalid
@@ -186,6 +195,26 @@ func windowsPathParts(path string) (absolute string, parts []string, root string
 		parts = append(parts, part)
 	}
 	return absolute, parts, root, nil
+}
+
+func expandWindowsPath(path string) (string, bool) {
+	path16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", false
+	}
+	buffer := make([]uint16, 512)
+	n, err := windows.GetLongPathName(path16, &buffer[0], uint32(len(buffer)))
+	if err != nil || n == 0 {
+		return "", false
+	}
+	if int(n) >= len(buffer) {
+		buffer = make([]uint16, int(n)+1)
+		n, err = windows.GetLongPathName(path16, &buffer[0], uint32(len(buffer)))
+		if err != nil || n == 0 || int(n) >= len(buffer) {
+			return "", false
+		}
+	}
+	return windows.UTF16ToString(buffer[:n]), true
 }
 
 func validWindowsBaseName(name string) bool {
@@ -302,7 +331,7 @@ func verifyWindowsACL(handle windows.Handle) error {
 		return ErrInvalid
 	}
 	var ace *windows.ACCESS_ALLOWED_ACE
-	if err := windows.GetAce(dacl, 0, &ace); err != nil || ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 || ace.Mask != windows.GENERIC_ALL {
+	if err := windows.GetAce(dacl, 0, &ace); err != nil || ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 || !windowsFullControlMask(uint32(ace.Mask)) {
 		return ErrInvalid
 	}
 	aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))

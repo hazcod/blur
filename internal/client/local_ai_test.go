@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,7 +11,24 @@ import (
 
 	"github.com/hazcod/blur/internal/notes"
 	"github.com/hazcod/blur/internal/platform"
+	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
+
+func writePrivateSettingsFixture(path string, data []byte) error {
+	file, temporary, err := bolt.CreatePrivateTempFile(filepath.Dir(path), ".settings-fixture-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(temporary) }()
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporary, path)
+}
 
 func TestLocalAISettingsRoundTripIsPrivateAndLoopbackOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "local-ai.json")
@@ -22,9 +40,13 @@ func TestLocalAISettingsRoundTripIsPrivateAndLoopbackOnly(t *testing.T) {
 	if err != nil || got != want {
 		t.Fatalf("read local AI settings = %#v, %v; want %#v", got, err, want)
 	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		t.Fatalf("settings file mode = %v, err=%v; want regular 0600", info, err)
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	if err := bolt.ValidatePrivateFile(file); err != nil {
+		t.Fatal("settings file did not retain private permissions", err)
 	}
 }
 
@@ -33,7 +55,7 @@ func TestLocalAISettingsRejectRemoteEndpointAndBadFile(t *testing.T) {
 	if err := writeLocalAISettings(path, LocalAISettings{Enabled: true, Endpoint: "http://example.test:11434", Model: "qwen3:4b"}); err == nil {
 		t.Fatal("settings accepted a remote provider endpoint")
 	}
-	if err := os.WriteFile(path, []byte(`{"enabled":true,"endpoint":"http://127.0.0.1:11434","model":"x","extra":"unexpected"}`), 0o600); err != nil {
+	if err := writePrivateSettingsFixture(path, []byte(`{"enabled":true,"endpoint":"http://127.0.0.1:11434","model":"x","extra":"unexpected"}`)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := readLocalAISettings(path); err == nil {
@@ -52,6 +74,34 @@ func TestBackgroundChroniclesRequireEnabledLocalProvider(t *testing.T) {
 	}
 	if err := validateLocalAISettings(LocalAISettings{BackgroundSummaries: true, Enabled: true, Provider: ProviderOllama, Endpoint: "http://127.0.0.1:11434", Model: "qwen3:4b"}); err != nil {
 		t.Fatalf("valid local opt-in rejected: %v", err)
+	}
+}
+
+func TestAutomaticLibraryRequiresSeparateLocalConsent(t *testing.T) {
+	for _, settings := range []LocalAISettings{
+		{AutomaticLibrary: true},
+		{AutomaticLibrary: true, Enabled: true, Provider: ProviderOpenAICompatible, Endpoint: "https://api.example.test/v1", Model: "model"},
+	} {
+		if validateLocalAISettings(settings) == nil {
+			t.Fatal("automatic capture processing allowed without local model", settings)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "local-ai.json")
+	settings := LocalAISettings{Enabled: true, Endpoint: "http://127.0.0.1:11434", Model: "qwen3:14b"}
+	if err := writeLocalAISettings(path, settings); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readLocalAISettings(path)
+	if err != nil || loaded.AutomaticLibrary {
+		t.Fatal("old note-only consent enabled capture processing")
+	}
+	settings.AutomaticLibrary = true
+	if err := writeLocalAISettings(path, settings); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = readLocalAISettings(path)
+	if err != nil || !loaded.AutomaticLibrary {
+		t.Fatal("explicit Library consent did not persist")
 	}
 }
 
@@ -154,7 +204,7 @@ func TestLocalAIControllerRejectsRemoteEndpointBeforeSaving(t *testing.T) {
 
 func TestLocalAIControllerFailsClosedAndCanRepairCorruptSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "local-ai.json")
-	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+	if err := writePrivateSettingsFixture(path, []byte("not json")); err != nil {
 		t.Fatal(err)
 	}
 	service := notes.NewService(nil, nil, nil)
@@ -170,11 +220,17 @@ func TestLocalAIControllerFailsClosedAndCanRepairCorruptSettings(t *testing.T) {
 	}
 }
 
-func TestLocalAIControllerDoesNotActivateNotesWhenAskModelConfigFails(t *testing.T) {
+func TestLocalAIControllerRejectsLegacyProxyRouteForNotesAndAnswers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "local-ai.json")
 	settings := LocalAISettings{Enabled: true, Provider: ProviderOllama, Endpoint: "http://127.0.0.1:11434/proxy", Model: "qwen3:4b"}
-	if err := writeLocalAISettings(path, settings); err != nil {
-		t.Fatalf("write provider-valid settings: %v", err)
+	if err := writeLocalAISettings(path, settings); err == nil {
+		t.Fatal("a non-root Ollama route was accepted")
+	}
+	// Simulate an older release that accepted a route the answer client could
+	// not validate. Startup must reject it for both note and answer processing.
+	encoded, _ := json.Marshal(settings)
+	if err := writePrivateSettingsFixture(path, encoded); err != nil {
+		t.Fatal(err)
 	}
 	service := notes.NewService(nil, nil, nil)
 	controller := newLocalAIController(path, service)

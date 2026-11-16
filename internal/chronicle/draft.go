@@ -40,7 +40,7 @@ type Draft struct {
 // same salience ordering as PackHour. Output is at most MaxDraftLines lines and
 // MaxDraftBytes bytes and is identical for identical input.
 func DraftHour(hour Hour, activity []ActivityLine, now time.Time) Draft {
-	draft := Draft{Start: hour.Start, End: now.UTC(), Sources: len(hour.Evidence)}
+	draft := Draft{Start: hour.Start, End: now.UTC(), Sources: len(hour.Evidence), Omitted: hour.SourceLimitReached}
 	if !hour.End.IsZero() && draft.End.After(hour.End) {
 		draft.End = hour.End
 	}
@@ -77,7 +77,7 @@ func DraftHour(hour Hour, activity []ActivityLine, now time.Time) Draft {
 	}
 	seenTitles := make(map[string]struct{})
 	for _, index := range salienceOrder(hour.Evidence) {
-		title := draftTitle(hour.Evidence[index].Observation.Text())
+		title := draftTitle(hour.Evidence[index].Text())
 		if title == "" {
 			continue
 		}

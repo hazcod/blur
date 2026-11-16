@@ -16,6 +16,9 @@ const (
 // MaxSpecLength bounds a persisted spec.
 const MaxSpecLength = 32
 
+// MeetingDefault opens the meeting workspace without starting a recording.
+const MeetingDefault = "ctrl+alt+m"
+
 // Option is one choice offered in settings.
 type Option struct {
 	// Spec is the canonical persisted string; "" means off.
@@ -40,6 +43,9 @@ func Options() []Option {
 
 // Label is the display name of a spec, or "Off" when empty or unknown.
 func Label(spec string) string {
+	if spec == MeetingDefault {
+		return "⌃⌥M"
+	}
 	for _, option := range Options() {
 		if option.Spec == spec {
 			return option.Label
@@ -48,7 +54,7 @@ func Label(spec string) string {
 	return "Off"
 }
 
-var keyCodes = map[string]uint32{"space": 49, "b": 11, "f18": 79, "f19": 80}
+var keyCodes = map[string]uint32{"space": 49, "b": 11, "m": 46, "f18": 79, "f19": 80}
 
 var modifierMasks = map[string]uint32{"cmd": ModCommand, "shift": ModShift, "alt": ModOption, "ctrl": ModControl}
 

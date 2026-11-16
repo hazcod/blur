@@ -12,11 +12,13 @@ func watchDesktopActivation() (<-chan struct{}, func(), error) {
 func keepDesktopBackgroundAlive() (func(), error) { return func() {}, nil }
 func openDesktopAccessibilitySettings() error     { return nil }
 
-func installDesktopMainMenu() error                                                              { return nil }
-func addDesktopQuitShortcut(window ui.WindowView, _ ui.App) ui.WindowView                        { return window }
+func installDesktopMainMenu() error { return nil }
+func addDesktopQuitShortcut(window ui.WindowView, _ ui.App, extra ...*ui.ShortcutView) ui.WindowView {
+	return window.Shortcuts(extra...)
+}
 func installDesktopStatusItem(_ ui.App, _ *pauseScheduler, _ bool, _, _, _ func(), _ func(bool)) {}
 func setDesktopMenuBarVisible(_ ui.App, _ *pauseScheduler, _ bool, _, _, _ func()) error         { return nil }
-func setDesktopMenuBarCapture(_ *pauseScheduler, _, _ bool)                                      {}
+func setDesktopMenuBarCapture(_ *pauseScheduler, _, _ bool, _ ...string)                         {}
 func addDesktopBackgroundClose(window ui.WindowView, _ ui.App, _ string, _ ...func()) ui.WindowView {
 	return window
 }

@@ -47,21 +47,31 @@ type KnownApp struct {
 
 // Plan is the model-free reading of a question.
 type Plan struct {
-	Kind     Kind
-	Scope    Scope
-	AppIDs   []string // canonical app ids the question names
-	AppNames []string // display names for AppIDs, same order
-	Domains  []string // web domains the question names
-	Terms    []string // normalised topic terms, stop words removed, sorted
-	Entity   string   // subject of a KindEntity question
-	Question string   // normalised question text
+	Kind              Kind
+	WholeDocument     bool // explicit request to analyze all parts of a captured source
+	Scope             Scope
+	AppIDs            []string // canonical app ids the question names
+	AppNames          []string // display names for AppIDs, same order
+	Domains           []string // web domains the question names
+	Terms             []string // normalised topic terms, stop words removed, sorted
+	Entity            string   // subject of a KindEntity question
+	Question          string   // normalised question text
+	Literal           bool     // Search-only quoted/code terms require lexical matches.
+	LiteralTerms      []string // Mandatory topics restored after scope/task grammar.
+	FilterQuestion    string   // Search-only grammar with literal topics masked.
+	MatchOnly         bool     // ambiguity probe: require a topic match, never recent-source fallback
+	ReferenceQuestion string   // original retrieval question retained through grounded continuations
+	SubjectFollowup   bool     // factual continuation may retrieve new matches for the inherited named subject
 }
 
 // Turn is one earlier exchange, kept so follow-ups can inherit scope.
 type Turn struct {
-	Question string
-	Answer   string
-	Plan     Plan
+	Question      string
+	Answer        string
+	Plan          Plan
+	General       bool              // explicitly generated without personal-memory evidence
+	SourceIDs     []string          // cited source handles; reload current evidence before using a private answer
+	SourceDigests map[string]string // changed derived evidence invalidates old answer prose, even if its handle is stable
 }
 
 // Layer orders evidence from broad, cheap summaries to raw captures.
@@ -75,17 +85,28 @@ const (
 
 // Diagnosis explains an empty or thin retrieval so the answer can say why.
 type Diagnosis struct {
-	CapturePaused  bool      // capture is off or paused right now
-	PausedSince    time.Time // when it was paused, if known
-	AppKnown       bool      // the named app has been captured before
-	SourcesInScope int       // captured sources inside the time scope
-	ModelFree      bool      // the answer was produced without a model
+	VoiceRequested             bool      // the question asks for spoken content, not browser playback controls
+	VoiceAssociationUnverified bool      // a recent transcript does not establish the requested website/video identity
+	VoiceRecallLimited         bool      // bounded transcript selection omitted other saved rows or sessions
+	RecapSampled               bool      // time-distributed retrieval omitted other saved candidates
+	TaskSearchLimited          bool      // bounded current-task recall omitted candidates
+	LibraryRecallLimited       bool      // bounded subject-name lookup omitted candidate Library entries
+	SemanticIssue              string    // closed retrieval coverage: disabled, loading, unavailable, limited
+	IndexingPending            bool      // saved sources still have exact-search work queued
+	CapturePaused              bool      // capture is off or paused right now
+	PausedSince                time.Time // when it was paused, if known
+	AppKnown                   bool      // the named app has been captured before
+	SourcesInScope             int       // captured sources inside the time scope
+	ModelFree                  bool      // the answer was produced without a model
+	CaptureIssue               string    // closed capture-health category; never source/error text
 }
 
 // Retrieval is what a planned retrieval returns.
 type Retrieval struct {
-	Evidence  []Evidence
-	Diagnosis Diagnosis
+	Targets          []TargetRef
+	Evidence         []Evidence
+	AlternateQueries []string // bounded model-ranked search phrases for one fallback retrieval
+	Diagnosis        Diagnosis
 }
 
 // PlanRetriever answers a Plan instead of a bare question. A retriever that
@@ -95,16 +116,52 @@ type PlanRetriever interface {
 	RetrievePlan(context.Context, Plan) (Retrieval, error)
 }
 
+// ExpandedPlanRetriever performs a single scope-preserving retry using
+// alternate phrases already produced while ranking the original candidates.
+type ExpandedPlanRetriever interface {
+	RetrievePlanWithQueries(context.Context, Plan, []string) (Retrieval, error)
+}
+
+// SourceRetriever reloads the original answer's cited evidence from current
+// storage. Missing/deleted handles must never return cached answer text.
+type SourceRetriever interface {
+	RetrieveSources(context.Context, Plan, []string) (Retrieval, error)
+}
+
 // AppLister exposes the apps and sites a retriever has seen so the planner can
 // recognise them in questions.
 type AppLister interface {
 	KnownApps(context.Context) ([]KnownApp, error)
 }
 
+// PlanningClock keeps relative-date parsing aligned with the source and task
+// retrieval clock, including its timezone at a local-day boundary.
+type PlanningClock interface {
+	AskTime() time.Time
+}
+
 // DirectAnswerer answers some plans without a model (time spent, capture
 // listings). ok is false when the plan needs evidence and a model.
 type DirectAnswerer interface {
-	AnswerDirect(context.Context, Plan) (answer Answer, ok bool, err error)
+	AnswerDirect(context.Context, Plan) (answer DirectAnswer, ok bool, err error)
+}
+
+// DirectAnswer carries the same inspectable source evidence as a generated
+// answer, while keeping deterministic capture listings independent of a model.
+type DirectAnswer struct {
+	Answer
+	Sources []Evidence
+	Targets []TargetRef
+}
+
+// TargetRef is an app-owned action handle returned by a local read. Models
+// receive only its short Label, never choose IDs or revisions themselves.
+type TargetRef struct {
+	Kind     string
+	ID       string
+	Revision uint64
+	Label    string
+	SourceID string
 }
 
 // PlanQuestion reads a question without a model: product principle "the model
@@ -116,13 +173,31 @@ type DirectAnswerer interface {
 // model; a model, when used, only receives a small byte-bounded labelled
 // selection of evidence and never the whole memory.
 func PlanQuestion(question string, now time.Time, apps []KnownApp) (Plan, error) {
+	return planQuestion(question, now, apps, false)
+}
+
+func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bool) (Plan, error) {
 	question, err := normalizeQuestion(question)
 	if err != nil {
 		return Plan{}, err
 	}
 	plan := Plan{Kind: KindGeneral, Question: question}
+	var literal []string
+	if searchMode {
+		question, literal, err = searchGrammar(question)
+		if err != nil {
+			return Plan{}, err
+		}
+		plan.Literal = len(literal) > 0
+		plan.LiteralTerms = literal
+		plan.FilterQuestion = question
+	}
 	ws := splitWords(question)
-	scope, numeral := detectScope(ws, now)
+	scopeWords := ws
+	if searchMode {
+		scopeWords = searchScopeWords(question, ws)
+	}
+	scope, numeral := detectScope(scopeWords, now)
 	ids, names, domains, consumed := matchApps(question, ws, apps)
 	more, consumed := findDomains(question, consumed)
 	for _, d := range more {
@@ -137,21 +212,51 @@ func PlanQuestion(question string, now time.Time, apps []KnownApp) (Plan, error)
 		consumed[numeral] = struct{}{}
 	}
 	entity := detectEntity(question, ws)
+	if entity == "" {
+		entity = detectOutstandingSubject(ws)
+	}
 	named := len(ids) > 0 || len(domains) > 0
-	memory := QuestionSeeksPersonalMemory(question) || !scope.IsZero() ||
+	plan.WholeDocument = !searchMode && detectWholeDocumentRequest(ws)
+	memory := plan.WholeDocument || searchMode || QuestionSeeksPersonalMemory(question) || !scope.IsZero() ||
+		entity != "" && IsOutstandingQuestion(question) ||
+		startsWith(ws, "what", "or", "who", "is") ||
 		startsWith(ws, "what", "do", "you", "know") || startsWith(ws, "what", "do", "you", "remember") ||
 		startsWith(ws, "do", "you", "know") || startsWith(ws, "do", "you", "remember")
 	// Scope and apps are recorded even for general questions so a short
 	// follow-up ("and in Slack?") can be completed from them.
 	plan.Scope = scope
 	plan.AppIDs, plan.AppNames, plan.Domains = ids, names, domains
-	if !memory && !(named && (detectTimeKind(ws) || detectCaptureKind(ws))) {
+	if plan.WholeDocument {
+		if consumed == nil {
+			consumed = make(map[string]struct{})
+		}
+		for _, word := range ws {
+			if isWholeDocumentGrammarWord(word.s) {
+				consumed[word.s] = struct{}{}
+			}
+		}
+	}
+	if !searchMode && !plan.WholeDocument && IsCreationRequest(question) && !creationNeedsMemory(question) {
 		return plan, nil
 	}
-	if plan.Terms, err = planTerms(question, consumed, !scope.IsZero()); err != nil {
+	if !memory && (!named || !detectTimeKind(ws) && !detectCaptureKind(ws)) {
+		return plan, nil
+	}
+	if strings.TrimSpace(question) != "" {
+		plan.Terms, err = planTerms(question, consumed, !scope.IsZero())
+	}
+	if err != nil {
 		return Plan{}, err
 	}
+	if searchMode {
+		plan.Terms, err = searchPlanTerms(plan.Terms, literal, ws)
+		if err != nil {
+			return Plan{}, err
+		}
+	}
 	switch {
+	case plan.WholeDocument:
+		plan.Kind = KindLookup
 	case detectTimeKind(ws):
 		plan.Kind = KindTime
 	case detectCaptureKind(ws):
@@ -168,7 +273,49 @@ func PlanQuestion(question string, now time.Time, apps []KnownApp) (Plan, error)
 	default:
 		plan.Kind = KindLookup
 	}
+	if IsOutstandingQuestion(question) {
+		plan.Kind = KindEntity
+		plan.Entity = entity
+		plan.MatchOnly = true
+		// In project-work questions the final name is the subject, even when
+		// it also aliases a captured website (for example, CraftedSignal and
+		// accounts.craftedsignal.io). Do not turn the subject into an app or
+		// domain filter; that would hide saved tasks and project knowledge.
+		plan.AppIDs, plan.AppNames, plan.Domains = nil, nil, nil
+		plan.Terms, err = planTerms(entity, nil, false)
+		if err != nil {
+			return Plan{}, err
+		}
+	}
 	return plan, nil
+}
+
+// IsCreationRequest identifies an explicit request for an answer or draft.
+// Merely using "me", "email", or a future date in a draft does not make it a
+// request to retrieve the user's history.
+func IsCreationRequest(question string) bool {
+	q := strings.ToLower(strings.TrimSpace(question))
+	q = strings.TrimSpace(strings.TrimPrefix(q, "please "))
+	for _, prefix := range []string{"write ", "draft ", "compose ", "rewrite ", "rephrase ", "translate ", "proofread ", "explain ", "compare ", "debug ", "help me write ", "help me understand "} {
+		if strings.HasPrefix(q, prefix) {
+			return true
+		}
+	}
+	return false
+}
+func creationNeedsMemory(question string) bool {
+	q := strings.ToLower(question)
+	// Pasted text belongs to the current request. Historical words inside it
+	// ("rewrite this: I worked yesterday") do not trigger background retrieval.
+	if at := strings.Index(q, ":"); at >= 0 {
+		q = q[:at]
+	}
+	for _, phrase := range []string{"what i ", "what we ", "what you remember", "my notes", "our notes", "my saved", "my last ", "my previous ", "i read", "i saw", "i worked", "we discussed", "we decided", "from memory", "my day", "my activity", "my captures", "my history"} {
+		if strings.Contains(q, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // Inherit fills a follow-up's missing scope and app from the previous turn's

@@ -10,52 +10,50 @@ import (
 	"time"
 )
 
-// Building from the root checkout must never compile its older storage reader.
-// Run the real Makefile against a disposable worktree and trap build tools so
-// a regression cannot build, sign, launch, or replace the user's app.
-func TestMacOSRootTargetsUseActiveWorktree(t *testing.T) {
+// The integrated checkout must build without a linked worktree. Run the real
+// Makefile in a disposable fixture and trap tools so these tests cannot build,
+// sign, launch, or replace the user's app.
+func TestMacOSRootTargetsUseIntegratedCheckout(t *testing.T) {
 	for _, target := range []string{
 		"macos-app", "macos-app-stable", "run-macos",
 		"macos-app-sandbox-check", "macos-app-safari-unsigned", "macos-app-safari-signed",
 	} {
 		t.Run(target, func(t *testing.T) {
-			root, makePath := macOSRootMakeFixture(t, true)
-			output, err := runMacOSRootMake(t, root, makePath, target)
+			root, makePath := macOSRootMakeFixture(t)
+			output, err := runMacOSRootMake(t, root, makePath, target, true)
 			if err != nil {
-				t.Fatalf("make %s did not delegate to the active worktree: %v\n%s", target, err, output)
+				t.Fatalf("make %s requires a removed worktree: %v\n%s", target, err, output)
 			}
-			got, err := os.ReadFile(filepath.Join(root, ".worktrees", "durable-memory-core", "invocation"))
-			if err != nil {
-				t.Fatalf("active worktree was not invoked: %v\n%s", err, output)
+			if strings.Contains(string(output), ".worktrees") || strings.Contains(string(output), "FORBIDDEN_BUILD_TOOL") {
+				t.Fatalf("make %s must use integrated source without executing build tools:\n%s", target, output)
 			}
-			wantTarget := target
-			if target == "macos-app" {
-				wantTarget = "macos-app-stable"
-			}
-			want := wantTarget + "\nfixture-signing-identity\n"
-			if string(got) != want {
-				t.Fatalf("active invocation = %q, want %q", got, want)
+			if target == "macos-app" || target == "macos-app-stable" || target == "run-macos" {
+				for _, want := range []string{"macos-app-compile", "lipo -create", "fixture-signing-identity", "macos-app-identity-check"} {
+					if !strings.Contains(string(output), want) {
+						t.Fatalf("make %s is missing %q:\n%s", target, want, output)
+					}
+				}
 			}
 		})
 	}
 }
 
-func TestMacOSRootBuildRefusesMissingActiveWorktree(t *testing.T) {
-	for _, target := range []string{"macos-app", "macos-app-stable"} {
+func TestMacOSRootBuildFailurePreventsSigningAndLaunching(t *testing.T) {
+	for _, target := range []string{"macos-app", "macos-app-stable", "run-macos"} {
 		t.Run(target, func(t *testing.T) {
-			root, makePath := macOSRootMakeFixture(t, false)
-			output, err := runMacOSRootMake(t, root, makePath, target)
+			root, makePath := macOSRootMakeFixture(t)
+			output, err := runMacOSRootMake(t, root, makePath, target, false)
 			if err == nil {
-				t.Fatalf("make %s accepted a missing active worktree", target)
+				t.Fatalf("make %s ignored the failing compiler", target)
 			}
-			if !strings.Contains(string(output), "active macOS worktree is unavailable") || strings.Contains(string(output), "FORBIDDEN_BUILD_TOOL") {
-				t.Fatalf("make %s must explain the missing worktree before invoking build tools:\n%s", target, output)
+			if !strings.Contains(string(output), "FORBIDDEN_BUILD_TOOL:go") || strings.Contains(string(output), "FORBIDDEN_BUILD_TOOL:codesign") || strings.Contains(string(output), "FORBIDDEN_BUILD_TOOL:open") {
+				t.Fatalf("make %s must stop before signing or launching after compilation fails:\n%s", target, output)
 			}
 		})
 	}
 }
 
-func macOSRootMakeFixture(t *testing.T, active bool) (string, string) {
+func macOSRootMakeFixture(t *testing.T) (string, string) {
 	t.Helper()
 	makePath, err := exec.LookPath("make")
 	if err != nil {
@@ -65,31 +63,33 @@ func macOSRootMakeFixture(t *testing.T, active bool) (string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Exercise quoted paths too, including the recursive make -C argument.
+	// Exercise quoted paths too, including recursive make arguments.
 	root := filepath.Join(t.TempDir(), "checkout with spaces")
 	writeAuditFile(t, filepath.Join(root, "Makefile"), string(contents))
 	bin := filepath.Join(root, "test-bin")
-	for _, tool := range []string{"go", "codesign", "open", "xcodebuild", "xcrun", "node"} {
+	for _, tool := range []string{"go", "codesign", "open", "xcodebuild", "xcrun", "node", "python3", "lipo"} {
 		path := filepath.Join(bin, tool)
-		writeAuditFile(t, path, "#!/bin/sh\necho FORBIDDEN_BUILD_TOOL >&2\nexit 97\n")
+		script := "#!/bin/sh\n"
+		if tool == "go" {
+			script += "if [ \"$1\" = env ] && [ \"$2\" = GOHOSTARCH ]; then echo arm64; exit 0; fi\n"
+		}
+		writeAuditFile(t, path, script+"echo FORBIDDEN_BUILD_TOOL:"+tool+" >&2\nexit 97\n")
 		if err := os.Chmod(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if active {
-		writeAuditFile(t, filepath.Join(root, ".worktrees", "durable-memory-core", "Makefile"), `.PHONY: macos-app-stable run-macos macos-app-sandbox-check macos-app-safari-unsigned macos-app-safari-signed safari-extension-build safari-extension-test
-macos-app-stable run-macos macos-app-sandbox-check macos-app-safari-unsigned macos-app-safari-signed safari-extension-build safari-extension-test:
-	@printf '%s\n' '$@' '$(MACOS_CODESIGN_IDENTITY)' > invocation
-`)
-	}
 	return root, makePath
 }
 
-func runMacOSRootMake(t *testing.T, root, makePath, target string) ([]byte, error) {
+func runMacOSRootMake(t *testing.T, root, makePath, target string, dryRun bool) ([]byte, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, makePath, "--no-print-directory", target, "MACOS_CODESIGN_IDENTITY=fixture-signing-identity")
+	args := []string{"--no-print-directory", target, "MACOS_CODESIGN_IDENTITY=fixture-signing-identity", "VERSION=fixture", "COMMIT=fixture", "BUILD_DATE=fixture", "XCODE_DEVELOPER_DIR=/fixture"}
+	if dryRun {
+		args = append(args, "-n")
+	}
+	cmd := exec.CommandContext(ctx, makePath, args...)
 	cmd.Dir = root
 	for _, entry := range os.Environ() {
 		name, _, _ := strings.Cut(entry, "=")

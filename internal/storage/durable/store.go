@@ -19,6 +19,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -31,7 +32,9 @@ import (
 )
 
 const (
-	OpenSchemaVersion = 2
+	// Schema 7 requires capture-part and exact-visit index erasure.
+	// Older clients must reject the store rather than leave derived capture rows.
+	OpenSchemaVersion = 7
 	valueVersion      = 1
 	recordRevision    = 1
 	storedValueHeader = 1 + 4
@@ -66,6 +69,9 @@ var (
 	ErrProjectionIndexUnavailable       = errors.New("durable store: projection index migration required")
 	ErrUnavailable                      = errors.New("durable store: unavailable")
 	ErrTransaction                error = &classifiedStoreError{code: "transaction", message: "durable store: transaction failed"}
+
+	ErrTransactionBudget       = errors.Join(&storage.StoreError{Code: storage.Invalid}, errors.New("durable store: transaction budget exceeded"))
+	ErrDeletionPending   error = &classifiedStoreError{code: "incomplete", message: "durable store: source deletion recovery required"}
 
 	errAbortTransaction = errors.New("durable store: abort")
 )
@@ -103,11 +109,17 @@ const (
 
 // Store is an authenticated encrypted implementation of storage.EncryptedStore.
 // Secret state is held behind a pointer so formatting cannot traverse key bytes.
-type Store struct{ state *storeState }
+type Store struct {
+	state *storeState
+	// Immutable private view selector; the database, gates and lifetime are shared.
+	captureSearch bool
+}
 
 type storeState struct {
 	mu          sync.RWMutex
 	knowledgeMu sync.RWMutex
+	taskMu      sync.RWMutex
+	profileMu   sync.RWMutex
 	noteMu      sync.Mutex
 	db          *bolt.DB
 	codec       *recordcodec.Codec
@@ -115,7 +127,11 @@ type storeState struct {
 	manifestKey []byte
 	storeID     [16]byte
 	schemaVer   uint32
-	closed      bool
+	// Immutable after OpenDurable publishes the store. This retention baseline
+	// is not proof of a historical capture at the same timestamp.
+	captureTimeBaseline time.Time
+	closed              bool
+	deletionPending     atomic.Bool
 }
 
 var _ storage.EncryptedStore = (*Store)(nil)
@@ -124,13 +140,15 @@ var _ storage.ChronicleStore = (*Store)(nil)
 // Tx groups record and future index mutations into one bbolt transaction. The
 // extension writes are keyed and encrypted by the same record/manifest boundary.
 type Tx struct {
-	mu       sync.Mutex
-	store    *Store
-	writer   bolt.Writer
-	manifest manifestState
-	failure  error
-	active   bool
-	dirty    bool
+	mu                  sync.Mutex
+	store               *Store
+	writer              bolt.Writer
+	manifest            manifestState
+	failure             error
+	active              bool
+	dirty               bool
+	exactInline         []capture.SanitizedObservation
+	importedObservation bool
 }
 
 // OpenDurable opens or creates a private encrypted store according to mode.
@@ -140,6 +158,10 @@ func OpenDurable(path string, key securestore.Key, mode OpenMode) (*Store, error
 }
 
 func openDurableWithHook(path string, key securestore.Key, mode OpenMode, migrationHook func() error) (*Store, error) {
+	return openDurableWithHooks(path, key, mode, migrationHook, nil)
+}
+
+func openDurableWithHooks(path string, key securestore.Key, mode OpenMode, migrationHook func() error, deletionHook func(int) error) (*Store, error) {
 	if mode != CreateNew && mode != OpenExisting {
 		return nil, ErrOpenMode
 	}
@@ -171,7 +193,23 @@ func openDurableWithHook(path string, key securestore.Key, mode OpenMode, migrat
 		_ = store.Close()
 		return nil, err
 	}
+	if err := store.ensureDeletionCutoffs(context.Background(), deletionHook); err != nil {
+		_ = store.Close()
+		return nil, errors.Join(ErrMigration, err)
+	}
+	if err := store.resumePendingSourceDeletion(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	if err := store.recoverCaptureStaging(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	if err := store.ensureSearchIndex(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	if err := store.ensureCapturePartIndex(context.Background()); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
@@ -180,6 +218,20 @@ func openDurableWithHook(path string, key securestore.Key, mode OpenMode, migrat
 			_ = store.Close()
 			return nil, err
 		}
+	}
+	baseline, complete, found, err := store.readCaptureTimeMigration(context.Background())
+	if err != nil || !found || !complete {
+		_ = store.Close()
+		return nil, ErrMigration
+	}
+	state.captureTimeBaseline = baseline
+	if err := store.ensureObservationTimeline(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	if err := store.ensureChronicleDependencies(context.Background(), migrationHook); err != nil {
+		_ = store.Close()
+		return nil, errors.Join(ErrMigration, err)
 	}
 	return store, nil
 }
@@ -292,6 +344,11 @@ func (s *Store) initialize() error {
 			tx.active = false
 			return errAbortTransaction
 		}
+		if err := tx.PutIndexRecord(chronicleDependencyMigrationNS, chronicleDependencyMigrationID, encodeChronicleDependencyMigration("", true)); err != nil {
+			callbackErr = err
+			tx.active = false
+			return errAbortTransaction
+		}
 		if err := tx.flushManifestLocked(); err != nil {
 			callbackErr = err
 			tx.active = false
@@ -328,11 +385,11 @@ func (s *Store) validateAndMigrate(ctx context.Context, migrationHook func() err
 	}
 	for version < OpenSchemaVersion {
 		switch version {
-		case 1:
-			if err := s.migrateOneToTwo(ctx, migrationHook); err != nil {
+		case 1, 2, 3, 4, 5, 6:
+			if err := s.migrateSchema(ctx, version, OpenSchemaVersion, migrationHook); err != nil {
 				return err
 			}
-			version = 2
+			version = OpenSchemaVersion
 		default:
 			return ErrUnsupportedSchema
 		}
@@ -348,6 +405,12 @@ func (s *Store) validateAndMigrate(ctx context.Context, migrationHook func() err
 }
 
 func (s *Store) readIdentity(ctx context.Context) error {
+	return s.readIdentityWithSchemaLimit(ctx, OpenSchemaVersion)
+}
+
+// Keep the authenticated reader boundary directly exercisable with an older
+// writer's supported version, without opening a user store or running an app.
+func (s *Store) readIdentityWithSchemaLimit(ctx context.Context, supported uint32) error {
 	var encoded []byte
 	err := s.view(ctx, func(reader bolt.Reader) error {
 		var found bool
@@ -384,7 +447,7 @@ func (s *Store) readIdentity(ctx context.Context) error {
 		!bytes.Equal(plain[1:17], storeID[:]) || binary.BigEndian.Uint32(plain[17:]) != schemaVersion {
 		return ErrCorrupt
 	}
-	if schemaVersion == 0 || schemaVersion > OpenSchemaVersion {
+	if schemaVersion == 0 || schemaVersion > supported {
 		return ErrUnsupportedSchema
 	}
 	s.state.storeID = storeID
@@ -488,10 +551,8 @@ func (s *Store) verifyManifest(ctx context.Context, want manifestState) error {
 	return nil
 }
 
-func (s *Store) migrateOneToTwo(ctx context.Context, migrationHook func() error) error {
-	const oldVersion = uint32(1)
-	const newVersion = uint32(2)
-	if s.state.schemaVer != oldVersion {
+func (s *Store) migrateSchema(ctx context.Context, oldVersion, newVersion uint32, migrationHook func() error) error {
+	if s.state.schemaVer != oldVersion || oldVersion >= newVersion || newVersion > OpenSchemaVersion {
 		return ErrUnsupportedSchema
 	}
 	var callbackErr error
@@ -579,6 +640,10 @@ func (s *Store) migrateOneToTwo(ctx context.Context, migrationHook func() error)
 }
 
 func (s *Store) view(ctx context.Context, callback func(bolt.Reader) error) error {
+	return s.viewWithReadLimit(ctx, bolt.MaxTransactionOps, callback)
+}
+
+func (s *Store) viewWithReadLimit(ctx context.Context, operationLimit int, callback func(bolt.Reader) error) error {
 	if ctx == nil {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
@@ -589,13 +654,19 @@ func (s *Store) view(ctx context.Context, callback func(bolt.Reader) error) erro
 		return &storage.StoreError{Code: storage.Closed}
 	}
 	state := s.state
+	if state.deletionPending.Load() {
+		return ErrDeletionPending
+	}
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 	if state.closed || state.db == nil {
 		return &storage.StoreError{Code: storage.Closed}
 	}
+	if state.deletionPending.Load() {
+		return ErrDeletionPending
+	}
 	var callbackErr error
-	err := state.db.View(ctx, func(reader bolt.Reader) error {
+	err := state.db.ViewWithReadLimit(ctx, operationLimit, func(reader bolt.Reader) error {
 		callbackErr = callback(reader)
 		if callbackErr != nil {
 			return errAbortTransaction
@@ -621,14 +692,43 @@ func (s *Store) Update(ctx context.Context, callback func(*Tx) error) error {
 		return &storage.StoreError{Code: storage.Closed}
 	}
 	state := s.state
-	state.mu.RLock()
-	defer state.mu.RUnlock()
-	if state.closed || state.db == nil {
-		return &storage.StoreError{Code: storage.Closed}
+	if state.deletionPending.Load() {
+		return ErrDeletionPending
 	}
+	var inline []capture.SanitizedObservation
+	err := func() error {
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		if state.closed || state.db == nil {
+			return &storage.StoreError{Code: storage.Closed}
+		}
+		if state.deletionPending.Load() {
+			return ErrDeletionPending
+		}
+		return s.updateLocked(ctx, func(tx *Tx) error {
+			err := callback(tx)
+			tx.mu.Lock()
+			inline = append(inline, tx.exactInline...)
+			tx.mu.Unlock()
+			return err
+		})
+	}()
+	if err == nil {
+		// This is an optimization after the primary commit. Index failures may
+		// delay search coverage, but can never roll back accepted evidence.
+		for _, observation := range inline {
+			_ = s.indexSmallObservation(ctx, observation)
+		}
+	}
+	return err
+}
+
+// updateLocked requires state.mu to be held; recovery uses its exclusive lock.
+func (s *Store) updateLocked(ctx context.Context, callback func(*Tx) error) error {
 	var callbackErr error
-	err := state.db.Update(ctx, func(writer bolt.Writer) error {
+	err := s.state.db.Update(ctx, func(writer bolt.Writer) error {
 		tx := &Tx{store: s, writer: writer, active: true}
+		tx.importedObservation, _ = ctx.Value(importedObservationKey{}).(bool)
 		tx.mu.Lock()
 		if err := tx.loadManifestLocked(); err != nil {
 			tx.failure = err
@@ -674,6 +774,21 @@ func sanitizeCallbackError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return context.DeadlineExceeded
 	}
+	if errors.Is(err, ErrTransactionBudget) {
+		return ErrTransactionBudget
+	}
+	if errors.Is(err, ErrDeletionPending) {
+		return ErrDeletionPending
+	}
+	if errors.Is(err, ErrSourceDeleted) {
+		return ErrSourceDeleted
+	}
+	if errors.Is(err, ErrCaptureConflict) {
+		return ErrCaptureConflict
+	}
+	if errors.Is(err, ErrCaptureClosed) {
+		return ErrCaptureClosed
+	}
 	var storeErr *storage.StoreError
 	if errors.As(err, &storeErr) && storeErr != nil {
 		switch storeErr.Code {
@@ -710,6 +825,8 @@ func mapStorePhysicalError(err error) error {
 		return err
 	case errors.Is(err, bolt.ErrClosed):
 		return &storage.StoreError{Code: storage.Closed}
+	case errors.Is(err, bolt.ErrBudget):
+		return ErrTransactionBudget
 	case errors.Is(err, bolt.ErrInvalid), errors.Is(err, bolt.ErrInvalidTx):
 		return &storage.StoreError{Code: storage.Invalid}
 	case errors.Is(err, bolt.ErrCorrupt):
@@ -732,6 +849,7 @@ func (s *Store) Close() error {
 		return nil
 	}
 	state.closed = true
+	state.deletionPending.Store(false)
 	database := state.db
 	state.db = nil
 	var closeErr error
@@ -1108,6 +1226,9 @@ func (tx *Tx) PutObservationAt(observation capture.SanitizedObservation, capture
 	if observation.Validate() != nil || capturedAt.IsZero() || !validCaptureTime(capturedAt) {
 		return tx.failLocked(&storage.StoreError{Code: storage.Invalid})
 	}
+	if err := tx.checkSourceAdmissionLocked(observation.ContentID(), capturedAt); err != nil {
+		return tx.failLocked(err)
+	}
 	plaintext, err := capture.MarshalAuthenticatedObservation(observation)
 	if err != nil {
 		return tx.failLocked(&storage.StoreError{Code: storage.Invalid})
@@ -1143,12 +1264,22 @@ func (tx *Tx) PutObservationAt(observation capture.SanitizedObservation, capture
 		return tx.failLocked(err)
 	}
 	clear(sizeValue)
-	if err := tx.indexObservationLocked(observation); err != nil {
+	if err := tx.queueObservationExactLocked(observation); err != nil {
 		clear(recordKey)
 		clear(orderKey)
 		return tx.failLocked(err)
 	}
 	if err := tx.indexCaptureHourLocked(logicalID, capturedAt); err != nil {
+		clear(recordKey)
+		clear(orderKey)
+		return tx.failLocked(err)
+	}
+	if err := tx.indexObservationTimelineLocked(observation, capturedAt); err != nil {
+		clear(recordKey)
+		clear(orderKey)
+		return tx.failLocked(err)
+	}
+	if err := tx.setObservationOriginLocked(logicalID, tx.importedObservation); err != nil {
 		clear(recordKey)
 		clear(orderKey)
 		return tx.failLocked(err)
@@ -1246,7 +1377,7 @@ func validNamespace(namespace string) bool {
 	}
 	for i := range namespace {
 		c := namespace[i]
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' && c != '-' {
 			return false
 		}
 	}
@@ -1335,13 +1466,17 @@ func (s *Store) PutObservationAt(ctx context.Context, observation capture.Saniti
 	return s.Update(ctx, func(tx *Tx) error { return tx.PutObservationAt(observation, capturedAt) })
 }
 
-// DeleteObservationRecord atomically removes a source and its exact-search
-// postings. Separate materialized projections must be invalidated by callers.
+// DeleteObservationRecord removes a source and its linked projections. Large
+// sources and captures use the gated, restart-resumable bounded journal.
 func (s *Store) DeleteObservationRecord(ctx context.Context, logicalID string) error {
 	if ctx == nil || !validHash(logicalID) {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
-	return s.Update(ctx, func(tx *Tx) error { return tx.deleteObservationRecord(logicalID) })
+	err := s.Update(ctx, func(tx *Tx) error { return tx.deleteObservationRecord(logicalID) })
+	if errors.Is(err, ErrTransactionBudget) || errors.Is(err, ErrDeletionPending) {
+		return s.deleteSourceStaged(ctx, logicalID, nil)
+	}
+	return err
 }
 
 // MaxObservationDeleteBatch bounds deletion work per atomic transaction. It is
@@ -1356,6 +1491,10 @@ func (s *Store) DeleteObservationRecords(ctx context.Context, logicalIDs []strin
 	if ctx == nil || len(logicalIDs) == 0 || len(logicalIDs) > MaxObservationDeleteBatch {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
+	if len(logicalIDs) == 1 {
+		return s.DeleteObservationRecord(ctx, logicalIDs[0])
+	}
+
 	seen := make(map[string]struct{}, len(logicalIDs))
 	for _, id := range logicalIDs {
 		if !validHash(id) {
@@ -1382,7 +1521,7 @@ func (s *Store) DeleteObservationRecords(ctx context.Context, logicalIDs []strin
 			}
 		}
 		if operationBudget > bolt.MaxTransactionOps-64 {
-			return ErrTransaction
+			return ErrTransactionBudget
 		}
 		for _, id := range logicalIDs {
 			if err := tx.deleteObservationRecord(id); err != nil {
@@ -1413,7 +1552,8 @@ func (s *Store) MaxObservationDeleteBatchWithinSearchBudget(observations []captu
 		}
 		if operations+cost > bolt.MaxTransactionOps-64 {
 			if i == 0 {
-				return 0, ErrTransaction
+				// One large source uses resumable coordinated erasure.
+				return 1, nil
 			}
 			return i, nil
 		}
@@ -1915,7 +2055,7 @@ func validID(id string) bool {
 	}
 	for i := range id {
 		c := id[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' {
 			return false
 		}
 	}
@@ -1928,7 +2068,7 @@ func validHash(value string) bool {
 	}
 	for i := range value {
 		c := value[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}

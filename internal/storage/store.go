@@ -19,6 +19,7 @@ const MaxObservationTextBytes = capture.MaxObservationTextBytes
 const MaxListLimit = 1000
 const MaxObservationPageRows = 64
 const MaxObservationPageBytes = 2 << 20
+const MaxObservationWindow = 31 * 24 * time.Hour
 
 // ObservationPageRequest bounds both returned rows and the aggregate bytes
 // that search will inspect. MaxBytes measures text, app ID and domain bytes.
@@ -35,11 +36,39 @@ type ObservationPageRequest struct {
 // not fit MaxBytes and therefore was not cloned into Observations.
 type ObservationPage struct {
 	Observations []capture.SanitizedObservation
-	// CapturedAt aligns with Observations. A zero value marks a legacy record
-	// for which the backend has no trustworthy timestamp.
+	// CapturedAt aligns with Observations. Backends may retain an upgrade-time
+	// baseline for retention. Readers presenting observed dates use the optional
+	// IsObservationTimeKnown(time.Time) capability; zero is always undated.
 	CapturedAt []time.Time
 	Bytes      int
 	HasMore    bool
+}
+
+// ObservationWindowRequest reads captures in a bounded time range, newest
+// first. BeforeCapturedAt and BeforeSourceID form the stable continuation
+// cursor returned by the previous page.
+type ObservationWindowRequest struct {
+	Start, End       time.Time
+	AppID, Domain    string
+	ExcludeAppIDs    []string
+	BeforeCapturedAt time.Time
+	BeforeSourceID   string
+	Limit            int
+	MaxBytes         int
+}
+
+// ObservationWindow is a stable, newest-first page from an encrypted capture
+// time index. CapturedAt is the latest observed visit in this window for each source;
+// a migration baseline alone does not qualify as a visit.
+// primary first-capture provenance remains in ObservationPage. Next* is the cursor for the
+// next page when HasMore is true.
+type ObservationWindow struct {
+	Observations   []capture.SanitizedObservation
+	CapturedAt     []time.Time
+	NextCapturedAt time.Time
+	NextSourceID   string
+	Bytes          int
+	HasMore        bool
 }
 
 type ErrorCode string
@@ -119,6 +148,7 @@ type EncryptedStore interface {
 	DeleteObservationRecord(context.Context, string) error
 	GetObservation(context.Context, string) (capture.SanitizedObservation, bool, error)
 	ListObservationPage(context.Context, ObservationPageRequest) (ObservationPage, error)
+	ListObservationWindow(context.Context, ObservationWindowRequest) (ObservationWindow, error)
 	PutDerivation(context.Context, Derivation) error
 	GetDerivation(context.Context, string) (Derivation, bool, error)
 	ListDerivations(context.Context, int, string) ([]Derivation, error)
@@ -128,6 +158,14 @@ type EncryptedStore interface {
 	ActivateGeneration(context.Context, string) error
 	ActiveGeneration(context.Context) (Generation, bool, error)
 	Close() error
+}
+
+// ObservationSightings records visits independently of immutable source text.
+// Admission must atomically require the primary source to exist; erasure must
+// remove every visit before the source can be considered deleted.
+type ObservationSightings interface {
+	RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error
+	ObservationSightingAt(context.Context, string, time.Time, time.Time) (time.Time, bool, error)
 }
 
 // ChronicleStore persists generated hourly summaries and their provenance.
@@ -143,23 +181,24 @@ type ChronicleStore interface {
 // EphemeralMemoryStore is TestOnly. It is never a production default and does
 // not encrypt or persist data. It exercises the EncryptedStore contract.
 type EphemeralMemoryStore struct {
-	mu               sync.RWMutex
-	closed           bool
-	observations     map[string]capture.SanitizedObservation
-	observationBytes map[string]int
-	observationTimes map[string]time.Time
-	observationIDs   []string
-	derivations      map[string]Derivation
-	derivationIDs    []string
-	generations      map[string]Generation
-	generationIDs    []string
-	active           string
+	mu                sync.RWMutex
+	closed            bool
+	observations      map[string]capture.SanitizedObservation
+	observationBytes  map[string]int
+	observationTimes  map[string]time.Time
+	observationVisits map[string][]time.Time
+	observationIDs    []string
+	derivations       map[string]Derivation
+	derivationIDs     []string
+	generations       map[string]Generation
+	generationIDs     []string
+	active            string
 }
 
 var _ EncryptedStore = (*EphemeralMemoryStore)(nil)
 
 func NewEphemeralMemoryStore() *EphemeralMemoryStore {
-	return &EphemeralMemoryStore{observations: make(map[string]capture.SanitizedObservation), observationBytes: make(map[string]int), observationTimes: make(map[string]time.Time), derivations: make(map[string]Derivation), generations: make(map[string]Generation)}
+	return &EphemeralMemoryStore{observations: make(map[string]capture.SanitizedObservation), observationBytes: make(map[string]int), observationTimes: make(map[string]time.Time), observationVisits: make(map[string][]time.Time), derivations: make(map[string]Derivation), generations: make(map[string]Generation)}
 }
 func (*EphemeralMemoryStore) EncryptedAtRest() bool { return false }
 func (s *EphemeralMemoryStore) Close() error {
@@ -203,7 +242,7 @@ func validHash(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -221,7 +260,7 @@ func validID(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' {
 			return false
 		}
 	}
@@ -259,8 +298,56 @@ func (s *EphemeralMemoryStore) PutObservationAt(ctx context.Context, o capture.S
 	s.observations[storedID] = stored
 	s.observationBytes[storedID] = searchBytes
 	s.observationTimes[storedID] = capturedAt.UTC()
+	s.observationVisits[storedID] = []time.Time{capturedAt.UTC()}
 	s.observationIDs = insertID(s.observationIDs, storedID)
 	return nil
+}
+
+// RecordObservationSighting preserves test-store parity with encrypted visit storage.
+func (s *EphemeralMemoryStore) RecordObservationSighting(ctx context.Context, o capture.SanitizedObservation, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ready(ctx, s.closed); err != nil {
+		return err
+	}
+	if o.Validate() != nil || !validCaptureTime(at) {
+		return &StoreError{Code: Invalid}
+	}
+	id := o.ContentID()
+	if _, found := s.observations[id]; !found {
+		return &StoreError{Code: Invalid}
+	}
+	visits := s.observationVisits[id]
+	index := sort.Search(len(visits), func(i int) bool { return !visits[i].Before(at) })
+	if index < len(visits) && visits[index].Equal(at) {
+		return nil
+	}
+	visits = append(visits, time.Time{})
+	copy(visits[index+1:], visits[index:])
+	visits[index] = at.UTC()
+	s.observationVisits[id] = visits
+	return nil
+}
+
+func latestVisit(visits []time.Time, start, end time.Time) time.Time {
+	index := sort.Search(len(visits), func(i int) bool { return !visits[i].Before(end) })
+	if index == 0 || visits[index-1].Before(start) {
+		return time.Time{}
+	}
+	return visits[index-1]
+}
+
+func (s *EphemeralMemoryStore) ObservationSightingAt(ctx context.Context, id string, start, end time.Time) (time.Time, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ready(ctx, s.closed); err != nil {
+		return time.Time{}, false, err
+	}
+	if !validHash(id) || !validObservationWindow(ObservationWindowRequest{Start: start, End: end, Limit: 1, MaxBytes: MaxObservationPageBytes}) {
+		return time.Time{}, false, &StoreError{Code: Invalid}
+	}
+	at := latestVisit(s.observationVisits[id], start, end)
+	return at, !at.IsZero(), nil
 }
 
 func (s *EphemeralMemoryStore) DeleteObservationRecord(ctx context.Context, id string) error {
@@ -284,6 +371,7 @@ func (s *EphemeralMemoryStore) DeleteObservationRecord(ctx context.Context, id s
 	delete(s.observations, id)
 	delete(s.observationBytes, id)
 	delete(s.observationTimes, id)
+	delete(s.observationVisits, id)
 	index := sort.SearchStrings(s.observationIDs, id)
 	if index < len(s.observationIDs) && s.observationIDs[index] == id {
 		copy(s.observationIDs[index:], s.observationIDs[index+1:])
@@ -309,6 +397,111 @@ func validPage(limit int, after string, hash bool) bool {
 }
 func validObservationPage(request ObservationPageRequest) bool {
 	return request.Limit > 0 && request.Limit <= MaxObservationPageRows && request.MaxBytes > 0 && request.MaxBytes <= MaxObservationPageBytes && (request.After == "" || validHash(request.After))
+}
+
+func validObservationWindow(request ObservationWindowRequest) bool {
+	if request.Start.IsZero() || request.End.IsZero() || !request.Start.Before(request.End) || request.End.Sub(request.Start) > MaxObservationWindow ||
+		request.Limit < 1 || request.Limit > MaxObservationPageRows || request.MaxBytes < MaxObservationTextBytes+128+253 || request.MaxBytes > MaxObservationPageBytes {
+		return false
+	}
+	if !validObservationWindowFilter(request.AppID, 128) || !validObservationWindowFilter(request.Domain, 253) ||
+		strings.Contains(request.Domain, "..") || strings.HasPrefix(request.Domain, ".") || strings.HasSuffix(request.Domain, ".") {
+		return false
+	}
+	if len(request.ExcludeAppIDs) > 32 {
+		return false
+	}
+	for _, app := range request.ExcludeAppIDs {
+		if app == "" || !validObservationWindowFilter(app, 128) {
+			return false
+		}
+	}
+	if request.BeforeCapturedAt.IsZero() != (request.BeforeSourceID == "") || request.BeforeSourceID != "" && !validHash(request.BeforeSourceID) {
+		return false
+	}
+	if !request.BeforeCapturedAt.IsZero() && (request.BeforeCapturedAt.Before(request.Start) || !request.BeforeCapturedAt.Before(request.End)) {
+		return false
+	}
+	return true
+}
+
+func validObservationWindowFilter(value string, maxBytes int) bool {
+	if len(value) > maxBytes {
+		return false
+	}
+	for _, character := range value {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '.' && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidObservationWindow reports whether a bounded, timestamp-ordered read is
+// safe for an EncryptedStore implementation to execute.
+func ValidObservationWindow(request ObservationWindowRequest) bool {
+	return validObservationWindow(request)
+}
+
+func (s *EphemeralMemoryStore) ListObservationWindow(ctx context.Context, request ObservationWindowRequest) (ObservationWindow, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ready(ctx, s.closed); err != nil {
+		return ObservationWindow{}, err
+	}
+	if !validObservationWindow(request) {
+		return ObservationWindow{}, &StoreError{Code: Invalid}
+	}
+	type candidate struct {
+		id string
+		at time.Time
+	}
+	start, end := request.Start.UTC(), request.End.UTC()
+	candidates := make([]candidate, 0)
+	for _, id := range s.observationIDs {
+		at := latestVisit(s.observationVisits[id], start, end)
+		if at.IsZero() || at.Before(start) || !at.Before(end) {
+			continue
+		}
+		observation := s.observations[id]
+		if request.AppID != "" && observation.AppID() != request.AppID || request.Domain != "" && observation.Domain() != request.Domain {
+			continue
+		}
+		excluded := false
+		for _, app := range request.ExcludeAppIDs {
+			excluded = excluded || observation.AppID() == app
+		}
+		if excluded {
+			continue
+		}
+		if !request.BeforeCapturedAt.IsZero() && (!at.Before(request.BeforeCapturedAt) && (!at.Equal(request.BeforeCapturedAt) || id >= request.BeforeSourceID)) {
+			continue
+		}
+		candidates = append(candidates, candidate{id: id, at: at})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].at.Equal(candidates[j].at) {
+			return candidates[i].at.After(candidates[j].at)
+		}
+		return candidates[i].id > candidates[j].id
+	})
+	page := ObservationWindow{Observations: make([]capture.SanitizedObservation, 0, request.Limit), CapturedAt: make([]time.Time, 0, request.Limit)}
+	for _, candidate := range candidates {
+		if len(page.Observations) >= request.Limit {
+			page.HasMore = true
+			break
+		}
+		bytes := s.observationBytes[candidate.id]
+		if bytes > request.MaxBytes-page.Bytes {
+			page.HasMore = true
+			break
+		}
+		page.Observations = append(page.Observations, copyObservation(s.observations[candidate.id]))
+		page.CapturedAt = append(page.CapturedAt, candidate.at)
+		page.Bytes += bytes
+		page.NextCapturedAt, page.NextSourceID = candidate.at, candidate.id
+	}
+	return page, nil
 }
 func (s *EphemeralMemoryStore) ListObservationPage(ctx context.Context, request ObservationPageRequest) (ObservationPage, error) {
 	s.mu.RLock()

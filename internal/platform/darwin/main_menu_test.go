@@ -4,6 +4,7 @@ package darwin
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,7 +46,7 @@ func TestMenuBarMenuOffersInteractSettingsPauseAndQuit(t *testing.T) {
 	if items[2].title != "Interact" || items[2].selector != "openInteract:" || items[2].target != statusTargetInteract {
 		t.Fatalf("Interact action = %+v", items[2])
 	}
-	if items[3].title != "Settings…" || items[3].selector != "openSettings:" || items[3].target != statusTargetSettings {
+	if items[3].title != "Settings" || items[3].selector != "openSettings:" || items[3].target != statusTargetSettings {
 		t.Fatalf("Settings action = %+v", items[3])
 	}
 	pause := items[5]
@@ -115,6 +116,32 @@ func TestMenuBarIconReflectsCaptureState(t *testing.T) {
 	}
 	if got := menuBarIconAlpha(false); got >= 1 || got <= 0 {
 		t.Fatalf("paused capture icon alpha = %v, want a visible faded value", got)
+	}
+}
+
+func TestMenuBarCaptureIndicatorStaysOnWhenCurrentAppIsNotCaptured(t *testing.T) {
+	now := time.Now()
+	alpha, title := menuBarCapturePresentation(true, false, time.Time{}, now, "")
+	if alpha != 1 || !strings.Contains(title, "Capture is on") || !strings.Contains(title, "waiting for readable content") {
+		t.Fatalf("excluded current app made capture look paused: alpha=%v title=%q", alpha, title)
+	}
+	alpha, title = menuBarCapturePresentation(false, false, time.Time{}, now)
+	if alpha >= 1 || title != "Capture is paused" {
+		t.Fatalf("paused indicator=%v %q", alpha, title)
+	}
+}
+
+func TestMenuBarCaptureSubstatusIsHiddenUnlessRequested(t *testing.T) {
+	now := time.Now()
+	for _, active := range []bool{false, true} {
+		alpha, title := menuBarCapturePresentation(true, active, time.Time{}, now)
+		if alpha != 1 || title != "Capture is on" {
+			t.Fatalf("default menu must stay compact: alpha=%v title=%q", alpha, title)
+		}
+	}
+	_, title := menuBarCapturePresentation(true, false, time.Time{}, now, "Current app exposed no readable text")
+	if title != "Capture is on; Current app exposed no readable text" {
+		t.Fatalf("requested capture detail = %q", title)
 	}
 }
 

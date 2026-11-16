@@ -329,13 +329,11 @@ func TestGrantStoreRejectsIssuanceAtTheTotalGrantCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var grants []IssuedGrant
 	for i := 0; i < 1024; i++ {
-		grant, err := store.Issue("client", []Scope{ScopeUIRead}, time.Hour)
+		_, err := store.Issue("client", []Scope{ScopeUIRead}, time.Hour)
 		if err != nil {
 			t.Fatalf("issue %d: %v", i, err)
 		}
-		grants = append(grants, grant)
 	}
 	if _, err := store.Issue("client", []Scope{ScopeUIRead}, time.Hour); err == nil {
 		t.Fatal("issuance beyond the total grant cap succeeded")

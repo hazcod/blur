@@ -288,18 +288,18 @@ func TestEveryPortRejectsInvalidReports(t *testing.T) {
 		ports := []struct {
 			name     string
 			reporter platform.CapabilityReporter
-			op       func() (error, int)
+			op       func() (int, error)
 		}{
-			{"capture", c, func() (error, int) { _, err := c.Probe(ctx); return err, c.Calls }},
-			{"text_targets", tt, func() (error, int) { _, err := tt.Lease(ctx); return err, tt.Calls }},
-			{"gesture_hotkeys", h, func() (error, int) { _, err := h.Next(ctx); return err, h.Calls }},
-			{"surface_manager", s, func() (error, int) { err := s.Show(ctx, platform.SurfaceRequest{}); return err, s.Calls }},
-			{"audio_recorder", a, func() (error, int) { err := a.Start(ctx); return err, a.Calls }},
-			{"secret_store", sec, func() (error, int) { _, err := sec.Get(ctx, "key", 32); return err, sec.Calls }},
-			{"local_transport", tr, func() (error, int) { err := tr.Start(ctx); return err, tr.Calls }},
-			{"private_path", p, func() (error, int) { _, err := p.Ensure(ctx, "data"); return err, p.Calls }},
-			{"autostart", au, func() (error, int) { err := au.SetEnabled(ctx, true); return err, au.Calls }},
-			{"session_state", ss, func() (error, int) { _, err := ss.Current(ctx); return err, ss.Calls }},
+			{"capture", c, func() (int, error) { _, err := c.Probe(ctx); return c.Calls, err }},
+			{"text_targets", tt, func() (int, error) { _, err := tt.Lease(ctx); return tt.Calls, err }},
+			{"gesture_hotkeys", h, func() (int, error) { _, err := h.Next(ctx); return h.Calls, err }},
+			{"surface_manager", s, func() (int, error) { err := s.Show(ctx, platform.SurfaceRequest{}); return s.Calls, err }},
+			{"audio_recorder", a, func() (int, error) { err := a.Start(ctx); return a.Calls, err }},
+			{"secret_store", sec, func() (int, error) { _, err := sec.Get(ctx, "key", 32); return sec.Calls, err }},
+			{"local_transport", tr, func() (int, error) { err := tr.Start(ctx); return tr.Calls, err }},
+			{"private_path", p, func() (int, error) { _, err := p.Ensure(ctx, "data"); return p.Calls, err }},
+			{"autostart", au, func() (int, error) { err := au.SetEnabled(ctx, true); return au.Calls, err }},
+			{"session_state", ss, func() (int, error) { _, err := ss.Current(ctx); return ss.Calls, err }},
 		}
 		for _, port := range ports {
 			t.Run(port.name+"/"+string(configured.State), func(t *testing.T) {
@@ -307,7 +307,7 @@ func TestEveryPortRejectsInvalidReports(t *testing.T) {
 				if !errors.Is(err, platform.ErrInvalidCapabilityReport) || report.Validate() != nil || report.State == platform.Available {
 					t.Fatalf("report = %+v, %v", report, err)
 				}
-				err, calls := port.op()
+				calls, err := port.op()
 				var unavailable *platform.UnavailableError
 				if !errors.As(err, &unavailable) || unavailable.Report.Validate() != nil || unavailable.Report.State == platform.Available || calls != 0 {
 					t.Fatalf("operation = %v, calls %d", err, calls)

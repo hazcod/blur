@@ -3,6 +3,7 @@ package durable
 import (
 	"context"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ func TestChronicleFollowUpFlowsIntoAnswerableTodayQuestion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	at := start.Add(10 * time.Minute)
 	source, err := capture.SanitizeObservation("editor.app", "", "Meeting: discussed the launch checklist.", 1024)
@@ -65,7 +66,7 @@ func TestChronicleFollowUpCreatesMinimalTodayProjectionWhenNeeded(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	at := start.Add(time.Minute)
 	source, err := capture.SanitizeObservation("editor.app", "", "Meeting: discussed the launch owner.", 1024)
@@ -101,7 +102,7 @@ func TestPutChronicleRejectsFollowUpWithoutMeetingEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	at := start.Add(time.Minute)
 	source, err := capture.SanitizeObservation("editor.app", "", "Reviewed the launch checklist.", 1024)
@@ -158,7 +159,7 @@ func TestChronicleRoundTripAndSourceDeletionCascade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	if err := store.DeleteObservationRecord(ctx, first.ContentID()); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +177,7 @@ func TestChronicleRejectsInvalidAndOversizedSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	for _, summary := range []chronicle.Summary{
 		{HourID: "bad", Start: start, End: start.Add(time.Hour), Text: "summary", SourceIDs: []string{repeatHex("a")}},
@@ -194,7 +195,7 @@ func TestDeleteAllChronicles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	for i := 0; i < 2; i++ {
 		hour := start.Add(time.Duration(i) * time.Hour)
@@ -227,7 +228,7 @@ func TestChronicleRequiresLiveSourceInsideItsHourAndRollbackPreservesIndexes(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	source, err := capture.SanitizeObservation("editor.app", "", "source", 1024)
 	if err != nil {
@@ -274,7 +275,7 @@ func TestCaptureHourEvidenceUsesBoundedEncryptedTimeIndexAndDeletion(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	first, _ := capture.SanitizeObservation("editor.app", "", "first source", 1024)
 	second, _ := capture.SanitizeObservation("editor.app", "", "second source", 1024)
@@ -295,7 +296,7 @@ func TestCaptureHourEvidenceUsesBoundedEncryptedTimeIndexAndDeletion(t *testing.
 		t.Fatal(err)
 	}
 	hour, err = store.CaptureHourEvidence(ctx, start)
-	if err != nil || len(hour.Evidence) != 1 || hour.Evidence[0].Observation.ContentID() != second.ContentID() {
+	if err != nil || len(hour.Evidence) != 1 || hour.Evidence[0].SourceID() != second.ContentID() {
 		t.Fatalf("post-delete hour evidence=%+v err=%v", hour.Evidence, err)
 	}
 }
@@ -327,7 +328,7 @@ func TestChronicleWorkerCannotRecreateSummaryAfterSourceDeletedDuringGeneration(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	source, err := capture.SanitizeObservation("editor.app", "", "sensitive source", 1024)
 	if err != nil {
@@ -347,5 +348,72 @@ func TestChronicleWorkerCannotRecreateSummaryAfterSourceDeletedDuringGeneration(
 	}
 	if _, found, err := store.GetChronicle(ctx, "hour:"+start.Format("20060102T15Z")); err != nil || found {
 		t.Fatalf("deleted evidence reappeared as a summary: found=%t err=%v", found, err)
+	}
+}
+
+type coverageChronicleGenerator struct{}
+
+func (coverageChronicleGenerator) CountInputTokens(context.Context, chronicle.Packed) (int, error) {
+	return 32, nil
+}
+func (coverageChronicleGenerator) Generate(_ context.Context, p chronicle.Packed, _ int) (chronicle.Summary, error) {
+	return chronicle.Summary{HourID: p.HourID, Start: p.Start, End: p.End, Text: "Reviewed saved material.", SourceIDs: p.SourceIDs}, nil
+}
+
+func TestCaptureHourRecoversLargeSavedSourceAndPersistsCoverageAcrossReopenAndDeletion(t *testing.T) {
+	ctx := context.Background()
+	path, key := durableTestPath(t), durableTestKey(t, 0x9a)
+	store, err := OpenDurable(path, key, CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	text := "saved head\n" + strings.Repeat("日本語🙂 ", 2000) + "\nsaved tail"
+	source, err := capture.SanitizeObservation("editor.app", "", text, capture.MaxObservationTextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservationAt(ctx, source, start.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	hour, err := store.CaptureHourEvidence(ctx, start)
+	if err != nil || len(hour.Evidence) != 1 {
+		t.Fatalf("recovery silently lost large saved source: evidence=%d err=%v", len(hour.Evidence), err)
+	}
+	packed, err := chronicle.PackHour(hour)
+	if err != nil || len(packed.SourceIDs) != 1 || packed.SourceIDs[0] != source.ContentID() {
+		t.Fatalf("recovery changed source identity: %+v %v", packed, err)
+	}
+	worker := chronicle.NewWorker(store, deletingChroniclePolicy{}, coverageChronicleGenerator{}, chronicle.WorkerConfig{Enabled: true, Provider: power.LocalProvider})
+	err = worker.Process(ctx, hour)
+	worker.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenDurable(path, key, OpenExisting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(close func() error) { _ = close() }(store.Close)
+	row, found, err := store.GetChronicle(ctx, "hour:"+start.Format("20060102T15Z"))
+	if err != nil || !found || !strings.Contains(row.Text, "1 source(s) excerpted") {
+		t.Fatalf("persisted coverage missing: %+v %t %v", row, found, err)
+	}
+	original, found, err := store.GetObservation(ctx, source.ContentID())
+	if err != nil || !found || original.Text() != text {
+		t.Fatal("inspectable original was changed or lost")
+	}
+	if err := store.DeleteObservationRecord(ctx, source.ContentID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.GetChronicle(ctx, row.HourID); err != nil || found {
+		t.Fatalf("deletion left excerpt recap: %t %v", found, err)
+	}
+	hour, err = store.CaptureHourEvidence(ctx, start)
+	if err != nil || len(hour.Evidence) != 0 {
+		t.Fatalf("deletion left recovery evidence: %d %v", len(hour.Evidence), err)
 	}
 }

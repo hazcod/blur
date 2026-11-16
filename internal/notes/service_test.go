@@ -77,6 +77,24 @@ func TestExplicitTodoMarkerWorksWithoutAI(t *testing.T) {
 	}
 }
 
+func TestExplicitReminderCommandWorksWithoutAI(t *testing.T) {
+	for _, test := range []struct{ text, want string }{
+		{"Reminder: Call Sam tomorrow", "Call Sam tomorrow"},
+		{"Remind me to call Sam tomorrow", "call Sam tomorrow"},
+	} {
+		t.Run(test.text, func(t *testing.T) {
+			repo := &testRepository{}
+			result, err := NewService(repo, nil, nil).Add(context.Background(), test.text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Proposals) != 1 || result.Proposals[0].Kind != Reminder || result.Proposals[0].Text != test.want || result.Proposals[0].Confirmed {
+				t.Fatalf("explicit reminder was not projected as an unconfirmed candidate: %+v", result.Proposals)
+			}
+		})
+	}
+}
+
 func TestOverBudgetModelLeavesSavedNoteAndDeterministicTodo(t *testing.T) {
 	repo := &testRepository{}
 	text := "TODO: Send the launch plan\n" + strings.Repeat("context ", 1200)

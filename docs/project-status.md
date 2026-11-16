@@ -2,6 +2,8 @@
 
 Detailed development status, security model, platform notes and packaging detail for Blur, moved here from the README. For the product overview, see the [README](../README.md).
 
+The current macOS Voice notes implementation, related fixes and remaining live
+acceptance work are tracked in [Voice notes status](voice-notes-status.md).
 
 Blur is a local-first memory and writing assistant in development. This
 repository contains a Go desktop shell, encrypted local durable storage,
@@ -110,7 +112,7 @@ They never accept keys through arguments, environment variables, or config.
 print bounded fixture content. Do not place personal data in a fixture store.
 The macOS desktop bundle is written to the stable, visible path
 `~/Downloads/Blur.app` so it can be selected in macOS Accessibility settings.
-`make macos-app` builds an Apple silicon arm64 executable with cgo disabled
+`make macos-app` builds a universal arm64 + x86_64 executable with cgo disabled
 and packages it into the same bundle.
 Set `MACOS_APP` and `MACOS_BINARY` to choose explicit output paths. Rebuilding
 replaces that generated bundle only after a staged build passes signature
@@ -123,15 +125,19 @@ use the per-user cache directory at
 `~/Library/Caches/Blur/Logs` instead. Directories and log files are
 user-private. Diagnostics are intended for troubleshooting, not as a memory
 export, but should still be treated as private files.
-App Sandbox (default): `make macos-app` signs the bundle with
-`platform/macos/Blur.sandbox.entitlements` (app-sandbox, outbound network
-client, user-selected read/write for the sync folder picker). Use
-`make macos-app MACOS_SANDBOX=0` for an unsandboxed build (data then lives in
-`~/Library/Application Support/Blur`). `make macos-app-sandbox-check` verifies
-the built bundle carries the sandbox entitlement. When `BLUR_APP_GROUP_ID` /
-`BLUR_KEYCHAIN_ACCESS_GROUP` are set, a merged entitlements plist is generated
-next to the build binary. Under the sandbox `HOME` is the container, so data
-lives in
+Direct-download builds are unsandboxed by default (`MACOS_SANDBOX=0`), including
+the Foundation Models helper, to support cross-app macOS Accessibility reads.
+The stable local target uses the same policy. Startup keeps an existing valid
+container data directory in place; fresh installs without one use
+`~/Library/Application Support/Blur`. Desktop and MCP share that resolver.
+Use `make macos-app MACOS_SANDBOX=1` only for an explicit sandbox compatibility
+build; cross-app Accessibility capture is unsupported there.
+It signs the bundle with `platform/macos/Blur.sandbox.entitlements`
+(app-sandbox, outbound network client, user-selected read/write for the sync
+folder picker). `make macos-app-sandbox-check` verifies that optional build's
+sandbox entitlement. When `BLUR_APP_GROUP_ID` / `BLUR_KEYCHAIN_ACCESS_GROUP`
+are set for a sandbox build, a merged entitlements plist is generated next to
+the build binary. Under the sandbox `HOME` is the container, so data lives in
 `~/Library/Containers/com.hazcod.blur/Data/Library/Application Support/Blur`
 and logs in `~/Library/Containers/com.hazcod.blur/Data/Library/Logs/Blur`
 (same content-free `blur.log` / `startup.log`). The `blur mcp` bridge runs from
@@ -236,16 +242,18 @@ The committed Xcode project can be regenerated from
 XcodeGen.
 
 `make cross-build` builds `blur`, `blur-core`, `blurctl`, and physical storage
-with cgo disabled for macOS Apple silicon (arm64), Windows x64 (amd64), and Linux
-x64 (amd64). `make cross-test-compile` compiles platform conformance tests for
-those three targets and the Linux adapter tests for x64. The
+with cgo disabled for Darwin arm64/amd64, Windows amd64, and Linux amd64/arm64;
+it also compiles the native GoUI package for Linux arm64. `make cross-test-compile`
+compiles platform conformance tests for Darwin arm64, Windows amd64, and Linux
+amd64/arm64, plus Linux adapter tests on both architectures. The
 GoUI compatibility fork is documented in
 [`docs/dependency-forks.md`](dependency-forks.md). `make no-cgo-audit` inspects
 command dependency graphs for Cgo files and `import "C"` across the supported
 target matrix.
 
 `make portable-packages` creates unsigned, version-free portable artifacts in
-`dist/packages/`: `blur-windows-amd64.zip` and `blur-linux-amd64.tar.gz`. The Windows archive contains a GUI-subsystem
+`dist/packages/`: `blur-windows-amd64.zip`, `blur-linux-amd64.tar.gz`, and
+`blur-linux-arm64.tar.gz`. The Windows archive contains a GUI-subsystem
 `Blur.exe`, a separate console-subsystem `blur-mcp.exe` for inherited Claude
 stdio, and the README, license, and security policy. The GUI app writes a
 bounded rotating `blur.log` and runtime crash output under
@@ -357,7 +365,7 @@ a shell cannot read the container, so for review tooling build a dev-only app wi
 the snapshot directory at the same path (never use or distribute that build):
 
 ```sh
-make macos-app MACOS_SANDBOX_DEV_PATH=/tmp/blur-ui-snapshots
+make macos-app MACOS_SANDBOX=1 MACOS_SANDBOX_DEV_PATH=/tmp/blur-ui-snapshots
 BLUR_UI_SNAPSHOT_DIR=/tmp/blur-ui-snapshots ~/Downloads/Blur.app/Contents/MacOS/blur
 ```
 

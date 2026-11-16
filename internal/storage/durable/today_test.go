@@ -18,7 +18,7 @@ func TestDeleteObservationRecordRemovesItsTodayProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	generated := time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC)
 	source, err := capture.SanitizeObservation("editor.app", "docs.example", "sensitive note", 1024)
 	if err != nil {
@@ -48,9 +48,16 @@ func TestDeleteSourceCleansEveryIndexedTodayDateAndPreservesUnrelatedEvidence(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	sourceID, otherID := repeatHex("a"), repeatHex("b")
+	defer func(close func() error) { _ = close() }(store.Close)
 	firstAt := time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC)
+	source, _ := capture.SanitizeObservation("notes", "local", "Private multi-day evidence", 512)
+	other, _ := capture.SanitizeObservation("notes", "local", "Unrelated retained evidence", 512)
+	for _, o := range []capture.SanitizedObservation{source, other} {
+		if err := store.PutObservationAt(ctx, o, firstAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sourceID, otherID := source.ContentID(), other.ContentID()
 	first, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: firstAt, GenerationID: "g-1", Evidence: []today.Evidence{{SourceID: sourceID, At: firstAt, Change: "private first day"}}})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +93,7 @@ func TestDeleteObservationTransactionRollbackRestoresTodayProjection(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	at := time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC)
 	source, err := capture.SanitizeObservation("editor.app", "docs.example", "rollback source", 1024)
 	if err != nil {
@@ -126,14 +133,21 @@ func TestTodaySnapshotIsEncryptedReplaceableAndReopenable(t *testing.T) {
 		t.Fatal(err)
 	}
 	generated := time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC)
-	snapshot, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: generated, GenerationID: "g-1", Evidence: []today.Evidence{{SourceID: "source-secret", At: generated.Add(-time.Hour), SubjectID: "project-secret", Subject: "Project secret", Change: "Changed private"}}})
+	first, _ := capture.SanitizeObservation("notes", "local", "First private source", 512)
+	next, _ := capture.SanitizeObservation("notes", "local", "Next private source", 512)
+	for _, o := range []capture.SanitizedObservation{first, next} {
+		if err := store.PutObservationAt(ctx, o, generated.Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: generated, GenerationID: "g-1", Evidence: []today.Evidence{{SourceID: first.ContentID(), At: generated.Add(-time.Hour), SubjectID: "project-secret", Subject: "Project secret", Change: "Changed private"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.PutTodaySnapshot(ctx, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	replacement, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: generated.Add(time.Minute), GenerationID: "g-2", Evidence: []today.Evidence{{SourceID: "source-next", At: generated, SubjectID: "project-next", Subject: "Next"}}})
+	replacement, err := today.Build(today.Input{Date: "2026-11-05", Zone: "UTC", GeneratedAt: generated.Add(time.Minute), GenerationID: "g-2", Evidence: []today.Evidence{{SourceID: next.ContentID(), At: generated, SubjectID: "project-next", Subject: "Next"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +170,7 @@ func TestTodaySnapshotIsEncryptedReplaceableAndReopenable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	got, found, err := store.GetTodaySnapshot(ctx, "2026-11-05")
 	if err != nil || !found {
 		t.Fatalf("GetTodaySnapshot() found=%v err=%v", found, err)
@@ -176,7 +190,7 @@ func TestTodaySnapshotRejectsInvalidDateAndHonorsContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	if _, _, err := store.GetTodaySnapshot(context.Background(), "../secret"); err == nil {
 		t.Fatal("invalid date accepted")
 	}

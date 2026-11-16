@@ -56,7 +56,9 @@ func BuiltinProfiles() []AppProfile {
 		{AppID: "com.tinyspeck.slackmacgap", IgnoreRoles: append([]string(nil), roles...)},
 		{AppID: "com.slack", IgnoreRoles: append([]string(nil), roles...)},
 		{AppID: "com.apple.safari", IgnoreRoles: browserChromeRoles()},
+		{AppID: "com.kagi.kagimacos", IgnoreRoles: browserChromeRoles()},
 		{AppID: "com.google.chrome", IgnoreRoles: browserChromeRoles()},
+		{AppID: "com.google.chrome.for.testing", IgnoreRoles: browserChromeRoles()},
 		{AppID: "com.google.chrome.canary", IgnoreRoles: browserChromeRoles()},
 		{AppID: "org.mozilla.firefox", IgnoreRoles: browserChromeRoles()},
 		{AppID: "com.brave.browser", IgnoreRoles: browserChromeRoles()},
@@ -135,23 +137,49 @@ func validAXRole(role string) bool {
 		return false
 	}
 	for _, r := range role[2:] {
-		if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+		if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
 			return false
 		}
 	}
 	return true
 }
 
-// isEditableTextRole prevents capture of unsent drafts, search queries, and
-// selected values. These nodes are treated as sensitive by the tree reader,
-// which prunes the whole subtree before asking the native API for children or
-// text; read-only message/history nodes retain their normal static-text roles.
+// isEditableTextRole is the conservative role policy used by structural browser
+// discovery and platforms without native sensitivity metadata. The macOS text
+// reader checks secure roles/subroles separately so editable documents remain
+// eligible for capture.
 func isEditableTextRole(role string) bool {
 	switch role {
 	case "AXSecureTextField", "AXPasswordField", "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField":
 		return true
 	default:
 		return false
+	}
+}
+
+// needsSecureSubroleCheck keeps the expensive per-node AXSubrole read focused
+// on roles that can contain text or whose custom semantics are unknown. Apple
+// defines AXSecureTextField as a specialized text-field subrole; ordinary
+// structural and display roles cannot represent that control.
+func needsSecureSubroleCheck(role string) bool {
+	if isEditableTextRole(role) {
+		return true
+	}
+	switch role {
+	case "AXApplication", "AXSheet", "AXDrawer", "AXGrowArea",
+		"AXImage", "AXButton", "AXRadioButton", "AXCheckBox", "AXPopUpButton",
+		"AXMenuButton", "AXTabGroup", "AXTab", "AXToolbar", "AXBusyIndicator",
+		"AXProgressIndicator", "AXRelevanceIndicator", "AXColumn", "AXRow",
+		"AXTable", "AXOutline", "AXBrowser", "AXScrollArea", "AXScrollBar",
+		"AXSplitGroup", "AXSplitter", "AXStaticText", "AXHeading", "AXLink",
+		"AXMenuBar", "AXMenuBarItem", "AXMenu", "AXMenuItem", "AXList",
+		"AXStatusBar", "AXRadioGroup", "AXColorWell", "AXSlider",
+		"AXIncrementor", "AXValueIndicator", "AXDisclosureTriangle", "AXCell",
+		"AXWebArea", "AXLandmark":
+		return false
+	default:
+		// AXUnknown and app-defined roles keep the conservative privacy check.
+		return true
 	}
 }
 

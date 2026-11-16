@@ -6,6 +6,7 @@ package appidentity
 func IsBrowserApp(id string) bool {
 	switch id {
 	case "com.apple.safari", "com.google.chrome", "com.google.chrome.canary",
+		"com.google.chrome.for.testing", "com.kagi.kagimacos",
 		"org.mozilla.firefox", "com.brave.browser", "com.microsoft.edgemac",
 		"company.thebrowser.browser", "com.operasoftware.opera", "com.vivaldi.vivaldi",
 		"google-chrome", "chrome", "chromium", "chromium-browser", "firefox", "firefox-esr",

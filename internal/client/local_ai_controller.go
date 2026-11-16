@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/assistant"
+	"github.com/hazcod/blur/internal/chatgpt"
 	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/knowledge/derive"
+	"github.com/hazcod/blur/internal/knowledge/enrich"
 	"github.com/hazcod/blur/internal/notes"
 	"github.com/hazcod/blur/internal/platform"
 	"github.com/hazcod/blur/internal/power"
@@ -34,12 +36,17 @@ type localAIController struct {
 	path            string
 	service         *notes.Service
 	secrets         platform.SecretStore
+	chatGPT         *chatgpt.Manager
 	settings        LocalAISettings
 	askModel        configuredAskModel
 	chronicleRepo   chronicle.SummaryRepository
 	chroniclePolicy chronicle.BackgroundPolicy
 	chronicleFeed   *chronicleFeed
 	chronicleWorker *chronicle.Worker
+	librarySources  enrich.Sources
+	libraryRepo     enrich.Repository
+	libraryOptions  enrich.Options
+	libraryWorker   *enrich.Service
 	needsRepair     bool
 }
 
@@ -60,6 +67,7 @@ func newLocalAIControllerContext(ctx context.Context, path string, service *note
 	controller := &localAIController{path: cleanPath, service: service}
 	if len(secretStores) > 0 {
 		controller.secrets = secretStores[0]
+		controller.chatGPT, _ = chatgpt.NewManager(secretStores[0])
 	}
 	settings, err := readLocalAISettings(path)
 	if err != nil {
@@ -75,15 +83,15 @@ func newLocalAIControllerContext(ctx context.Context, path string, service *note
 			controller.needsRepair = true
 			return controller
 		}
-		extractor, err := newConfiguredExtractor(settings, credential)
+		extractor, err := controller.configuredExtractor(settings, credential)
 		if err != nil {
 			controller.needsRepair = true
 			return controller
 		}
-		if effectiveProvider(settings) == ProviderOllama {
-			controller.askModel, err = newConfiguredAskModel(settings, credential)
-		} else if settings.RemoteAskEnabled {
-			controller.askModel, err = newConfiguredAskModel(settings, credential)
+		if isLocalCompletionProvider(effectiveProvider(settings)) {
+			controller.askModel, err = controller.configuredAskModel(settings, credential)
+		} else if settings.RemoteAskEnabled || cloudAccountProvider(settings.Provider) {
+			controller.askModel, err = controller.configuredAskModel(settings, credential)
 		}
 		if err != nil {
 			controller.needsRepair = true
@@ -98,7 +106,7 @@ func (c *localAIController) Configure(ctx context.Context, settings LocalAISetti
 	if c == nil || ctx == nil || ctx.Err() != nil || c.path == "" || c.service == nil || validateLocalAISettings(settings) != nil {
 		return errLocalAIUnavailable
 	}
-	if len(credentials) > 1 {
+	if len(credentials) > 1 || effectiveProvider(settings) == ProviderApple && len(credentials) == 1 && credentials[0] != "" {
 		return errLocalAIUnavailable
 	}
 	providedCredential := len(credentials) == 1
@@ -114,7 +122,12 @@ func (c *localAIController) Configure(ctx context.Context, settings LocalAISetti
 	if provider == "" && (settings.Enabled || settings.Endpoint != "" || settings.Model != "") {
 		provider = ProviderOllama
 	}
-	sameRemoteAskTarget := previous.Enabled && effectiveProvider(previous) == ProviderOpenAICompatible && provider == ProviderOpenAICompatible && previous.Endpoint == settings.Endpoint && previous.Model == settings.Model
+	sameRemoteAskTarget := sameRemoteAITarget(previous, settings)
+	if providedCredential && credential != "" && (provider == ProviderClaude || provider == ProviderOpenAICompatible) {
+		// A replacement key may represent another account even at the same
+		// endpoint. Its identity has not inherited either previous permission.
+		sameRemoteAskTarget = false
+	}
 	if settings.RemoteAskEnabled && !sameRemoteAskTarget {
 		if previous.RemoteAskEnabled {
 			// Consent never follows a changed destination, even for callers that
@@ -126,9 +139,16 @@ func (c *localAIController) Configure(ctx context.Context, settings LocalAISetti
 			return errLocalAIUnavailable
 		}
 	}
+	if settings.RemoteNotesEnabled && !sameRemoteAskTarget {
+		if previous.RemoteNotesEnabled {
+			settings.RemoteNotesEnabled = false
+		} else {
+			return errLocalAIUnavailable
+		}
+	}
 	settings.CredentialRef = ""
 	newSecret := false
-	if provider == ProviderOpenAICompatible && settings.Enabled {
+	if (provider == ProviderOpenAICompatible || provider == ProviderClaude) && settings.Enabled {
 		if providedCredential && credential != "" {
 			ref, err := newCredentialRef()
 			if err != nil {
@@ -136,7 +156,7 @@ func (c *localAIController) Configure(ctx context.Context, settings LocalAISetti
 			}
 			settings.CredentialRef = ref
 			newSecret = true
-		} else if previousRef != "" && effectiveProvider(previous) == ProviderOpenAICompatible {
+		} else if previousRef != "" && effectiveProvider(previous) == provider {
 			settings.CredentialRef = previousRef
 			loaded, err := c.readCredential(ctx, previousRef)
 			if err != nil {
@@ -149,15 +169,15 @@ func (c *localAIController) Configure(ctx context.Context, settings LocalAISetti
 	var extractor notes.Extractor
 	if settings.Enabled {
 		var err error
-		extractor, err = newConfiguredExtractor(settings, credential)
+		extractor, err = c.configuredExtractor(settings, credential)
 		if err != nil {
 			return errLocalAIUnavailable
 		}
 	}
 	var askModel configuredAskModel
-	if settings.Enabled && (effectiveProvider(settings) == ProviderOllama || settings.RemoteAskEnabled) {
+	if settings.Enabled && (isLocalCompletionProvider(effectiveProvider(settings)) || settings.RemoteAskEnabled || cloudAccountProvider(settings.Provider)) {
 		var err error
-		askModel, err = newConfiguredAskModel(settings, credential)
+		askModel, err = c.configuredAskModel(settings, credential)
 		if err != nil {
 			return errLocalAIUnavailable
 		}
@@ -193,7 +213,11 @@ func (c *localAIController) Configure(ctx context.Context, settings LocalAISetti
 	c.settings = settings
 	c.needsRepair = false
 	previousWorker := c.replaceChronicleWorkerLocked()
+	previousLibrary := c.replaceLibraryWorkerLocked()
 	c.mu.Unlock()
+	if previousLibrary != nil {
+		previousLibrary.Close()
+	}
 	if previousWorker != nil {
 		previousWorker.Close()
 	}
@@ -235,7 +259,7 @@ func (c *localAIController) SetBackgroundSummaries(ctx context.Context, enabled 
 	settings, needsRepair := c.settings, c.needsRepair
 	c.mu.RUnlock()
 	settings.BackgroundSummaries = enabled
-	if needsRepair || enabled && (!settings.Enabled || effectiveProvider(settings) != ProviderOllama) || validateLocalAISettings(settings) != nil {
+	if needsRepair || enabled && (!settings.Enabled || !isLocalCompletionProvider(effectiveProvider(settings))) || validateLocalAISettings(settings) != nil {
 		return errLocalAIUnavailable
 	}
 	if err := ctx.Err(); err != nil {
@@ -260,8 +284,8 @@ func (c *localAIController) replaceChronicleWorkerLocked() *chronicle.Worker {
 	previous := c.chronicleWorker
 	c.chronicleWorker = nil
 	settings := c.settings
-	if settings.Enabled && settings.BackgroundSummaries && !c.needsRepair && effectiveProvider(settings) == ProviderOllama && c.chronicleRepo != nil && c.chroniclePolicy != nil {
-		generator, err := chronicle.NewOllamaGenerator(settings.Endpoint, settings.Model)
+	if settings.Enabled && settings.BackgroundSummaries && !c.needsRepair && isLocalCompletionProvider(effectiveProvider(settings)) && c.chronicleRepo != nil && c.chroniclePolicy != nil {
+		generator, err := newConfiguredChronicleGenerator(settings)
 		if err == nil {
 			c.chronicleWorker = chronicle.NewWorker(c.chronicleRepo, c.chroniclePolicy, generator, chronicle.WorkerConfig{Enabled: true, Provider: power.LocalProvider})
 		}
@@ -280,6 +304,8 @@ type configuredAskModel interface {
 
 func newConfiguredAskModel(settings LocalAISettings, credential string) (configuredAskModel, error) {
 	switch effectiveProvider(settings) {
+	case ProviderApple:
+		return assistant.NewAppleGenerator()
 	case ProviderOllama:
 		return assistant.NewOllamaGenerator(settings.Endpoint, settings.Model)
 	case ProviderOpenAICompatible:
@@ -296,10 +322,10 @@ func (c *localAIController) askService(retriever assistant.Retriever) (*assistan
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	provider := effectiveProvider(c.settings)
-	if !c.settings.Enabled || c.needsRepair || c.service == nil || provider != ProviderOllama && !(provider == ProviderOpenAICompatible && c.settings.RemoteAskEnabled) || c.askModel == nil {
+	if !c.settings.Enabled || c.needsRepair || c.service == nil || !isLocalCompletionProvider(provider) && (provider != ProviderOpenAICompatible || !c.settings.RemoteAskEnabled) && !cloudAccountProvider(provider) || c.askModel == nil {
 		return nil, false
 	}
-	return assistant.NewService(retriever, c.askModel, c.askModel, assistant.ContextTokenLimit), true
+	return assistant.NewService(retriever, c.askModel, c.askModel, assistant.ContextTokenLimit).WithPersonalContext(isLocalCompletionProvider(provider)).WithMemoryGeneration(isLocalCompletionProvider(provider) || c.settings.RemoteAskEnabled), true
 }
 
 func (c *localAIController) knowledgeGenerator() (derive.Generator, bool) {
@@ -307,12 +333,12 @@ func (c *localAIController) knowledgeGenerator() (derive.Generator, bool) {
 		return nil, false
 	}
 	c.mu.RLock()
-	settings, available := c.settings, c.settings.Enabled && !c.needsRepair && c.service != nil && c.service.AIConfigured() && effectiveProvider(c.settings) == ProviderOllama
+	settings, available := c.settings, c.settings.Enabled && !c.needsRepair && c.service != nil && c.service.AIConfigured() && isLocalCompletionProvider(effectiveProvider(c.settings))
 	c.mu.RUnlock()
 	if !available {
 		return nil, false
 	}
-	generator, err := derive.NewOllamaGenerator(settings.Endpoint, settings.Model)
+	generator, err := newConfiguredKnowledgeGenerator(settings)
 	if err != nil {
 		return nil, false
 	}
@@ -325,7 +351,13 @@ func (c *localAIController) canSuggestKnowledge() bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.settings.Enabled && !c.needsRepair && c.service != nil && c.service.AIConfigured() && effectiveProvider(c.settings) == ProviderOllama
+	return c.settings.Enabled && !c.needsRepair && c.service != nil && c.service.AIConfigured() && isLocalCompletionProvider(effectiveProvider(c.settings))
+}
+
+// isLocalCompletionProvider identifies completion providers that keep model inputs
+// on this device. Normal recall, answers and notes share this selected model.
+func isLocalCompletionProvider(provider string) bool {
+	return provider == ProviderOllama || provider == ProviderApple
 }
 
 func effectiveProvider(settings LocalAISettings) string {
@@ -337,6 +369,8 @@ func effectiveProvider(settings LocalAISettings) string {
 
 func newConfiguredExtractor(settings LocalAISettings, credential string) (notes.Extractor, error) {
 	switch effectiveProvider(settings) {
+	case ProviderApple:
+		return notes.NewAppleExtractor()
 	case ProviderOllama:
 		return notes.NewOllamaExtractor(settings.Endpoint, settings.Model)
 	case ProviderOpenAICompatible:
@@ -391,7 +425,7 @@ func (c *localAIController) Enabled() bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.settings.Enabled && c.service != nil && c.service.AIConfigured()
+	return c.settings.Enabled && c.service != nil && (c.service.AIConfigured() || cloudAccountProvider(c.settings.Provider) && c.askModel != nil)
 }
 
 func (c *localAIController) NeedsRepair() bool {
@@ -405,8 +439,11 @@ func (c *localAIController) NeedsRepair() bool {
 
 func (c *localAIController) Close() {
 	if c != nil {
+		c.configMu.Lock()
+		defer c.configMu.Unlock()
 		c.mu.Lock()
-		defer c.mu.Unlock()
+		library := c.libraryWorker
+		c.libraryWorker = nil
 		if c.service != nil {
 			c.service.SetExtractor(nil)
 		}
@@ -417,6 +454,13 @@ func (c *localAIController) Close() {
 		if c.chronicleWorker != nil {
 			c.chronicleWorker.Close()
 			c.chronicleWorker = nil
+		}
+		c.mu.Unlock()
+		if c.chatGPT != nil {
+			c.chatGPT.Close()
+		}
+		if library != nil {
+			library.Close()
 		}
 	}
 }
@@ -441,4 +485,26 @@ func (c *localAIController) BackgroundSummariesEnabled() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.chronicleWorker != nil
+}
+
+func newConfiguredChronicleGenerator(settings LocalAISettings) (*chronicle.OllamaGenerator, error) {
+	switch effectiveProvider(settings) {
+	case ProviderApple:
+		return chronicle.NewAppleGenerator()
+	case ProviderOllama:
+		return chronicle.NewOllamaGenerator(settings.Endpoint, settings.Model)
+	default:
+		return nil, errLocalAIUnavailable
+	}
+}
+
+func newConfiguredKnowledgeGenerator(settings LocalAISettings) (*derive.OllamaGenerator, error) {
+	switch effectiveProvider(settings) {
+	case ProviderApple:
+		return derive.NewAppleGenerator()
+	case ProviderOllama:
+		return derive.NewOllamaGenerator(settings.Endpoint, settings.Model)
+	default:
+		return nil, errLocalAIUnavailable
+	}
 }

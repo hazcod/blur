@@ -49,7 +49,7 @@ func TestRPCOwnerRejectsDuplicateStart(t *testing.T) {
 	if _, err := owner.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer owner.Stop()
+	defer func() { _ = owner.Stop() }()
 	if _, err := owner.Start(context.Background()); err == nil {
 		t.Fatal("duplicate owner start succeeded")
 	}
@@ -133,7 +133,7 @@ func TestRPCOwnerRestoresPersistedGrantAcrossAppRestart(t *testing.T) {
 	if err := second.StartWithGrant(context.Background(), grant); err != nil {
 		t.Fatalf("restored owner rejected its persisted grant: %v", err)
 	}
-	defer second.Stop()
+	defer func() { _ = second.Stop() }()
 	if _, err := NewRPCClient(transport, endpoint, grant).Call(context.Background(), RPCSearchMemory, json.RawMessage(`{"query":"standup"}`)); err != nil {
 		t.Fatalf("existing MCP client credential failed after app restart: %v", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"sort"
 	"time"
 
@@ -20,7 +21,7 @@ const (
 	chronicleSourceNS   = "chronicle-src"
 	chronicleDaysNS     = "chronicle-days"
 	chronicleDaysID     = "all"
-	maxChronicleSources = 1 // a source has one capture hour and one canonical summary
+	maxChronicleSources = 1 // legacy singleton reverse receipts; current links are paged
 	maxChronicleDays    = 10000
 	maxChronicleRange   = 32 * 24 * time.Hour
 )
@@ -35,29 +36,34 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 		return &storage.StoreError{Code: storage.Invalid}
 	}
 	defer clear(encoded)
+	dependencies := summary.DependencyIDs()
 	return s.Update(ctx, func(tx *Tx) error {
 		var followUpAt time.Time
-		for _, sourceID := range summary.SourceIDs {
-			observation, found, err := s.getObservationReader(tx.writer, sourceID)
+		var priorSources []string
+		admission := &chronicleAdmissionReader{Reader: tx.writer}
+		defer admission.close()
+		for _, sourceID := range dependencies {
+			observation, capturedAt, found, err := s.sourceEvidenceReader(admission, sourceID)
 			if err != nil {
 				return err
 			} else if !found {
 				return &storage.StoreError{Code: storage.Invalid}
 			}
-			capturedAt, err := s.observationCapturedAtReader(tx.writer, sourceID)
+			visited, observed, err := s.chronicleSourceVisitReader(ctx, admission, sourceID, capturedAt, summary.Start, summary.End)
 			if err != nil {
 				return err
 			}
-			if capturedAt.Before(summary.Start) || !capturedAt.Before(summary.End) {
+			if !observed {
 				return &storage.StoreError{Code: storage.Invalid}
 			}
 			if summary.FollowUp != nil && sourceID == summary.FollowUp.SourceID {
-				if !chronicle.SupportsFollowUpEvidence(observation) {
+				if !chronicle.SupportsFollowUpSource(observation) {
 					return &storage.StoreError{Code: storage.Invalid}
 				}
-				followUpAt = capturedAt
+				followUpAt = visited
 			}
 		}
+		admission.close() // release the read-only cache before any projection write
 		oldBytes, found, err := tx.readIndexValue(chronicleNS, summary.HourID, chronicle.MaxSummaryBytes+(16<<10))
 		if err != nil {
 			return err
@@ -69,7 +75,16 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 				return ErrCorrupt
 			}
 			clear(oldBytes)
-			for _, sourceID := range old.SourceIDs {
+			priorSources = old.DependencyIDs()
+			if old.FollowUp != nil && (summary.FollowUp == nil || chronicleFollowUpID(old.HourID, old.FollowUp.SourceID, old.FollowUp.Text) != chronicleFollowUpID(summary.HourID, summary.FollowUp.SourceID, summary.FollowUp.Text)) {
+				if err := tx.removeChronicleFollowUp(old); err != nil {
+					return err
+				}
+			}
+			for _, sourceID := range priorSources {
+				if slices.Contains(dependencies, sourceID) {
+					continue
+				}
 				if err := tx.removeChronicleSource(sourceID, old.HourID); err != nil {
 					return err
 				}
@@ -83,7 +98,10 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 				return err
 			}
 		}
-		for _, sourceID := range summary.SourceIDs {
+		for _, sourceID := range dependencies {
+			if slices.Contains(priorSources, sourceID) {
+				continue
+			}
 			if err := tx.addChronicleSource(sourceID, summary.HourID); err != nil {
 				return err
 			}
@@ -92,50 +110,70 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 			return err
 		}
 		if summary.FollowUp != nil {
-			return tx.putChronicleFollowUp(summary.HourID, *summary.FollowUp, followUpAt)
+			return tx.putChronicleFollowUp(summary, followUpAt)
 		}
 		return nil
 	})
 }
 
-func (tx *Tx) putChronicleFollowUp(hourID string, followUp chronicle.FollowUp, at time.Time) error {
-	if tx == nil || at.IsZero() || len(followUp.SourceID) != 64 || len(followUp.Text) == 0 {
+func (tx *Tx) putChronicleFollowUp(summary chronicle.Summary, at time.Time) error {
+	if tx == nil || at.IsZero() || summary.FollowUp == nil {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
-	date, zone := localDate(at)
-	questionID := chronicleFollowUpID(hourID, followUp.SourceID, followUp.Text)
-	snapshot := today.Snapshot{}
-	encoded, found, err := tx.readIndexValue(todayNamespace, date, today.MaxSnapshotBytes)
+	followUp := *summary.FollowUp
+	dependencies := summary.DependencyIDs()
+	questionID := chronicleFollowUpID(summary.HourID, followUp.SourceID, followUp.Text)
+	// The same deterministic question can have been saved under a different
+	// local zone. Refresh its actual model dependencies wherever it exists,
+	// retaining the user's resolution and separately authored answer.
+	dates, err := tx.chronicleFollowUpDates(summary)
 	if err != nil {
 		return err
 	}
-	if found {
-		if json.Unmarshal(encoded, &snapshot) != nil || snapshot.Date != date || snapshot.Validate() != nil {
-			clear(encoded)
-			return ErrCorrupt
+	updated := false
+	for _, date := range dates {
+		snapshot, found, err := tx.readChronicleFollowUpSnapshot(date)
+		if err != nil {
+			return err
 		}
-		clear(encoded)
-	} else {
-		snapshot = today.Snapshot{Date: date, Zone: zone, GeneratedAt: at, GenerationID: "chronicle-followup-" + questionID}
-	}
-	for _, existing := range snapshot.Questions {
-		if existing.ID == questionID {
-			return nil
+		if !found {
+			continue
+		}
+		for i := range snapshot.Questions {
+			if snapshot.Questions[i].ID != questionID {
+				continue
+			}
+			snapshot.Questions[i].SourceIDs = append([]string(nil), dependencies...)
+			if err := addChronicleFollowUpSources(&snapshot, dependencies); err != nil {
+				return err
+			}
+			if err := tx.putTodaySnapshot(snapshot); err != nil {
+				return err
+			}
+			updated = true
+			break
 		}
 	}
-	if len(snapshot.Questions) >= today.MaxQuestions {
+	if updated {
 		return nil
 	}
-	if !hasSource(snapshot.SourceIDs, followUp.SourceID) {
-		if len(snapshot.SourceIDs) >= today.MaxSources {
-			return nil
-		}
-		snapshot.SourceIDs = append(snapshot.SourceIDs, followUp.SourceID)
-		sort.Strings(snapshot.SourceIDs)
+	date, zone := localDate(at)
+	snapshot, found, err := tx.readChronicleFollowUpSnapshot(date)
+	if err != nil {
+		return err
+	}
+	if !found {
+		snapshot = today.Snapshot{Date: date, Zone: zone, GeneratedAt: at, GenerationID: "chronicle-followup-" + questionID}
+	}
+	if len(snapshot.Questions) >= today.MaxQuestions || !chronicleFollowUpSourcesFit(snapshot, dependencies) {
+		return nil
+	}
+	if err := addChronicleFollowUpSources(&snapshot, dependencies); err != nil {
+		return err
 	}
 	snapshot.Questions = append(snapshot.Questions, today.Question{
 		ID: questionID, Text: followUp.Text, Reason: "Possible missing follow-up after this meeting.",
-		SourceIDs: []string{followUp.SourceID}, CreatedAt: at,
+		SourceIDs: dependencies, CreatedAt: at,
 	})
 	return tx.putTodaySnapshot(snapshot)
 }
@@ -177,6 +215,13 @@ func (s *Store) GetChronicle(ctx context.Context, id string) (chronicle.Summary,
 		defer clear(b)
 		if json.Unmarshal(b, &summary) != nil || !validChronicle(summary) || summary.HourID != id {
 			return ErrCorrupt
+		}
+		known, err := s.chronicleTimeKnownReader(ctx, reader, summary)
+		if err != nil {
+			return err
+		}
+		if !known {
+			summary = chronicle.Summary{}
 		}
 		return nil
 	})
@@ -226,6 +271,13 @@ func (s *Store) ListChronicles(ctx context.Context, start, end time.Time, after 
 				if row.Start.Before(start) || !row.Start.Before(end) {
 					continue
 				}
+				known, err := s.chronicleTimeKnownReader(ctx, reader, row)
+				if err != nil {
+					return err
+				}
+				if !known {
+					continue
+				}
 				rows = append(rows, row)
 				if len(rows) > limit {
 					next = rows[limit-1].HourID
@@ -240,6 +292,33 @@ func (s *Store) ListChronicles(ctx context.Context, start, end time.Time, after 
 		return nil, "", err
 	}
 	return rows, next, nil
+}
+
+// Only the baseline's UTC hour can contain a summary dated by the old
+// migration. Omit a mixed summary if any source has unknown original time;
+// its text remains saved and the original sources stay available unscoped.
+func (s *Store) chronicleTimeKnownReader(ctx context.Context, reader bolt.Reader, summary chronicle.Summary) (bool, error) {
+	baseline := s.state.captureTimeBaseline
+	if baseline.Before(summary.Start) || !baseline.Before(summary.End) {
+		return true, nil
+	}
+	for _, id := range summary.DependencyIDs() {
+		_, first, found, err := s.sourceEvidenceReader(reader, id)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, nil
+		}
+		_, observed, err := s.chronicleSourceVisitReader(ctx, reader, id, first, summary.Start, summary.End)
+		if err != nil {
+			return false, err
+		}
+		if !observed {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *Store) DeleteAllChronicles(ctx context.Context) error {
@@ -290,7 +369,10 @@ func (tx *Tx) deleteChronicle(id string) error {
 		return ErrCorrupt
 	}
 	clear(b)
-	for _, sourceID := range summary.SourceIDs {
+	if err := tx.removeChronicleFollowUp(summary); err != nil {
+		return err
+	}
+	for _, sourceID := range summary.DependencyIDs() {
 		if err := tx.removeChronicleSource(sourceID, id); err != nil {
 			return err
 		}
@@ -366,47 +448,38 @@ func (tx *Tx) addChronicleDayHour(day, id string) error {
 }
 
 func (tx *Tx) addChronicleSource(sourceID, id string) error {
-	ids, found, err := tx.readChronicleSource(sourceID)
+	root, _, err := tx.migrateChronicleLinks(sourceID)
 	if err != nil {
 		return err
 	}
-	i := sort.SearchStrings(ids, id)
-	if i < len(ids) && ids[i] == id {
-		return ErrCorrupt
-	}
-	if len(ids) >= maxChronicleSources {
-		return &storage.StoreError{Code: storage.Invalid}
-	}
-	ids = append(ids, "")
-	copy(ids[i+1:], ids[i:])
-	ids[i] = id
-	_ = found
-	return tx.PutIndexRecord(chronicleSourceNS, sourceID, mustJSON(ids))
+	return tx.appendChronicleLink(sourceID, id, &root)
 }
 func (tx *Tx) removeChronicleSource(sourceID, id string) error {
-	ids, found, err := tx.readChronicleSource(sourceID)
+	root, found, err := tx.chronicleLinkRoot(sourceID)
 	if err != nil {
 		return err
 	}
 	if !found {
-		return ErrCorrupt
-	}
-	ids = removeString(ids, id)
-	if len(ids) == 0 {
-		return tx.deleteKnowledgeRecord(chronicleSourceNS, sourceID)
-	}
-	return tx.PutIndexRecord(chronicleSourceNS, sourceID, mustJSON(ids))
-}
-
-func (tx *Tx) removeChroniclesForSource(sourceID string) error {
-	ids, found, err := tx.readChronicleSource(sourceID)
-	if err != nil || !found {
-		return err
-	}
-	for _, id := range ids {
-		if err := tx.deleteChronicle(id); err != nil {
+		// Removing a legacy singleton needs no linked-list migration. This also
+		// keeps cleanup of a maximum-source legacy recap in one transaction.
+		ids, present, err := tx.readChronicleSource(sourceID)
+		if err != nil {
 			return err
 		}
+		if !present || len(ids) != 1 || ids[0] != id {
+			return ErrCorrupt
+		}
+		return tx.deleteKnowledgeRecord(chronicleSourceNS, sourceID)
+	}
+	return tx.unlinkChronicleLink(sourceID, id, root)
+}
+func (tx *Tx) removeChroniclesForSource(sourceID string) error {
+	complete, err := tx.removeChroniclesForSourceBatch(sourceID)
+	if err != nil {
+		return err
+	}
+	if !complete {
+		return ErrTransactionBudget
 	}
 	return nil
 }

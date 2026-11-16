@@ -1,24 +1,32 @@
 # ADR 0003: Add a private, bounded exact-search index
 
-Status: accepted — durable-memory-core Task 3 (2026-11-05).
+Status: accepted — durable-memory-core Task 3 (2026-11-05); amended for durable queued indexing (2026-11-12).
 
 ## Context
 
 Durable observations are sanitized and encrypted, but scanning them for every
-query becomes costly as the local store grows. The store has no authoritative
-observation timestamp, so time-window retrieval cannot be inferred safely.
-Task 2's bounded writer transaction is the atomic boundary for updating an
-observation, its index entries, and the authenticated manifest.
+query becomes costly as the local store grows. The initial store lacked an
+authoritative observation timestamp; authenticated capture metadata and a
+separate timeline have since supplied that capability. The bounded writer is
+still the atomic boundary for each primary-source receipt or derived-index
+batch and its authenticated manifest.
 
 ## Decision
 
 Use a private exact index. Normalize tokens by Go Unicode lowercase mapping,
 split on Unicode runes other than letters and digits, deduplicate, then sort by
 UTF-8 byte order. There is no locale-specific folding, stemming,
-transliteration, or Unicode normalization. At most 128 unique terms are
-indexed per observation; a larger term set rejects the whole observation
-transaction with `storage.Invalid`, rather than silently omitting searchable
-terms.
+transliteration, or Unicode normalization. The complete term set is indexed.
+The former 128-term document rejection was a capture-loss bug: it coupled a
+batch budget to source acceptance. `InlineObservationTerms` now names only an
+optimization threshold. It never limits document coverage.
+
+Primary source, authenticated time/size metadata, timeline/hour links and an
+encrypted ID-only indexing receipt commit first. Posting maintenance runs in
+separate transactions. Small sources attempt the existing inline tree update
+after that commit; failure leaves the receipt for repair and cannot undo the
+accepted source. Larger sources advance at most 64 terms per transaction.
+An always-on local worker resumes receipts independently of all AI settings.
 
 Term, app-filter, domain-filter, and reverse-link lookup keys are HMAC-SHA-256
 values with separate domain labels and the store's keyed identifier secret.
@@ -28,9 +36,16 @@ encrypted source-ID-order fences. Node contents, source IDs, child IDs, branch
 fences, and deferred sibling links are encrypted/authenticated. Node IDs are
 128-bit opaque values inside encrypted nodes; physical node records are
 addressed by keyed HMACs. Reverse links map an observation to every lookup key
-it references, so its postings can be removed transactionally. Observation
-writes/deletes, tree changes, reverse links, and the manifest share one
-`Store.Update` transaction.
+it references, so its postings can be removed completely. Small completed
+sources retain the bounded v4 reverse record. Large sources use a v5 reverse
+root with term cursor, total, erasure cursor and app/domain references. Bounded
+encrypted reverse pages enumerate every indexed term for deletion. Keyed,
+encrypted per-term membership proofs let a query score a large source without
+loading its whole vocabulary. Each batch publishes its postings, proof records,
+reverse page and cursor atomically with the manifest. Source existence is
+rechecked in every writer transaction; erasure cannot be undone by a late job.
+Large-source erasure drains reverse pages under the existing encrypted erasure
+journal/publication gate, then removes the source and final receipt atomically.
 
 Index format version 4 uses encrypted deferred right-sibling links for a
 non-root branch split. This avoids materializing/rebucketing a second full
@@ -43,10 +58,14 @@ The format-version mismatch causes versions 1 through 3 to be cleared and
 rebuilt before the store is exposed; there is no mixed-version query state.
 
 When opening an existing store without a completed-index marker, opening first
-removes any incomplete index, rebuilds it in bounded transactions, and commits
-the marker last. `OpenDurable` does not return the store until that succeeds.
-After a crash, the missing marker causes the next open to discard partial
-pages and repeat the rebuild; a partial index is never exposed as ready.
+removes any incompatible index, queues authenticated sources in bounded
+transactions, and commits the format marker last. Small sources are usually
+indexed before return; large-source receipts resume in the worker. Ordinary
+restart retains committed term batches and continues their cursors. A missing
+format marker still restarts format reconstruction. Format readiness is
+separate from complete coverage: exact pages and MCP expose `indexing_pending`,
+and native Search/Ask/Settings explain incomplete coverage. Pending empty
+results never assert that no source was saved.
 
 Queries use exact AND semantics, with canonical bounded app/domain equality
 filters. Each posting tree is traversed in rank-descending/source-ID-ascending
@@ -90,11 +109,15 @@ Leaf and packed-branch splits move a median split along the root-to-leaf path;
 they do not rebucket all siblings. The maximum tree depth is four and all node
 reads, rows, bytes, and mutations remain bounded. The declared write estimate
 is seven operations per affected posting tree plus 20 fixed observation,
-reverse-link, size-row, and manifest operations. With the maximum 128 unique
-text terms plus app and domain trees (130 trees), the estimate is 930
+reverse-link, size-row, and manifest operations. With the inline threshold of 128 unique
+terms plus app and domain trees (130 trees), the estimate is 930
 operations, leaving headroom under the physical writer's 1,024-operation cap.
-A transaction that reaches the physical operation/byte ceiling aborts
-atomically; it is never split into multiple commits for one observation. The
+Those estimates describe the optional small-source posting transaction,
+separate from source acceptance. A posting transaction that reaches the
+physical operation/byte ceiling aborts atomically and leaves work pending.
+Large sources intentionally use multiple resumable commits. The 64-term batch
+bound also reserves space for proof/page/cursor records; no physical cap was
+raised. The
 16 MiB limit is per physical transaction, not a global posting-store cap. No
 global posting-count or total-index-size cap is currently enforced; bounded
 page/value sizes and query/transaction budgets are not a global storage quota.
@@ -121,6 +144,10 @@ the operation used 9 charged writer operations and 102,020 transaction bytes.
 These are local synthetic fixture measurements, not portable latency targets.
 
 ## Scale benchmark
+
+The measurements below predate queued source acceptance and its additional
+transactions. They remain historical posting-tree baselines, not verified
+latency claims for the amended ingestion path.
 
 `internal/storage/durable/index_bench_test.go` builds 100,000- and 1,000,000-
 observation durable synthetic corpora only when explicitly opted in. The

@@ -174,11 +174,23 @@ func installQuickPanelBackdrop(window appkit.NSWindow) {
 // lower edges. The border layer is taller than the surface so its top edge is
 // clipped by the content layer, leaving the top flush with the display.
 func installQuickPanelHairline(parent objc.ID) objc.ID {
+	name := foundation.ToNSString("com.hazcod.blur.panel-hairline").ID
+	defer releaseNativeObject(name)
+	layers := objc.Send[objc.ID](parent, objc.RegisterName("sublayers"))
+	count := objc.Send[uint64](layers, objc.RegisterName("count"))
+	for index := uint64(0); index < min(count, 64); index++ {
+		layer := objc.Send[objc.ID](layers, objc.RegisterName("objectAtIndex:"), index)
+		layerName := objc.Send[objc.ID](layer, objc.RegisterName("name"))
+		if layerName != 0 && objc.Send[bool](layerName, objc.RegisterName("isEqualToString:"), name) {
+			return layer
+		}
+	}
 	bounds := objc.Send[nsRect](parent, objc.RegisterName("bounds"))
 	hairline := objc.Send[objc.ID](objc.ID(objc.GetClass("CALayer")), objc.RegisterName("layer"))
 	if hairline == 0 {
 		return 0
 	}
+	objc.Send[objc.ID](hairline, objc.RegisterName("setName:"), name)
 	objc.Send[objc.ID](hairline, objc.RegisterName("setFrame:"), nsRect{X: 0, Y: 0, Width: bounds.Width, Height: bounds.Height + quickPanelHairlineBleed})
 	objc.Send[objc.ID](hairline, objc.RegisterName("setAutoresizingMask:"), quickPanelHairlineAutoresize)
 	objc.Send[objc.ID](hairline, objc.RegisterName("setBorderWidth:"), float64(1))

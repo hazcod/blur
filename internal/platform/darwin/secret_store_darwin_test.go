@@ -271,3 +271,19 @@ func TestKeychainStatusClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestScopedSecretStoreUsesOnlyExplicitAcceptanceService(t *testing.T) {
+	const service = "sh.blur.acceptance.0123456789abcdef0123456789abcdef"
+	store, err := NewScopedSecretStore(service)
+	if err != nil || store.ServiceIdentity() != service {
+		t.Fatal("acceptance namespace fell back to the user's key service", store.ServiceIdentity(), err)
+	}
+	if NewSecretStore().ServiceIdentity() != keychainService {
+		t.Fatal("stable production key namespace changed")
+	}
+	for _, invalid := range []string{"", ".invalid", "invalid.", "invalid/name", "invalid..name"} {
+		if store, err := NewScopedSecretStore(invalid); err == nil || store != nil {
+			t.Fatal("invalid secret namespace accepted", invalid)
+		}
+	}
+}

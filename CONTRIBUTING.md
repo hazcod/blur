@@ -24,6 +24,27 @@ make vulncheck
 CI also runs `gofmt`, `golangci-lint` (`.github/golangci.yml`), and CodeQL. Please
 state the platforms and Go version you used for platform-sensitive changes.
 
+## Local macOS app
+
+Build the app used on this Mac with:
+
+```sh
+make macos-app-stable
+```
+
+This replaces `~/Downloads/Blur.app` with bundle identifier `com.hazcod.blur`.
+Keep using this path for local builds, including builds from worktrees. Do not
+create timestamped, renamed, acceptance, or alternate local app bundles.
+
+The build reuses the existing signing identity and checks that the staged app
+has the same designated requirement and exact signing certificate before
+replacement. If the existing certificate is unavailable, restore that identity;
+do not switch to ad-hoc signing, create a replacement certificate, alter trust,
+or reset Accessibility permissions. Those changes can cause macOS to request
+permission again. Direct-download builds are unsandboxed because macOS forbids
+cross-app Accessibility capture inside App Sandbox. Existing container memory
+and settings are reused in place. Building does not launch or restart the app.
+
 ## Rules
 
 - **cgo-free.** Shipped targets build with `CGO_ENABLED=0`. Do not add cgo or

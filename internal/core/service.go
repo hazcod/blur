@@ -148,7 +148,7 @@ func coherentReport(report platform.CapabilityReport) bool {
 }
 
 func newService(grants *localapi.GrantStore, store storage.EncryptedStore, reports []platform.CapabilityReport, ephemeral bool) (*Service, error) {
-	if grants == nil || store == nil || reflect.ValueOf(store).Kind() == reflect.Ptr && reflect.ValueOf(store).IsNil() || (!store.EncryptedAtRest() && !ephemeral) {
+	if grants == nil || store == nil || reflect.ValueOf(store).Kind() == reflect.Pointer && reflect.ValueOf(store).IsNil() || (!store.EncryptedAtRest() && !ephemeral) {
 		return nil, ErrInvalidService
 	}
 	if reports == nil {
@@ -286,7 +286,16 @@ func (s *Service) Ingest(ctx context.Context, o capture.SanitizedObservation, pr
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
-	return s.store.PutObservation(ctx, o)
+	err := s.store.PutObservation(ctx, o)
+	var storeErr *storage.StoreError
+	if errors.As(err, &storeErr) && storeErr.Code == storage.Duplicate {
+		if recorder, ok := s.store.(interface {
+			RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error
+		}); ok {
+			return recorder.RecordObservationSighting(ctx, o, time.Now())
+		}
+	}
+	return err
 }
 
 func (s *Service) Search(ctx context.Context, request search.Request, proof localapi.Proof) (search.Response, error) {

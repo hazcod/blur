@@ -5,14 +5,18 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
 
 const (
-	// MaxIndexedObservationTerms keeps each observation's atomic index update
-	// comfortably below the durable transaction's operation and byte ceilings.
-	MaxIndexedObservationTerms = 128
+	// InlineObservationTerms is the inline-index optimization threshold.
+	// Larger observations are fully indexed in resumable batches; this is
+	// never a document acceptance or total coverage limit.
+	InlineObservationTerms = 128
+	MaxScopeSourceIDs      = 65536
+	MaxExcludedApps        = 32
 )
 
 var (
@@ -37,25 +41,47 @@ type ExactQuery struct {
 	MaxRows        int
 	MaxBytes       int
 	MinTermMatches int
+	// PartialOnly excludes sources containing every requested term while
+	// preserving ranked matching for MinTermMatches. Ask uses it to retrieve
+	// candidates beyond a crowded strict-match prefix.
+	PartialOnly   bool
+	CapturedStart time.Time
+	CapturedEnd   time.Time
+	// ScopeSourceIDs additionally admit sources with a later activity sighting
+	// inside CapturedStart/End, even if the content was first saved earlier.
+	ScopeSourceIDs []string
+	ExcludeAppIDs  []string
 }
 
 // IndexHit identifies a source meeting the query's term threshold and filters.
 // Bytes is the encrypted index's authenticated estimate of its observation
 // payload; callers use it to enforce a read budget before decrypting the source.
 type IndexHit struct {
-	SourceID string
-	Score    int
-	Bytes    int
+	SourceID   string
+	Score      int
+	Bytes      int
+	CapturedAt time.Time
+	MatchStart int
+	MatchEnd   int
 }
 
 // ExactPage is a bounded prefix of exact matches. HasMore means the row or
 // byte budget stopped evaluation before the query's candidate set was done.
 type ExactPage struct {
-	Hits    []IndexHit
-	Rows    int
-	Nodes   int
-	Bytes   int
-	HasMore bool
+	Hits []IndexHit
+	// AlternateQueries contains short phrases generated while relevance-ranking
+	// Ask candidates; callers may use them for one bounded recovery search.
+	AlternateQueries []string
+	Rows             int
+	Nodes            int
+	Bytes            int
+	HasMore          bool
+	// IndexingPending means saved sources still have exact-index work queued.
+	// Matches remain useful, but absence and global ranking are provisional.
+	IndexingPending bool
+	// CoverageLimited means optional meaning retrieval could not run. Exact
+	// matches remain usable, but an empty page does not prove absence.
+	CoverageLimited bool
 }
 
 // ExactIndex is the optional durable retrieval capability. Engines prefer it

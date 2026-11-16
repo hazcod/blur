@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-const maxStreamFrameBytes = 8 << 20
-
 // streamConnFramer applies the same bounded length-prefixed protocol to any
 // deadline-capable byte-stream connection (Unix sockets and Windows pipes).
 type streamConnFramer struct {

@@ -21,9 +21,8 @@ const (
 	tombstoneNS         = "tombstones"
 	tombstoneLogID      = "log"
 	tombstoneEntryBytes = 8 + 1 + 32
-	// MaxTombstones bounds the persisted deletion log. When full, the oldest
-	// entries are dropped; a replica that never saw them can still resurrect
-	// those sources, which is the documented phase-one limit.
+	// MaxTombstones is the historical log/migration bound and the maximum
+	// compatibility snapshot. Permanent cutoffs and paged changes do not evict.
 	MaxTombstones = 16384
 	// AllSourcesTombstone is the SourceID of a "delete everything captured
 	// before At" tombstone.
@@ -47,48 +46,38 @@ func (s *Store) RecordTombstone(ctx context.Context, t Tombstone) error {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
 	return s.Update(ctx, func(tx *Tx) error {
-		encoded, found, err := tx.readIndexValue(tombstoneNS, tombstoneLogID, MaxTombstones*tombstoneEntryBytes+1)
-		if err != nil {
-			return err
-		}
-		var log []Tombstone
-		if found {
-			log, err = decodeTombstones(encoded)
-			clear(encoded)
-			if err != nil {
-				return err
-			}
-		}
-		for i, existing := range log {
-			if existing.SourceID != t.SourceID {
-				continue
-			}
-			if t.SourceID == AllSourcesTombstone && !existing.At.Equal(t.At) {
-				continue
-			}
-			if !t.At.After(existing.At) {
-				return nil
-			}
-			log = append(log[:i], log[i+1:]...) // later deletion of the same source replaces it
-			break
-		}
-		log = append(log, Tombstone{SourceID: t.SourceID, At: t.At.UTC()})
-		sortTombstones(log)
-		if len(log) > MaxTombstones {
-			log = log[len(log)-MaxTombstones:]
-		}
-		return tx.PutIndexRecord(tombstoneNS, tombstoneLogID, encodeTombstones(log))
+		tx.mu.Lock()
+		defer tx.mu.Unlock()
+		return tx.putDeletionCutoffLocked(t)
 	})
 }
 
 // Tombstones returns the deletion log ordered by time, then source ID.
 func (s *Store) Tombstones(ctx context.Context) ([]Tombstone, error) {
-	encoded, found, err := s.readIndexValue(ctx, tombstoneNS, tombstoneLogID, MaxTombstones*tombstoneEntryBytes+1)
-	if err != nil || !found {
-		return nil, err
+	latest := map[string]Tombstone{}
+	var after uint64
+	for {
+		page, err := s.DeletionChanges(ctx, after, MaxDeletionChangePage)
+		if err != nil {
+			return nil, err
+		}
+		for _, change := range page.Changes {
+			latest[change.SourceID] = change.Tombstone
+			if len(latest) > MaxTombstones {
+				return nil, &storage.StoreError{Code: storage.Incomplete}
+			}
+		}
+		if !page.HasMore {
+			break
+		}
+		after = page.Next
 	}
-	defer clear(encoded)
-	return decodeTombstones(encoded)
+	log := make([]Tombstone, 0, len(latest))
+	for _, t := range latest {
+		log = append(log, t)
+	}
+	sortTombstones(log)
+	return log, nil
 }
 
 // TombstoneCovers reports whether log deletes a source with the given ID and
@@ -335,6 +324,49 @@ func decodeImportedShard(encoded []byte) ([][32]byte, error) {
 		copy(ids[i][:], encoded[i*32:])
 	}
 	return ids, nil
+}
+
+// Origin is committed with admission. A later local recapture clears a stale
+// imported mark so other devices can receive that new post-deletion capture.
+func (tx *Tx) setObservationOriginLocked(id string, imported bool) error {
+	shard := importedShard(id)
+	b, found, err := tx.readIndexValueLocked(importedNS, shard, maxImportedPerShard*32)
+	if err != nil {
+		return err
+	}
+	if !found && !imported {
+		return nil
+	}
+	ids, err := decodeImportedShard(b)
+	clear(b)
+	if err != nil {
+		return err
+	}
+	raw, _ := hex.DecodeString(id)
+	defer clear(raw)
+	var key [32]byte
+	copy(key[:], raw)
+	kept := make([][32]byte, 0, len(ids)+1)
+	for _, item := range ids {
+		if item != key {
+			kept = append(kept, item)
+		}
+	}
+	if imported {
+		kept = append(kept, key)
+	}
+	if len(kept) == len(ids) && !imported {
+		return nil
+	}
+	if len(kept) > maxImportedPerShard {
+		kept = kept[len(kept)-maxImportedPerShard:]
+	}
+	out := make([]byte, 0, len(kept)*32)
+	for _, item := range kept {
+		out = append(out, item[:]...)
+	}
+	defer clear(out)
+	return tx.putIndexValueLocked(importedNS, shard, out)
 }
 
 // MarkImported remembers content IDs that were imported from another device.

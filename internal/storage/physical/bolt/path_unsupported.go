@@ -4,8 +4,10 @@ package bolt
 
 import "os"
 
-func openSecureDirectory(string) (secureDirectory, error) { return nil, ErrUnavailable }
-func createPrivateDirectory(string) error                 { return ErrUnavailable }
+func openSecureDirectory(string) (secureDirectory, error)     { return nil, ErrUnavailable }
+func createPrivateDirectory(string) error                     { return ErrUnavailable }
+func openDirectoryPath(string, bool) (secureDirectory, error) { return nil, ErrUnavailable }
+func validatePrivateFile(*os.File) error                      { return ErrUnavailable }
 
 type unavailableDirectory struct{}
 

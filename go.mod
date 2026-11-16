@@ -4,7 +4,9 @@ go 1.27.3
 
 require (
 	github.com/Microsoft/go-winio v0.6.4
+	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/ebitengine/purego v0.11.3
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/godbus/dbus/v5 v5.2.4
 	github.com/goexlib/cgo v0.1.2
 	github.com/golang-gui/goui v0.7.0
@@ -26,7 +28,7 @@ require (
 	github.com/xuges/gothread v0.0.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/image v0.45.0 // indirect
-	golang.org/x/oauth2 v0.35.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect

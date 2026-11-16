@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestPackagePortableWindowsArchiveContainsAppAndNotices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer archive.Close()
+	defer func(close func() error) { _ = close() }(archive.Close)
 	want := map[string]string{
 		"blur-windows-amd64/Blur.exe":     "binary fixture",
 		"blur-windows-amd64/blur-mcp.exe": "mcp fixture",
@@ -62,12 +63,12 @@ func TestPackagePortableLinuxArchiveIncludesLauncherAndArtwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer func(close func() error) { _ = close() }(file.Close)
 	gz, err := gzip.NewReader(file)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer gz.Close()
+	defer func(close func() error) { _ = close() }(gz.Close)
 	archive := tar.NewReader(gz)
 	entries := map[string]string{}
 	modes := map[string]int64{}
@@ -106,7 +107,7 @@ func TestPackagePortableLinuxArchiveIncludesLauncherAndArtwork(t *testing.T) {
 func TestPackagePortableRejectsUnsupportedTargetsAndSymlinkBinary(t *testing.T) {
 	root, binary := packageFixture(t)
 	output := filepath.Join(t.TempDir(), "blur.zip")
-	for _, target := range [][2]string{{"windows", "arm64"}, {"linux", "arm64"}, {"windows", "386"}, {"linux", "386"}} {
+	for _, target := range [][2]string{{"windows", "arm64"}, {"windows", "386"}, {"linux", "386"}} {
 		suffix := ".zip"
 		if target[0] == "linux" {
 			suffix = ".tar.gz"
@@ -184,7 +185,7 @@ func TestPackagePortableWritesDeterministicArchives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o644 {
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o644 {
 		t.Fatalf("portable archive permissions = %#o, want 0644 for distribution", got)
 	}
 }

@@ -29,7 +29,7 @@ const (
 	secretMaxBytes         = 1 << 20
 	secretMaxMatches       = 64
 	secretOperationTimeout = 5 * time.Second
-	secretDHAlgorithm      = "dh-ietf1024-sha256-aes128-cbc-pkcs7"
+	secretDHAlgorithm      = "dh-ietf1024-sha256-aes128-cbc-pkcs7" // #nosec G101 -- Public Secret Service algorithm identifier, not a credential.
 	secretDHPrimeHex       = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF"
 )
 
@@ -157,7 +157,7 @@ func validSecretName(name string) bool {
 		return false
 	}
 	for _, r := range name {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
 			return false
 		}
 	}
@@ -184,7 +184,7 @@ func (b secretServiceBackend) capability(ctx context.Context) (platform.Capabili
 	if err != nil {
 		return report, ctxOrSecretError(ctx, err)
 	}
-	defer conn.Close()
+	defer func(close func() error) { _ = close() }(conn.Close)
 	var owns bool
 	err = conn.Object("org.freedesktop.DBus", "/org/freedesktop/DBus").CallWithContext(ctx, "org.freedesktop.DBus.NameHasOwner", 0, secretBusName).Store(&owns)
 	if err != nil {
@@ -201,7 +201,7 @@ func (b secretServiceBackend) get(ctx context.Context, name string, maxBytes int
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func(close func() error) { _ = close() }(conn.Close)
 	item, err := findSecretItem(ctx, service, name)
 	if err != nil {
 		return nil, err
@@ -210,7 +210,7 @@ func (b secretServiceBackend) get(ctx context.Context, name string, maxBytes int
 	if err != nil {
 		return nil, err
 	}
-	defer session.close(service, ctx)
+	defer session.close(ctx, service)
 	var secret secretWire
 	if err := conn.Object(secretBusName, item).CallWithContext(ctx, secretItemIface+".GetSecret", 0, session.path).Store(&secret); err != nil {
 		clear(secret.Value)
@@ -237,7 +237,7 @@ func (b secretServiceBackend) put(ctx context.Context, name string, value []byte
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func(close func() error) { _ = close() }(conn.Close)
 	items, locked, err := searchSecretItems(ctx, service, name)
 	if err != nil {
 		return err
@@ -250,7 +250,7 @@ func (b secretServiceBackend) put(ctx context.Context, name string, value []byte
 	if err != nil {
 		return err
 	}
-	defer session.close(service, ctx)
+	defer session.close(ctx, service)
 	parameters, ciphertext, err := encryptSecretTransfer(session.key, value)
 	if err != nil {
 		return secretError(platform.SecretUnavailable)
@@ -288,7 +288,7 @@ func (b secretServiceBackend) delete(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func(close func() error) { _ = close() }(conn.Close)
 	items, locked, err := searchSecretItems(ctx, service, name)
 	if err != nil {
 		return err
@@ -365,7 +365,7 @@ func searchSecretItems(ctx context.Context, service dbus.BusObject, name string)
 }
 
 func secretAttributes(name string) map[string]string {
-	return map[string]string{secretAppAttr: "sh.blur.desktop", secretNameAttr: name}
+	return map[string]string{secretAppAttr: "sh.blur.desktop", secretNameAttr: name} // #nosec G101 -- Public Secret Service lookup attributes, not credential material.
 }
 
 func openEncryptedSession(ctx context.Context, service dbus.BusObject) (*encryptedSession, error) {
@@ -427,7 +427,7 @@ func deriveSecretSessionKey(private, peerPublic, prime *big.Int) ([]byte, error)
 	return hkdf.Key(sha256.New, sharedBytes, nil, "", aes.BlockSize)
 }
 
-func (s *encryptedSession) close(service dbus.BusObject, ctx context.Context) {
+func (s *encryptedSession) close(ctx context.Context, service dbus.BusObject) {
 	if s == nil {
 		return
 	}

@@ -15,20 +15,84 @@ import (
 )
 
 const (
-	rpcProtocolVersion        = 2
-	rpcChallengeBytes         = 32
-	maxRPCFrameBytes          = 32 << 10
-	maxRPCParamsBytes         = 24 << 10
-	rpcTimeout                = 3 * time.Second
-	RPCSearchMemory           = "search_memory"
-	RPCGetToday               = "get_today"
-	MaxRPCSearchResponseBytes = 24 << 10
+	rpcProtocolVersion          = 2
+	rpcChallengeBytes           = 32
+	maxRPCFrameBytes            = 32 << 10
+	maxRPCParamsBytes           = 24 << 10
+	rpcTimeout                  = 3 * time.Second
+	RPCSearchMemory             = "search_memory"
+	RPCGetToday                 = "get_today"
+	RPCGetSnapshots             = "get_snapshots"
+	RPCGetChronicle             = "get_chronicle"
+	RPCListChronicles           = "list_chronicles"
+	RPCGetWorkingMemory         = "get_working_memory"
+	RPCGetRecentActivity        = "get_recent_activity"
+	RPCSearchWiki               = "search_wiki"
+	RPCGetWikiPage              = "get_wiki_page"
+	RPCListTasks                = "list_tasks"
+	MaxRPCSearchResponseBytes   = 24 << 10
+	MaxRPCSnapshotResponseBytes = 24 << 10
 )
 
 // SearchMemoryParams is the bounded request shape for local exact search.
 type SearchMemoryParams struct {
 	Query string `json:"query"`
 	Limit int    `json:"limit"`
+}
+
+// GetSnapshotsParams reads bounded UTF-8 chunks from source IDs returned by
+// search_memory. Offsets are byte offsets and must fall on UTF-8 boundaries.
+type GetSnapshotsParams struct {
+	SourceIDs         []string       `json:"source_ids"`
+	Offsets           map[string]int `json:"offsets,omitempty"`
+	MaxBytesPerSource int            `json:"max_bytes_per_source"`
+}
+
+// GetChronicleParams reads one source-linked hourly recap by its stable ID.
+type GetChronicleParams struct {
+	HourID string `json:"hour_id"`
+}
+
+// ListChroniclesParams reads a bounded, source-linked page of hourly recaps
+// from a half-open time range. After is the last hour ID returned previously.
+type ListChroniclesParams struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+	After string    `json:"after,omitempty"`
+	Limit int       `json:"limit"`
+}
+
+// GetWorkingMemoryParams reads a small, newest-first set of captures from the
+// last Hours of activity. Limit is the maximum number of source excerpts.
+type GetWorkingMemoryParams struct {
+	Hours int `json:"hours"`
+	Limit int `json:"limit"`
+}
+
+// GetRecentActivityParams reads a bounded local-calendar activity window.
+type GetRecentActivityParams struct {
+	DaysBack int `json:"days_back"`
+	Limit    int `json:"limit"`
+}
+
+// SearchWikiParams searches the source-backed Library directory locally.
+type SearchWikiParams struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit"`
+}
+
+// GetWikiPageParams reads a bounded page of one Library subject's details.
+type GetWikiPageParams struct {
+	ID     string `json:"id"`
+	Offset int    `json:"offset"`
+	Limit  int    `json:"limit"`
+}
+
+// ListTasksParams reads one bounded page of explicit task state.
+type ListTasksParams struct {
+	State string `json:"state"`
+	Limit int    `json:"limit"`
+	After string `json:"after,omitempty"`
 }
 
 var (
@@ -128,7 +192,7 @@ func (c *RPCClient) Call(ctx context.Context, method string, params json.RawMess
 	if err != nil {
 		return nil, rpcTransportError(requestCtx, err)
 	}
-	defer conn.Close()
+	defer func(close func() error) { _ = close() }(conn.Close)
 	challenge, err := conn.Receive(requestCtx)
 	if err != nil || len(challenge) != rpcChallengeBytes || allZero(challenge) {
 		clear(challenge)
@@ -185,7 +249,7 @@ func ServeRPC(ctx context.Context, transport LocalTransport, endpoint EndpointDe
 	if err != nil {
 		return ErrRPCUnavailable
 	}
-	defer listener.Close()
+	defer func(close func() error) { _ = close() }(listener.Close)
 	for {
 		conn, err := listener.Accept(ctx)
 		if ctx.Err() != nil {
@@ -314,7 +378,7 @@ func validRPCObject(value []byte) bool {
 }
 
 func validRPCMethod(method string) bool {
-	return method == RPCSearchMemory || method == RPCGetToday
+	return method == RPCSearchMemory || method == RPCGetToday || method == RPCGetSnapshots || method == RPCGetChronicle || method == RPCListChronicles || method == RPCGetWorkingMemory || method == RPCGetRecentActivity || method == RPCSearchWiki || method == RPCGetWikiPage || method == RPCListTasks
 }
 
 func validRPCID(id string) bool {
@@ -323,7 +387,7 @@ func validRPCID(id string) bool {
 	}
 	for i := range id {
 		c := id[i]
-		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
 			return false
 		}
 	}

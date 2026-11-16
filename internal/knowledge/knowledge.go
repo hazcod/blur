@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -19,6 +20,8 @@ const (
 	MaxTextBytes   = 4096
 	MaxEntityBytes = 1 << 20
 )
+
+const PossibleOpenItemPrefix = "Possible open item (inferred, not confirmed): "
 
 type Kind string
 
@@ -50,10 +53,11 @@ type Source struct {
 }
 
 type Fact struct {
-	ID      string   `json:"id"`
-	Text    string   `json:"text"`
-	State   State    `json:"state"`
-	Sources []Source `json:"sources"`
+	ID         string   `json:"id"`
+	Text       string   `json:"text"`
+	State      State    `json:"state"`
+	Sources    []Source `json:"sources"`
+	Supersedes []string `json:"supersedes,omitempty"`
 }
 
 type OpenLoop struct {
@@ -76,6 +80,17 @@ type Entity struct {
 	RelatedIDs        []string   `json:"related_ids,omitempty"`
 	ActivitySourceIDs []string   `json:"activity_source_ids,omitempty"`
 	MergedInto        string     `json:"merged_into,omitempty"`
+	Inference         *Inference `json:"inference,omitempty"`
+}
+
+// Inference identifies a group of source-backed mentions in one context.
+// Equal names in different contexts do not assert the same real identity.
+type Inference struct {
+	AppID  string `json:"app_id,omitempty"`
+	Domain string `json:"domain,omitempty"`
+	// SourceTime is hydrated from saved evidence for display only. It never
+	// changes the stored inference context or its source identifiers.
+	SourceTime time.Time `json:"-"`
 }
 
 type Page struct {
@@ -90,7 +105,7 @@ func validOpaqueID(s string) bool {
 	}
 	for i := range s {
 		c := s[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' {
 			return false
 		}
 	}
@@ -103,7 +118,7 @@ func validSourceID(s string) bool {
 	}
 	for i := range s {
 		c := s[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -148,6 +163,9 @@ func (e Entity) Validate() error {
 	if !validOpaqueID(e.ID) || !validKind(e.Kind) || !validText(e.Name, MaxTextBytes) || !validState(e.State) {
 		return ErrInvalid
 	}
+	if e.Inference != nil && (len(e.Inference.AppID) > 128 || len(e.Inference.Domain) > 253 || !utf8.ValidString(e.Inference.AppID) || !utf8.ValidString(e.Inference.Domain) || strings.ContainsAny(e.Inference.AppID+e.Inference.Domain, "\x00\r\n")) {
+		return ErrInvalid
+	}
 	if len(e.Aliases) > MaxAliases || len(e.Facts) > MaxFacts || len(e.OpenLoops) > MaxFacts || len(e.RelatedIDs) > MaxEntities || len(e.ActivitySourceIDs) > MaxFacts {
 		return ErrInvalid
 	}
@@ -181,10 +199,17 @@ func (e Entity) Validate() error {
 	}
 	seenIDs = map[string]bool{}
 	for _, fact := range e.Facts {
-		if !validOpaqueID(fact.ID) || seenIDs[fact.ID] || !validText(fact.Text, MaxTextBytes) || !validState(fact.State) || fact.State == Merged || !validSources(fact.Sources) {
+		if !validOpaqueID(fact.ID) || seenIDs[fact.ID] || !validText(fact.Text, MaxTextBytes) || !validState(fact.State) || fact.State == Merged || !validSources(fact.Sources) || len(fact.Supersedes) > 64 {
 			return ErrInvalid
 		}
 		seenIDs[fact.ID] = true
+		superseded := map[string]bool{}
+		for _, sourceID := range fact.Supersedes {
+			if !validSourceID(sourceID) || superseded[sourceID] {
+				return ErrInvalid
+			}
+			superseded[sourceID] = true
+		}
 	}
 	for _, loop := range e.OpenLoops {
 		if !validOpaqueID(loop.ID) || seenIDs[loop.ID] || !validText(loop.Text, MaxTextBytes) || !validState(loop.State) || loop.State == Merged || !validSources(loop.Sources) {
@@ -215,12 +240,17 @@ func NormalizeExact(value string) string {
 }
 
 func Clone(e Entity) Entity {
+	if e.Inference != nil {
+		context := *e.Inference
+		e.Inference = &context
+	}
 	e.Aliases = append([]string(nil), e.Aliases...)
 	e.RelatedIDs = append([]string(nil), e.RelatedIDs...)
 	e.ActivitySourceIDs = append([]string(nil), e.ActivitySourceIDs...)
 	e.Facts = append([]Fact(nil), e.Facts...)
 	for i := range e.Facts {
 		e.Facts[i].Sources = append([]Source(nil), e.Facts[i].Sources...)
+		e.Facts[i].Supersedes = append([]string(nil), e.Facts[i].Supersedes...)
 	}
 	e.OpenLoops = append([]OpenLoop(nil), e.OpenLoops...)
 	for i := range e.OpenLoops {

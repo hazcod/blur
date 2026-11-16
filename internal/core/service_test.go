@@ -52,6 +52,24 @@ func sample(t *testing.T) capture.SanitizedObservation {
 	return o
 }
 
+func TestFreshAuthenticatedIngestRetainsLaterVisit(t *testing.T) {
+	svc, store, _, grant := fixture(t, localapi.ScopeCaptureIngest)
+	ctx := context.Background()
+	o := sample(t)
+	first := time.Now().Add(-48 * time.Hour)
+	if err := store.PutObservationAt(ctx, o, first); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(-time.Second)
+	if err := svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
+		t.Fatalf("fresh authenticated revisit rejected: %v", err)
+	}
+	page, err := store.ListObservationWindow(ctx, storage.ObservationWindowRequest{Start: start, End: time.Now().Add(time.Second), Limit: 5, MaxBytes: storage.MaxObservationPageBytes})
+	if err != nil || len(page.Observations) != 1 {
+		t.Fatalf("authenticated current visit was lost: %+v %v", page, err)
+	}
+}
+
 func TestIngestRequiresOneUseExactProof(t *testing.T) {
 	// Catches writes before authorization, wrong scope, or replay acceptance.
 	svc, store, _, grant := fixture(t, localapi.ScopeCaptureIngest, localapi.ScopeUIRead)

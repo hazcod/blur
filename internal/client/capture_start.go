@@ -51,7 +51,7 @@ func startCaptureOnLaunch(ctx context.Context, controller *ingest.Controller, en
 }
 
 func (d *desktop) startCaptureOnLaunch() {
-	if d == nil || d.app == nil || d.capture == nil || !d.preferences.CaptureEnabled || d.capture.Running() || d.captureStarting {
+	if d == nil || d.app == nil || d.capture == nil || !d.preferences.CaptureEnabled || d.capturePauseUnsaved || d.capture.Running() || d.captureStarting {
 		return
 	}
 	d.captureStarting = true
@@ -128,7 +128,7 @@ func (d *desktop) noteCaptureStarted() {
 // exponential backoff; an explicit global pause or in-progress privacy action
 // always suppresses recovery.
 func (d *desktop) scheduleCaptureRecovery() {
-	if d == nil || d.app == nil || d.capture == nil || !d.preferences.CaptureEnabled ||
+	if d == nil || d.app == nil || d.capture == nil || !d.preferences.CaptureEnabled || d.capturePauseUnsaved ||
 		d.loading || d.captureStarting || d.capture.Running() || d.captureRecoveryScheduled || d.setupRequired {
 		return
 	}
@@ -147,7 +147,7 @@ func (d *desktop) scheduleCaptureRecovery() {
 	slog.Warn("capture worker recovery scheduled", "delay_seconds", int(delay.Seconds()), "attempt", int(d.captureRecoveryAttempts))
 	d.app.TimeoutFunc(delay, func() {
 		d.captureRecoveryScheduled = false
-		if !d.preferences.CaptureEnabled || d.loading || d.captureStarting || d.capture.Running() {
+		if !d.preferences.CaptureEnabled || d.capturePauseUnsaved || d.loading || d.captureStarting || d.capture.Running() {
 			return
 		}
 		d.startCaptureOnLaunch()
@@ -158,17 +158,20 @@ func captureSetupRequired(report platform.CapabilityReport, running bool) bool {
 	return !running && report.State == platform.PermissionRequired
 }
 
-func desktopWindowOnActivation(dashboardOpen bool) string {
+func desktopWindowOnActivation(dashboardOpen, quickOpen bool) string {
+	if quickOpen {
+		return "quick"
+	}
 	if dashboardOpen {
 		return "main"
 	}
-	return "quick"
+	return ""
 }
 
-func reopenDesktopOnActivation(dashboardOpen bool, show func(string) error, recheck func()) error {
+func reopenDesktopOnActivation(dashboardOpen, quickOpen bool, show func(string) error, recheck func()) error {
 	var err error
-	if show != nil {
-		err = show(desktopWindowOnActivation(dashboardOpen))
+	if id := desktopWindowOnActivation(dashboardOpen, quickOpen); id != "" && show != nil {
+		err = show(id)
 	}
 	if recheck != nil {
 		recheck()
@@ -232,7 +235,17 @@ func (d *desktop) watchDesktopReactivation(done <-chan struct{}) {
 					return
 				}
 				d.app.Post(func() {
-					if err := reopenDesktopOnActivation(d.dashboardOpen, func(id string) error {
+					if d.meetingUI.overlayOpen && !d.quickActivationPreferred() {
+						d.presentMeetingOverlay(0)
+						return
+					}
+					quickOpen := d.quickActivationPreferred()
+					slog.Debug("Blur self activation", "window", desktopWindowOnActivation(d.dashboardOpen, quickOpen))
+					if err := reopenDesktopOnActivation(d.dashboardOpen, quickOpen, func(id string) error {
+						if id == "quick" {
+							d.openQuickPanel()
+							return nil
+						}
 						window := d.app.FindWindow(id)
 						if window == nil {
 							return nil

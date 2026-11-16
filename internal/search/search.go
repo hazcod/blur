@@ -76,11 +76,12 @@ type Result struct {
 }
 
 type Response struct {
-	Results      []Result `json:"results"`
-	Scanned      int      `json:"scanned"`
-	ScannedBytes int      `json:"scanned_bytes"`
-	Truncated    bool     `json:"truncated"`
-	Omitted      int      `json:"omitted"`
+	Results         []Result `json:"results"`
+	Scanned         int      `json:"scanned"`
+	ScannedBytes    int      `json:"scanned_bytes"`
+	Truncated       bool     `json:"truncated"`
+	Omitted         int      `json:"omitted"`
+	IndexingPending bool     `json:"indexing_pending,omitempty"`
 }
 
 type Engine struct{ store storage.EncryptedStore }
@@ -263,17 +264,28 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 		})
 		response := Response{
 			Results: make([]Result, 0, min(request.ResultLimit, len(page.Hits))),
-			Scanned: page.Rows, ScannedBytes: page.Bytes, Truncated: page.HasMore,
+			Scanned: page.Rows, ScannedBytes: page.Bytes, Truncated: page.HasMore, IndexingPending: page.IndexingPending,
 		}
 		for _, hit := range page.Hits {
 			if err := ctx.Err(); err != nil {
 				return Response{}, err
 			}
+			if current, ok := e.store.(interface {
+				IsCurrentNoteSource(context.Context, string) (bool, error)
+			}); ok {
+				live, err := current.IsCurrentNoteSource(ctx, hit.SourceID)
+				if err != nil {
+					return Response{}, err
+				}
+				if !live {
+					continue
+				}
+			}
 			if hit.Bytes > request.EffectiveIndexBytes()-response.ScannedBytes {
 				response.Truncated = true
 				break
 			}
-			observation, found, err := e.store.GetObservation(ctx, hit.SourceID)
+			observation, found, err := storage.ReadSourceEvidence(ctx, e.store, hit.SourceID)
 			if err != nil {
 				return Response{}, err
 			}
@@ -284,7 +296,16 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 				return Response{}, ErrIndexCorrupt
 			}
 			response.ScannedBytes += hit.Bytes
-			response.Results = append(response.Results, Result{SourceID: hit.SourceID, AppID: appID, Domain: domain, Score: hit.Score, Snippet: snippet(text, request.SnippetBytes), ProvenanceKind: "raw_sanitized_observation"})
+			passageStart, passageEnd := MatchPassage(text, wanted, request.SnippetBytes)
+			excerpt := text
+			if passageEnd > passageStart {
+				excerpt = text[passageStart:passageEnd]
+			}
+			provenance := "raw_sanitized_observation"
+			if _, multipart := observation.Provenance(); multipart {
+				provenance = "raw_sanitized_capture_part"
+			}
+			response.Results = append(response.Results, Result{SourceID: hit.SourceID, AppID: appID, Domain: domain, Score: hit.Score, Snippet: snippet(excerpt, request.SnippetBytes), ProvenanceKind: provenance})
 			if len(response.Results) == request.ResultLimit {
 				break
 			}
@@ -342,6 +363,17 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 			response.ScannedBytes += observationBytes
 			sourceID := o.ContentID()
 			after = sourceID
+			if current, ok := e.store.(interface {
+				IsCurrentNoteSource(context.Context, string) (bool, error)
+			}); ok {
+				live, err := current.IsCurrentNoteSource(ctx, sourceID)
+				if err != nil {
+					return Response{}, err
+				}
+				if !live {
+					continue
+				}
+			}
 			if appFilter != "" && appID != appFilter || domainFilter != "" && domain != domainFilter {
 				continue
 			}
@@ -401,7 +433,7 @@ func validSourceID(id string) bool {
 		return false
 	}
 	for i := range id {
-		if !(id[i] >= '0' && id[i] <= '9' || id[i] >= 'a' && id[i] <= 'f') {
+		if (id[i] < '0' || id[i] > '9') && (id[i] < 'a' || id[i] > 'f') {
 			return false
 		}
 	}

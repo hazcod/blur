@@ -46,7 +46,7 @@ func TestActivitySegmentsAreEncryptedImmutableAndReopenable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	got, err := store.GetActivitySegments(ctx, []string{"absent", segment.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func TestListActivitySegmentsForDateUsesStableBoundedPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	for i := range 65 {
 		id := fmt.Sprintf("seg-%03d", i)
@@ -90,7 +90,7 @@ func TestListActivitySegmentsForDatesUsesOneBoundedRangeRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	for i := range 65 {
 		start := time.Date(2026, 11, 4+i/64, 23, 0, 0, 0, time.UTC).Add(time.Duration(i%64) * time.Minute)
 		segment := activity.Segment{ID: fmt.Sprintf("range-%03d", i), WallStart: start, WallEnd: start.Add(time.Minute), Duration: int64(time.Minute), AppID: "editor"}
@@ -113,7 +113,7 @@ func TestDeleteObservationRecordRemovesLinkedActivitySegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	source := repeatHex("a")
 	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	segment := activity.Segment{ID: "activity-linked", WallStart: start, WallEnd: start.Add(time.Minute), Duration: int64(time.Minute), AppID: "editor", SourceIDs: []string{source}}
@@ -169,7 +169,7 @@ func TestDeleteObservationRecordFailsClosedWithoutProjectionIndexMarker(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	observation := schemaMigrationFixtureObservation(t)
 	if err := store.PutObservation(ctx, observation); err != nil {
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestActivitySourceSegmentCapPersistsExtraSegmentsWithoutSourceLink(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	const total = maxSegmentsPerSource + 6
 	for i := 0; i < total; i++ {
@@ -267,7 +267,7 @@ func TestEngineAlternatingStaticContentsNeverFailsActivityWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	engine := activity.New(activity.Config{MaxGap: 10 * time.Minute, RingSize: 16})
 	wall := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	var mono int64

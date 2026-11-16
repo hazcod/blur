@@ -27,6 +27,7 @@ func (a *LocalApp) CaptureController(source *platformlinux.Adapter) *ingest.Cont
 		if err != nil {
 			return nil, err
 		}
+		service.SetHealthNotify(a.Client.setCaptureHealth)
 		return service.Run, nil
 	})
 }

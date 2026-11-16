@@ -170,7 +170,7 @@ func createPrivateDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
+	defer func(close func() error) { _ = close() }(parent.Close)
 	created := false
 	if err := unix.Mkdirat(int(parent.file.Fd()), name, 0o700); err == nil {
 		created = true
@@ -184,7 +184,7 @@ func createPrivateDirectory(path string) error {
 		}
 		return ErrUnavailable
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	if created {
 		if err := unix.Fchmod(fd, 0o700); err != nil {
 			return ErrUnavailable

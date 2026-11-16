@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -114,7 +115,7 @@ func TestRunPersistsOnlySanitizedCurrentObservationsAndCoalescesDuplicates(t *te
 	}
 }
 
-func TestCaptureChangeNotifiesOnlyAfterNewObservationIsPersisted(t *testing.T) {
+func TestCaptureChangeNotifiesAfterSourceOrVisitIsPersisted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	source := &eventSource{probe: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}, events: make(chan platform.CaptureEvent, 1)}
@@ -158,8 +159,8 @@ func TestCaptureChangeNotifiesOnlyAfterNewObservationIsPersisted(t *testing.T) {
 	waitFor(t, func() bool { return service.Stats().Duplicates == 1 })
 	select {
 	case <-changes:
-		t.Fatal("duplicate observation emitted a change notification")
-	default:
+	case <-time.After(time.Second):
+		t.Fatal("persisted visit did not refresh readers")
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -206,7 +207,7 @@ func TestCaptureNotificationReceivesOnlyPersistedSanitizedObservationAndTimestam
 		t.Fatal("missing capture timestamp")
 	}
 	cancel()
-	<-done
+	<-done //nolint:errcheck // Completion after cancellation is asserted by the test.
 }
 
 func TestNewRejectsUnencryptedSink(t *testing.T) {
@@ -515,6 +516,26 @@ func TestFlushPendingActivityDropsPermanentlyRejectedSegmentWithoutBlockingQueue
 		if !strings.Contains(logs.String(), "dropped=1") || strings.Contains(logs.String(), "src-a") {
 			t.Fatalf("%s: unexpected log %q", code, logs.String())
 		}
+	}
+}
+
+func TestCaptureSkipLogsTypedReadStageWithoutBackendText(t *testing.T) {
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	private := fmt.Errorf("private window title: %w", capture.NativeReadError(capture.ReadStageText, -25204))
+	capturer := captureFunc(func(context.Context) (capture.SanitizedObservation, error) {
+		return capture.SanitizedObservation{}, errors.Join(&capture.CaptureError{Code: capture.ReadFailed}, private)
+	})
+	service, err := newService(&eventSource{}, capturer, &recordingSink{}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.captureCurrent(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := logs.String()
+	if !strings.Contains(got, "read_stage=text") || !strings.Contains(got, "ax_status=-25204") || strings.Contains(got, "private window title") {
+		t.Fatalf("capture diagnostics omitted the safe read issue or leaked backend text: %q", got)
 	}
 }
 

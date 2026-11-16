@@ -34,5 +34,5 @@ func versionString() string {
 }
 
 func printVersion(w io.Writer) {
-	fmt.Fprintln(w, versionString())
+	_, _ = fmt.Fprintln(w, versionString())
 }

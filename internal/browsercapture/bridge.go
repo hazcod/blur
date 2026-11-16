@@ -15,6 +15,7 @@ import (
 
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/localapi"
+	"github.com/hazcod/blur/internal/storage"
 )
 
 const MaxWireBytes = 288 << 10
@@ -30,6 +31,11 @@ type ObservationSink interface {
 	PutObservation(context.Context, capture.SanitizedObservation) error
 }
 
+// CommitPolicy validates the latest user scope and invokes write while that
+// policy is stable. Implementations must honor ctx and must not retain write.
+// A rejection must return without invoking write.
+type CommitPolicy func(context.Context, capture.SanitizedObservation, func(context.Context) error) error
+
 type Receiver struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -39,16 +45,23 @@ type Receiver struct {
 	clock    func() time.Time
 	paused   bool
 	inFlight int
+	policy   CommitPolicy
 }
 
-func NewReceiver(grants *localapi.GrantStore, sink ObservationSink, enabled func() bool, clock func() time.Time) (*Receiver, error) {
+func NewReceiver(grants *localapi.GrantStore, sink ObservationSink, enabled func() bool, clock func() time.Time, policies ...CommitPolicy) (*Receiver, error) {
 	if grants == nil || sink == nil || !sink.EncryptedAtRest() || enabled == nil {
 		return nil, errInvalidFrame
 	}
 	if clock == nil {
 		clock = time.Now
 	}
+	if len(policies) > 1 || (len(policies) == 1 && policies[0] == nil) {
+		return nil, errInvalidFrame
+	}
 	r := &Receiver{grants: grants, sink: sink, enabled: enabled, clock: clock}
+	if len(policies) == 1 {
+		r.policy = policies[0]
+	}
 	r.cond = sync.NewCond(&r.mu)
 	return r, nil
 }
@@ -114,11 +127,48 @@ func (r *Receiver) Accept(ctx context.Context, wire []byte) error {
 	if err := r.grants.Authorize(proof, digest); err != nil {
 		return errInvalidFrame
 	}
-	observation, err := Sanitize(page, true, r.clock())
+	observedAt := r.clock()
+	observation, err := Sanitize(page, true, observedAt)
 	if err != nil {
 		return ErrRejected
 	}
-	return r.sink.PutObservation(ctx, observation)
+	write := func(writeCtx context.Context) error { return r.persist(writeCtx, observation, observedAt) }
+	if r.policy != nil {
+		return r.policy(ctx, observation, write)
+	}
+	return write(ctx)
+}
+
+func (r *Receiver) persist(ctx context.Context, observation capture.SanitizedObservation, observedAt time.Time) error {
+	if ctx == nil {
+		return ErrRejected
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	allowed := !r.paused && r.enabled()
+	r.mu.Unlock()
+	if !allowed {
+		return ErrReceiverPaused
+	}
+	var err error
+	if sink, ok := r.sink.(interface {
+		PutObservationAt(context.Context, capture.SanitizedObservation, time.Time) error
+	}); ok {
+		err = sink.PutObservationAt(ctx, observation, observedAt)
+	} else {
+		err = r.sink.PutObservation(ctx, observation)
+	}
+	var storeErr *storage.StoreError
+	if errors.As(err, &storeErr) && storeErr.Code == storage.Duplicate {
+		if recorder, ok := r.sink.(interface {
+			RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error
+		}); ok {
+			return recorder.RecordObservationSighting(ctx, observation, observedAt)
+		}
+	}
+	return err
 }
 
 func (r *Receiver) Pause() {

@@ -25,6 +25,14 @@ feed. Blur therefore writes its own log.
 - Non-goals (phase one): real-time sync, merge of derived views, CloudKit,
   physical erasure on the provider, multi-user sharing.
 
+### Current capture coverage
+
+Sync currently exports legacy observation records and deletion records. The
+new multipart document captures (editions and their text parts) are not included
+in the replica format. Their encrypted text is available to local Search, Ask,
+Library processing and recaps on the capturing Mac, but does not transfer to
+another Mac through Sync. Enabling Sync does not change this limitation.
+
 ## Layout
 
 ```

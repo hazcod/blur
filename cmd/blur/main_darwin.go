@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/hazcod/blur/internal/acceptance"
 	"github.com/hazcod/blur/internal/client"
 	"github.com/hazcod/blur/internal/ingest"
 	"github.com/hazcod/blur/internal/localapi"
@@ -27,6 +28,12 @@ func runMain() (exitCode int) {
 	if versionRequested(os.Args) {
 		printVersion(os.Stdout)
 		return 0
+	}
+	if acceptance.Enabled {
+		if _, err := acceptance.Load(); err != nil {
+			fmt.Fprintln(os.Stderr, "Blur acceptance fixture is not configured")
+			return 1
+		}
 	}
 	debug.SetPanicOnFault(true)
 	closeLog, logErr := configurePersistentLogging()
@@ -71,15 +78,18 @@ func runMain() (exitCode int) {
 }
 
 func runMCPCommand() error {
-	configDir, err := os.UserConfigDir()
+	directory, err := desktopDataDirectory()
 	if err != nil {
-		return client.ErrNotConfigured
+		return err
 	}
-	endpoint := localapi.EndpointDescriptor{Kind: localapi.EndpointUnix, Address: client.MCPSocketAddress(filepath.Join(configDir, "Blur"))}
+	endpoint := localapi.EndpointDescriptor{Kind: localapi.EndpointUnix, Address: client.MCPSocketAddress(directory)}
 	if endpoint.Validate() != nil {
 		return client.ErrNotConfigured
 	}
-	secrets := darwin.NewSecretStore()
+	secrets, err := desktopSecretStore()
+	if err != nil {
+		return err
+	}
 	rpc, err := mcpClientFromSecret(context.Background(), secrets, localapi.NewUnixTransport(32<<10), endpoint)
 	if err != nil {
 		return client.ErrNotConfigured
@@ -105,7 +115,11 @@ func startupFailureMessage(err error) string {
 
 func run() (runErr error) {
 	traceLaunchStage("store_open_started")
-	app, err := client.OpenLocalApp(context.Background(), darwin.NewSecretStore())
+	secrets, err := desktopSecretStore()
+	if err != nil {
+		return err
+	}
+	app, err := client.OpenLocalApp(context.Background(), secrets)
 	if err != nil {
 		traceLaunchStage("store_open_failed")
 	} else {

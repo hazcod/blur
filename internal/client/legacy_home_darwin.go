@@ -54,7 +54,8 @@ func passwdHome() string {
 	}
 	var out []byte
 	for i := 0; i < 4096; i++ {
-		b := *(*byte)(unsafe.Add(unsafe.Pointer(dir), i))
+		// getpwuid owns pw_dir; this bounded read finishes before any other passwd call.
+		b := *(*byte)(unsafe.Add(unsafe.Pointer(dir), i)) // #nosec G103 -- trusted native C string, capped at 4096 bytes.
 		if b == 0 {
 			break
 		}

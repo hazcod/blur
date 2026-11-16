@@ -2,6 +2,8 @@ package capture
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -20,22 +22,77 @@ type fakeAXNode struct {
 	childReads   int
 	maxRequested int
 	releases     int
+	roleErr      error
+	sensitiveErr error
+	childrenErr  error
+	onValue      func()
 }
 
 func (n *fakeAXNode) identity() uintptr                    { return n.id }
-func (n *fakeAXNode) role(context.Context) (string, error) { return n.roleName, nil }
+func (n *fakeAXNode) role(context.Context) (string, error) { return n.roleName, n.roleErr }
 func (n *fakeAXNode) sensitive(_ context.Context, role string) (bool, error) {
-	return n.isSensitive || isEditableTextRole(role), nil
+	return n.isSensitive || isEditableTextRole(role), n.sensitiveErr
 }
 func (n *fakeAXNode) value(_ context.Context, max int) (string, error) {
 	n.valueReads++
+	if n.onValue != nil {
+		n.onValue()
+	}
 	if len(n.text) > max {
 		return n.text[:max], errAXValueTruncated
 	}
 	return n.text, nil
 }
+
+func TestSecureSubroleCheckTargetsTextInputsAndUnknownRoles(t *testing.T) {
+	for _, role := range []string{"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXSecureTextField", "AXUnknown", "AXCustomEditor"} {
+		if !needsSecureSubroleCheck(role) {
+			t.Errorf("role %q did not receive a secure-subrole check", role)
+		}
+	}
+	for _, role := range []string{"AXButton", "AXStaticText", "AXScrollArea"} {
+		if needsSecureSubroleCheck(role) {
+			t.Errorf("role %q received an unnecessary secure-subrole check", role)
+		}
+	}
+}
+
+func TestCaptureRejectsAncestorBecomingSecureBeforeOrDuringDescendantRead(t *testing.T) {
+	for _, during := range []bool{false, true} {
+		t.Run(fmt.Sprintf("during_read_%t", during), func(t *testing.T) {
+			parent := &fakeAXNode{id: 2, roleName: "AXGroup"}
+			child := &fakeAXNode{id: 3, roleName: "AXStaticText", text: "protected descendant text"}
+			parent.childNodes = []*fakeAXNode{child}
+			root := &fakeAXNode{id: 1, roleName: "AXWindow", childNodes: []*fakeAXNode{parent}}
+			makeSecure := func() { parent.isSensitive = true; parent.roleName = "AXSecureTextArea" }
+			if during {
+				child.onValue = makeSecure
+			}
+			p := Pipeline{
+				Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "t", AppID: "arbitrary.app"}},
+				Limits: Limits{MaxBytes: 256, MaxNodes: 8, MaxDepth: 4, MaxDuration: time.Second},
+				// Parent values are ignored; ancestor validation must not depend on reading them.
+				Profiles: []AppProfile{{AppID: "arbitrary.app", IgnoreRoles: []string{"AXGroup"}}},
+				Read: func(ctx context.Context, _ platform.CaptureProbe, limit Limits) (rawFrame, error) {
+					frame, err := collectAXFrame(ctx, root, limit)
+					if !during {
+						makeSecure()
+					}
+					return frame, err
+				},
+			}
+			got, err := p.Capture(context.Background())
+			if err == nil || got.Text() != "" || !during && child.valueReads != 0 {
+				t.Fatalf("secure ancestor did not invalidate descendant: text=%q err=%v child_reads=%d", got.Text(), err, child.valueReads)
+			}
+		})
+	}
+}
 func (n *fakeAXNode) children(_ context.Context, max int) ([]axTreeNode, bool, error) {
 	n.childReads++
+	if n.childrenErr != nil {
+		return nil, false, n.childrenErr
+	}
 	if max > n.maxRequested {
 		n.maxRequested = max
 	}
@@ -49,6 +106,34 @@ func (n *fakeAXNode) children(_ context.Context, max int) ([]axTreeNode, bool, e
 		result[i] = n.childNodes[i]
 	}
 	return result, more, nil
+}
+
+func TestCaptureKeepsReadableSiblingsWhenOneAXElementIsUnavailable(t *testing.T) {
+	for _, failure := range []string{"role", "sensitivity", "children"} {
+		t.Run(failure, func(t *testing.T) {
+			bad := &fakeAXNode{id: 2, roleName: "AXGroup", text: "unverified private text"}
+			switch failure {
+			case "role":
+				bad.roleErr = errors.New("unavailable")
+			case "sensitivity":
+				bad.sensitiveErr = errors.New("unavailable")
+			case "children":
+				bad.childrenErr = errors.New("unavailable")
+			}
+			good := &fakeAXNode{id: 3, roleName: "AXStaticText", text: "Visible result: Mira owns rollback."}
+			root := &fakeAXNode{id: 1, roleName: "AXWindow", childNodes: []*fakeAXNode{bad, good}}
+			l := Limits{MaxBytes: 256, MaxNodes: 8, MaxDepth: 4, MaxDuration: time.Second}
+			p := Pipeline{Source: &fake.CaptureSource{Report: available(), ProbeResult: platform.CaptureProbe{TargetID: "fixture", AppID: "arbitrary.app"}}, Limits: l,
+				Read: func(ctx context.Context, _ platform.CaptureProbe, limit Limits) (rawFrame, error) {
+					return collectAXFrame(ctx, root, limit)
+				},
+			}
+			got, err := p.Capture(context.Background())
+			if err != nil || got.Text() != "Visible result: Mira owns rollback." || !got.Truncated() || bad.valueReads != 0 || good.valueReads != 1 {
+				t.Fatalf("one stale element discarded readable work or exposed unverified text: text=%q partial=%t err=%v", got.Text(), got.Truncated(), err)
+			}
+		})
+	}
 }
 func (n *fakeAXNode) release() { n.releases++ }
 
@@ -75,6 +160,32 @@ func TestCollectAXFrameBoundsNodesAndDefersValuesUntilPipeline(t *testing.T) {
 	frame.cleanup()
 	if root.releases != 1 || first.releases != 1 || second.releases != 1 || extra.releases != 1 {
 		t.Fatalf("native nodes not released exactly once: %d,%d,%d,%d", root.releases, first.releases, second.releases, extra.releases)
+	}
+}
+
+func TestCollectAXFrameRechecksGlobalNodeBudgetBetweenBranches(t *testing.T) {
+	first := &fakeAXNode{id: 3, roleName: "AXStaticText", text: "first"}
+	second := &fakeAXNode{id: 4, roleName: "AXStaticText", text: "second"}
+	branch := &fakeAXNode{id: 2, roleName: "AXGroup", childNodes: []*fakeAXNode{first, second}}
+	later := &fakeAXNode{id: 5, roleName: "AXStaticText", text: "later"}
+	root := &fakeAXNode{id: 1, roleName: "AXWindow", childNodes: []*fakeAXNode{branch, later}}
+	limits := Limits{MaxBytes: 128, MaxNodes: 4, MaxDepth: 4, MaxDuration: time.Second}
+	frame, err := collectAXFrame(context.Background(), root, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.cleanup()
+	if _, err := validateFrame(frame, limits); err != nil {
+		t.Fatalf("bounded branched capture was discarded by frame validation: %v", err)
+	}
+	if !frame.truncated || len(frame.roots[0].children) != 1 || later.childReads != 0 || later.valueReads != 0 {
+		t.Fatalf("late sibling was traversed after descendants exhausted the budget: truncated=%t children=%d late=%+v", frame.truncated, len(frame.roots[0].children), later)
+	}
+	frame.cleanup()
+	for _, node := range []*fakeAXNode{root, branch, first, second, later} {
+		if node.releases != 1 {
+			t.Fatalf("node %d released %d times", node.id, node.releases)
+		}
 	}
 }
 

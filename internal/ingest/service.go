@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -51,6 +52,8 @@ type ActivitySink interface {
 type Service struct {
 	source          platform.CaptureSource
 	capture         Capturer
+	document        capture.DocumentJob
+	onDocument      func(capture.CaptureSummary, bool)
 	sink            ObservationSink
 	logger          *slog.Logger
 	activity        *activity.Engine
@@ -60,6 +63,9 @@ type Service struct {
 	onChange        func()
 	onObservation   func(capture.SanitizedObservation, time.Time)
 	onCaptureCycle  func()
+	onHealth        func(Health)
+	health          Health
+	refreshInterval time.Duration
 	started         atomic.Bool
 	lastContentID   string // Run is the sole writer; this stores a hash, never captured text.
 	persisted       atomic.Uint64
@@ -74,6 +80,16 @@ func (s *Service) SetCaptureCycleNotify(notify func()) {
 		return
 	}
 	s.onCaptureCycle = notify
+}
+
+// SetPeriodicRefresh enables a bounded fallback for content changes that do
+// not emit focus notifications. Configure before Run; zero keeps event-only
+// behavior for adapters without an idle-state reader.
+func (s *Service) SetPeriodicRefresh(interval time.Duration) {
+	if s == nil || s.started.Load() || interval != 0 && (interval < time.Second || interval > time.Minute) {
+		return
+	}
+	s.refreshInterval = interval
 }
 
 // New binds event delivery to the exact source used by the capture pipeline,
@@ -160,6 +176,7 @@ func (s *Service) Run(ctx context.Context) (runErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	defer s.closeDocument()
 	if s.activity != nil {
 		defer func() {
 			if err := s.closeActivitySession(); err != nil {
@@ -175,16 +192,41 @@ func (s *Service) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	for {
-		event, err := s.source.Next(ctx)
+		waitCtx, cancelWait := ctx, func() {}
+		interval := s.refreshInterval
+		if s.document != nil {
+			interval = 25 * time.Millisecond
+		}
+		if interval > 0 {
+			waitCtx, cancelWait = context.WithTimeout(ctx, interval)
+		}
+		event, err := s.source.Next(waitCtx)
+		refreshDue := errors.Is(waitCtx.Err(), context.DeadlineExceeded)
+		cancelWait()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if refreshDue && errors.Is(err, context.DeadlineExceeded) {
+				if err := s.captureCurrent(ctx); err != nil {
+					return err
+				}
+				continue
 			}
 			s.logger.Warn("capture event source stopped", "operation", "capture", "result", "unavailable")
 			return ErrCaptureFailed
 		}
 		switch event.Kind {
 		case "frontmost_app_changed", "focused_context_changed":
+			// A progressive read can span many rounds. Stop attributing its
+			// acquisition time to the prior app. Ordinary bounded captures keep
+			// their existing contiguous activity accounting.
+			if _, streams := s.capture.(DocumentCapturer); streams {
+				if _, stages := s.sink.(DocumentSink); stages {
+					s.pauseActivity(ctx)
+				}
+			}
+			s.closeDocument()
 			if err := s.captureCurrent(ctx); err != nil {
 				return err
 			}
@@ -264,20 +306,61 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 	if s.onCaptureCycle != nil {
 		defer s.onCaptureCycle()
 	}
-	observation, err := s.capture.Capture(ctx)
+	state, attemptedAt := HealthUnavailable, time.Now().UTC()
+	var readIssue capture.ReadIssue
+	partial := false
+	defer func() {
+		if state == HealthSaved || state == HealthUnchanged {
+			s.health.LastReadablePartial = partial
+		}
+		s.reportHealth(state, attemptedAt, readIssue)
+	}()
+	handled, documentState, documentPartial, err := s.captureDocumentCurrent(ctx)
+	if handled && err == nil {
+		state, partial = documentState, documentPartial
+		return nil
+	}
+	if handled && errors.Is(err, ErrStoreWrite) {
+		if s.rejectPolicyCommit(ctx, err, &state) {
+			return nil
+		}
+		state = HealthStorageError
+		return ErrStoreWrite
+	}
+	var observation capture.SanitizedObservation
+	if !handled {
+		observation, err = s.capture.Capture(ctx)
+	}
 	if err != nil {
+		readIssue = capture.ReadIssueForError(err)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		var captureErr *capture.CaptureError
 		if errors.As(err, &captureErr) {
+			state = healthForCode(captureErr.Code)
+			if readIssue.Valid() {
+				if readIssue.Status == -25211 {
+					state = HealthPermission
+				} else if readIssue.Status == -25204 && state == HealthPermission {
+					state = HealthUnavailable
+				}
+			}
 			code, recoverable := safeCaptureCode(captureErr.Code)
 			if !recoverable {
 				s.logger.Error("capture configuration rejected", "operation", "capture", "result", code)
 				return ErrCaptureFailed
 			}
+			s.pauseActivity(ctx)
 			s.skipped.Add(1)
-			s.logger.Debug("capture frame skipped", "operation", "capture", "result", code)
+			attrs := []any{"operation", "capture", "result", code}
+			if readIssue.Valid() {
+				attrs = append(attrs, "read_stage", string(readIssue.Stage))
+				if readIssue.Status != 0 {
+					attrs = append(attrs, "ax_status", readIssue.Status)
+				}
+			}
+			s.logger.Debug("capture frame skipped", attrs...)
 			return nil
 		}
 		s.logger.Warn("capture operation failed", "operation", "capture", "result", "failed")
@@ -290,14 +373,23 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 		s.logger.Warn("capture output rejected", "operation", "capture", "result", "invalid")
 		return ErrCaptureFailed
 	}
+	if strings.TrimSpace(observation.Text()) == "" {
+		state = HealthEmpty
+		s.skipped.Add(1)
+		s.pauseActivity(ctx)
+		return nil
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	partial = observation.Truncated()
 	contentID := observation.ContentID()
 	newObservation := false
-	capturedAt := time.Now().UTC()
+	observedAt := time.Now()
+	capturedAt := observedAt.UTC()
 	if contentID == s.lastContentID {
 		s.duplicates.Add(1)
+		state = HealthUnchanged
 	} else {
 		var putErr error
 		if timestamped, ok := s.sink.(interface {
@@ -311,21 +403,46 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if s.rejectPolicyCommit(ctx, putErr, &state) {
+				return nil
+			}
 			var storeErr *storage.StoreError
 			if errors.As(putErr, &storeErr) && storeErr.Code == storage.Duplicate {
 				s.duplicates.Add(1)
+				state = HealthUnchanged
 			} else {
+				state = HealthStorageError
 				s.logger.Error("encrypted observation write failed", "operation", "capture", "result", "failed")
 				return ErrStoreWrite
 			}
 		} else {
 			s.persisted.Add(1)
+			state = HealthSaved
 			newObservation = true
 		}
 		s.lastContentID = contentID
 	}
+	sightingSaved := false
+	if !newObservation {
+		if recorder, ok := s.sink.(interface {
+			RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error
+		}); ok {
+			if err := recorder.RecordObservationSighting(ctx, observation, capturedAt); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if s.rejectPolicyCommit(ctx, err, &state) {
+					return nil
+				}
+				state = HealthStorageError
+				s.logger.Error("encrypted visit write failed", "operation", "capture", "result", "failed")
+				return ErrStoreWrite
+			}
+			sightingSaved = true
+		}
+	}
 	if s.activity != nil {
-		monotonic := capturedAt.Sub(s.activityEpoch).Nanoseconds()
+		monotonic := observedAt.Sub(s.activityEpoch).Nanoseconds()
 		segments, err := s.activity.Apply(activity.Event{Kind: activity.Seen, Monotonic: monotonic, Wall: capturedAt, SourceID: contentID, AppID: observation.AppID(), Domain: observation.Domain()})
 		if err != nil {
 			s.logger.Error("activity event rejected", "operation", "activity", "result", "invalid")
@@ -336,13 +453,26 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 			}
 		}
 	}
-	if newObservation && s.onChange != nil {
+	if (newObservation || sightingSaved) && s.onChange != nil {
 		s.onChange()
 	}
 	if newObservation && s.onObservation != nil {
 		s.onObservation(observation.Clone(), capturedAt)
 	}
 	return nil
+}
+
+func (s *Service) pauseActivity(ctx context.Context) {
+	if s.activity == nil || ctx.Err() != nil {
+		return
+	}
+	now := time.Now()
+	segments, err := s.activity.Apply(activity.Event{Kind: activity.Idle, Monotonic: now.Sub(s.activityEpoch).Nanoseconds(), Wall: now.UTC()})
+	if err != nil {
+		return
+	}
+	s.enqueueActivity(segments)
+	_ = s.flushPendingActivity(ctx)
 }
 
 // isPermanentActivityWriteError reports store rejections that retrying cannot fix.
@@ -376,7 +506,10 @@ func safeActivityWriteResult(err error) string {
 func safeCaptureCode(code capture.ErrorCode) (string, bool) {
 	switch code {
 	case capture.Unavailable, capture.ProbeFailed, capture.InvalidProbe, capture.Excluded,
-		capture.ReadFailed, capture.LimitExceeded, capture.Cancelled, capture.TimedOut:
+		capture.ReadFailed, capture.LimitExceeded, capture.Cancelled, capture.TimedOut,
+		capture.PermissionRequired, capture.ScreenPermissionRequired, capture.ScreenTextUnavailable, capture.ScreenNotVisible, capture.BrowserUnavailable, capture.DomainUnknown, capture.NoContent:
+		return string(code), true
+	case capture.UserIdle:
 		return string(code), true
 	default:
 		return "failed", false
@@ -388,4 +521,17 @@ func (s *Service) Stats() Stats {
 		return Stats{}
 	}
 	return Stats{Persisted: s.persisted.Load(), Duplicates: s.duplicates.Load(), Skipped: s.skipped.Load()}
+}
+
+// A preference change may reject the frame between capture and its encrypted
+// write. This is an expected privacy exclusion, never a storage outage.
+func (s *Service) rejectPolicyCommit(ctx context.Context, err error, state *HealthState) bool {
+	var rejected *capture.CaptureError
+	if !errors.As(err, &rejected) || rejected.Code != capture.Excluded {
+		return false
+	}
+	*state = HealthExcluded
+	s.skipped.Add(1)
+	s.pauseActivity(ctx)
+	return true
 }

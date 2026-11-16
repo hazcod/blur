@@ -59,7 +59,7 @@ func (s *UnixServer) Start(parent context.Context) error {
 
 func (s *UnixServer) serve(ctx context.Context) {
 	defer close(s.done)
-	defer s.listener.Close()
+	defer func(close func() error) { _ = close() }(s.listener.Close)
 	semaphore := make(chan struct{}, maxBridgeClients)
 	for {
 		conn, err := s.listener.Accept(ctx)
@@ -75,7 +75,7 @@ func (s *UnixServer) serve(ctx context.Context) {
 			go func() {
 				defer s.workers.Done()
 				defer func() { <-semaphore }()
-				defer conn.Close()
+				defer func(close func() error) { _ = close() }(conn.Close)
 				requestCtx, cancel := context.WithTimeout(ctx, bridgeReadTimeout)
 				defer cancel()
 				frame, err := conn.Receive(requestCtx)

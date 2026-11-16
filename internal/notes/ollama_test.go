@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/hazcod/blur/internal/model/modeltest"
 	"io"
 	"net"
 	"net/http"
@@ -65,16 +66,12 @@ func TestLocalModelTransportSendsNoBytesWhenLocalhostResolvesRemotely(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	observation, err := capture.SanitizeObservation("sh.blur.notes", "local", "meeting notes", MaxNoteBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	extractor := &OllamaExtractor{
-		endpoint: "http://localhost:" + parsed.Port(), model: "test",
-		client: &http.Client{Transport: newOllamaTransport(testIPResolver{{IP: net.ParseIP("203.0.113.10")}})},
-	}
-	if _, err := extractor.Extract(context.Background(), observation); !errors.Is(err, ErrModelUnavailable) {
-		t.Fatalf("Extract() error = %v, want local model unavailable", err)
+	client := &http.Client{Transport: newOllamaTransport(testIPResolver{{IP: net.ParseIP("203.0.113.10")}})}
+	defer client.CloseIdleConnections()
+	request, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://localhost:"+parsed.Port()+"/api/generate", strings.NewReader("synthetic note"))
+	if response, err := client.Do(request); err == nil {
+		_ = response.Body.Close()
+		t.Fatal("transport accepted non-loopback resolution")
 	}
 	if requests != 0 {
 		t.Fatalf("server received %d request(s) despite non-loopback resolution", requests)
@@ -83,7 +80,7 @@ func TestLocalModelTransportSendsNoBytesWhenLocalhostResolvesRemotely(t *testing
 
 func TestOllamaExtractorUsesBoundedLocalOnlyRequest(t *testing.T) {
 	var got ollamaRequest
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(modeltest.LocalOllama("qwen3:4b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/generate" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
@@ -91,7 +88,7 @@ func TestOllamaExtractorUsesBoundedLocalOnlyRequest(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, _ = io.WriteString(w, `{"response":"{\"proposals\":[{\"kind\":\"reminder\",\"text\":\"Ask Sam\",\"due\":\"tomorrow\"},{\"kind\":\"question\",\"text\":\"Who owns the next step?\"}]}"}`)
-	}))
+	})))
 	defer server.Close()
 
 	extractor, err := NewOllamaExtractor(server.URL, "qwen3:4b")
@@ -140,9 +137,9 @@ func TestOllamaExtractorRejectsNonLoopbackAndMalformedOutput(t *testing.T) {
 			t.Errorf("accepted non-local endpoint %q", endpoint)
 		}
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(modeltest.LocalOllama("model", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"response":"{\"proposals\":[{\"kind\":\"shell\",\"text\":\"run command\"}]}"}`)
-	}))
+	})))
 	defer server.Close()
 	extractor, err := NewOllamaExtractor(server.URL, "model")
 	if err != nil {

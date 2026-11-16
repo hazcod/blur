@@ -58,6 +58,12 @@ type CaptureSource interface {
 	Next(context.Context) (CaptureEvent, error)
 }
 
+// CapturePresence reports only an aggregate idle state, never individual
+// keyboard/mouse events. Capture can pause before probing application text.
+type CapturePresence interface {
+	UserIdle(context.Context) (bool, error)
+}
+
 // ActiveApplicationReporter exposes only the current app identifier for
 // preference/status UI. It never reports titles, URLs, or captured content.
 type ActiveApplicationReporter interface {

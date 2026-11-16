@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -98,7 +99,7 @@ func TestRPCRejectsCapturedRequestAfterOwnerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func(close func() error) { _ = close() }(conn.Close)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	challenge, err := conn.Receive(ctx)
@@ -195,7 +196,7 @@ func TestRPCServerRejectsUnauthorizedGrantBeforeCallingHandler(t *testing.T) {
 	}
 	cancel()
 	select {
-	case <-serverDone:
+	case <-serverDone: //nolint:errcheck // This branch only waits for shutdown after cancellation.
 	case <-time.After(time.Second):
 		t.Fatal("ServeRPC did not stop after cancellation")
 	}
@@ -210,7 +211,13 @@ func waitForRPCListener(t *testing.T, transport LocalTransport, endpoint Endpoin
 		cancel()
 		if err == nil {
 			_ = conn.Close()
-			return
+			if _, unixTransport := transport.(*UnixTransport); !unixTransport {
+				return
+			}
+			info, statErr := os.Lstat(endpoint.Address)
+			if statErr == nil && info.Mode()&os.ModeSocket != 0 && info.Mode().Perm() == 0o600 {
+				return
+			}
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -218,6 +225,9 @@ func waitForRPCListener(t *testing.T, transport LocalTransport, endpoint Endpoin
 }
 
 func TestRPCClientRejectsUnboundedOrMalformedRequestBeforeDial(t *testing.T) {
+	if !validRPCMethod(RPCGetChronicle) || !validRPCMethod(RPCListChronicles) || !validRPCMethod(RPCGetWorkingMemory) || !validRPCMethod(RPCListTasks) || !validRPCMethod(RPCGetWikiPage) {
+		t.Fatal("read-only chronicle/task/Library RPC is not registered")
+	}
 	transport := NewMemoryTransport(1, 32<<10)
 	grants, err := NewGrantStore(nil, nil, 8)
 	if err != nil {

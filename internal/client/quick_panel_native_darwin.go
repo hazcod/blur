@@ -56,8 +56,6 @@ func unregisterQuickAskHotkey() { darwin.UnregisterQuickAskHotkey() }
 
 const quickAskHotkeySupported = true
 
-func activateDesktopApp() { darwin.ActivateApplication() }
-
 // orderWindowFrontQuietly shows a window without activating the app or making
 // it key.
 func orderWindowFrontQuietly(handle uintptr) error { return darwin.OrderWindowFrontQuietly(handle) }

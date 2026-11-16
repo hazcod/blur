@@ -11,22 +11,22 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 
 ## Local macOS builds
 
-- The active macOS implementation is in `.worktrees/durable-memory-core`
-  (`feature/durable-memory-core`). Until it is integrated, build from that
-  worktree. The main checkout is older and cannot read its schema-5 store;
-  do not overwrite the current app with a build of the main checkout.
+- The active macOS implementation is integrated into `main`. Build from the
+  root checkout; no linked worktree is required. The source uses schema-7
+  memory. Preserve existing memory and never replace the app with an older
+  storage reader.
 
-- Build the user's app at `~/Downloads/Blur.app`, with bundle identifier
-  `com.hazcod.blur`, including from worktrees. Use `make macos-app-stable` when
-  available. Never create renamed, timestamped, acceptance, or alternate app
-  bundles for the user.
-- Preserve its existing signing identity, designated signing requirement, and
-  exact signing certificate. If the identity is unavailable, stop and report the
-  blocker; do not fall back to ad-hoc signing, create a certificate, change
-  certificate trust, or reset Accessibility/TCC permissions.
+- Build the user's app with `make macos-app-stable`, including from worktrees.
+- Always replace `~/Downloads/Blur.app`, using `com.hazcod.blur` and its existing
+  signing identity. Do not create renamed, timestamped, acceptance, or alternate
+  app bundles for the user.
+- Preserve its designated signing requirement and exact signing certificate.
+  The Makefile checks both before replacement. If the identity is unavailable,
+  stop and report the blocker; do not fall back to ad-hoc signing, create a
+  certificate, change certificate trust, or reset Accessibility/TCC permissions.
 - Direct-download macOS builds must be unsandboxed: the user explicitly approved
   this on 2026-11-13 because cross-app Accessibility capture is incompatible with
-  App Sandbox. Preserve existing container memory, settings and Keychain identity
-  in place; never silently open a second empty or older store. Do not enable
-  acceptance behavior or change menu visibility for a normal local build.
+  App Sandbox. Preserve the user's existing container memory, settings and
+  Keychain identity in place; never silently open a second empty or older store.
+  Do not enable acceptance behavior or change menu visibility for a normal build.
 - A build does not authorize launching, quitting, restarting, or opening the app.

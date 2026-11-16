@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/search"
@@ -28,12 +30,11 @@ const (
 	searchIndexPageRows             = 64
 	searchIndexPageHeader           = 2
 	searchIndexRefBytes             = 1 + sha256.Size + 4 + 1
-	searchIndexMaxRefs              = search.MaxIndexedObservationTerms + 2
+	searchIndexMaxRefs              = search.InlineObservationTerms + 2
 	searchIndexReverseKeyBytes      = 2 + sha256.Size
 )
 
 var (
-	searchIndexPrefix   = []byte{searchIndexGroup}
 	searchIndexStateKey = []byte{searchIndexGroup, searchIndexState}
 )
 
@@ -58,7 +59,7 @@ var _ search.ExactIndex = (*Store)(nil)
 
 func (s *Store) searchLookupDigest(kind byte, value string) [sha256.Size]byte {
 	mac := hmac.New(sha256.New, s.state.idKey)
-	_, _ = io.WriteString(mac, "blur.durable.search.lookup.v1\x00")
+	_, _ = io.WriteString(mac, s.exactNamespace("blur.durable.search.lookup.v1\x00"))
 	_, _ = mac.Write([]byte{kind})
 	writeMACString(mac, value)
 	var digest [sha256.Size]byte
@@ -70,7 +71,7 @@ func (s *Store) searchLookupDigest(kind byte, value string) [sha256.Size]byte {
 
 func (s *Store) searchReverseDigest(sourceID string) [sha256.Size]byte {
 	mac := hmac.New(sha256.New, s.state.idKey)
-	_, _ = io.WriteString(mac, "blur.durable.search.reverse.v1\x00")
+	_, _ = io.WriteString(mac, s.exactNamespace("blur.durable.search.reverse.v1\x00"))
 	writeMACString(mac, sourceID)
 	var digest [sha256.Size]byte
 	sum := mac.Sum(nil)
@@ -82,7 +83,7 @@ func (s *Store) searchReverseDigest(sourceID string) [sha256.Size]byte {
 func (s *Store) searchReverseKey(sourceID string) []byte {
 	digest := s.searchReverseDigest(sourceID)
 	key := make([]byte, searchIndexReverseKeyBytes)
-	key[0], key[1] = searchIndexGroup, searchIndexReverse
+	key[0], key[1] = s.exactGroup(), searchIndexReverse
 	copy(key[2:], digest[:])
 	clear(digest[:])
 	return key
@@ -200,6 +201,10 @@ func encodeSearchIndexReverse(sourceBytes int, refs []searchIndexRef) ([]byte, e
 }
 
 func decodeSearchIndexReverse(encoded []byte) (int, []searchIndexRef, error) {
+	if len(encoded) > 0 && encoded[0] == searchPagedReverseVersion {
+		_, sourceBytes, refs, err := decodePagedSearchReverse(encoded)
+		return sourceBytes, refs, err
+	}
 	if len(encoded) < 7 || encoded[0] != searchIndexFormatVersion {
 		return 0, nil, ErrCorrupt
 	}
@@ -237,7 +242,7 @@ func searchIndexRefLess(a, b searchIndexRef) bool {
 	return bytes.Compare(a.digest[:], b.digest[:]) < 0
 }
 
-func (tx *Tx) searchIndexPlainLocked(key []byte, namespace string) ([]byte, bool, error) {
+func (tx *searchIndexTx) searchIndexPlainLocked(key []byte, namespace string) ([]byte, bool, error) {
 	encoded, found, err := tx.writer.Get(key)
 	if err != nil {
 		return nil, false, mapStorePhysicalError(err)
@@ -245,7 +250,7 @@ func (tx *Tx) searchIndexPlainLocked(key []byte, namespace string) ([]byte, bool
 	if !found {
 		return nil, false, nil
 	}
-	plain, err := tx.store.open(key, namespace, encoded)
+	plain, err := tx.store.open(key, tx.store.exactNamespace(namespace), encoded)
 	clear(encoded)
 	if err != nil {
 		return nil, false, ErrCorrupt
@@ -253,8 +258,8 @@ func (tx *Tx) searchIndexPlainLocked(key []byte, namespace string) ([]byte, bool
 	return plain, true, nil
 }
 
-func (tx *Tx) putSearchIndexValueLocked(key []byte, namespace string, plaintext []byte, replace bool) error {
-	envelope, err := tx.store.seal(key, namespace, plaintext)
+func (tx *searchIndexTx) putSearchIndexValueLocked(key []byte, namespace string, plaintext []byte, replace bool) error {
+	envelope, err := tx.store.seal(key, tx.store.exactNamespace(namespace), plaintext)
 	if err != nil {
 		return err
 	}
@@ -262,7 +267,7 @@ func (tx *Tx) putSearchIndexValueLocked(key []byte, namespace string, plaintext 
 	return tx.writeEntryLocked(key, envelope, replace)
 }
 
-func (tx *Tx) addSearchIndexPostingLocked(kind byte, value, sourceID string, fields byte) (uint32, [sha256.Size]byte, error) {
+func (tx *searchIndexTx) addSearchIndexPostingLocked(kind byte, value, sourceID string, fields byte) (uint32, [sha256.Size]byte, error) {
 	digest := tx.store.searchLookupDigest(kind, value)
 	ordered, err := searchIndexOrderKey(kind, fields, sourceID)
 	if err != nil {
@@ -279,19 +284,26 @@ func (tx *Tx) addSearchIndexPostingLocked(kind byte, value, sourceID string, fie
 }
 
 func observationSearchTerms(observation capture.SanitizedObservation) (map[string]byte, error) {
+	return observationSearchTermsLimit(observation, capture.MaxObservationTextBytes+128+253)
+}
+
+func observationSearchTermsLimit(observation capture.SanitizedObservation, limit int) (map[string]byte, error) {
+	return searchFieldTermsLimit(observation.Text(), observation.AppID(), observation.Domain(), limit)
+}
+func searchFieldTermsLimit(text, app, domain string, limit int) (map[string]byte, error) {
 	terms := make(map[string]byte)
 	fields := []struct {
 		value string
 		mask  byte
-	}{{observation.Text(), 0x01}, {observation.AppID(), 0x02}, {observation.Domain(), 0x04}}
+	}{{text, 0x01}, {app, 0x02}, {domain, 0x04}}
 	for _, field := range fields {
-		normalized, err := search.NormalizeTokens(field.value, search.MaxIndexedObservationTerms)
+		normalized, err := search.NormalizeTokens(field.value, limit)
 		if err != nil {
 			return nil, &storage.StoreError{Code: storage.Invalid}
 		}
 		for _, term := range normalized {
 			terms[term] |= field.mask
-			if len(terms) > search.MaxIndexedObservationTerms {
+			if len(terms) > limit {
 				return nil, &storage.StoreError{Code: storage.Invalid}
 			}
 		}
@@ -301,11 +313,11 @@ func observationSearchTerms(observation capture.SanitizedObservation) (map[strin
 
 // indexObservationLocked extends the exact index in the observation's writer
 // transaction. The caller owns tx.mu and stores no searchable value in keys.
-func (tx *Tx) indexObservationLocked(observation capture.SanitizedObservation) error {
+func (tx *searchIndexTx) indexObservationLocked(observation capture.SanitizedObservation) error {
 	if observation.Validate() != nil {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
-	terms, err := observationSearchTerms(observation)
+	terms, err := observationSearchTermsLimit(observation, search.InlineObservationTerms)
 	if err != nil {
 		return err
 	}
@@ -342,7 +354,7 @@ func (tx *Tx) indexObservationLocked(observation capture.SanitizedObservation) e
 		return err
 	}
 	reverseKey := tx.store.searchReverseKey(observation.ContentID())
-	err = tx.putSearchIndexValueLocked(reverseKey, "search-index-reverse-v4", reversePlain, false)
+	err = tx.putSearchIndexValueLocked(reverseKey, "search-index-reverse-v4", reversePlain, true)
 	clear(reversePlain)
 	clear(reverseKey)
 	return err
@@ -408,7 +420,13 @@ func (tx *Tx) deleteKnownEntryLocked(key, value []byte) error {
 	return nil
 }
 
-func (tx *Tx) removeSearchIndexSourceLocked(sourceID string) error {
+func (tx *searchIndexTx) removeSearchIndexSourceLocked(sourceID string) error {
+	if done, err := tx.removePagedSearchBatchLocked(sourceID, false); err != nil || !done {
+		if err != nil {
+			return err
+		}
+		return ErrTransactionBudget // coordinated erasure will drain bounded pages
+	}
 	reverseKey := tx.store.searchReverseKey(sourceID)
 	reversePlain, found, err := tx.searchIndexPlainLocked(reverseKey, "search-index-reverse-v4")
 	if err != nil || !found {
@@ -449,9 +467,30 @@ func (tx *Tx) deleteObservation(sourceID string) error {
 	if tx == nil {
 		return &storage.StoreError{Code: storage.Closed}
 	}
+	tx.mu.Lock()
+	err := tx.removeNoteDocumentSourceLocked(sourceID)
+	tx.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	for step := 0; ; step++ {
+		if step >= 8 {
+			return ErrTransactionBudget
+		}
+		drained, err := tx.eraseObservationSighting(sourceID)
+		if err != nil {
+			return err
+		}
+		if drained {
+			break
+		}
+	}
 	// Remove this source from the exact-hour recovery index in the same
 	// transaction, regardless of which deletion entry point was used.
 	if err := tx.removeCaptureHourSource(sourceID); err != nil {
+		return err
+	}
+	if err := tx.removeObservationTimelineSource(sourceID); err != nil {
 		return err
 	}
 	tx.mu.Lock()
@@ -500,6 +539,20 @@ func (tx *Tx) deleteObservationRecord(sourceID string) error {
 		defer tx.mu.Unlock()
 		return tx.failLocked(&storage.StoreError{Code: storage.Invalid})
 	}
+	if _, found, err := tx.store.captureIndexPartReader(tx.writer, sourceID); err != nil || found {
+		if err == nil {
+			err = ErrDeletionPending
+		}
+		defer tx.mu.Unlock()
+		return tx.failLocked(err)
+	}
+	if _, _, found, err := tx.store.captureEditionReader(tx.writer, sourceID); err != nil || found {
+		if err == nil {
+			err = ErrDeletionPending
+		}
+		defer tx.mu.Unlock()
+		return tx.failLocked(err)
+	}
 	tx.mu.Unlock()
 	if err := tx.requireProjectionIndexes(); err != nil {
 		return err
@@ -524,8 +577,23 @@ func (tx *Tx) deleteObservationRecord(sourceID string) error {
 	if err := tx.removeChroniclesForSource(sourceID); err != nil {
 		return err
 	}
+	if err := tx.removeSemanticSource(sourceID); err != nil {
+		return err
+	}
+	if err := tx.removeEnrichmentSource(sourceID); err != nil {
+		return err
+	}
+	if err := tx.removeTasksSource(sourceID); err != nil {
+		return err
+	}
 	if err := tx.quarantineKnowledgeSource(sourceID); err != nil {
 		return err
+	}
+	tx.mu.Lock()
+	meetingErr := tx.removeMeetingSourceLocked(sourceID)
+	tx.mu.Unlock()
+	if meetingErr != nil {
+		return meetingErr
 	}
 	if !found {
 		return nil
@@ -533,22 +601,22 @@ func (tx *Tx) deleteObservationRecord(sourceID string) error {
 	return tx.deleteObservation(sourceID)
 }
 
-func (tx *Tx) writeSearchIndexStateLocked() error {
+func (tx *searchIndexTx) writeSearchIndexStateLocked() error {
 	plain := []byte{searchIndexFormatVersion, 1}
-	return tx.putSearchIndexValueLocked(searchIndexStateKey, "search-index-state-v1", plain, false)
+	return tx.putSearchIndexValueLocked(tx.store.exactStateKey(), "search-index-state-v1", plain, false)
 }
 
 func (s *Store) ensureSearchIndex(ctx context.Context) error {
 	ready := false
 	err := s.view(ctx, func(reader bolt.Reader) error {
-		envelope, found, err := reader.Get(searchIndexStateKey)
+		envelope, found, err := reader.Get(s.exactStateKey())
 		if err != nil {
 			return mapStorePhysicalError(err)
 		}
 		if !found {
 			return nil
 		}
-		plain, err := s.open(searchIndexStateKey, "search-index-state-v1", envelope)
+		plain, err := s.open(s.exactStateKey(), s.exactNamespace("search-index-state-v1"), envelope)
 		clear(envelope)
 		if err != nil || len(plain) != 2 || plain[0] == 0 || plain[0] > searchIndexFormatVersion || plain[1] != 1 {
 			clear(plain)
@@ -579,10 +647,7 @@ func (s *Store) ensureSearchIndex(ctx context.Context) error {
 		for start := 0; start < len(page.Observations); {
 			end, operations := start, 2 // reserve the manifest load and flush
 			for end < len(page.Observations) {
-				cost, err := estimatedSearchIndexOperations(page.Observations[end])
-				if err != nil {
-					return err
-				}
+				cost := 20 // only durable queue/root writes belong to this transaction
 				if end > start && operations+cost > bolt.MaxTransactionOps {
 					break
 				}
@@ -600,7 +665,7 @@ func (s *Store) ensureSearchIndex(ctx context.Context) error {
 					return tx.failLocked(err)
 				}
 				for _, observation := range batch {
-					if err := tx.indexObservationLocked(observation); err != nil {
+					if err := tx.queueObservationExactLocked(observation); err != nil {
 						return tx.failLocked(err)
 					}
 				}
@@ -633,7 +698,7 @@ func (s *Store) clearSearchIndex(ctx context.Context) error {
 			if err := tx.checkLocked(); err != nil {
 				return tx.failLocked(err)
 			}
-			entries, hasMore, err := tx.writer.Scan(searchIndexPrefix, after, 256, 8<<20)
+			entries, hasMore, err := tx.writer.Scan(s.exactPrefix(), after, 256, 8<<20)
 			if err != nil {
 				return tx.failLocked(mapStorePhysicalError(err))
 			}
@@ -692,12 +757,12 @@ func readBoundedIndexValue(reader bolt.Reader, key []byte, maxBytes int) ([]byte
 }
 
 func decodeSearchIndexState(reader bolt.Reader, store *Store, maxBytes int) (int, bool, bool, error) {
-	plain, found, used, blocked, err := readBoundedIndexValue(reader, searchIndexStateKey, maxBytes)
+	plain, found, used, blocked, err := readBoundedIndexValue(reader, store.exactStateKey(), maxBytes)
 	if err != nil || blocked || !found {
 		return used, found, blocked, err
 	}
 	envelope := plain
-	decoded, err := store.open(searchIndexStateKey, "search-index-state-v1", envelope)
+	decoded, err := store.open(store.exactStateKey(), store.exactNamespace("search-index-state-v1"), envelope)
 	clear(envelope)
 	if err != nil || len(decoded) != 2 || decoded[0] != searchIndexFormatVersion || decoded[1] != 1 {
 		clear(decoded)
@@ -707,26 +772,27 @@ func decodeSearchIndexState(reader bolt.Reader, store *Store, maxBytes int) (int
 	return used, true, false, nil
 }
 
-func readSearchIndexReverse(reader bolt.Reader, store *Store, sourceID string, maxBytes int) (int, []searchIndexRef, int, bool, error) {
+func readSearchIndexReverse(reader bolt.Reader, store *Store, sourceID string, maxBytes int) (int, []searchIndexRef, bool, int, bool, error) {
 	key := store.searchReverseKey(sourceID)
 	encoded, found, used, blocked, err := readBoundedIndexValue(reader, key, maxBytes)
 	if err != nil || blocked {
 		clear(key)
-		return 0, nil, used, blocked, err
+		return 0, nil, false, used, blocked, err
 	}
 	if !found {
 		clear(key)
-		return 0, nil, used, false, ErrCorrupt
+		return 0, nil, false, used, false, ErrCorrupt
 	}
-	plain, err := store.open(key, "search-index-reverse-v4", encoded)
+	plain, err := store.open(key, store.exactNamespace("search-index-reverse-v4"), encoded)
 	clear(key)
 	clear(encoded)
 	if err != nil {
-		return 0, nil, used, false, ErrCorrupt
+		return 0, nil, false, used, false, ErrCorrupt
 	}
+	paged := len(plain) > 0 && plain[0] == searchPagedReverseVersion
 	sourceBytes, refs, err := decodeSearchIndexReverse(plain)
 	clear(plain)
-	return sourceBytes, refs, used, false, err
+	return sourceBytes, refs, paged, used, false, err
 }
 
 func findSearchIndexRef(refs []searchIndexRef, kind byte, digest [sha256.Size]byte) (searchIndexRef, bool) {
@@ -743,7 +809,7 @@ func findSearchIndexRef(refs []searchIndexRef, kind byte, digest [sha256.Size]by
 }
 
 func (s *Store) SearchExact(ctx context.Context, query search.ExactQuery) (search.ExactPage, error) {
-	if ctx == nil || len(query.Terms) == 0 || len(query.Terms) > search.MaxTerms || query.MinTermMatches < 0 || query.MinTermMatches > len(query.Terms) || query.TopK < 0 || query.TopK > search.MaxResults || query.MaxRows < 1 || query.MaxRows > search.MaxIndexRows || query.MaxBytes < 1 || query.MaxBytes > search.MaxIndexBytes {
+	if ctx == nil || len(query.Terms) == 0 || len(query.Terms) > search.MaxTerms || query.MinTermMatches < 0 || query.MinTermMatches > len(query.Terms) || query.PartialOnly && (query.MinTermMatches == 0 || query.MinTermMatches >= len(query.Terms)) || query.TopK < 0 || query.TopK > search.MaxResults || query.MaxRows < 1 || query.MaxRows > search.MaxIndexRows || query.MaxBytes < 1 || query.MaxBytes > search.MaxIndexBytes {
 		return search.ExactPage{}, search.ErrInvalidRequest
 	}
 	if query.TopK == 0 {
@@ -763,11 +829,34 @@ func (s *Store) SearchExact(ctx context.Context, query search.ExactQuery) (searc
 	if err != nil || domain != query.Domain {
 		return search.ExactPage{}, search.ErrInvalidRequest
 	}
+	if query.CapturedStart.IsZero() != query.CapturedEnd.IsZero() || len(query.ScopeSourceIDs) > search.MaxScopeSourceIDs || len(query.ExcludeAppIDs) > search.MaxExcludedApps {
+		return search.ExactPage{}, search.ErrInvalidRequest
+	}
+	if !query.CapturedStart.IsZero() && (!validCaptureTime(query.CapturedStart) || !validCaptureTime(query.CapturedEnd) || !query.CapturedStart.Before(query.CapturedEnd) || query.CapturedEnd.Sub(query.CapturedStart) > storage.MaxObservationWindow) {
+		return search.ExactPage{}, search.ErrInvalidRequest
+	}
+	if len(query.ScopeSourceIDs) > 0 && query.CapturedStart.IsZero() {
+		return search.ExactPage{}, search.ErrInvalidRequest
+	}
+	for _, id := range query.ScopeSourceIDs {
+		if !validHash(id) {
+			return search.ExactPage{}, search.ErrInvalidRequest
+		}
+	}
+	for _, raw := range query.ExcludeAppIDs {
+		app, err := search.CanonicalAppID(raw)
+		if err != nil || app == "" || app != raw {
+			return search.ExactPage{}, search.ErrInvalidRequest
+		}
+	}
 	var result search.ExactPage
 	err = s.view(ctx, func(reader bolt.Reader) error { // one snapshot for every posting and source reference
-		return s.searchExactTreeReader(ctx, reader, query, &result)
+		return s.searchExactAllReader(ctx, reader, query, &result)
 	})
 	if err != nil {
+		if errors.Is(err, ErrTransactionBudget) || errors.Is(err, bolt.ErrBudget) {
+			return search.ExactPage{}, search.ErrIndexBudget
+		}
 		return search.ExactPage{}, err
 	}
 	return result, nil
@@ -791,7 +880,11 @@ type searchIndexEvaluatedCandidate struct {
 }
 
 func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, query search.ExactQuery, result *search.ExactPage) error {
-	used, ready, blocked, err := decodeSearchIndexState(reader, s, query.MaxBytes)
+	return s.searchExactTreeReaderScoped(ctx, reader, query, result, false)
+}
+
+func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Reader, query search.ExactQuery, result *search.ExactPage, captureEvidence bool) error {
+	used, ready, blocked, err := decodeSearchIndexState(reader, s, query.MaxBytes-result.Bytes)
 	result.Bytes += used
 	result.Nodes++
 	if err != nil {
@@ -802,6 +895,31 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 	}
 	if !ready {
 		return search.ErrIndexUnavailable
+	}
+	pendingID, pendingBytes, stopped, err := s.firstPendingSearchReader(reader, query.MaxBytes-result.Bytes)
+	result.Nodes++
+	result.Bytes += pendingBytes
+	if err != nil {
+		return err
+	}
+	if stopped {
+		return search.ErrIndexBudget
+	}
+	result.IndexingPending = result.IndexingPending || pendingID != ""
+	if captureEvidence {
+		pending, err := s.captureIndexPendingReader(captureQueryReader{reader, result, query.MaxBytes})
+		if err != nil {
+			return err
+		}
+		result.IndexingPending = result.IndexingPending || pending
+	}
+	excluded := make([][sha256.Size]byte, 0, len(query.ExcludeAppIDs))
+	for _, app := range query.ExcludeAppIDs {
+		excluded = append(excluded, s.searchLookupDigest(searchIndexApp, app))
+	}
+	scopeSources := make(map[string]struct{}, len(query.ScopeSourceIDs))
+	for _, id := range query.ScopeSourceIDs {
+		scopeSources[id] = struct{}{}
 	}
 	constraints := make([]searchIndexConstraint, 0, len(query.Terms)+2)
 	defer func() { clearSearchIndexConstraints(constraints) }()
@@ -876,7 +994,7 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 			return search.ErrIndexBudget
 		}
 		result.Nodes++
-		sourceBytes, refs, readBytes, stopped, err := readSearchIndexReverse(reader, s, posting.sourceID, query.MaxBytes-result.Bytes)
+		sourceBytes, refs, paged, readBytes, stopped, err := readSearchIndexReverse(reader, s, posting.sourceID, query.MaxBytes-result.Bytes)
 		result.Bytes += readBytes
 		if err != nil {
 			return err
@@ -887,6 +1005,22 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 		candidate := searchIndexEvaluatedCandidate{fields: make([]byte, len(constraints)), metadataOkay: true}
 		for i, constraint := range constraints {
 			ref, found := findSearchIndexRef(refs, constraint.kind, constraint.digest)
+			if paged && constraint.kind == searchIndexTerm {
+				if result.Nodes >= search.MaxIndexNodes {
+					return search.ErrIndexBudget
+				}
+				result.Nodes++
+				var readBytes int
+				var stopped bool
+				ref, found, readBytes, stopped, err = s.readSearchTermProof(reader, posting.sourceID, constraint.digest, query.MaxBytes-result.Bytes)
+				result.Bytes += readBytes
+				if err != nil {
+					return err
+				}
+				if stopped {
+					return search.ErrIndexBudget
+				}
+			}
 			if !found {
 				if constraint.kind != searchIndexTerm {
 					candidate.metadataOkay = false
@@ -907,8 +1041,72 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 				return ErrCorrupt
 			}
 		}
+		for _, digest := range excluded {
+			if _, found := findSearchIndexRef(refs, searchIndexApp, digest); found {
+				candidate.metadataOkay = false
+				break
+			}
+		}
 		clearSearchIndexRefs(refs)
-		candidate.matches = candidate.metadataOkay && candidate.termMatches >= minTermMatches
+		candidate.matches = candidate.metadataOkay && candidate.termMatches >= minTermMatches && (!query.PartialOnly || candidate.termMatches < len(query.Terms))
+		if candidate.matches && !captureEvidence {
+			current, err := s.isCurrentNoteSourceReader(reader, posting.sourceID)
+			if err != nil {
+				return err
+			}
+			candidate.matches = current
+		}
+		var capturedAt time.Time
+		var captureEdition captureEditionRecord
+		var captureSummary capture.CaptureSummary
+		if captureEvidence && candidate.matches {
+			var err error
+			captureEdition, captureSummary, candidate.matches, err = s.captureQuerySource(reader, posting.sourceID, sourceBytes, result, query.MaxBytes)
+			if err != nil {
+				return err
+			}
+			if candidate.matches {
+				capturedAt = captureSummary.Header().CapturedAt()
+			}
+		}
+		if candidate.matches && !query.CapturedStart.IsZero() && captureEvidence {
+			var visit time.Time
+			if err := s.captureSightingInWindowBudget(ctx, reader, captureSummary.ContentID(), captureEdition, query.CapturedStart, query.CapturedEnd, &visit, result, query.MaxBytes); err != nil {
+				return err
+			}
+			_, laterSighting := scopeSources[posting.sourceID]
+			candidate.matches = laterSighting || !visit.IsZero()
+			if !visit.IsZero() {
+				capturedAt = visit
+			}
+		}
+		if candidate.matches && !query.CapturedStart.IsZero() && !captureEvidence {
+			if result.Nodes >= search.MaxIndexNodes {
+				return search.ErrIndexBudget
+			}
+			result.Nodes++
+			at, readBytes, blocked, err := s.readSearchCaptureTime(reader, posting.sourceID, sourceBytes, query.MaxBytes-result.Bytes)
+			result.Bytes += readBytes
+			if err != nil {
+				return err
+			}
+			if blocked {
+				return search.ErrIndexBudget
+			}
+			visit, found, err := s.sightingInWindow(posting.sourceID, at, query.CapturedStart, query.CapturedEnd, s.searchSightingReader(reader, result, query.MaxBytes))
+			if err != nil {
+				return err
+			}
+			capturedAt = at
+			if !s.IsObservationTimeKnown(capturedAt) {
+				capturedAt = time.Time{}
+			}
+			if found {
+				capturedAt = visit
+			}
+			_, laterSighting := scopeSources[posting.sourceID]
+			candidate.matches = laterSighting || found
+		}
 		if candidate.fields[stream.constraintIndex] != posting.fields {
 			clear(candidate.fields)
 			return ErrCorrupt
@@ -916,7 +1114,7 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 		evaluated[posting.sourceID] = candidate
 		if candidate.matches {
 			matchedCount++
-			result.Hits = append(result.Hits, search.IndexHit{SourceID: posting.sourceID, Score: candidate.score, Bytes: sourceBytes})
+			result.Hits = append(result.Hits, search.IndexHit{SourceID: posting.sourceID, Score: candidate.score, Bytes: sourceBytes, CapturedAt: capturedAt})
 			sort.Slice(result.Hits, func(i, j int) bool {
 				if result.Hits[i].Score != result.Hits[j].Score {
 					return result.Hits[i].Score > result.Hits[j].Score
@@ -964,6 +1162,30 @@ func (s *Store) searchExactTreeReader(ctx context.Context, reader bolt.Reader, q
 			return nil
 		}
 	}
+}
+
+func (s *Store) readSearchCaptureTime(reader bolt.Reader, sourceID string, sourceBytes, maxBytes int) (time.Time, int, bool, error) {
+	key := s.logicalKey(groupOrder, kindObservation, "", sourceID)
+	defer clear(key)
+	encoded, found, used, blocked, err := readBoundedIndexValue(reader, key, maxBytes)
+	if err != nil || blocked {
+		return time.Time{}, used, blocked, err
+	}
+	if !found {
+		return time.Time{}, used, false, ErrCorrupt
+	}
+	defer clear(encoded)
+	size, at, recordKey, err := s.decodeSizeEntry(key, encoded)
+	defer clear(recordKey)
+	if err != nil {
+		return time.Time{}, used, false, err
+	}
+	expectedKey := s.logicalKey(groupRecord, kindObservation, "", sourceID)
+	defer clear(expectedKey)
+	if at.IsZero() || size != sourceBytes || !bytes.Equal(recordKey, expectedKey) {
+		return time.Time{}, used, false, ErrCorrupt
+	}
+	return at, used, false, nil
 }
 
 func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream) bool {

@@ -3,6 +3,7 @@ package durable
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ func TestUserNoteAndSourceLinkedProposalsPersistEncryptedInToday(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	at := time.Date(2026, 11, 5, 14, 0, 0, 0, time.UTC)
 	observation, err := capture.SanitizeObservation("sh.blur.notes", "local", "Follow up with Alex about the draft tomorrow", 4096)
 	if err != nil {
@@ -96,12 +97,17 @@ func TestTodayNoteOmittedWhenReverseSourceIndexIsFull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(close func() error) { _ = close() }(store.Close)
 	at := time.Date(2026, 11, 5, 14, 0, 0, 0, time.UTC)
 	snapshot := today.Snapshot{Date: "2026-11-05", Zone: "UTC", GeneratedAt: at, GenerationID: "full-index"}
 	for i := 0; i < today.MaxSources; i++ {
-		snapshot.SourceIDs = append(snapshot.SourceIDs, fmt.Sprintf("%064x", i+1))
+		o, _ := capture.SanitizeObservation("notes", "local", fmt.Sprintf("Bounded source %d", i), 512)
+		if err := store.PutObservationAt(ctx, o, at); err != nil {
+			t.Fatal(err)
+		}
+		snapshot.SourceIDs = append(snapshot.SourceIDs, o.ContentID())
 	}
+	sort.Strings(snapshot.SourceIDs)
 	if err := snapshot.Validate(); err != nil {
 		t.Fatalf("full index fixture invalid: %v", err)
 	}

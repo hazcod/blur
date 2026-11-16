@@ -12,6 +12,7 @@ import (
 	"time"
 
 	bbolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 const (
@@ -19,6 +20,8 @@ const (
 	MaxValueBytes       = 5 << 20
 	MaxTransactionBytes = 16 << 20
 	MaxTransactionOps   = 1024
+	// Large read-only metadata scans keep the same byte ceiling and snapshot.
+	MaxReadTransactionOps = 4096
 
 	openTimeout = 5 * time.Second
 )
@@ -32,6 +35,8 @@ var (
 	ErrTransaction = errors.New("physical bolt: transaction failed")
 	ErrClosed      = errors.New("physical bolt: closed")
 	ErrInvalidTx   = errors.New("physical bolt: transaction limit or operation rejected")
+	ErrBudget      = errors.New("physical bolt: transaction budget exceeded")
+	errBudget      = errors.Join(ErrInvalidTx, ErrBudget)
 )
 
 var recordBucket = []byte("blur_records_v1")
@@ -113,7 +118,7 @@ func openWithMode(path string, mode openMode, afterDirectoryOpen func() error) (
 	if err != nil {
 		return nil, err
 	}
-	defer parent.Close()
+	defer func(close func() error) { _ = close() }(parent.Close)
 	if afterDirectoryOpen != nil {
 		if err := afterDirectoryOpen(); err != nil {
 			return nil, ErrUnavailable
@@ -139,7 +144,7 @@ func openWithMode(path string, mode openMode, afterDirectoryOpen func() error) (
 		if errors.Is(err, os.ErrExist) && mode == createNew {
 			return nil, ErrExists
 		}
-		if errors.Is(err, ErrCorrupt) || errors.Is(err, bbolt.ErrInvalid) || errors.Is(err, bbolt.ErrChecksum) || errors.Is(err, bbolt.ErrVersionMismatch) {
+		if errors.Is(err, ErrCorrupt) || errors.Is(err, bolterrors.ErrInvalid) || errors.Is(err, bolterrors.ErrChecksum) || errors.Is(err, bolterrors.ErrVersionMismatch) {
 			return nil, ErrCorrupt
 		}
 		return nil, ErrUnavailable
@@ -187,7 +192,14 @@ func openBbolt(path string, openFile func(string, int, os.FileMode) (*os.File, e
 // View runs a bounded read-only transaction. Callback errors are reduced to a
 // content-free sentinel so caller-provided text cannot enter backend errors.
 func (db *DB) View(ctx context.Context, callback func(Reader) error) error {
-	if ctx == nil || callback == nil {
+	return db.ViewWithReadLimit(ctx, MaxTransactionOps, callback)
+}
+
+// ViewWithReadLimit permits a separately bounded read-only metadata scan.
+// Write transactions and the default View retain MaxTransactionOps; all reads
+// retain MaxTransactionBytes and cancellation after every operation.
+func (db *DB) ViewWithReadLimit(ctx context.Context, operationLimit int, callback func(Reader) error) error {
+	if ctx == nil || callback == nil || operationLimit < 1 || operationLimit > MaxReadTransactionOps {
 		return ErrInvalid
 	}
 	if err := ctx.Err(); err != nil {
@@ -201,7 +213,7 @@ func (db *DB) View(ctx context.Context, callback func(Reader) error) error {
 	if db.closed || db.db == nil {
 		return ErrClosed
 	}
-	state := &txState{ctx: ctx, active: true}
+	state := &txState{ctx: ctx, active: true, operationLimit: operationLimit}
 	err := db.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(recordBucket)
 		if bucket == nil {
@@ -272,6 +284,8 @@ func sanitizeCallbackError(err error) error {
 		return context.Canceled
 	case errors.Is(err, context.DeadlineExceeded):
 		return context.DeadlineExceeded
+	case errors.Is(err, ErrBudget):
+		return errBudget
 	case errors.Is(err, ErrInvalid), errors.Is(err, ErrInvalidTx):
 		return ErrInvalidTx
 	default:
@@ -287,6 +301,8 @@ func sanitizeTransactionError(err error) error {
 		return context.Canceled
 	case errors.Is(err, context.DeadlineExceeded):
 		return context.DeadlineExceeded
+	case errors.Is(err, ErrBudget):
+		return errBudget
 	case errors.Is(err, ErrInvalid), errors.Is(err, ErrInvalidTx):
 		return ErrInvalidTx
 	case errors.Is(err, ErrCorrupt):
@@ -322,12 +338,13 @@ func (db *DB) Close() error {
 }
 
 type txState struct {
-	mu     sync.Mutex
-	ctx    context.Context
-	active bool
-	ops    int
-	bytes  int
-	err    error
+	mu             sync.Mutex
+	ctx            context.Context
+	active         bool
+	ops            int
+	operationLimit int
+	bytes          int
+	err            error
 }
 
 func (s *txState) fail(err error) error {
@@ -339,7 +356,7 @@ func (s *txState) fail(err error) error {
 
 func (s *txState) setError(err error) {
 	s.mu.Lock()
-	s.fail(err)
+	_ = s.fail(err)
 	s.mu.Unlock()
 }
 
@@ -359,11 +376,15 @@ func (s *txState) begin(key []byte, valueBytes int) error {
 	if len(key) == 0 || len(key) > MaxKeyBytes || valueBytes < 0 || valueBytes > MaxValueBytes {
 		return s.fail(ErrInvalidTx)
 	}
-	if s.ops >= MaxTransactionOps {
-		return s.fail(ErrInvalidTx)
+	limit := s.operationLimit
+	if limit == 0 {
+		limit = MaxTransactionOps
+	}
+	if s.ops >= limit {
+		return s.fail(errBudget)
 	}
 	if len(key) > MaxTransactionBytes-valueBytes || s.bytes > MaxTransactionBytes-len(key)-valueBytes {
-		return s.fail(ErrInvalidTx)
+		return s.fail(errBudget)
 	}
 	s.ops++
 	s.bytes += len(key) + valueBytes
@@ -374,8 +395,11 @@ func (s *txState) chargeReadValue(valueBytes int) error {
 	if !s.active {
 		return s.fail(ErrClosed)
 	}
-	if valueBytes < 0 || valueBytes > MaxValueBytes || valueBytes > MaxTransactionBytes-s.bytes {
+	if valueBytes < 0 || valueBytes > MaxValueBytes {
 		return s.fail(ErrInvalidTx)
+	}
+	if valueBytes > MaxTransactionBytes-s.bytes {
+		return s.fail(errBudget)
 	}
 	s.bytes += valueBytes
 	return nil

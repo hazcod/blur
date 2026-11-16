@@ -13,6 +13,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const maxStreamFrameBytes = 8 << 20
+
 type NamedPipeTransport struct{ maxBytes int }
 
 func NewNamedPipeTransport(maxMessageBytes int) *NamedPipeTransport {

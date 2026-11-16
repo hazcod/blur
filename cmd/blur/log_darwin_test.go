@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/hazcod/blur/internal/applog"
 )
 
 func TestOpenPersistentLogRejectsSymlink(t *testing.T) {
@@ -31,6 +34,34 @@ func TestOpenPersistentLogRejectsSymlink(t *testing.T) {
 	data, readErr := os.ReadFile(target)
 	if readErr != nil || string(data) != "private target" {
 		t.Fatalf("symlink target changed: data=%q err=%v", data, readErr)
+	}
+}
+
+func TestPersistentLoggingUsesDynamicApplicationLevel(t *testing.T) {
+	if directory := os.Getenv("BLUR_DYNAMIC_LOG_TEST_DIR"); directory != "" {
+		persistentLogDirectory = directory
+		closeLog, err := configurePersistentLogging()
+		if err != nil {
+			os.Exit(3)
+		}
+		slog.Debug("default-hidden-debug-marker")
+		_ = applog.SetLevel("debug")
+		slog.Debug("enabled-debug-marker")
+		_ = applog.SetLevel("error")
+		slog.Warn("error-hidden-warning-marker")
+		slog.Error("enabled-error-marker")
+		closeLog()
+		os.Exit(0)
+	}
+	directory := t.TempDir()
+	command := exec.Command(os.Args[0], "-test.run=^TestPersistentLoggingUsesDynamicApplicationLevel$")
+	command.Env = append(os.Environ(), "BLUR_DYNAMIC_LOG_TEST_DIR="+directory)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("dynamic logging subprocess failed: %v: %s", err, output)
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "blur.log"))
+	if err != nil || !bytes.Contains(data, []byte("enabled-debug-marker")) || !bytes.Contains(data, []byte("enabled-error-marker")) || bytes.Contains(data, []byte("default-hidden-debug-marker")) || bytes.Contains(data, []byte("error-hidden-warning-marker")) {
+		t.Fatal("persistent application handler did not honor immediate level changes", err)
 	}
 }
 

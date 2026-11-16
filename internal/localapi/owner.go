@@ -85,7 +85,7 @@ func (o *RPCOwner) startLocked(ctx context.Context, grants *GrantStore, grant Is
 		cancel()
 		_ = grants.Revoke(grant.ID)
 		select {
-		case <-done:
+		case <-done: //nolint:errcheck // Startup already failed; only drain the stopped server.
 		case <-time.After(time.Second):
 		}
 		o.grants, o.grantID, o.cancel, o.done = nil, "", nil, nil

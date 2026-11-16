@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/storage"
 	"github.com/hazcod/blur/internal/storage/durable"
+	"github.com/hazcod/blur/internal/tasks"
 )
 
 type observationBatchDeleter interface {
@@ -20,6 +22,15 @@ type observationBatchDeleter interface {
 
 type observationBatchSizer interface {
 	MaxObservationDeleteBatchWithinSearchBudget([]capture.SanitizedObservation) (int, error)
+}
+
+type sourceDeletionRecovery interface{ RecoverSourceDeletion(context.Context) error }
+
+func (s *Service) recoverCommittedDeletion(ctx context.Context) error {
+	if recovery, ok := s.store.(sourceDeletionRecovery); ok {
+		return recovery.RecoverSourceDeletion(ctx)
+	}
+	return nil
 }
 
 type knowledgeDeleter interface {
@@ -40,8 +51,38 @@ var (
 )
 
 type Service struct {
-	store    storage.EncryptedStore
-	activity *activity.Engine
+	store         storage.EncryptedStore
+	activity      *activity.Engine
+	cleanupMu     sync.RWMutex
+	notifications NotificationCleanup
+}
+
+type NotificationCleanup interface {
+	GuardSources(context.Context, []string) (func(), error)
+	GuardAll(context.Context) (func(), error)
+}
+
+func (s *Service) SetNotificationCleanup(cleanup NotificationCleanup) {
+	s.cleanupMu.Lock()
+	s.notifications = cleanup
+	s.cleanupMu.Unlock()
+}
+func (s *Service) notificationCleanup() NotificationCleanup {
+	s.cleanupMu.RLock()
+	defer s.cleanupMu.RUnlock()
+	return s.notifications
+}
+
+type allNotificationGuardKey struct{}
+
+func (s *Service) guardSources(ctx context.Context, ids []string) (func(), error) {
+	if held, _ := ctx.Value(allNotificationGuardKey{}).(bool); held {
+		return func() {}, nil
+	}
+	if cleanup := s.notificationCleanup(); cleanup != nil {
+		return cleanup.GuardSources(ctx, ids)
+	}
+	return func() {}, nil
 }
 
 // NewService requires an encrypted store; the activity engine is optional for
@@ -70,6 +111,17 @@ func (s *Service) DeleteSource(ctx context.Context, sourceID string) (int, error
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	if err := s.recoverCommittedDeletion(ctx); err != nil {
+		return 0, err
+	}
+	if removed, handled, err := s.deletePreparedCapture(ctx, sourceID); handled || err != nil {
+		return removed, err
+	}
+	release, err := s.guardSources(ctx, []string{sourceID})
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	if err := s.recordTombstone(ctx, sourceID, time.Now()); err != nil {
 		return 0, err
 	}
@@ -86,6 +138,70 @@ func (s *Service) DeleteSource(ctx context.Context, sourceID string) (int, error
 	return removed, nil
 }
 
+type conditionalSourceDeleter interface {
+	DeleteObservationRecordBefore(context.Context, string, time.Time, bool, func([]tasks.Item) error) (bool, error)
+}
+type conditionalNotificationCleanup interface {
+	WithSourceDeletionGuard(context.Context, func(context.Context, func([]tasks.Item) error) error) error
+}
+
+// DeleteSourceThrough applies an original replicated cutoff, preserving any
+// primary captured later. It never invents a newer deletion timestamp.
+func (s *Service) DeleteSourceThrough(ctx context.Context, sourceID string, cutoff time.Time) (int, error) {
+	return s.deleteSourceAtCutoff(ctx, sourceID, cutoff, true)
+}
+
+func (s *Service) deleteSourceAtCutoff(ctx context.Context, sourceID string, cutoff time.Time, inclusive bool) (removed int, err error) {
+	if s == nil || s.store == nil || ctx == nil || !durable.ValidCapturedAt(cutoff) {
+		return 0, ErrInvalid
+	}
+	store, ok := s.store.(conditionalSourceDeleter)
+	if !ok {
+		return 0, ErrUnavailable
+	}
+	if err := s.recoverCommittedDeletion(ctx); err != nil {
+		return 0, err
+	}
+	if prepared, ok := s.store.(preparedSourceDeleter); ok {
+		return s.withCaptureDeletionGuard(ctx, func(guardCtx context.Context, prepare func(string, []tasks.Item) error) (int, error) {
+			erased, err := prepared.DeleteSourceRecordBeforeWithPrepare(guardCtx, sourceID, cutoff, inclusive, prepare)
+			if erased {
+				return 1, err
+			}
+			return 0, err
+		})
+	}
+	action := func(guardCtx context.Context, cancel func([]tasks.Item) error) error {
+		erased, err := store.DeleteObservationRecordBefore(guardCtx, sourceID, cutoff, inclusive, func(items []tasks.Item) error {
+			if cancel != nil {
+				if err := cancel(items); err != nil {
+					return err
+				}
+			}
+			if s.activity != nil {
+				var err error
+				_, err = s.activity.ForgetSource(sourceID)
+				return err
+			}
+			return nil
+		})
+		if erased {
+			removed = 1
+		}
+		return err
+	}
+	if cleanup := s.notificationCleanup(); cleanup != nil {
+		guard, ok := cleanup.(conditionalNotificationCleanup)
+		if !ok {
+			return 0, ErrUnavailable
+		}
+		err = guard.WithSourceDeletionGuard(ctx, action)
+		return removed, err
+	}
+	err = action(ctx, nil)
+	return removed, err
+}
+
 // DeleteAll removes every encrypted source through the same cascade as an
 // individual deletion. It pages in stable content-ID order so it never clones
 // the whole store into memory. On failure, removed is the completed prefix;
@@ -93,6 +209,17 @@ func (s *Service) DeleteSource(ctx context.Context, sourceID string) (int, error
 func (s *Service) DeleteAll(ctx context.Context) (removed int, err error) {
 	if s == nil || s.store == nil || ctx == nil {
 		return 0, ErrInvalid
+	}
+	if err := s.recoverCommittedDeletion(ctx); err != nil {
+		return 0, err
+	}
+	if cleanup := s.notificationCleanup(); cleanup != nil {
+		release, err := cleanup.GuardAll(ctx)
+		if err != nil {
+			return 0, err
+		}
+		defer release()
+		ctx = context.WithValue(ctx, allNotificationGuardKey{}, true)
 	}
 	// The tombstone is written first so a crash mid-delete still replicates.
 	if err := s.recordTombstone(ctx, durable.AllSourcesTombstone, time.Now()); err != nil {
@@ -102,12 +229,34 @@ func (s *Service) DeleteAll(ctx context.Context) (removed int, err error) {
 	if err != nil {
 		return removed, err
 	}
+	captures, err := s.deleteCaptureMatching(ctx, nil)
+	removed += captures
+	if err != nil {
+		return removed, err
+	}
 	deleter, ok := s.store.(knowledgeDeleter)
 	if !ok {
 		return removed, ErrUnavailable
 	}
 	if err := deleter.DeleteAllKnowledge(ctx); err != nil {
 		return removed, err
+	}
+	if taskStore, ok := s.store.(interface{ DeleteAllTasks(context.Context) error }); ok {
+		if err := taskStore.DeleteAllTasks(ctx); err != nil {
+			return removed, err
+		}
+	}
+	if profileStore, ok := s.store.(interface{ DeleteAllProfile(context.Context) error }); ok {
+		if err := profileStore.DeleteAllProfile(ctx); err != nil {
+			return removed, err
+		}
+	}
+	if meetingStore, ok := s.store.(interface {
+		DeleteAllMeetings(context.Context) (int, error)
+	}); ok {
+		if _, err := meetingStore.DeleteAllMeetings(ctx); err != nil {
+			return removed, err
+		}
 	}
 	if clearer, ok := s.store.(importedClearer); ok {
 		if err := clearer.ClearImported(ctx); err != nil {
@@ -150,12 +299,29 @@ func (s *Service) DeleteBefore(ctx context.Context, cutoff time.Time) (int, erro
 		return 0, ErrInvalid
 	}
 	cutoff = cutoff.UTC()
-	return s.deleteMatching(ctx, &cutoff)
+	removed, err := s.deleteMatching(ctx, &cutoff)
+	if err != nil {
+		return removed, err
+	}
+	captures, err := s.deleteCaptureMatching(ctx, &cutoff)
+	removed += captures
+	if err != nil {
+		return removed, err
+	}
+	if meetingStore, ok := s.store.(interface {
+		DeleteMeetingsBefore(context.Context, time.Time) (int, error)
+	}); ok {
+		_, err = meetingStore.DeleteMeetingsBefore(ctx, cutoff)
+	}
+	return removed, err
 }
 
 func (s *Service) deleteMatching(ctx context.Context, cutoff *time.Time) (removed int, err error) {
 	if s == nil || s.store == nil || ctx == nil {
 		return 0, ErrInvalid
+	}
+	if err := s.recoverCommittedDeletion(ctx); err != nil {
+		return 0, err
 	}
 	after := ""
 	for {
@@ -189,6 +355,14 @@ func (s *Service) deleteMatching(ctx context.Context, cutoff *time.Time) (remove
 				if !page.CapturedAt[i].Before(*cutoff) {
 					continue
 				}
+				if _, conditional := s.store.(conditionalSourceDeleter); conditional {
+					n, err := s.deleteSourceAtCutoff(ctx, observation.ContentID(), *cutoff, false)
+					removed += n
+					if err != nil {
+						return removed, err
+					}
+					continue
+				}
 			}
 			selected = append(selected, observation)
 		}
@@ -208,11 +382,17 @@ func (s *Service) deleteMatching(ctx context.Context, cutoff *time.Time) (remove
 			if len(batch) == 0 {
 				return nil
 			}
+			release, err := s.guardSources(ctx, batch)
+			if err != nil {
+				return err
+			}
+			defer release()
 			if supportsBatch {
-				if err := batchStore.DeleteObservationRecords(ctx, batch); err != nil {
+				completed, err := deleteBoundedBatch(ctx, batchStore, batch)
+				removed += completed
+				if err != nil {
 					return err
 				}
-				removed += len(batch)
 				batch = batch[:0]
 				return nil
 			}
@@ -256,4 +436,25 @@ func (s *Service) deleteMatching(ctx context.Context, cutoff *time.Time) (remove
 			return removed, nil
 		}
 	}
+}
+
+// A valid batch can exceed the physical byte cap as source-linked vectors or
+// other projections grow. Invalid transactions roll back atomically, so split
+// only that classified rejection. Never retry corruption or generic I/O errors.
+func deleteBoundedBatch(ctx context.Context, store observationBatchDeleter, ids []string) (int, error) {
+	err := store.DeleteObservationRecords(ctx, ids)
+	if err == nil {
+		return len(ids), nil
+	}
+	var rejected *storage.StoreError
+	if len(ids) < 2 || !errors.As(err, &rejected) || rejected.Code != storage.Invalid {
+		return 0, err
+	}
+	middle := len(ids) / 2
+	first, err := deleteBoundedBatch(ctx, store, ids[:middle])
+	if err != nil {
+		return first, err
+	}
+	second, err := deleteBoundedBatch(ctx, store, ids[middle:])
+	return first + second, err
 }
