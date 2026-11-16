@@ -255,3 +255,11 @@ func TestRPCClientRejectsUnboundedOrMalformedRequestBeforeDial(t *testing.T) {
 		})
 	}
 }
+
+func TestParityReadMethodsAreAcceptedByTheRPCFrame(t *testing.T) {
+	for _, method := range []string{RPCReadSession, RPCListWiki, RPCGetTimeReport, RPCGetPromises} {
+		if !validRPCMethod(method) {
+			t.Errorf("%s rejected", method)
+		}
+	}
+}

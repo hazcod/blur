@@ -283,6 +283,9 @@ func (c *Client) HandleMCPRead(ctx context.Context, method string, raw json.RawM
 	if c == nil || c.data == nil || ctx == nil {
 		return nil, ErrNotConfigured
 	}
+	if isMCPParityMethod(method) {
+		return c.handleMCPParityRead(ctx, method, raw)
+	}
 	if method != localapi.RPCSearchMemory && method != localapi.RPCGetSnapshots && method != localapi.RPCGetChronicle && method != localapi.RPCListChronicles && method != localapi.RPCGetWorkingMemory && method != localapi.RPCGetRecentActivity && method != localapi.RPCSearchWiki && method != localapi.RPCGetWikiPage && method != localapi.RPCListTasks {
 		return nil, ErrInvalidRequest
 	}
