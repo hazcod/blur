@@ -794,9 +794,9 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	// Breadcrumb last: it only labels where the text was seen, runs under its
 	// own 200 ms budget, and any failure leaves the fields empty.
 	if role, name, path := readFocusForCapture(parent, frame.focus); role != "" || name != "" || path != "" {
-		observation = observation.withFocusRaw(role, name, path)
-		if err := observation.Validate(); err != nil {
-			return empty, err
+		// A breadcrumb that does not validate is dropped; it never fails a capture.
+		if labelled := observation.withFocusRaw(role, name, path); labelled.Validate() == nil {
+			observation = labelled
 		}
 	}
 	return observation, nil

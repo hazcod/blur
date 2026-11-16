@@ -9,6 +9,7 @@ import (
 
 	"github.com/hazcod/blur/internal/platform"
 	"github.com/hazcod/blur/internal/platform/fake"
+	"github.com/hazcod/blur/internal/privacy"
 )
 
 // fakeFocusNode is a fake AX element. It records every attribute requested so
@@ -280,5 +281,58 @@ func TestSanitizeObservationHasNoFocusBreadcrumb(t *testing.T) {
 	o, err := SanitizeObservation("example.app", "", "text", 64)
 	if err != nil || o.FocusedRole() != "" || o.FocusedName() != "" || o.FocusedPath() != "" {
 		t.Fatalf("%v %+v", err, o)
+	}
+}
+
+// Hostile labels must never fail a capture: each stored field is either a
+// clean fixed point of the redactor within bounds, or empty.
+func TestCaptureNeverFailsOnHostileFocusLabels(t *testing.T) {
+	hostile := []string{
+		"ghp_a1B2c3D4e5F6g7H8https://]api_key=key", // reviewer's reproducer
+		"ghp_" + strings.Repeat("a1B2", 10) + "https://]password=hunter2hunter2",
+		"https://user:pass@host/path?token=abcdef0123456789abcdef#frag",
+		"Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+		"-----BEGIN PRIVATE KEY-----" + strings.Repeat("A", 200),
+		"api_key=" + strings.Repeat("x", 118) + "api_key=zzzz",
+		strings.Repeat("é", 200),
+		strings.Repeat("日本語", 80),
+		strings.Repeat("a", 110) + "password: hunter2hunter2",
+		strings.Repeat("a", 100) + "https://]api_key=key",
+		"line1\nline2\ttab\x01\x1b[31mred\x7f",
+		"\xff\xfe invalid",
+		"nul\x00byte",
+		"  ",
+		"[REDACTED:SECRET]x[REDACTED",
+	}
+	for i, label := range hostile {
+		for _, shape := range []rawFocus{
+			{role: "AXTextField", name: label},
+			{role: "AXTextField", ancestors: []string{label, label}},
+			{role: "AXTextField", name: label, ancestors: []string{"ok", label}},
+		} {
+			shape := shape
+			p := focusPipeline("visible window text", func(context.Context) (rawFocus, bool) { return shape, true })
+			observation, err := p.Capture(context.Background())
+			if err != nil {
+				t.Fatalf("label %d %q failed the capture: %v", i, label, err)
+			}
+			if err := observation.Validate(); err != nil {
+				t.Fatalf("label %d produced an invalid observation: %v", i, err)
+			}
+			for _, field := range []string{observation.FocusedName(), observation.FocusedPath()} {
+				if len(field) > MaxFocusFieldBytes {
+					t.Fatalf("label %d: field is %d bytes", i, len(field))
+				}
+				if redacted, _ := privacy.Redact(field); redacted != field {
+					t.Fatalf("label %d: field %q is not redactor-stable", i, field)
+				}
+			}
+		}
+	}
+}
+
+func TestSanitizeFocusTextReachesAFixedPointOrEmpty(t *testing.T) {
+	if got := sanitizeFocusText("ghp_a1B2c3D4e5F6g7H8https://]api_key=key"); !validFocusFields("", got, "") {
+		t.Fatalf("reproducer left unstable text %q", got)
 	}
 }

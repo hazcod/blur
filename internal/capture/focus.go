@@ -174,17 +174,23 @@ func cleanFocusText(value string) string {
 	}, value)), " ")
 }
 
+// sanitizeFocusText returns a field that is a fixed point of the redactor and
+// at most MaxFocusFieldBytes, or "" when no such value can be reached within a
+// bounded number of passes. Redaction can expose new matches (a removed token
+// can join its neighbours), so it repeats until stable; truncation can bisect
+// a placeholder, so each truncation is followed by another stability check.
 func sanitizeFocusText(value string) string {
 	value = cleanFocusText(value)
-	if value == "" {
-		return ""
+	for pass := 0; pass < 8 && value != ""; pass++ {
+		redacted, _ := privacy.Redact(value)
+		redacted, _ = truncateUTF8(redacted, MaxFocusFieldBytes)
+		redacted = strings.TrimSpace(redacted)
+		if redacted == value && validFocusFields("", value, "") {
+			return value
+		}
+		value = redacted
 	}
-	redacted, _ := privacy.Redact(value)
-	redacted, truncated := truncateUTF8(redacted, MaxFocusFieldBytes)
-	if truncated {
-		redacted = safeTruncatedText(redacted)
-	}
-	return strings.TrimSpace(redacted)
+	return ""
 }
 
 // WithFocus returns the observation with a focused-element breadcrumb. The

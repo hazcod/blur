@@ -617,15 +617,6 @@ func (n *nativeAXNode) sensitive(ctx context.Context, role string) (bool, error)
 	return false, nil
 }
 
-func isSecureTextRole(role string) bool {
-	switch strings.TrimPrefix(role, "AX") {
-	case "SecureTextField", "SecureTextArea", "PasswordField":
-		return true
-	default:
-		return false
-	}
-}
-
 func (n *nativeAXNode) verifyTextSensitivity(ctx context.Context) error {
 	role, err := n.role(ctx)
 	if err != nil {
