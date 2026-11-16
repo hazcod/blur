@@ -193,6 +193,7 @@ func New(reader RPCReader) *mcp.Server {
 	}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return searchMemory(ctx, reader, request)
 	})
+	registerParityTools(server, reader, &openWorld)
 	return server
 }
 
