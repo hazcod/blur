@@ -78,6 +78,10 @@ type mcpSnapshotItem struct {
 	PartCount          *int64 `json:"part_count,omitempty"`
 	DocumentOffset     *int64 `json:"document_offset_bytes,omitempty"`
 	DocumentTotalBytes *int64 `json:"document_total_bytes,omitempty"`
+
+	// Sighting fields: how often identical content was seen.
+	SightingCount int64  `json:"sighting_count"`
+	LastSeenAt    string `json:"last_seen_at,omitempty"`
 }
 
 type mcpSnapshotResponse struct {
@@ -152,6 +156,10 @@ type mcpWorkingMemoryItem struct {
 	CapturedAt time.Time `json:"captured_at"`
 	Content    string    `json:"content"`
 	Truncated  bool      `json:"truncated"`
+
+	// Sighting fields: how often identical content was seen.
+	SightingCount int64  `json:"sighting_count"`
+	LastSeenAt    string `json:"last_seen_at,omitempty"`
 }
 
 type mcpWorkingMemoryResponse struct {
@@ -707,9 +715,14 @@ func (c *Client) readMCPWorkingMemory(ctx context.Context, epoch uint64, params 
 		previous = at
 		content, clipped := workingMemoryExcerpt(source.Text())
 		response.Truncated = response.Truncated || clipped || source.Truncated()
+		sightings, lastSeen, err := c.mcpSighting(ctx, source.SourceID(), at)
+		if err != nil {
+			return nil, err
+		}
 		response.Items = append(response.Items, mcpWorkingMemoryItem{
 			SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(),
 			CapturedAt: at.UTC(), Content: content, Truncated: clipped || source.Truncated(),
+			SightingCount: sightings, LastSeenAt: lastSeen,
 		})
 	}
 	encoded, err := json.Marshal(response)
@@ -1316,8 +1329,11 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 			item.DocumentOffset = &provenance.Start
 			item.DocumentTotalBytes = &provenance.TotalBytes
 		}
+		if item.SightingCount, item.LastSeenAt, err = c.mcpSighting(ctx, id, at); err != nil {
+			return nil, err
+		}
 		response.Snapshots = append(response.Snapshots, item)
-		used += len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.Content) + 192
+		used += mcpSightingFieldsBytes + len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.Content) + 192
 		if used > localapi.MaxRPCSnapshotResponseBytes {
 			return nil, ErrInvalidRequest
 		}

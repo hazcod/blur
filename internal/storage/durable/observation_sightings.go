@@ -29,6 +29,98 @@ type observationSightingHour struct {
 	Times    []int64 `json:"times"`
 }
 
+// observationSightingCount is the additive per-source tally. Sources written
+// before it existed have no record and read as count 0 until their next
+// sighting. It is erased with the source's sighting chain.
+type observationSightingCount struct {
+	Count    int64 `json:"count"`
+	LastSeen int64 `json:"last_seen"`
+}
+
+func sightingCountKey(id string) string { return id + ":count" }
+
+func decodeSightingCount(encoded []byte) (observationSightingCount, error) {
+	var rec observationSightingCount
+	if json.Unmarshal(encoded, &rec) != nil || rec.Count < 1 || !validCaptureTime(time.Unix(0, rec.LastSeen).UTC()) {
+		return rec, ErrCorrupt
+	}
+	return rec, nil
+}
+
+// bumpSightingCountLocked raises the per-source count by one and keeps the
+// newest last-seen time. A legacy source (no record) counts its original
+// capture plus this sighting.
+func (tx *Tx) bumpSightingCountLocked(id string, at time.Time) error {
+	encoded, found, err := tx.readIndexValueLocked(observationSightingNS, sightingCountKey(id), 256)
+	if err != nil {
+		return err
+	}
+	rec := observationSightingCount{Count: 1}
+	if found {
+		rec, err = decodeSightingCount(encoded)
+		clear(encoded)
+		if err != nil {
+			return err
+		}
+	}
+	rec.Count++
+	if n := at.UnixNano(); n > rec.LastSeen {
+		rec.LastSeen = n
+	}
+	out, err := json.Marshal(rec)
+	if err != nil {
+		return ErrCorrupt
+	}
+	defer clear(out)
+	return tx.putIndexValueLocked(observationSightingNS, sightingCountKey(id), out)
+}
+
+// ObservationSightingStats returns the monotonic sighting count (the original
+// capture counts as one) and the newest sighting time. Sources recorded before
+// counts existed report count 1 and their capture time until sighted again.
+func (s *Store) ObservationSightingStats(ctx context.Context, id string) (int64, time.Time, bool, error) {
+	if ctx == nil || !validHash(id) {
+		return 0, time.Time{}, false, &storage.StoreError{Code: storage.Invalid}
+	}
+	var count int64
+	var last time.Time
+	var found bool
+	err := s.view(ctx, func(reader bolt.Reader) error {
+		key := s.logicalKey(groupRecord, kindObservation, "", id)
+		exists, err := reader.Has(key)
+		clear(key)
+		if err != nil {
+			return mapStorePhysicalError(err)
+		}
+		if !exists {
+			return nil
+		}
+		first, err := s.observationCapturedAtReader(reader, id)
+		if err != nil {
+			return err
+		}
+		found, count, last = true, 1, first
+		encoded, ok, err := s.readIndexValueReader(reader, observationSightingNS, sightingCountKey(id), 256)
+		if err != nil || !ok {
+			return err
+		}
+		rec, err := decodeSightingCount(encoded)
+		clear(encoded)
+		if err != nil {
+			return err
+		}
+		count = rec.Count
+		if at := time.Unix(0, rec.LastSeen).UTC(); at.After(last) {
+			last = at
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	return count, last, found, nil
+}
+
 func sightingHourKey(id, hour string) string { return id + ":" + hour }
 func sightingMonthKey(id string, at time.Time) string {
 	return id + ":month:" + at.UTC().Format("200601")
@@ -180,6 +272,9 @@ func (tx *Tx) recordObservationSighting(observation capture.SanitizedObservation
 		return err
 	}
 	if err := tx.changeSightingMonthLocked(id, latest, false); err != nil {
+		return err
+	}
+	if err := tx.bumpSightingCountLocked(id, at); err != nil {
 		return err
 	}
 	if newHour {
@@ -335,6 +430,13 @@ func (tx *Tx) eraseObservationSighting(id string) (bool, error) {
 		return false, err
 	}
 	if node.Previous == "" {
+		if _, has, cerr := tx.readIndexValueLocked(observationSightingNS, sightingCountKey(id), 256); cerr != nil {
+			return false, cerr
+		} else if has {
+			if cerr := tx.deleteIndexValueLocked(observationSightingNS, sightingCountKey(id)); cerr != nil {
+				return false, cerr
+			}
+		}
 		err = tx.deleteIndexValueLocked(observationSightingNS, id)
 	} else {
 		err = tx.putIndexValueLocked(observationSightingNS, id, []byte(node.Previous))
