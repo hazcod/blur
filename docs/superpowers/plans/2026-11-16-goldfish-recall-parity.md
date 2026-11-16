@@ -110,7 +110,23 @@
 - [ ] Task creation without a model: "add (a )?task:? <text>", "add <text> to my (todo | to-do | task) list", "(todo | to-do | task): <text>", "new task:? <text>" create a task with the remaining text trimmed to ≤ 512 bytes and reply with a confirmation that names the task; "what's on my todo list?" / "list my tasks" keep listing. Scenario `task-create-list` passes in both modes.
 - [ ] Tests for each (including negatives: "add a task manager app?" is not a creation; "at 9pm" stays 21:00); run `go test ./internal/assistant/... ./internal/reminders/... ./internal/client/... -count=1` and flip the three `knownGap` tags (verify PASS twice).
 
-### Task 7: Parity record and canonical build
+### Task 8: Capture fidelity — minimum content and sighting counts (audit gaps 1, 3)
+
+**Files:** `internal/capture/pipeline.go`, `internal/ingest/service.go`, `internal/storage/durable/observation_sightings.go`, `internal/storage/store.go`, `internal/client/mcp_read.go` (sighting fields only, in a separate block), tests beside each. Must not touch `internal/client/ask_retrieval.go`, `recap_retrieval.go`, `internal/search/*`, `internal/assistant/context.go`, or `internal/client/scenario_*_test.go` (Task 5 owns them).
+
+- [ ] Minimum-content filter: an observation whose text has fewer than 32 non-whitespace Unicode characters is not stored as a capture (activity timing still counts the foreground visit), except voice transcripts and typed notes, which are always stored. Constant `capture.MinObservationChars = 32`. `ingest.Stats` gains `DroppedShort`. Tests: 31 vs 32 characters, whitespace-only, the two exemptions.
+- [ ] Sighting counts: the per-source sighting record keeps a monotonically increasing `SightingCount` and the newest `LastSeenAt`, additively encoded (schema stays 7; records written by current `main` decode with count 0 and are upgraded on the next sighting). `get_snapshots`, `get_working_memory` and `read_session` return `sighting_count` and `last_seen_at` for each capture. Tests: round-trip, increments across hour buckets, decode of a pre-change record, the three MCP responses.
+- [ ] Run `gofmt -l .`, `go vet ./...`, `go test ./internal/capture/... ./internal/ingest/... ./internal/storage/... ./internal/client/... ./internal/mcpserver/... -count=1`.
+
+### Task 9: Focused-element breadcrumb and persistent question history (audit gaps 2, 18)
+
+**Files:** `internal/capture/pipeline_darwin.go`, `internal/capture/pipeline.go` (observation fields), `internal/storage/durable/*` (additive record), `internal/storage/store.go`, `internal/client/mcp_read.go` (breadcrumb fields only, in a separate block), `internal/client/quick_history.go`, `internal/deletion/*` (fence), tests beside each. Same must-not-touch list as Task 8; coordinate with Task 8 by keeping `mcp_read.go` edits in separate, clearly commented blocks.
+
+- [ ] Focused-element breadcrumb: on macOS, after the window text is read, read the keyboard-focused element's role, its name (title, else description), and up to three ancestor names outermost first, with a 200 ms budget; never read the value of the focused element and never read anything for secure fields; store on the sanitized observation as `FocusedRole`, `FocusedName`, `FocusedPath` (each ≤ 120 bytes after the same redaction the text gets); a failed or slow read leaves the fields empty and never blocks or fails the capture. Exposed as `focused_role`, `focused_name`, `focused_path` on `get_snapshots`, `get_working_memory` and `read_session`. Tests: parsing and bounds with a fake AX API, redaction of a secret-looking name, store round-trip, MCP fields; the live AX path is documented as unverified until native acceptance.
+- [ ] Persistent question history: each Ask question (text ≤ 512 bytes), its asked-at time, plan kind, and cited source IDs are stored in the durable store as an additive record namespace (`question-history`), capped at the 500 newest, deletion-fenced (a deleted source is removed from every cited list; delete-all clears the namespace). The quick panel history loads from it on startup instead of process memory; no new UI surface. Tests: round-trip, cap, fence, delete-all, startup load.
+- [ ] Run `gofmt -l .`, `go vet ./...`, `go test ./internal/capture/... ./internal/storage/... ./internal/client/... ./internal/deletion/... ./internal/mcpserver/... -count=1`.
+
+### Task 10: Parity record and canonical build
 
 - [ ] Update `docs/goldfish-feature-parity.md` statuses for chronicles, MCP tools, time, and the scenario harness; append a dated "Behavioral findings (2026-11-16)" section to `docs/goldfish-local-architecture.md` describing the recovered behavior in Blur's own words (no Goldfish text), and a "Remaining gaps" list.
 - [ ] `make macos-app-stable`, verify `codesign -dv --verbose=2 ~/Downloads/Blur.app` reports `com.hazcod.blur` with the existing Developer ID, do not launch the app.
