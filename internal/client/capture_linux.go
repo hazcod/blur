@@ -5,6 +5,7 @@ package client
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/ingest"
@@ -28,6 +29,7 @@ func (a *LocalApp) CaptureController(source *platformlinux.Adapter) *ingest.Cont
 			return nil, err
 		}
 		service.SetHealthNotify(a.Client.setCaptureHealth)
+		service.SetPeriodicRefresh(6 * time.Second)
 		return service.Run, nil
 	})
 }

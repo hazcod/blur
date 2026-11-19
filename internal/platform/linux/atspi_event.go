@@ -16,6 +16,7 @@ import (
 )
 
 const atspiFocusSignal = "org.a11y.atspi.Event.Focus.Focus"
+const atspiWindowActivateSignal = "org.a11y.atspi.Event.Window.Activate"
 const a11yAccessible = "org.a11y.atspi.Accessible"
 
 type atspiSubscription struct {
@@ -286,8 +287,17 @@ func atspiRole(role uint32) (name string, sensitive bool) {
 		return "AXSeparator", false
 	case 51:
 		return "AXSlider", false
+	case 52:
+		// Spin buttons accept user-entered numeric text just like form
+		// entries; prune them before requesting values or descendants.
+		return "AXTextField", true
 	case 54:
 		return "AXStatusBar", false
+	case 60:
+		// Terminals echo everything the user types and every command
+		// response, including credentials and tokens. Prune them before
+		// requesting values or descendants.
+		return "AXTextArea", true
 	case 61:
 		return "AXTextArea", true
 	case 63:
@@ -298,12 +308,19 @@ func atspiRole(role uint32) (name string, sensitive bool) {
 		return "AXParagraph", false
 	case 75:
 		return "AXApplication", false
+	case 76:
+		// Autocomplete entries hold user-entered text like form entries;
+		// prune them before requesting values or descendants.
+		return "AXTextField", true
 	case 79:
 		return "AXTextField", true
 	case 87:
 		return "AXGroup", false
 	case 88:
 		return "AXLink", false
+	case 94:
+		// Document text is the user's editable document content.
+		return "AXTextArea", true
 	case 95:
 		return "AXWebArea", false
 	default:
