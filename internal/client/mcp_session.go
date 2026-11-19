@@ -21,6 +21,8 @@ const (
 	maxMCPSessionScan         = 512
 	maxMCPSessionAppMatches   = 4
 	mcpSessionItemOverheadEst = 256
+	// mcpFocusFieldsOverheadEst covers the three breadcrumb keys, quotes and commas.
+	mcpFocusFieldsOverheadEst = 80
 	mcpSessionSlice           = time.Hour
 )
 
@@ -286,7 +288,7 @@ func (c *Client) readMCPSession(ctx context.Context, epoch uint64, params mcpSes
 		if err != nil {
 			return nil, err
 		}
-		cost := len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.LastSeenAt) + len(item.Content) + mcpSessionItemOverheadEst + mcpSightingFieldsBytes
+		cost := mcpSessionItemCost(item)
 		if len(response.Captures) > 0 && used+cost > localapi.MaxRPCSnapshotResponseBytes-1024 {
 			response.HasMore = true
 			break
@@ -321,6 +323,18 @@ func (c *Client) readMCPSession(ctx context.Context, epoch uint64, params mcpSes
 	}
 	noteSightingUnavailable(response.SightingUnavailable)
 	return c.publishMCPParity(ctx, epoch, response, localapi.MaxRPCSnapshotResponseBytes)
+}
+
+// mcpSessionItemCost estimates one capture's JSON size so paging is honest
+// about the focused-element breadcrumb as well as the content. The
+// whole-response mcpParityFits trim stays as the backstop.
+func mcpSessionItemCost(item mcpSessionCapture) int {
+	cost := len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.LastSeenAt) + len(item.Content) +
+		mcpSessionItemOverheadEst + mcpSightingFieldsBytes
+	if breadcrumb := len(item.FocusedRole) + len(item.FocusedName) + len(item.FocusedPath); breadcrumb > 0 {
+		cost += breadcrumb + mcpFocusFieldsOverheadEst
+	}
+	return cost
 }
 
 // sessionCapture hydrates one capture with the same UTF-8 paging convention as
