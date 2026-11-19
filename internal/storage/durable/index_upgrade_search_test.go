@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/hazcod/blur/internal/search"
 )
 
 // Search after upgrading a store that holds both a plain observation and a
@@ -97,5 +95,4 @@ func TestSearchAfterFormatUpgradeFindsObservationsAndPublishedCaptures(t *testin
 	if page, err := again.SearchExact(ctx, scopedQuery("quokka")); err != nil || len(page.Hits) != 1 {
 		t.Fatalf("search after second open: %+v err=%v", page, err)
 	}
-	var _ = search.MaxResults
 }
