@@ -29,6 +29,11 @@ type BackgroundWorkGroup struct {
 	LastErrorCode              string
 	LastErrorAt                time.Time
 	CoverageLimited            bool
+	// RollupsPending counts day and week recaps that can be generated now;
+	// RollupsDirty counts every one waiting on changed or unfinished input.
+	// RollupReason is a closed reason while rollups are skipped. Recaps only.
+	RollupsPending, RollupsDirty int
+	RollupReason                 string
 }
 type noteWorkTelemetry struct {
 	deferred        bool
@@ -100,6 +105,7 @@ func (c *Client) BackgroundWorkStatus() BackgroundWorkSnapshot {
 			group := &out.Groups[1]
 			group.Queued, group.Running, group.Completed = status.Queued, status.Running, status.Completed
 			group.LastCompletedAt, group.LastErrorCode, group.LastErrorAt = status.LastCompletedAt, status.LastErrorCode, status.LastErrorAt
+			group.RollupsPending, group.RollupsDirty, group.RollupReason = status.RollupsPending, status.RollupsDirty, status.RollupReason
 			if group.Enabled && !repair {
 				group.State, group.Reason = status.State, status.Reason
 			}

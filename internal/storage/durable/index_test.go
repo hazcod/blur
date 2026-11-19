@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -109,6 +110,49 @@ func TestDurableSearchSupportsBoundedMinimumTermMatches(t *testing.T) {
 		TopK: 1, MaxRows: 8, MaxBytes: search.MaxIndexBytes,
 	}); !errors.Is(err, search.ErrInvalidRequest) {
 		t.Fatalf("partial-only query without an explicit threshold error=%v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestDurableSearchMinimumTermMatchesSurvivesAnExhaustedOrEmptyTermStream(t *testing.T) {
+	store, err := OpenDurable(t.TempDir()+"/search.db", durableTestKey(t, 0x7d), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var youssef []string
+	for i, text := range []string{"youssef will send the sow", "youssef wants the deck", "call with youssef", "youssef budget rare"} {
+		observation := indexObservation(t, "editor.app", "docs.example", text)
+		if err := store.PutObservation(context.Background(), observation); err != nil {
+			t.Fatalf("observation %d: %v", i, err)
+		}
+		youssef = append(youssef, observation.ContentID())
+	}
+	other := indexObservation(t, "editor.app", "docs.example", "unrelated budget notes")
+	if err := store.PutObservation(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	// "promise" is indexed nowhere. A one-of-two query must still return every
+	// source that has the other term; an empty stream cannot end the search.
+	page, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: []string{"promise", "youssef"}, MinTermMatches: 1, PartialOnly: true,
+		TopK: 10, MaxRows: 64, MaxBytes: search.MaxIndexBytes,
+	})
+	if err != nil || len(page.Hits) != len(youssef) {
+		t.Fatalf("empty-term page=%+v err=%v, want %d youssef sources", page, err, len(youssef))
+	}
+	for _, hit := range page.Hits {
+		if !slices.Contains(youssef, hit.SourceID) || hit.MatchedTerms != 0b10 {
+			t.Fatalf("hit %+v: want a youssef source reporting only term 1 matched", hit)
+		}
+	}
+	// A short stream ("budget" has two sources) exhausts while "youssef" still
+	// has unseen sources; they must be found through the long stream.
+	page, err = store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: []string{"budget", "youssef"}, MinTermMatches: 1, PartialOnly: true,
+		TopK: 10, MaxRows: 64, MaxBytes: search.MaxIndexBytes,
+	})
+	if err != nil || len(page.Hits) != 4 {
+		t.Fatalf("short-stream page=%+v err=%v, want the 3 youssef-only sources and the budget-only source", page, err)
 	}
 }
 

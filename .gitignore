@@ -11,3 +11,4 @@ coverage.out
 dist/
 research_notes/
 vendor/
+.claude/worktrees/

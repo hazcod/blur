@@ -539,6 +539,7 @@ func newDesktop(app ui.App, client *Client, captureController *ingest.Controller
 			d.mcpStatus = "Local bridge ready. Add Blur to Claude’s MCP configuration to connect it."
 		}
 	}
+	d.restoreQuickHistory() // recall earlier Ask questions from the encrypted store
 	d.excludedAppsDraft = strings.Join(d.preferences.ExcludedApps, "\n")
 	d.excludedDomainsDraft = strings.Join(d.preferences.ExcludedDomains, "\n")
 	d.includedAppsDraft = strings.Join(d.preferences.IncludedApps, "\n")
@@ -3621,6 +3622,9 @@ func (d *desktop) refreshAfterMemoryChange() {
 
 func (d *desktop) refreshInvalidatedMemoryViews() {
 	d.answers = make(map[string]string)
+	// Invalidation emptied the recall list; the encrypted store is its source
+	// of truth once the mutation settles (delete-all leaves it empty).
+	d.restoreQuickHistory()
 	switch d.page {
 	case "Today":
 		d.loadToday()

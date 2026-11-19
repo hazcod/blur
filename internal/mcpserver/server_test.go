@@ -72,7 +72,7 @@ func TestMCPExposesBoundedReadOnlyMemoryTools(t *testing.T) {
 	for _, tool := range tools.Tools {
 		byName[tool.Name] = tool
 	}
-	if len(tools.Tools) != 9 || byName["get_snapshots"] == nil || byName["get_chronicle"] == nil || byName["get_chronicles"] == nil || byName["get_working_memory"] == nil || byName["get_recent_activity"] == nil || byName["search_wiki"] == nil || byName["get_wiki_page"] == nil || byName["list_tasks"] == nil || byName["search_memory"] == nil {
+	if len(tools.Tools) != 13 || byName["get_snapshots"] == nil || byName["get_chronicle"] == nil || byName["get_chronicles"] == nil || byName["get_working_memory"] == nil || byName["get_recent_activity"] == nil || byName["search_wiki"] == nil || byName["get_wiki_page"] == nil || byName["list_tasks"] == nil || byName["search_memory"] == nil {
 		t.Fatalf("MCP tools = %+v, want bounded memory read tools and search_memory", byName)
 	}
 	if byName["search_memory"].Annotations == nil || !byName["search_memory"].Annotations.ReadOnlyHint || !byName["search_memory"].Annotations.IdempotentHint {
@@ -191,7 +191,7 @@ func TestMCPExposesPaginatedReadOnlySnapshots(t *testing.T) {
 	for _, tool := range tools.Tools {
 		byName[tool.Name] = tool
 	}
-	if len(tools.Tools) != 9 || byName["get_snapshots"] == nil || byName["get_chronicle"] == nil || byName["get_chronicles"] == nil || byName["get_working_memory"] == nil || byName["get_recent_activity"] == nil || byName["search_wiki"] == nil || byName["get_wiki_page"] == nil || byName["list_tasks"] == nil || byName["search_memory"] == nil {
+	if len(tools.Tools) != 13 || byName["get_snapshots"] == nil || byName["get_chronicle"] == nil || byName["get_chronicles"] == nil || byName["get_working_memory"] == nil || byName["get_recent_activity"] == nil || byName["search_wiki"] == nil || byName["get_wiki_page"] == nil || byName["list_tasks"] == nil || byName["search_memory"] == nil {
 		t.Fatalf("MCP tools = %+v, want read-only snapshot, chronicle, activity, and search tools", byName)
 	}
 	if byName["get_snapshots"].Annotations == nil || !byName["get_snapshots"].Annotations.ReadOnlyHint || !byName["get_snapshots"].Annotations.IdempotentHint {

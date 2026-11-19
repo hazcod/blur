@@ -10,10 +10,24 @@ import (
 // MeetingForSource resolves one authenticated live record through the existing
 // reverse edge. App IDs and opaque domains alone never grant session membership.
 func (s *Store) MeetingForSource(ctx context.Context, sourceID string) (meetings.Meeting, bool, error) {
+	meeting, _, found, err := s.meetingRecordForSource(ctx, sourceID)
+	return meeting, found, err
+}
+
+// MeetingRecordKindForSource reports whether a live meeting source is a spoken
+// transcript segment or a user-authored note. It applies the same
+// authentication as MeetingForSource.
+func (s *Store) MeetingRecordKindForSource(ctx context.Context, sourceID string) (meetings.RecordKind, bool, error) {
+	_, kind, found, err := s.meetingRecordForSource(ctx, sourceID)
+	return kind, found, err
+}
+
+func (s *Store) meetingRecordForSource(ctx context.Context, sourceID string) (meetings.Meeting, meetings.RecordKind, bool, error) {
 	if ctx == nil || !validHash(sourceID) {
-		return meetings.Meeting{}, false, meetings.ErrInvalid
+		return meetings.Meeting{}, "", false, meetings.ErrInvalid
 	}
 	var result meetings.Meeting
+	var resultKind meetings.RecordKind
 	found := false
 	err := s.view(ctx, func(reader bolt.Reader) error {
 		o, live, err := s.getObservationReader(reader, sourceID)
@@ -77,11 +91,11 @@ func (s *Store) MeetingForSource(ctx context.Context, sourceID string) (meetings
 		if _, _, err := validateMeetingRecord(h, record); err != nil {
 			return ErrCorrupt
 		}
-		result, found = h.Meeting, true
+		result, resultKind, found = h.Meeting, record.Kind, true
 		return nil
 	})
 	if err != nil {
-		return meetings.Meeting{}, false, err
+		return meetings.Meeting{}, "", false, err
 	}
-	return result, found, nil
+	return result, resultKind, found, nil
 }

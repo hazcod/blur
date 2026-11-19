@@ -263,6 +263,12 @@ func (s *Service) DeleteAll(ctx context.Context) (removed int, err error) {
 			return removed, err
 		}
 	}
+	// Ask question history cites sources; delete-all clears the whole namespace.
+	if questions, ok := s.store.(storage.QuestionHistory); ok {
+		if err := questions.DeleteAllQuestions(ctx); err != nil {
+			return removed, err
+		}
+	}
 	if chronicles, ok := s.store.(chronicleDeleter); ok {
 		return removed, chronicles.DeleteAllChronicles(ctx)
 	}

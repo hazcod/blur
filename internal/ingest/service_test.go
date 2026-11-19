@@ -120,7 +120,7 @@ func TestCaptureChangeNotifiesAfterSourceOrVisitIsPersisted(t *testing.T) {
 	defer cancel()
 	source := &eventSource{probe: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}, events: make(chan platform.CaptureEvent, 1)}
 	store := openTestStore(t)
-	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "new note", 256)
+	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "new note plus enough extra visible detail", 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestCaptureNotificationReceivesOnlyPersistedSanitizedObservationAndTimestam
 	defer cancel()
 	source := &eventSource{probe: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}, events: make(chan platform.CaptureEvent, 1)}
 	store := openTestStore(t)
-	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "reviewed notes", 256)
+	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "reviewed notes plus enough extra visible detail", 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestCaptureCancellationWinsBeforeDurableWrite(t *testing.T) {
 	defer cancel()
 	source := &eventSource{events: make(chan platform.CaptureEvent)}
 	sink := &recordingSink{}
-	observation, err := capture.SanitizeObservation("org.example.editor", "", "cancellation boundary", 256)
+	observation, err := capture.SanitizeObservation("org.example.editor", "", "cancellation boundary plus enough extra visible detail", 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestRunPersistsSourceLinkedActivitySegmentsOnFocusEvents(t *testing.T) {
 	defer cancel()
 	source := &eventSource{probe: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}, events: make(chan platform.CaptureEvent, 1)}
 	store := openTestStore(t)
-	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "project context", 256)
+	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "project context plus enough extra visible detail", 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestActivityWriteFailureDoesNotStopCaptureAndIsRetried(t *testing.T) {
 	source := &eventSource{probe: platform.CaptureProbe{TargetID: "opaque", AppID: "org.example.editor"}, events: make(chan platform.CaptureEvent, 2)}
 	store := openTestStore(t)
 	sink := &failFirstActivitySink{ActivitySink: store}
-	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "working context", 256)
+	observation, err := capture.SanitizeObservation(source.probe.AppID, "", "working context plus enough extra visible detail", 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestActivityWriteFailureDoesNotStopCaptureAndIsRetried(t *testing.T) {
 
 func TestRunClosesActivitySessionOnPauseWithoutCountingPausedTime(t *testing.T) {
 	store := openTestStore(t)
-	observation, err := capture.SanitizeObservation("org.example.editor", "", "context", 256)
+	observation, err := capture.SanitizeObservation("org.example.editor", "", "context plus enough extra visible detail", 256)
 	if err != nil {
 		t.Fatal(err)
 	}

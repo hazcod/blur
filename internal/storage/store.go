@@ -168,12 +168,25 @@ type ObservationSightings interface {
 	ObservationSightingAt(context.Context, string, time.Time, time.Time) (time.Time, bool, error)
 }
 
+// ObservationSightingStatsReader reports how often a capture's identical
+// content was seen (the original capture counts as one) and when it was last
+// seen. Counts only ever increase; the bool is false for unknown sources.
+type ObservationSightingStatsReader interface {
+	ObservationSightingStats(context.Context, string) (int64, time.Time, bool, error)
+}
+
 // ChronicleStore persists generated hourly summaries and their provenance.
 // Implementations must cascade source deletion and bound every list request.
 type ChronicleStore interface {
 	PutChronicle(context.Context, chronicle.Summary) error
 	GetChronicle(context.Context, string) (chronicle.Summary, bool, error)
 	ListChronicles(context.Context, time.Time, time.Time, string, int) ([]chronicle.Summary, string, error)
+	// Rollups are derived day and ISO-week recaps of the hourly summaries.
+	PutChronicleRollup(context.Context, chronicle.Rollup) error
+	GetChronicleRollup(context.Context, string) (chronicle.Rollup, bool, error)
+	// ListChronicleRollups pages one level ("day" or "week") by period start
+	// in a half-open range, with at most 64 rows per page.
+	ListChronicleRollups(ctx context.Context, level string, start, end time.Time, after string, limit int) ([]chronicle.Rollup, string, error)
 	DeleteChronicle(context.Context, string) error
 	DeleteAllChronicles(context.Context) error
 }
@@ -327,6 +340,22 @@ func (s *EphemeralMemoryStore) RecordObservationSighting(ctx context.Context, o 
 	visits[index] = at.UTC()
 	s.observationVisits[id] = visits
 	return nil
+}
+
+func (s *EphemeralMemoryStore) ObservationSightingStats(ctx context.Context, id string) (int64, time.Time, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ready(ctx, s.closed); err != nil {
+		return 0, time.Time{}, false, err
+	}
+	if !validHash(id) {
+		return 0, time.Time{}, false, &StoreError{Code: Invalid}
+	}
+	visits := s.observationVisits[id]
+	if len(visits) == 0 {
+		return 0, time.Time{}, false, nil
+	}
+	return int64(len(visits)), visits[len(visits)-1], true, nil
 }
 
 func latestVisit(visits []time.Time, start, end time.Time) time.Time {

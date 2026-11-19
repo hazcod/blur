@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hazcod/blur/internal/capture"
@@ -27,6 +31,239 @@ type observationSightingHour struct {
 	Page     string  `json:"page"`
 	Previous string  `json:"previous,omitempty"`
 	Times    []int64 `json:"times"`
+}
+
+// observationSightingCount is the additive per-source tally. It is absent for
+// sources whose sightings were recorded before it existed (they decode as
+// count 0, meaning "not tallied"); readers then derive the count and newest
+// time from the source's sighting chain, and the next sighting persists the
+// derived count so the tally continues from the true number. It is erased
+// with the source's sighting chain.
+type observationSightingCount struct {
+	Count    int64 `json:"count"`
+	LastSeen int64 `json:"last_seen"`
+}
+
+func sightingCountKey(id string) string { return id + ":count" }
+
+func decodeSightingCount(encoded []byte) (observationSightingCount, error) {
+	var rec observationSightingCount
+	if json.Unmarshal(encoded, &rec) != nil || rec.Count < 1 || !validCaptureTime(time.Unix(0, rec.LastSeen).UTC()) {
+		return rec, ErrCorrupt
+	}
+	return rec, nil
+}
+
+// maxSightingChainHops bounds the legacy chain walk (one hop per source/hour).
+var maxSightingChainHops = 4096
+
+// ErrSightingUnknown reports that a source's sighting chain is too long to
+// count reliably. It is an integrity signal, not a number: no count is
+// reported or persisted for such a source.
+var ErrSightingUnknown = errors.New("durable store: sighting count unknown")
+
+var (
+	// sightingChainWalks counts legacy chain derivations (observed by tests).
+	sightingChainWalks atomic.Uint64
+	// sightingRepairs counts count records rebuilt from the chain because
+	// they were damaged; sightingRepairLog and sightingUnknownLog rate-limit
+	// the identifier-free warnings to one per process.
+	sightingRepairs    atomic.Uint64
+	sightingRepairLog  sync.Once
+	sightingUnknownLog sync.Once
+)
+
+// SightingRepairs reports how many damaged sighting count records were rebuilt
+// from the sighting chain since the process started.
+func SightingRepairs() uint64 { return sightingRepairs.Load() }
+
+// deriveSightingChain counts the distinct recorded sighting instants of a
+// source across its hour chain (the original capture always counts, at least
+// once) and returns the newest instant. It is the source of truth for sources
+// that have no count record.
+func deriveSightingChain(read sightingReader, id string, first time.Time) (int64, time.Time, error) {
+	sightingChainWalks.Add(1)
+	count, last := int64(1), first
+	head, ok, err := read(observationSightingNS, id, 64)
+	if err != nil || !ok {
+		return count, last, err
+	}
+	hour := string(head)
+	clear(head)
+	for hops := 0; hour != "" && hops < maxSightingChainHops; hops++ {
+		if !validChronicleHourID(hour) {
+			return 0, time.Time{}, ErrCorrupt
+		}
+		encoded, found, err := read(observationSightingNS, sightingHourKey(id, hour), maxSightingHourBytes)
+		if err != nil {
+			return 0, time.Time{}, err
+		}
+		if !found {
+			return 0, time.Time{}, ErrCorrupt
+		}
+		node, err := decodeSightingHour(encoded, hour)
+		clear(encoded)
+		if err != nil {
+			return 0, time.Time{}, err
+		}
+		for _, n := range node.Times {
+			if n != first.UnixNano() { // the capture itself is already counted
+				count++
+			}
+			if at := time.Unix(0, n).UTC(); at.After(last) {
+				last = at
+			}
+		}
+		hour = node.Previous
+	}
+	if hour != "" {
+		sightingUnknownLog.Do(func() {
+			slog.Warn("sighting chain exceeds the countable limit; count omitted", "operation", "sighting_count", "result", "unknown")
+		})
+		return 0, time.Time{}, ErrSightingUnknown
+	}
+	return count, last, nil
+}
+
+// bumpSightingCountLocked records one more sighting, which the caller has
+// already written into the hour chain. Without a count record (legacy source)
+// the tally is derived from the chain, which already includes this sighting.
+func (tx *Tx) bumpSightingCountLocked(id string, at time.Time, first time.Time) error {
+	read := func(ns, key string, max int) ([]byte, bool, error) { return tx.readIndexValueLocked(ns, key, max) }
+	encoded, found, err := tx.readIndexValueLocked(observationSightingNS, sightingCountKey(id), 256)
+	if err != nil {
+		return err
+	}
+	var rec observationSightingCount
+	damaged := false
+	if found {
+		rec, err = decodeSightingCount(encoded)
+		clear(encoded)
+		damaged = err != nil
+	}
+	if !found || damaged {
+		// Legacy (absent) or damaged record: rebuild from the authoritative chain.
+		n, last, derr := deriveSightingChain(read, id, first)
+		if errors.Is(derr, ErrSightingUnknown) {
+			if found {
+				// Never leave a damaged record behind pretending to be a count.
+				return tx.deleteIndexValueLocked(observationSightingNS, sightingCountKey(id))
+			}
+			return nil
+		}
+		if derr != nil {
+			return derr
+		}
+		if damaged {
+			sightingRepairs.Add(1)
+			sightingRepairLog.Do(func() {
+				slog.Warn("damaged sighting count record rebuilt from the sighting chain", "operation", "sighting_count", "result", "repaired")
+			})
+		}
+		rec = observationSightingCount{Count: n, LastSeen: last.UnixNano()}
+	} else {
+		rec.Count++
+		if n := at.UnixNano(); n > rec.LastSeen {
+			rec.LastSeen = n
+		}
+	}
+	out, err := json.Marshal(rec)
+	if err != nil {
+		return ErrCorrupt
+	}
+	defer clear(out)
+	return tx.putIndexValueLocked(observationSightingNS, sightingCountKey(id), out)
+}
+
+// ObservationSightingStats returns the monotonic sighting count (the original
+// capture counts as one) and the newest sighting time. A source with no count
+// record (recorded before counts existed, or with a damaged record) reports
+// values derived from its sighting chain.
+func (s *Store) ObservationSightingStats(ctx context.Context, id string) (int64, time.Time, bool, error) {
+	if ctx == nil || !validHash(id) {
+		return 0, time.Time{}, false, &storage.StoreError{Code: storage.Invalid}
+	}
+	var count int64
+	var last time.Time
+	var found, derived bool
+	err := s.view(ctx, func(reader bolt.Reader) error {
+		key := s.logicalKey(groupRecord, kindObservation, "", id)
+		exists, err := reader.Has(key)
+		clear(key)
+		if err != nil {
+			return mapStorePhysicalError(err)
+		}
+		if !exists {
+			return nil
+		}
+		first, err := s.observationCapturedAtReader(reader, id)
+		if err != nil {
+			return err
+		}
+		found = true
+		read := func(ns, key string, max int) ([]byte, bool, error) {
+			return s.readIndexValueReader(reader, ns, key, max)
+		}
+		encoded, ok, err := read(observationSightingNS, sightingCountKey(id), 256)
+		if err != nil {
+			return err
+		}
+		if ok {
+			rec, derr := decodeSightingCount(encoded)
+			clear(encoded)
+			if derr != nil {
+				return derr // damaged record: the caller degrades this capture
+			}
+			count, last = rec.Count, time.Unix(0, rec.LastSeen).UTC()
+			if first.After(last) {
+				last = first
+			}
+			return nil
+		}
+		count, last, err = deriveSightingChain(read, id, first)
+		derived = err == nil
+		return err
+	})
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	if derived && count > 1 {
+		// Persist the derived tally once so later reads are O(1). The write
+		// re-derives inside its transaction; a failure only costs a re-walk.
+		_ = s.Update(ctx, func(tx *Tx) error { return tx.persistDerivedSightingCount(id) })
+	}
+	return count, last, found, nil
+}
+
+// persistDerivedSightingCount stores the chain-derived tally for a legacy
+// source unless a record already exists or the chain cannot be counted.
+func (tx *Tx) persistDerivedSightingCount(id string) error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if err := tx.checkLocked(); err != nil {
+		return tx.failLocked(err)
+	}
+	if _, has, err := tx.readIndexValueLocked(observationSightingNS, sightingCountKey(id), 256); err != nil || has {
+		return err
+	}
+	first, err := tx.store.observationCapturedAtReader(tx.writer, id)
+	if err != nil {
+		return err
+	}
+	read := func(ns, key string, max int) ([]byte, bool, error) { return tx.readIndexValueLocked(ns, key, max) }
+	n, last, err := deriveSightingChain(read, id, first)
+	if errors.Is(err, ErrSightingUnknown) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	out, err := json.Marshal(observationSightingCount{Count: n, LastSeen: last.UnixNano()})
+	if err != nil {
+		return ErrCorrupt
+	}
+	defer clear(out)
+	return tx.putIndexValueLocked(observationSightingNS, sightingCountKey(id), out)
 }
 
 func sightingHourKey(id, hour string) string { return id + ":" + hour }
@@ -183,9 +420,12 @@ func (tx *Tx) recordObservationSighting(observation capture.SanitizedObservation
 		return err
 	}
 	if newHour {
-		return tx.putIndexValueLocked(observationSightingNS, id, []byte(hour))
+		if err := tx.putIndexValueLocked(observationSightingNS, id, []byte(hour)); err != nil {
+			return err
+		}
 	}
-	return nil
+	// Last: a legacy derivation walks the chain, which must include this hour.
+	return tx.bumpSightingCountLocked(id, at, first)
 }
 
 func (tx *Tx) changeSightingMonthLocked(id string, at time.Time, remove bool) error {
@@ -335,6 +575,13 @@ func (tx *Tx) eraseObservationSighting(id string) (bool, error) {
 		return false, err
 	}
 	if node.Previous == "" {
+		if _, has, cerr := tx.readIndexValueLocked(observationSightingNS, sightingCountKey(id), 256); cerr != nil {
+			return false, cerr
+		} else if has {
+			if cerr := tx.deleteIndexValueLocked(observationSightingNS, sightingCountKey(id)); cerr != nil {
+				return false, cerr
+			}
+		}
 		err = tx.deleteIndexValueLocked(observationSightingNS, id)
 	} else {
 		err = tx.putIndexValueLocked(observationSightingNS, id, []byte(node.Previous))

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -46,7 +47,13 @@ type Receiver struct {
 	paused   bool
 	inFlight int
 	policy   CommitPolicy
+
+	droppedShort atomic.Uint64
 }
+
+// DroppedShort counts snapshots discarded for carrying fewer than
+// capture.MinObservationChars non-whitespace characters.
+func (r *Receiver) DroppedShort() uint64 { return r.droppedShort.Load() }
 
 func NewReceiver(grants *localapi.GrantStore, sink ObservationSink, enabled func() bool, clock func() time.Time, policies ...CommitPolicy) (*Receiver, error) {
 	if grants == nil || sink == nil || !sink.EncryptedAtRest() || enabled == nil {
@@ -151,6 +158,10 @@ func (r *Receiver) persist(ctx context.Context, observation capture.SanitizedObs
 	r.mu.Unlock()
 	if !allowed {
 		return ErrReceiverPaused
+	}
+	if !capture.MeetsMinimumContent(observation.AppID(), observation.Text()) {
+		r.droppedShort.Add(1)
+		return nil
 	}
 	var err error
 	if sink, ok := r.sink.(interface {

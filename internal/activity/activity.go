@@ -106,7 +106,7 @@ func (e *Engine) Apply(event Event) ([]Segment, error) {
 	if e == nil || event.Kind < Seen || event.Kind > Resumed || event.Monotonic < 0 || event.Wall.IsZero() {
 		return nil, ErrInvalid
 	}
-	if event.Kind == Seen && (!validText(event.SourceID, 128) || !validText(event.AppID, 128) || len(event.Domain) > 253) {
+	if event.Kind == Seen && (event.SourceID != "" && !validText(event.SourceID, 128) || !validText(event.AppID, 128) || len(event.Domain) > 253) {
 		return nil, ErrInvalid
 	}
 	e.mu.Lock()
@@ -154,7 +154,11 @@ func (e *Engine) Apply(event Event) ([]Segment, error) {
 		for i := range e.sources {
 			e.sources[i] = ""
 		}
-		e.sources = append(e.sources[:0], strings.Clone(event.SourceID))
+		if event.SourceID == "" {
+			e.sources = e.sources[:0]
+		} else {
+			e.sources = append(e.sources[:0], strings.Clone(event.SourceID))
+		}
 	case Idle, Locked, Sleeping:
 		e.active = false
 		e.appID = ""

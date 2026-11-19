@@ -63,6 +63,10 @@ type IndexHit struct {
 	CapturedAt time.Time
 	MatchStart int
 	MatchEnd   int
+	// MatchedTerms has bit i set when ExactQuery.Terms[i] is indexed for the
+	// source. Zero means the index did not report it (for example hits from
+	// semantic or recency retrieval); callers must not read it as "no match".
+	MatchedTerms uint32
 }
 
 // ExactPage is a bounded prefix of exact matches. HasMore means the row or

@@ -250,3 +250,132 @@ to its configured model provider. This remains a partial parity slice: working
 memory, multi-scale chronicles, inferred promises/follow-through, time reports,
 attention context, privacy controls, and Goldfish's broader workflows are not
 yet exposed through MCP.
+
+## Behavioral findings (2026-11-16)
+
+Read-only inspection of the installed Goldfish **0.1.70**: `strings` over the
+shipped binaries, the published MCP tool descriptions and the local SQLite
+schema. No process was run or attached, no private rows were copied, and no
+Goldfish wording is reused in Blur. VERBATIM marks facts taken directly from
+strings, SQL or tool descriptions; INFERRED marks deductions.
+
+### Retrieval
+
+- Raw search is FTS5 over snapshots ordered by `rank` (BM25); the displayed text
+  prefers the normalized body over the raw capture, and a windowed variant
+  filters on capture time. Chronicle summaries, Wiki pages, Wiki facts and the
+  topic index each have their own FTS table queried the same way. (VERBATIM)
+- Result-source labels for OR-joined BM25, embedding search and graph
+  PageRank sit side by side (INFERRED: three candidate sources feed one list).
+  No fusion weights, decay or recency boost were recoverable; recency appears
+  only as "last seen" ordering and in a working-memory relevance column.
+- Keyword search ANDs terms, returns ~200-character excerpts, defaults to 20
+  results (max 30) and may return day/hour summary rows alongside captures.
+  Working memory is the last few hours newest-first with full text and a
+  focused-element breadcrumb; recent activity is the last 30 minutes (max 360)
+  in forward order with a tail excerpt; a session read returns one app over a
+  time window in order. (VERBATIM)
+- Routing rules given to the assistant: recent activity first for vague or
+  "just now" questions; summaries plus working memory for day/week questions;
+  open full captures before quoting anything from a messaging app; Wiki and
+  summaries are orientation, never evidence. (VERBATIM)
+
+### Processing
+
+- Summary shape: hour ≈ 4–6 bullets / 80 words; day ≈ 4–7 bullets / 180 words
+  plus an optional short list (≤ 4) of commitments and upcoming items; week and
+  year are thematic. Summaries keep child IDs, source snapshot IDs and a dirty
+  flag so only changed periods regenerate. (VERBATIM limits)
+- Hourly extraction yields entities (person, project, topic, tool, org, with
+  aliases and relations) and typed flags (commitment, blocker, decision,
+  artifact, pivot, question) each tied to a source snapshot; already-known page
+  names are supplied so entities do not fragment. (VERBATIM)
+- Wiki pages are assembled from atomic claims tagged by subject (user, world,
+  third party), basis (observed action, on-screen content, user-stated,
+  inferred), worth (core, detail, noise) and cited excerpt indexes; noise and
+  uncited claims are discarded and claims describe what was observed rather
+  than inferred roles. (VERBATIM)
+- Open loops are consolidated in bounded passes (≤ 6 items) that must re-list
+  kept loops by key; each carries a source snapshot, an exact quote, a horizon
+  and a confidence where ≥ 0.85 is reserved for near-certain items. Closing a
+  loop requires quoted resolution evidence; silence, age, viewing or drafting
+  never count as done. Default relevance windows: 3 days, 24 hours for
+  same-day or meeting items, 30 days for projects. (VERBATIM)
+- Attention extraction runs per screen (≤ 12 email/event/commitment items)
+  with numbered screen lines cited by id. Answer grounding uses a claim
+  verification pass that cites evidence-span handles resolved by code, then a
+  supported/issues gate with a single rewrite; nothing is sent when no
+  supported content remains. (VERBATIM)
+- Proactive messages are JSON (send, title, body, deep link, skip reason); a
+  privacy block skips sensitive context; contextual nudges are capped at one
+  per day; meeting briefs follow who / last time / since then / open / bring
+  up; the UI schedules a morning brief at 08:45 and an evening wrap at 16:45.
+  A ≈ 400-word memory digest (focus, projects, people, decisions and
+  commitments, preferences and tools) is rebuilt daily and injected into chat.
+  (VERBATIM)
+
+### Capture and privacy
+
+- Identical content seen again updates the existing row in place: last-seen
+  time, accumulated duration, sighting count and the latest focused element.
+  (VERBATIM SQL)
+- Secure text fields are never read; private-browsing windows are detected by
+  title; a user blacklist, built-in rules and a remotely fetched exclusion
+  list gate capture; secrets are redacted by more than 100 patterns; frames
+  from Goldfish itself, system chrome and low-signal windows are dropped, and
+  content under 32 characters is excluded from indexing and summaries.
+  (VERBATIM)
+- Not recoverable without disassembly: capture and scheduler intervals, token
+  budgets, vector index parameters, fusion weights and dedup thresholds.
+
+### Model and transport
+
+- Backends: a hosted gateway by default, Azure OpenAI, an OpenAI-compatible
+  bring-your-own-key path and an Anthropic path; the local embedder is a small
+  static model used for Wiki vectors. The daemon serves the same read-only data
+  over loopback HTTP with a bearer token, and sixteen MCP tools: search,
+  chronicle, working memory, attention context, nudge history, promises, work
+  context, memory facts, recent activity, snapshots, session read, Wiki search,
+  page and list, time report and time rules. (VERBATIM)
+
+### What Blur takes from this (plan 2026-11-16)
+
+Merged on 2026-11-16 (branch `feature/goldfish-recall-parity`): a realistic
+recall scenario harness (15 natural-language scenarios × no-model and
+fake-generator modes, all passing); stored, source-linked day and ISO-week
+rollups generated only by the local background provider; `read_session`,
+`list_wiki`, `get_time_report` and `get_promises` reads; planner routing for
+recency, day parts, conversation recaps, speaker questions, pronoun follow-ups
+and stored-location cues; majority-term ranking with login-chrome demotion and
+chronological multi-day recaps; no-model extractive whole-page answers,
+bare-hour reminders and task-creation phrasings; a 32-character minimum-content
+filter on every write path with per-source sighting counts; a focused-element
+breadcrumb per capture; and persistent, deletion-fenced question history.
+
+### Remaining gaps (2026-11-16)
+
+Inside the recall goal:
+
+- Normalized body text with learned, per-surface boilerplate stripping: Blur
+  still indexes the raw sanitized capture and only drops Accessibility chrome
+  by role. Repeated sidebars and navigation can still outrank substantive text
+  for rare terms.
+- Inferred commitments: open loops are user-authored or explicit markers;
+  nothing yet reads captured prose for promises with confidence, horizon and
+  quoted closure evidence.
+- Entity detection only recognises capitalised names or Library matches at
+  retrieval time; the planner cannot consult the Library, so lowercase names
+  ("what did dima say") do not become a subject.
+- Month and year rollups, and rule-based project time in `get_time_report`.
+- Semantic recall covers only the optional local index; raw captures are
+  lexical, as in Goldfish, but Blur has no vector index over Library pages.
+- The live Accessibility breadcrumb path, long-session voice capture and
+  cross-app native acceptance remain unverified until a native acceptance run.
+- Background visibility: rollup counters joined the Settings panel; voice,
+  meeting and open-loop jobs still report nothing there.
+
+Outside the goal (not started): morning/evening briefs and contextual nudges,
+inline writing assistance and learned writing rules, time-rule editing UI,
+attention items from observed calendars and mail, chat threads/inbox, and
+ChatGPT/Claude history import. Details per area are in
+`docs/goldfish-feature-parity.md`.

@@ -78,15 +78,43 @@ type mcpSnapshotItem struct {
 	PartCount          *int64 `json:"part_count,omitempty"`
 	DocumentOffset     *int64 `json:"document_offset_bytes,omitempty"`
 	DocumentTotalBytes *int64 `json:"document_total_bytes,omitempty"`
+
+	// Sighting fields: how often identical content was seen.
+	SightingCount  int64  `json:"sighting_count,omitempty"`
+	LastSeenAt     string `json:"last_seen_at,omitempty"`
+	mcpFocusFields        // focused-element breadcrumb (mcp_focus.go)
 }
 
 type mcpSnapshotResponse struct {
 	Snapshots []mcpSnapshotItem `json:"snapshots"`
 	Truncated bool              `json:"truncated"`
+
+	// SightingUnavailable counts captures whose sighting fields were omitted
+	// because their sighting metadata is damaged.
+	SightingUnavailable int `json:"sighting_unavailable,omitempty"`
 }
 
 type mcpChronicleParams struct {
-	HourID string `json:"hour_id"`
+	HourID string `json:"hour_id,omitempty"`
+	Level  string `json:"level,omitempty"`
+	Period string `json:"period,omitempty"`
+}
+
+// maxMCPRollupSourceIDs bounds the source IDs one day or week response lists.
+const maxMCPRollupSourceIDs = 64
+
+type mcpRollupResponse struct {
+	Found              bool      `json:"found"`
+	Level              string    `json:"level,omitempty"`
+	Period             string    `json:"period,omitempty"`
+	Start              time.Time `json:"start,omitempty"`
+	End                time.Time `json:"end,omitempty"`
+	Text               string    `json:"text,omitempty"`
+	ChildIDs           []string  `json:"child_ids,omitempty"`
+	SourceIDs          []string  `json:"source_ids,omitempty"`
+	SourceIDsTruncated bool      `json:"source_ids_truncated,omitempty"`
+	GeneratedAt        time.Time `json:"generated_at,omitempty"`
+	Dirty              bool      `json:"dirty,omitempty"`
 }
 
 type mcpChronicleResponse struct {
@@ -133,6 +161,11 @@ type mcpWorkingMemoryItem struct {
 	CapturedAt time.Time `json:"captured_at"`
 	Content    string    `json:"content"`
 	Truncated  bool      `json:"truncated"`
+
+	// Sighting fields: how often identical content was seen.
+	SightingCount  int64  `json:"sighting_count,omitempty"`
+	LastSeenAt     string `json:"last_seen_at,omitempty"`
+	mcpFocusFields        // focused-element breadcrumb (mcp_focus.go)
 }
 
 type mcpWorkingMemoryResponse struct {
@@ -141,6 +174,10 @@ type mcpWorkingMemoryResponse struct {
 	Items           []mcpWorkingMemoryItem `json:"items"`
 	Truncated       bool                   `json:"truncated"`
 	IndexingPending bool                   `json:"indexing_pending,omitempty"`
+
+	// SightingUnavailable counts items whose sighting fields were omitted
+	// because their sighting metadata is damaged.
+	SightingUnavailable int `json:"sighting_unavailable,omitempty"`
 }
 
 type mcpActivityParams struct {
@@ -282,6 +319,9 @@ type mcpTaskResponse struct {
 func (c *Client) HandleMCPRead(ctx context.Context, method string, raw json.RawMessage) (json.RawMessage, error) {
 	if c == nil || c.data == nil || ctx == nil {
 		return nil, ErrNotConfigured
+	}
+	if isMCPParityMethod(method) {
+		return c.handleMCPParityRead(ctx, method, raw)
 	}
 	if method != localapi.RPCSearchMemory && method != localapi.RPCGetSnapshots && method != localapi.RPCGetChronicle && method != localapi.RPCListChronicles && method != localapi.RPCGetWorkingMemory && method != localapi.RPCGetRecentActivity && method != localapi.RPCSearchWiki && method != localapi.RPCGetWikiPage && method != localapi.RPCListTasks {
 		return nil, ErrInvalidRequest
@@ -458,13 +498,72 @@ func decodeMCPChronicleParams(raw []byte) (mcpChronicleParams, error) {
 		return mcpChronicleParams{}, ErrInvalidRequest
 	}
 	var trailing any
-	if !errors.Is(decoder.Decode(&trailing), io.EOF) || !validChronicleID(params.HourID) {
+	if !errors.Is(decoder.Decode(&trailing), io.EOF) {
+		return mcpChronicleParams{}, ErrInvalidRequest
+	}
+	switch params.Level {
+	case "", "hour":
+		// An hourly read needs its hour ID and takes no period.
+		if !validChronicleID(params.HourID) || params.Period != "" {
+			return mcpChronicleParams{}, ErrInvalidRequest
+		}
+		params.Level = ""
+	case chronicle.RollupLevelDay:
+		if params.HourID != "" || !chronicle.ValidDayKey(params.Period) {
+			return mcpChronicleParams{}, ErrInvalidRequest
+		}
+	case chronicle.RollupLevelWeek:
+		if params.HourID != "" || !chronicle.ValidWeekKey(params.Period) {
+			return mcpChronicleParams{}, ErrInvalidRequest
+		}
+	default:
 		return mcpChronicleParams{}, ErrInvalidRequest
 	}
 	return params, nil
 }
 
+// readMCPRollup serves one stored day or ISO-week recap. A placeholder, or a
+// rollup whose text was discarded because a source was erased, has no text to
+// return and is reported as not found; it is never returned without sources.
+func (c *Client) readMCPRollup(ctx context.Context, epoch uint64, params mcpChronicleParams) (json.RawMessage, error) {
+	if c.chronicles == nil {
+		return nil, ErrNotConfigured
+	}
+	id := params.Level + ":" + params.Period
+	rollup, found, err := c.chronicles.GetChronicleRollup(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	response := mcpRollupResponse{}
+	if found && rollup.Text != "" {
+		if rollup.ID != id || rollup.Level != params.Level || rollup.PeriodKey != params.Period || chronicle.ValidateRollup(rollup) != nil || len(rollup.SourceIDs) == 0 {
+			return nil, ErrInvalidRequest
+		}
+		response = mcpRollupResponse{Found: true, Level: rollup.Level, Period: rollup.PeriodKey, Start: rollup.Start.UTC(), End: rollup.End.UTC(), Text: rollup.Text, ChildIDs: append([]string(nil), rollup.ChildIDs...), GeneratedAt: rollup.GeneratedAt.UTC(), Dirty: rollup.Dirty}
+		response.SourceIDs = append([]string(nil), rollup.SourceIDs...)
+		if len(response.SourceIDs) > maxMCPRollupSourceIDs {
+			response.SourceIDs, response.SourceIDsTruncated = response.SourceIDs[:maxMCPRollupSourceIDs], true
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var encoded []byte
+	var marshalErr error
+	if !c.PublishMemoryRead(epoch, func() { encoded, marshalErr = json.Marshal(response) }) {
+		return nil, ErrMemoryChanging
+	}
+	if marshalErr != nil || len(encoded) > maxMCPReadOutputBytes {
+		clear(encoded)
+		return nil, ErrInvalidRequest
+	}
+	return encoded, nil
+}
+
 func (c *Client) readMCPChronicle(ctx context.Context, epoch uint64, params mcpChronicleParams) (json.RawMessage, error) {
+	if params.Level != "" {
+		return c.readMCPRollup(ctx, epoch, params)
+	}
 	if c.chronicles == nil {
 		return nil, ErrNotConfigured
 	}
@@ -626,11 +725,22 @@ func (c *Client) readMCPWorkingMemory(ctx context.Context, epoch uint64, params 
 		previous = at
 		content, clipped := workingMemoryExcerpt(source.Text())
 		response.Truncated = response.Truncated || clipped || source.Truncated()
+		sightings, lastSeen, err := c.mcpSighting(ctx, source.SourceID(), at)
+		if err != nil {
+			return nil, err
+		}
+		if sightings == 0 {
+			response.SightingUnavailable++
+		}
 		response.Items = append(response.Items, mcpWorkingMemoryItem{
 			SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(),
 			CapturedAt: at.UTC(), Content: content, Truncated: clipped || source.Truncated(),
+			SightingCount: sightings, LastSeenAt: lastSeen,
+			mcpFocusFields: focusFieldsOf(source), // focused-element breadcrumb
 		})
 	}
+	noteSightingUnavailable(response.SightingUnavailable)
+	trimWorkingMemoryFocus(&response) // breadcrumb yields to the byte budget
 	encoded, err := json.Marshal(response)
 	if err != nil || len(encoded) > maxMCPReadOutputBytes {
 		clear(encoded)
@@ -1228,6 +1338,7 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 		if !at.IsZero() {
 			item.CapturedAt = at.UTC().Format(time.RFC3339Nano)
 		}
+		item.mcpFocusFields = focusFieldsOf(evidence) // focused-element breadcrumb
 		if provenance, multipart := evidence.Provenance(); multipart {
 			item.DocumentID = provenance.EditionID
 			item.PartIndex = &provenance.PartIndex
@@ -1235,8 +1346,14 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 			item.DocumentOffset = &provenance.Start
 			item.DocumentTotalBytes = &provenance.TotalBytes
 		}
+		if item.SightingCount, item.LastSeenAt, err = c.mcpSighting(ctx, id, at); err != nil {
+			return nil, err
+		}
+		if item.SightingCount == 0 {
+			response.SightingUnavailable++
+		}
 		response.Snapshots = append(response.Snapshots, item)
-		used += len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.Content) + 192
+		used += mcpSightingFieldsBytes + len(item.SourceID) + len(item.AppID) + len(item.Domain) + len(item.CapturedAt) + len(item.Content) + 192
 		if used > localapi.MaxRPCSnapshotResponseBytes {
 			return nil, ErrInvalidRequest
 		}
@@ -1244,6 +1361,7 @@ func (c *Client) readMCPSnapshots(ctx context.Context, epoch uint64, params mcpS
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	noteSightingUnavailable(response.SightingUnavailable)
 	var encoded []byte
 	var marshalErr error
 	if !c.PublishMemoryRead(epoch, func() { encoded, marshalErr = json.Marshal(response) }) {

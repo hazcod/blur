@@ -15,21 +15,26 @@ import (
 )
 
 const (
-	rpcProtocolVersion          = 2
-	rpcChallengeBytes           = 32
-	maxRPCFrameBytes            = 32 << 10
-	maxRPCParamsBytes           = 24 << 10
-	rpcTimeout                  = 3 * time.Second
-	RPCSearchMemory             = "search_memory"
-	RPCGetToday                 = "get_today"
-	RPCGetSnapshots             = "get_snapshots"
-	RPCGetChronicle             = "get_chronicle"
-	RPCListChronicles           = "list_chronicles"
-	RPCGetWorkingMemory         = "get_working_memory"
-	RPCGetRecentActivity        = "get_recent_activity"
-	RPCSearchWiki               = "search_wiki"
-	RPCGetWikiPage              = "get_wiki_page"
-	RPCListTasks                = "list_tasks"
+	rpcProtocolVersion   = 2
+	rpcChallengeBytes    = 32
+	maxRPCFrameBytes     = 32 << 10
+	maxRPCParamsBytes    = 24 << 10
+	rpcTimeout           = 3 * time.Second
+	RPCSearchMemory      = "search_memory"
+	RPCGetToday          = "get_today"
+	RPCGetSnapshots      = "get_snapshots"
+	RPCGetChronicle      = "get_chronicle"
+	RPCListChronicles    = "list_chronicles"
+	RPCGetWorkingMemory  = "get_working_memory"
+	RPCGetRecentActivity = "get_recent_activity"
+	RPCSearchWiki        = "search_wiki"
+	RPCGetWikiPage       = "get_wiki_page"
+	RPCListTasks         = "list_tasks"
+	// parity reads
+	RPCReadSession              = "read_session"
+	RPCListWiki                 = "list_wiki"
+	RPCGetTimeReport            = "get_time_report"
+	RPCGetPromises              = "get_promises"
 	MaxRPCSearchResponseBytes   = 24 << 10
 	MaxRPCSnapshotResponseBytes = 24 << 10
 )
@@ -48,9 +53,13 @@ type GetSnapshotsParams struct {
 	MaxBytesPerSource int            `json:"max_bytes_per_source"`
 }
 
-// GetChronicleParams reads one source-linked hourly recap by its stable ID.
+// GetChronicleParams reads one source-linked recap. An hourly recap is read by
+// its stable HourID. A day or week recap is read with Level ("day" or "week")
+// and Period (YYYY-MM-DD or YYYY-Www); HourID is then empty.
 type GetChronicleParams struct {
-	HourID string `json:"hour_id"`
+	HourID string `json:"hour_id,omitempty"`
+	Level  string `json:"level,omitempty"`
+	Period string `json:"period,omitempty"`
 }
 
 // ListChroniclesParams reads a bounded, source-linked page of hourly recaps
@@ -93,6 +102,38 @@ type ListTasksParams struct {
 	State string `json:"state"`
 	Limit int    `json:"limit"`
 	After string `json:"after,omitempty"`
+}
+
+// ReadSessionParams reads one app's captures inside a window of at most 24
+// hours. From and To are Unix seconds (To exclusive). After is the last source
+// ID of the previous page; partially read captures continue via get_snapshots.
+type ReadSessionParams struct {
+	App               string `json:"app"`
+	From              int64  `json:"from"`
+	To                int64  `json:"to"`
+	Limit             int    `json:"limit"`
+	After             string `json:"after,omitempty"`
+	MaxBytesPerSource int    `json:"max_bytes_per_source,omitempty"`
+}
+
+// ListWikiParams lists Library entries, optionally of one kind.
+type ListWikiParams struct {
+	Type  string `json:"type,omitempty"`
+	Limit int    `json:"limit"`
+}
+
+// GetTimeReportParams selects a named period or inclusive local dates.
+type GetTimeReportParams struct {
+	Period string `json:"period,omitempty"`
+	From   string `json:"from,omitempty"`
+	To     string `json:"to,omitempty"`
+}
+
+// GetPromisesParams reads the follow-through view over existing records.
+type GetPromisesParams struct {
+	Query         string `json:"query,omitempty"`
+	IncludeClosed bool   `json:"include_closed,omitempty"`
+	Limit         int    `json:"limit"`
 }
 
 var (
@@ -378,7 +419,7 @@ func validRPCObject(value []byte) bool {
 }
 
 func validRPCMethod(method string) bool {
-	return method == RPCSearchMemory || method == RPCGetToday || method == RPCGetSnapshots || method == RPCGetChronicle || method == RPCListChronicles || method == RPCGetWorkingMemory || method == RPCGetRecentActivity || method == RPCSearchWiki || method == RPCGetWikiPage || method == RPCListTasks
+	return method == RPCSearchMemory || method == RPCGetToday || method == RPCGetSnapshots || method == RPCGetChronicle || method == RPCListChronicles || method == RPCGetWorkingMemory || method == RPCGetRecentActivity || method == RPCSearchWiki || method == RPCGetWikiPage || method == RPCListTasks || method == RPCReadSession || method == RPCListWiki || method == RPCGetTimeReport || method == RPCGetPromises
 }
 
 func validRPCID(id string) bool {

@@ -22,7 +22,7 @@ func TestPeriodicRefreshCapturesContentThatLoadsWithoutFocusEvents(t *testing.T)
 	defer cancel()
 	source := &eventSource{events: make(chan platform.CaptureEvent)}
 	sink := &recordingSink{}
-	observation, _ := capture.SanitizeObservation("editor", "", "Content loaded after focus", 100)
+	observation, _ := capture.SanitizeObservation("editor", "", "Content loaded after focus plus enough extra visible detail", 100)
 	var calls atomic.Int32
 	service, err := newService(source, captureFunc(func(context.Context) (capture.SanitizedObservation, error) {
 		if calls.Add(1) == 1 {
@@ -78,7 +78,7 @@ func TestCaptureHealthClassifiesRecoverableGapsWithoutSavingEmptySources(t *test
 func TestUnreadableOrExcludedContextStopsAttributingTimeToPreviousSource(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	observation, _ := capture.SanitizeObservation("editor", "", "saved source", 100)
+	observation, _ := capture.SanitizeObservation("editor", "", "saved source plus enough extra visible detail", 100)
 	if err := store.PutObservation(ctx, observation); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestUnreadableOrExcludedContextStopsAttributingTimeToPreviousSource(t *test
 }
 
 func TestCaptureHealthUnchangedContentPreservesLastSavedTime(t *testing.T) {
-	observation, _ := capture.SanitizeObservation("editor", "", "saved source", 100)
+	observation, _ := capture.SanitizeObservation("editor", "", "saved source plus enough extra visible detail", 100)
 	service, _ := newService(&eventSource{}, captureFunc(func(context.Context) (capture.SanitizedObservation, error) { return observation, nil }), &recordingSink{}, nil)
 	var samples []Health
 	service.SetHealthNotify(func(value Health) { samples = append(samples, value) })
@@ -125,11 +125,12 @@ func TestCaptureHealthUnchangedContentPreservesLastSavedTime(t *testing.T) {
 }
 
 func TestCaptureHealthReportsPartialContentUntilNextCompleteRead(t *testing.T) {
-	partial, err := capture.SanitizeObservation("editor.app", "", "Visible\npassword:x", len("Visible\npassword:x"))
+	const partialText = "Visible content that is long enough to keep\npassword:x"
+	partial, err := capture.SanitizeObservation("editor.app", "", partialText, len(partialText))
 	if err != nil || !partial.Truncated() {
 		t.Fatal("invalid partial fixture", err)
 	}
-	complete, err := capture.SanitizeObservation("editor.app", "", "Complete visible source", 100)
+	complete, err := capture.SanitizeObservation("editor.app", "", "Complete visible source plus enough extra visible detail", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +167,7 @@ func TestHealthAcceptsOnlyWhitelistedNativeReadDiagnostics(t *testing.T) {
 }
 
 func TestCaptureHealthRetainsTypedIssueAcrossExclusionAndClearsOnReadableContent(t *testing.T) {
-	observation, err := capture.SanitizeObservation("terminal.app", "", "synthetic saved output", 100)
+	observation, err := capture.SanitizeObservation("terminal.app", "", "synthetic saved output plus enough extra visible detail", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +249,7 @@ func (*policyRejectedSink) PutObservation(context.Context, capture.SanitizedObse
 	return &capture.CaptureError{Code: capture.Excluded}
 }
 func TestLateCapturePolicyRejectionIsExcludedNotStorageFailure(t *testing.T) {
-	observation, err := capture.SanitizeObservation("dev.herdr.app", "", "Synthetic", 1024)
+	observation, err := capture.SanitizeObservation("dev.herdr.app", "", "Synthetic plus enough extra visible detail", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}

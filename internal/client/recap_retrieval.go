@@ -16,6 +16,12 @@ const maxRecapChroniclePages = 32 // the supported 31-day range holds at most 74
 // Full originals stay available to the source inspector; model packing has its
 // own much smaller budget. At most eight raw 1 MiB records are retained.
 func (c *Client) recapEvidence(ctx context.Context, plan assistant.Plan, start, end time.Time, segments []activity.Segment) ([]assistant.Evidence, bool, error) {
+	return c.recapEvidenceWithDiagnosis(ctx, plan, start, end, segments, nil)
+}
+
+// recapEvidenceWithDiagnosis also reports how many in-scope day or week
+// rollups are waiting to be regenerated.
+func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.Plan, start, end time.Time, segments []activity.Segment, diagnosis *assistant.Diagnosis) ([]assistant.Evidence, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -29,6 +35,15 @@ func (c *Client) recapEvidence(ctx context.Context, plan assistant.Plan, start, 
 		return nil, false, nil
 	}
 	segments = recapSegmentsInWindow(segments, start, end)
+	// Whole local days and ISO weeks come from stored rollups; hour recaps and
+	// raw captures only fill the partial periods around them.
+	rollups, covered, dirty, err := c.recapRollups(ctx, plan, start, end)
+	if err != nil {
+		return nil, false, err
+	}
+	if diagnosis != nil {
+		diagnosis.RollupsDirty = dirty
+	}
 	var candidates []assistant.Evidence
 	if c.chronicles != nil && len(plan.AppIDs)+len(plan.Domains) == 0 {
 		after := ""
@@ -47,7 +62,7 @@ func (c *Client) recapEvidence(ctx context.Context, plan assistant.Plan, start, 
 			for _, row := range rows {
 				// A summary crossing a requested boundary also contains work
 				// outside that scope. Primary captures fill that boundary.
-				if strings.TrimSpace(row.Text) == "" || row.Start.Before(start) || row.End.After(end) || !row.End.After(row.Start) {
+				if strings.TrimSpace(row.Text) == "" || row.Start.Before(start) || row.End.After(end) || !row.End.After(row.Start) || coveredByRollup(covered, row.Start, row.End) {
 					continue
 				}
 				// A recap is its own derived source. Reusing its first supporting
@@ -104,8 +119,44 @@ func (c *Client) recapEvidence(ctx context.Context, plan assistant.Plan, start, 
 		}
 	}
 	candidates = append(candidates, raw...)
-	selected, limited := assistant.TimeDistributedEvidence(candidates, assistant.MaxEvidenceItems)
-	return selected, sampled || limited, nil
+	// Sign-in screens are chrome; hour recaps and other captures in the same
+	// window are the substance when any exist.
+	candidates = demoteAuthenticationPages(plan.Question, candidates)
+	var leading []assistant.Evidence
+	rollupLimited := false
+	if len(rollups) > 0 {
+		var weeks, days []assistant.Evidence
+		for _, item := range rollups {
+			if item.Layer == assistant.LayerWeek {
+				weeks = append(weeks, item)
+			} else {
+				days = append(days, item)
+			}
+		}
+		var weekLimited, dayLimited bool
+		leading, weekLimited = assistant.TimeDistributedEvidence(weeks, maxRollupRecapItems)
+		var chosen []assistant.Evidence
+		chosen, dayLimited = assistant.TimeDistributedEvidence(days, maxRollupRecapItems-len(leading))
+		leading = append(leading, chosen...)
+		rollupLimited = weekLimited || dayLimited
+	}
+	var selected []assistant.Evidence
+	var limited bool
+	if end.Sub(start) > 24*time.Hour {
+		// A long period reads as a timeline: every day with saved items is
+		// represented before any day is represented twice, oldest first.
+		zone, zoneErr := loadZone(localZoneName())
+		if zoneErr != nil {
+			zone = time.UTC
+		}
+		selected, limited = assistant.DayBalancedEvidence(candidates, assistant.MaxEvidenceItems-len(leading), zone)
+		if diagnosis != nil {
+			diagnosis.Chronological = true
+		}
+	} else {
+		selected, limited = assistant.TimeDistributedEvidence(candidates, assistant.MaxEvidenceItems-len(leading))
+	}
+	return append(leading, selected...), sampled || limited || rollupLimited, nil
 }
 
 func recapSegmentsInWindow(segments []activity.Segment, start, end time.Time) []activity.Segment {

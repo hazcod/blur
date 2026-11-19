@@ -14,6 +14,14 @@ import (
 
 const maxRecentDayCaptures = 8
 
+// maxRecentCandidates bounds how many recent captures one read may return. Capture
+// questions read three times their answer size so that demoting sign-in screens
+// still leaves a full list.
+const (
+	maxRecentCandidates   = 3 * planEvidenceItems
+	captureDemotionFactor = 3
+)
+
 // recentPlanEvidence joins exact persisted visit timestamps with legacy
 // activity sightings. Raw evidence is available before a session closes. Each filter
 // read is bounded, and the returned deduplicated evidence stays under one
@@ -24,7 +32,7 @@ func (c *Client) recentPlanEvidence(ctx context.Context, plan assistant.Plan, st
 }
 
 func (c *Client) recentPlanEvidenceWithCoverage(ctx context.Context, plan assistant.Plan, start, end time.Time, segments []activity.Segment, limit int) ([]assistant.Evidence, bool, error) {
-	if limit < 1 || limit > planEvidenceItems || len(plan.AppIDs)+len(plan.Domains) > 8 {
+	if limit < 1 || limit > maxRecentCandidates || len(plan.AppIDs)+len(plan.Domains) > 8 {
 		return nil, false, ErrInvalidRequest
 	}
 	sampled := uniqueSources(segments) > limit

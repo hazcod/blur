@@ -190,3 +190,12 @@ func ignoredAXRole(app, role string, profiles map[string]map[string]struct{}) bo
 	_, ignored := profiles[app][role]
 	return ignored
 }
+
+func isSecureTextRole(role string) bool {
+	switch strings.TrimPrefix(role, "AX") {
+	case "SecureTextField", "SecureTextArea", "PasswordField":
+		return true
+	default:
+		return false
+	}
+}

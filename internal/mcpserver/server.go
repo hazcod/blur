@@ -69,9 +69,9 @@ const snapshotInputSchema = `{"type":"object","additionalProperties":false,"prop
 
 const snapshotOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"snapshots":{"type":"array","maxItems":3,"items":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","maxLength":64},"app_id":{"type":"string","maxLength":128},"domain":{"type":"string","maxLength":253},"captured_at":{"type":"string","maxLength":40},"content":{"type":"string","maxLength":4096},"offset_bytes":{"type":"integer","minimum":0},"next_offset_bytes":{"type":"integer","minimum":0},"complete":{"type":"boolean"},"partial_capture":{"type":"boolean"},"document_id":{"type":"string","maxLength":64},"part_index":{"type":"integer","minimum":0},"part_count":{"type":"integer","minimum":1},"document_offset_bytes":{"type":"integer","minimum":0},"document_total_bytes":{"type":"integer","minimum":0}},"required":["source_id","app_id","content","offset_bytes","next_offset_bytes","complete"]}},"truncated":{"type":"boolean"}},"required":["snapshots","truncated"]}`
 
-const chronicleInputSchema = `{"type":"object","additionalProperties":false,"properties":{"hour_id":{"type":"string","pattern":"^hour:[0-9]{8}T[0-9]{2}Z$","description":"Stable hour ID from the capture timestamp, formatted hour:YYYYMMDDTHHZ."}},"required":["hour_id"]}`
+const chronicleInputSchema = `{"type":"object","additionalProperties":false,"properties":{"level":{"type":"string","enum":["hour","day","week"],"description":"Recap level. hour (default) needs hour_id; day and week need period."},"hour_id":{"type":"string","pattern":"^hour:[0-9]{8}T[0-9]{2}Z$","description":"Stable hour ID from the capture timestamp, formatted hour:YYYYMMDDTHHZ. Only for level hour."},"period":{"type":"string","pattern":"^([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-W[0-9]{2})$","description":"Local calendar day YYYY-MM-DD for level day, or ISO week YYYY-Www for level week."}}}`
 
-const chronicleOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"found":{"type":"boolean"},"hour_id":{"type":"string","maxLength":18},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"summary":{"type":"string","maxLength":4096},"source_ids":{"type":"array","maxItems":64,"items":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"follow_up":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","pattern":"^[0-9a-f]{64}$"},"text":{"type":"string","maxLength":512}},"required":["source_id","text"]}},"required":["found"]}`
+const chronicleOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"found":{"type":"boolean"},"hour_id":{"type":"string","maxLength":18},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"summary":{"type":"string","maxLength":4096},"source_ids":{"type":"array","maxItems":64,"items":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"follow_up":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","pattern":"^[0-9a-f]{64}$"},"text":{"type":"string","maxLength":512}},"required":["source_id","text"]},"level":{"type":"string","enum":["day","week"]},"period":{"type":"string","maxLength":10},"text":{"type":"string","maxLength":2048},"child_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":18}},"source_ids_truncated":{"type":"boolean"},"generated_at":{"type":"string","format":"date-time"},"dirty":{"type":"boolean"}},"required":["found"]}`
 
 const chronicleRangeInputSchema = `{"type":"object","additionalProperties":false,"properties":{"start":{"type":"string","format":"date-time","description":"Inclusive RFC3339 start time."},"end":{"type":"string","format":"date-time","description":"Exclusive RFC3339 end time, at most 32 days after start."},"after":{"type":"string","pattern":"^hour:[0-9]{8}T[0-9]{2}Z$","description":"Continue after the last hour_id returned by the previous page."},"limit":{"type":"integer","minimum":1,"maximum":8,"default":8}},"required":["start","end"]}`
 
@@ -108,15 +108,15 @@ func New(reader RPCReader) *mcp.Server {
 		Title:        "Read saved capture text",
 		Description:  "Read full saved capture text for source IDs returned by search_memory. Large captures are paginated by UTF-8 byte offsets; pass next_offset_bytes in offsets to continue. Each result may contain full text from a source part of a larger document. Results are returned to the MCP host and may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(snapshotInputSchema),
-		OutputSchema: json.RawMessage(snapshotOutputSchema),
+		OutputSchema: withFocusProperties(snapshotOutputSchema, "snapshots"),
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld},
 	}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return getSnapshots(ctx, reader, request)
 	})
 	server.AddTool(&mcp.Tool{
 		Name:         "get_chronicle",
-		Title:        "Read an hourly recap",
-		Description:  "Read the saved hourly recap for a stable hour ID. The recap includes the exact capture source IDs it was based on; call get_snapshots before making exact claims. Results are returned to the MCP host and may be sent to its configured model provider.",
+		Title:        "Read an hourly, daily or weekly recap",
+		Description:  "Read a saved recap. Level hour (the default) reads the hourly recap for a stable hour ID. Level day reads the recap of one local calendar day (period YYYY-MM-DD), and level week the recap of one ISO week (period YYYY-Www); day and week recaps list the hours or days they summarize, and may be marked dirty while newer activity awaits regeneration. Every recap includes the exact capture source IDs it was based on; call get_snapshots before making exact claims. Results are returned to the MCP host and may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(chronicleInputSchema),
 		OutputSchema: json.RawMessage(chronicleOutputSchema),
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld},
@@ -148,7 +148,7 @@ func New(reader RPCReader) *mcp.Server {
 		Title:        "Read recent context",
 		Description:  "Read the newest saved captures from the last few hours, excluding Blur's own interface. Use this for vague/current questions; each excerpt has a source ID and may be shortened, so call get_snapshots before exact claims. Results are returned to the MCP host and may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(workingMemoryInputSchema),
-		OutputSchema: json.RawMessage(workingMemoryOutputSchema),
+		OutputSchema: withFocusProperties(workingMemoryOutputSchema, "items"),
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld},
 	}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return getWorkingMemory(ctx, reader, request)
@@ -193,11 +193,14 @@ func New(reader RPCReader) *mcp.Server {
 	}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return searchMemory(ctx, reader, request)
 	})
+	registerParityTools(server, reader, &openWorld)
 	return server
 }
 
 type chronicleInput struct {
-	HourID string `json:"hour_id"`
+	HourID string `json:"hour_id,omitempty"`
+	Level  string `json:"level,omitempty"`
+	Period string `json:"period,omitempty"`
 }
 
 type chronicleFollowUp struct {
@@ -213,6 +216,14 @@ type chronicleOutput struct {
 	Summary   string             `json:"summary,omitempty"`
 	SourceIDs []string           `json:"source_ids,omitempty"`
 	FollowUp  *chronicleFollowUp `json:"follow_up,omitempty"`
+	// Day and week recaps.
+	Level              string   `json:"level,omitempty"`
+	Period             string   `json:"period,omitempty"`
+	Text               string   `json:"text,omitempty"`
+	ChildIDs           []string `json:"child_ids,omitempty"`
+	SourceIDsTruncated bool     `json:"source_ids_truncated,omitempty"`
+	GeneratedAt        string   `json:"generated_at,omitempty"`
+	Dirty              bool     `json:"dirty,omitempty"`
 }
 
 type chronicleRangeInput struct {
@@ -270,6 +281,8 @@ type workingMemoryItem struct {
 	CapturedAt string `json:"captured_at"`
 	Content    string `json:"content"`
 	Truncated  bool   `json:"truncated"`
+
+	focusFields // focused-element breadcrumb (focus.go)
 }
 
 type workingMemoryOutput struct {
@@ -819,6 +832,9 @@ func boundWorkingMemoryOutput(output workingMemoryOutput, input workingMemoryInp
 	seen := make(map[string]bool, len(output.Items))
 	previous := end
 	for _, item := range output.Items {
+		if !item.focusFields.valid() {
+			return false
+		}
 		if len(item.SourceID) != 64 || strings.ToLower(item.SourceID) != item.SourceID || seen[item.SourceID] || !validOutputText(item.AppID, 128) || strings.EqualFold(item.AppID, appidentity.BundleID) || item.Domain != "" && !validOutputText(item.Domain, 253) || !validOutputText(item.Content, 1600) {
 			return false
 		}
@@ -884,12 +900,12 @@ func boundRecentActivityOutput(output recentActivityOutput, limit int) bool {
 func getChronicle(ctx context.Context, reader RPCReader, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	input, err := decodeChronicleInput(request)
 	if err != nil {
-		return toolError("A chronicle needs an hour ID in the format hour:YYYYMMDDTHHZ."), nil
+		return toolError("A chronicle needs level hour with an hour ID like hour:YYYYMMDDTHHZ, level day with a period like YYYY-MM-DD, or level week with a period like YYYY-Www."), nil
 	}
 	if reader == nil || ctx == nil || ctx.Err() != nil {
 		return toolError("Blur local memory is unavailable."), nil
 	}
-	params, err := json.Marshal(localapi.GetChronicleParams{HourID: input.HourID})
+	params, err := json.Marshal(localapi.GetChronicleParams{HourID: input.HourID, Level: input.Level, Period: input.Period})
 	if err != nil {
 		return toolError("Blur local memory is unavailable."), nil
 	}
@@ -904,8 +920,14 @@ func getChronicle(ctx context.Context, reader RPCReader, request *mcp.CallToolRe
 		return toolError("Blur returned an invalid chronicle response."), nil
 	}
 	message := "No saved hourly recap for " + input.HourID + "."
+	if input.Level != "" {
+		message = "No saved " + input.Level + " recap for " + input.Period + "."
+	}
 	if output.Found {
 		message = "Returned the hourly recap and its source IDs. Open the cited captures before making exact claims."
+		if input.Level != "" {
+			message = "Returned the " + input.Level + " recap and its source IDs. It summarizes hourly recaps; open the cited captures before making exact claims."
+		}
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: message}}, StructuredContent: output}, nil
 }
@@ -1021,16 +1043,64 @@ func decodeChronicleInput(request *mcp.CallToolRequest) (chronicleInput, error) 
 		return chronicleInput{}, ErrUnavailable
 	}
 	var input chronicleInput
-	if decodeJSON(request.Params.Arguments, &input) != nil || len(input.HourID) != len("hour:20060102T15Z") || !strings.HasPrefix(input.HourID, "hour:") {
+	if decodeJSON(request.Params.Arguments, &input) != nil {
 		return chronicleInput{}, ErrUnavailable
 	}
-	if _, err := time.Parse("20060102T15Z", input.HourID[len("hour:"):]); err != nil {
+	switch input.Level {
+	case "", "hour":
+		if len(input.HourID) != len("hour:20060102T15Z") || !strings.HasPrefix(input.HourID, "hour:") || input.Period != "" {
+			return chronicleInput{}, ErrUnavailable
+		}
+		if _, err := time.Parse("20060102T15Z", input.HourID[len("hour:"):]); err != nil {
+			return chronicleInput{}, ErrUnavailable
+		}
+		input.Level = ""
+	case "day":
+		if input.HourID != "" || !validDayPeriod(input.Period) {
+			return chronicleInput{}, ErrUnavailable
+		}
+	case "week":
+		if input.HourID != "" || !validWeekPeriod(input.Period) {
+			return chronicleInput{}, ErrUnavailable
+		}
+	default:
 		return chronicleInput{}, ErrUnavailable
 	}
 	return input, nil
 }
 
+func validDayPeriod(period string) bool {
+	if len(period) != len("2006-01-02") {
+		return false
+	}
+	parsed, err := time.Parse("2006-01-02", period)
+	return err == nil && parsed.Format("2006-01-02") == period
+}
+
+// validWeekPeriod accepts only a real ISO week such as 2026-W46.
+func validWeekPeriod(period string) bool {
+	if len(period) != len("2006-W01") || period[4:6] != "-W" {
+		return false
+	}
+	year, err := strconv.Atoi(period[:4])
+	week, werr := strconv.Atoi(period[6:])
+	if err != nil || werr != nil || year < 1 || week < 1 || week > 53 {
+		return false
+	}
+	// January 4th always falls in ISO week one; step to the requested week.
+	jan4 := time.Date(year, time.January, 4, 0, 0, 0, 0, time.UTC)
+	monday := jan4.AddDate(0, 0, -((int(jan4.Weekday())+6)%7)+(week-1)*7)
+	y, w := monday.ISOWeek()
+	return y == year && w == week
+}
+
 func boundChronicleOutput(output chronicleOutput, request chronicleInput) bool {
+	if request.Level != "" {
+		return boundRollupOutput(output, request)
+	}
+	if output.Level != "" || output.Period != "" || output.Text != "" || len(output.ChildIDs) != 0 || output.SourceIDsTruncated || output.GeneratedAt != "" || output.Dirty {
+		return false
+	}
 	if !output.Found {
 		return output.HourID == "" && output.Start == "" && output.End == "" && output.Summary == "" && len(output.SourceIDs) == 0 && output.FollowUp == nil
 	}
@@ -1092,6 +1162,8 @@ type snapshotItem struct {
 	PartCount          *int64 `json:"part_count,omitempty"`
 	DocumentOffset     *int64 `json:"document_offset_bytes,omitempty"`
 	DocumentTotalBytes *int64 `json:"document_total_bytes,omitempty"`
+
+	focusFields // focused-element breadcrumb (focus.go)
 }
 
 type snapshotOutput struct {
@@ -1176,6 +1248,9 @@ func boundSnapshotOutput(input snapshotOutput, request snapshotInput) (snapshotO
 	seen := map[string]bool{}
 	used := 0
 	for _, item := range input.Snapshots {
+		if !item.focusFields.valid() {
+			return snapshotOutput{}, false
+		}
 		_, sourceIDErr := hex.DecodeString(item.SourceID)
 		if sourceIDErr != nil || !allowed[item.SourceID] || seen[item.SourceID] || !validOutputText(item.AppID, 128) || item.Domain != "" && !validOutputText(item.Domain, 253) || !utf8.ValidString(item.Content) || strings.IndexByte(item.Content, 0) >= 0 || len(item.Content) > request.MaxBytesPerSource || len(item.Content) > 4096 || item.OffsetBytes != request.Offsets[item.SourceID] || item.NextOffsetBytes != item.OffsetBytes+len(item.Content) || item.NextOffsetBytes < item.OffsetBytes || item.CapturedAt != "" && len(item.CapturedAt) > 40 {
 			return snapshotOutput{}, false
@@ -1352,4 +1427,48 @@ func searchSummary(count int, truncated bool) string {
 
 func toolError(message string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: message}}, IsError: true}
+}
+
+// boundRollupOutput validates a day or week recap response against its request.
+// Derived text is accepted only with the capture source IDs that support it.
+func boundRollupOutput(output chronicleOutput, request chronicleInput) bool {
+	if output.HourID != "" || output.Summary != "" || output.FollowUp != nil {
+		return false
+	}
+	if !output.Found {
+		return output.Level == "" && output.Period == "" && output.Start == "" && output.End == "" && output.Text == "" && len(output.ChildIDs) == 0 && len(output.SourceIDs) == 0 && !output.SourceIDsTruncated && output.GeneratedAt == "" && !output.Dirty
+	}
+	if output.Level != request.Level || output.Period != request.Period || !validOutputText(output.Text, 2048) || len(output.SourceIDs) == 0 || len(output.SourceIDs) > 64 || len(output.ChildIDs) == 0 || len(output.ChildIDs) > 64 {
+		return false
+	}
+	start, err := time.Parse(time.RFC3339Nano, output.Start)
+	if err != nil {
+		return false
+	}
+	end, err := time.Parse(time.RFC3339Nano, output.End)
+	if err != nil || !end.After(start) || end.Sub(start) > 8*24*time.Hour {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, output.GeneratedAt); err != nil {
+		return false
+	}
+	last := ""
+	for _, id := range output.SourceIDs {
+		if len(id) != 64 || strings.ToLower(id) != id || id <= last {
+			return false
+		}
+		if _, err := hex.DecodeString(id); err != nil {
+			return false
+		}
+		last = id
+	}
+	last = ""
+	for _, id := range output.ChildIDs {
+		if !validOutputText(id, 18) || id <= last {
+			return false
+		}
+		last = id
+	}
+	encoded, err := json.Marshal(output)
+	return err == nil && len(encoded) <= maxSearchOutputBytes
 }

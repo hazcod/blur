@@ -45,7 +45,7 @@ func proof(t *testing.T, grant localapi.IssuedGrant, scope localapi.Scope, diges
 
 func sample(t *testing.T) capture.SanitizedObservation {
 	t.Helper()
-	o, err := capture.SanitizeObservation("demo.app", "example.test", "Café plan", 256)
+	o, err := capture.SanitizeObservation("demo.app", "example.test", "Café plan with enough visible text to keep", 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestIngestRequiresOneUseExactProof(t *testing.T) {
 	if err := svc.Ingest(context.Background(), o, proof(t, grant, localapi.ScopeUIRead, IngestDigest(o))); err == nil {
 		t.Fatal("read scope accepted")
 	}
-	wrong, err := capture.SanitizeObservation("demo.app", "example.test", "different", 256)
+	wrong, err := capture.SanitizeObservation("demo.app", "example.test", "different text that is also long enough", 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,4 +857,25 @@ func TestCapabilityEvidenceMatchesPort(t *testing.T) {
 	check("surface_manager", platform.PortalMissing, "portal_missing", "xdg_portal", true)
 	check("capture", platform.PortalMissing, "portal_missing", "xdg_portal", false)
 	check("autostart", platform.PortalMissing, "portal_missing", "xdg_portal", false)
+}
+
+func TestIngestDropsShortObservationsExceptNotesAndTranscripts(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		app, text string
+		stored    bool
+	}{{"demo.app", strings.Repeat("x", 31), false}, {"demo.app", strings.Repeat("x", 32), true}, {"sh.blur.notes", "hi", true}, {"sh.blur.meetings", "hi", true}} {
+		svc, store, _, grant := fixture(t, localapi.ScopeCaptureIngest)
+		o, err := capture.SanitizeObservation(c.app, "example.test", c.text, 256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Ingest(ctx, o, proof(t, grant, localapi.ScopeCaptureIngest, IngestDigest(o))); err != nil {
+			t.Fatalf("%q: %v", c.text, err)
+		}
+		page, err := store.ListObservationPage(ctx, storage.ObservationPageRequest{Limit: 5, MaxBytes: storage.MaxObservationPageBytes})
+		if err != nil || (len(page.Observations) == 1) != c.stored || (svc.DroppedShort() == 1) == c.stored {
+			t.Fatalf("%s %q: rows=%d dropped=%d err=%v", c.app, c.text, len(page.Observations), svc.DroppedShort(), err)
+		}
+	}
 }

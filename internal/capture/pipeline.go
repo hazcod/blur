@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/appidentity"
@@ -119,6 +120,11 @@ type SanitizedObservation struct {
 	truncated        bool
 	redactionVersion int
 	redactionCounts  []privacy.Count
+	// Focused-element breadcrumb (focus.go). Labels only, never a value; not
+	// part of the content ID.
+	focusedRole string
+	focusedName string
+	focusedPath string
 }
 
 const MaxObservationTextBytes = 1 << 20
@@ -126,7 +132,11 @@ const MaxObservationTextBytes = 1 << 20
 const (
 	MaxAuthenticatedObservationBytes = MaxObservationTextBytes + 8192
 	observationRecordVersion         = 1
-	observationRecordHeaderBytes     = 49
+	// observationRecordVersionFocus appends a breadcrumb trailer after the
+	// redaction counts. It is written only when a breadcrumb exists, so every
+	// record without one stays byte-identical to version 1.
+	observationRecordVersionFocus = 2
+	observationRecordHeaderBytes  = 49
 )
 
 func (o SanitizedObservation) ContentID() string                { return strings.Clone(o.contentID) }
@@ -154,6 +164,9 @@ func (o SanitizedObservation) Clone() SanitizedObservation {
 	o.domain = strings.Clone(o.domain)
 	o.text = strings.Clone(o.text)
 	o.redactionCounts = copyCounts(o.redactionCounts)
+	o.focusedRole = strings.Clone(o.focusedRole)
+	o.focusedName = strings.Clone(o.focusedName)
+	o.focusedPath = strings.Clone(o.focusedPath)
 	return o
 }
 
@@ -195,12 +208,18 @@ func MarshalAuthenticatedObservation(o SanitizedObservation) ([]byte, error) {
 	for _, count := range o.redactionCounts {
 		total += 5 + len(count.Rule)
 	}
+	if o.hasFocus() {
+		total += 3 + len(o.focusedRole) + len(o.focusedName) + len(o.focusedPath)
+	}
 	if total > MaxAuthenticatedObservationBytes {
 		return nil, captureError(InvalidObservation, nil)
 	}
 
 	encoded := make([]byte, total)
 	encoded[0] = observationRecordVersion
+	if o.hasFocus() {
+		encoded[0] = observationRecordVersionFocus
+	}
 	if o.truncated {
 		encoded[1] = 1
 	}
@@ -226,6 +245,17 @@ func MarshalAuthenticatedObservation(o SanitizedObservation) ([]byte, error) {
 		copy(encoded[offset:], count.Rule)
 		offset += len(count.Rule)
 	}
+	if o.hasFocus() {
+		encoded[offset] = byte(len(o.focusedRole))
+		encoded[offset+1] = byte(len(o.focusedName))
+		encoded[offset+2] = byte(len(o.focusedPath))
+		offset += 3
+		copy(encoded[offset:], o.focusedRole)
+		offset += len(o.focusedRole)
+		copy(encoded[offset:], o.focusedName)
+		offset += len(o.focusedName)
+		copy(encoded[offset:], o.focusedPath)
+	}
 	return encoded, nil
 }
 
@@ -237,7 +267,7 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 		return empty, captureError(InvalidObservation, nil)
 	}
 	if len(encoded) < observationRecordHeaderBytes || len(encoded) > MaxAuthenticatedObservationBytes ||
-		encoded[0] != observationRecordVersion || encoded[1]&^byte(1) != 0 {
+		(encoded[0] != observationRecordVersion && encoded[0] != observationRecordVersionFocus) || encoded[1]&^byte(1) != 0 {
 		return invalid()
 	}
 	appLength := binary.BigEndian.Uint32(encoded[4:8])
@@ -271,6 +301,24 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 		counts = append(counts, privacy.Count{Rule: string(ruleBytes), Count: int(count)})
 		offset += ruleLength
 	}
+	countsEnd := offset
+	var focusRole, focusName, focusPath string
+	if encoded[0] == observationRecordVersionFocus {
+		if len(encoded)-offset < 3 {
+			return invalid()
+		}
+		roleLength, nameLength, pathLength := int(encoded[offset]), int(encoded[offset+1]), int(encoded[offset+2])
+		offset += 3
+		if roleLength > maxProfileRoleLen || nameLength > MaxFocusFieldBytes || pathLength > MaxFocusFieldBytes || roleLength+nameLength+pathLength != len(encoded)-offset {
+			return invalid()
+		}
+		focusRole = string(encoded[offset : offset+roleLength])
+		offset += roleLength
+		focusName = string(encoded[offset : offset+nameLength])
+		offset += nameLength
+		focusPath = string(encoded[offset : offset+pathLength])
+		offset += pathLength
+	}
 	if offset != len(encoded) {
 		return invalid()
 	}
@@ -280,7 +328,7 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 	textStart := domainStart + int(domainLength)
 	appBytes := encoded[appStart:domainStart]
 	domainBytes := encoded[domainStart:textStart]
-	textBytes := encoded[textStart : offset-lenCountsBytes(counts)]
+	textBytes := encoded[textStart : countsEnd-lenCountsBytes(counts)]
 	if !utf8.Valid(appBytes) || !utf8.Valid(domainBytes) || !utf8.Valid(textBytes) {
 		return invalid()
 	}
@@ -293,6 +341,9 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 		truncated:        encoded[1]&1 == 1,
 		redactionVersion: int(binary.BigEndian.Uint16(encoded[2:4])),
 		redactionCounts:  counts,
+		focusedRole:      focusRole,
+		focusedName:      focusName,
+		focusedPath:      focusPath,
 	}
 	if o.Validate() != nil {
 		return invalid()
@@ -375,6 +426,9 @@ func (o SanitizedObservation) Validate() error {
 			return invalid()
 		}
 	}
+	if !validFocusFields(o.focusedRole, o.focusedName, o.focusedPath) {
+		return invalid()
+	}
 	if o.contentID != contentID(o) {
 		return invalid()
 	}
@@ -402,6 +456,9 @@ type rawFrame struct {
 	validate       func(context.Context) error
 	visual         func(context.Context, int, visualAdmission) (string, bool, error)
 	browserRegion  visualRegionVerifier
+	// focus optionally reads the focused-element breadcrumb (focus.go). It is
+	// best effort and never fails a capture.
+	focus func(context.Context) (rawFocus, bool)
 }
 type rawNode struct {
 	role          string
@@ -735,6 +792,14 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 	if strings.TrimSpace(observation.Text()) == "" {
 		return empty, captureError(NoContent, nil)
 	}
+	// Breadcrumb last: it only labels where the text was seen, runs under its
+	// own 200 ms budget, and any failure leaves the fields empty.
+	if role, name, path := readFocusForCapture(parent, frame.focus); role != "" || name != "" || path != "" {
+		// A breadcrumb that does not validate is dropped; it never fails a capture.
+		if labelled := observation.withFocusRaw(role, name, path); labelled.Validate() == nil {
+			observation = labelled
+		}
+	}
 	return observation, nil
 }
 
@@ -1010,4 +1075,37 @@ func visualFrameSafe(frame rawFrame, nodes []*rawNode) bool {
 		}
 	}
 	return true
+}
+
+// MinObservationChars is the fewest non-whitespace Unicode characters a
+// passively captured observation must carry to be stored as a capture.
+const MinObservationChars = 32
+
+// Voice transcripts and typed notes are user-authored and always stored.
+const (
+	meetingsAppID = "sh.blur.meetings"
+	notesAppID    = "sh.blur.notes"
+)
+
+// ExemptFromMinimum reports whether an app identity belongs to a voice
+// transcript or typed note, which are stored regardless of length.
+func ExemptFromMinimum(appID string) bool {
+	return appID == meetingsAppID || appID == notesAppID
+}
+
+// MeetsMinimumContent reports whether text has at least MinObservationChars
+// non-whitespace characters, or the app identity is exempt.
+func MeetsMinimumContent(appID, text string) bool {
+	if ExemptFromMinimum(appID) {
+		return true
+	}
+	n := 0
+	for _, r := range text {
+		if !unicode.IsSpace(r) {
+			if n++; n >= MinObservationChars {
+				return true
+			}
+		}
+	}
+	return false
 }
