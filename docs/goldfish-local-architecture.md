@@ -387,6 +387,14 @@ summary rows from day/week rollups and hour recaps; match-centred excerpts;
 `search_memory` limits raised to Goldfish's (default 20, max 30) under the
 16 KiB budget; a second harness of search queries over both surfaces.
 
+Upgrade note: the first launch of this build re-indexes existing captures in
+the background (search reports "indexing pending" until it finishes, roughly
+0.7 s of queueing per 1,000 captures at open plus the background pass).
+Captures now carry a version-3 record when a window title exists; a Mac still
+running an older build cannot import sync segments that contain them and stops
+at the first such segment until it is upgraded (nothing is lost). Upgrade all
+synced Macs together.
+
 Still open for search: a vector index over Library pages (Goldfish embeds
 Wiki pages; Blur's optional meaning index covers captures only), lowercase
 entity detection in the planner, and re-tokenization of capture parts
