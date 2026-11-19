@@ -71,6 +71,11 @@ func (s *Store) ensureCapturePartIndex(ctx context.Context) error {
 	})
 }
 
+// The capture-part index is not rebuilt on a content-version bump: its parts
+// are indexed incrementally from retained sources, so a marker written at the
+// structure version stays valid. Parts indexed before version 5 keep their
+// earlier tokenization (no diacritic folding, no possessive handling) until
+// they are indexed again.
 func (s *Store) capturePartIndexStateReader(reader bolt.Reader) (bool, error) {
 	index := s.capturePartIndex()
 	key := index.exactStateKey()
@@ -84,7 +89,7 @@ func (s *Store) capturePartIndexStateReader(reader bolt.Reader) (bool, error) {
 	plain, err := index.open(key, index.exactNamespace("search-index-state-v1"), envelope)
 	clear(envelope)
 	defer clear(plain)
-	if err != nil || len(plain) != 2 || plain[0] != searchIndexFormatVersion || plain[1] != 1 {
+	if err != nil || len(plain) != 2 || plain[0] < searchIndexStructureVersion || plain[0] > searchIndexFormatVersion || plain[1] != 1 {
 		return false, ErrCorrupt
 	}
 	return true, nil
@@ -240,7 +245,7 @@ func (s *Store) IndexPendingCaptures(ctx context.Context, maxBatches int) (bool,
 		var ordered []string
 		sourceBytes := 0
 		if snapshot.part.Text() != "" {
-			terms, err = searchFieldTermsLimit(snapshot.part.Text(), snapshot.summary.Header().AppID(), snapshot.summary.Header().Domain(), capture.MaxCapturePartTextBytes+128+253)
+			terms, err = searchFieldTermsLimit(snapshot.part.Text(), snapshot.summary.Header().AppID(), snapshot.summary.Header().Domain(), "", capture.MaxCapturePartTextBytes+128+253)
 			if err != nil {
 				return true, err
 			}
