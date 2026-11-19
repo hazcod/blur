@@ -149,7 +149,7 @@ type appMatch struct {
 func appKeys(app KnownApp) []string {
 	keys := make([]string, 0, 3+len(app.Aliases))
 	add := func(k string) {
-		k = strings.Join(strings.Fields(strings.ToLower(k)), " ")
+		k = strings.Join(strings.Fields(search.FoldLower(k)), " ")
 		if len(k) >= 2 {
 			keys = append(keys, k)
 		}
@@ -158,7 +158,7 @@ func appKeys(app KnownApp) []string {
 	for _, a := range app.Aliases {
 		add(a)
 	}
-	id := strings.ToLower(app.ID)
+	id := search.FoldLower(app.ID)
 	if app.Domain {
 		parts := strings.Split(id, ".")
 		if len(parts) >= 2 {
