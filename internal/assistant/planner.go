@@ -19,7 +19,7 @@ import (
 // selection of evidence, never the whole memory.
 
 type word struct {
-	s          string // lower-case
+	s          string // search.FoldLower form: lower-case, diacritics folded
 	start, end int    // byte offsets into the original question
 }
 
@@ -28,8 +28,7 @@ func splitWords(q string) []word {
 	start := -1
 	flush := func(end int) {
 		if start >= 0 {
-			w := strings.ToLower(q[start:end])
-			w = strings.TrimRight(w, "'’")
+			w := search.FoldLower(strings.TrimRight(q[start:end], "'’"))
 			if w != "" {
 				out = append(out, word{s: w, start: start, end: end})
 			}
@@ -466,7 +465,7 @@ func detectWholeDocumentRequest(ws []word) bool {
 		"analyze", "analyse", "analyser", "review", "explain", "describe", "outline",
 		"walk", "inspect", "digest",
 	)
-	complete := hasWord(ws, "whole", "entire", "full", "complete", "all", "everything", "entirety", "completely", "tout", "toute", "tous", "toutes")
+	complete := hasWord(ws, "whole", "entire", "full", "complete", "all", "everything", "entirety", "completely", "tout", "toute", "tous", "toutes", "entier", "entiere")
 	document := hasWord(ws, "page", "webpage", "website", "site", "article", "document", "doc", "source", "file", "report", "transcript", "text", "content", "email", "thread", "conversation")
 	aboutSubject := hasWord(ws, "page", "webpage", "website", "site", "article", "document", "doc", "source", "file", "report", "text", "content")
 	aboutQuestion := aboutSubject && hasWord(ws, "what", "what's", "what’s") && hasWord(ws, "is", "was", "are", "were", "what's", "what’s") && hasWord(ws, "about")
@@ -481,7 +480,7 @@ func isWholeDocumentGrammarWord(word string) bool {
 	case "summarize", "summarise", "summary", "résume", "resume", "résumer", "resumer",
 		"analyze", "analyse", "analyser", "review", "explain", "describe", "outline",
 		"overview", "recap", "gist", "takeaway", "takeaways", "breakdown", "walkthrough", "key", "point", "points", "idea", "walk", "inspect", "digest", "captured",
-		"whole", "entire", "full", "complete", "all", "everything", "entirety", "completely", "tout", "toute", "tous", "toutes",
+		"whole", "entire", "full", "complete", "all", "everything", "entirety", "completely", "tout", "toute", "tous", "toutes", "entier", "entiere", "entière", "la", "le", "les", "sur",
 		"page", "webpage", "website", "site", "article", "document", "doc", "source", "file", "report", "transcript", "text", "content", "email", "thread", "conversation":
 		return true
 	default:
@@ -950,6 +949,14 @@ func planTerms(q string, consumed map[string]struct{}, scopeFound bool) ([]strin
 	if err != nil {
 		return nil, ErrContext
 	}
+	// consumed holds planner words (folded, possessives intact); terms are in
+	// NormalizeTokens space, so compare through the one shared fold.
+	used := make(map[string]struct{}, 2*len(consumed))
+	for word := range consumed {
+		used[word] = struct{}{}
+		used[search.FoldWord(word)] = struct{}{}
+	}
+	consumed = used
 	var out []string
 	var sourceTypeTerms []string
 	for _, term := range terms {
