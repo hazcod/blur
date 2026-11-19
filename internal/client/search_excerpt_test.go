@@ -114,12 +114,33 @@ func TestQueryExcerptCentresOnTheDensestTermCluster(t *testing.T) {
 }
 
 func TestMatchedQueryTermsComeFromTheTextWhenTheIndexReportsNone(t *testing.T) {
-	got := matchedQueryTerms("Heads up: the Orfit external retest is on Thursday, Dima will send it.", []string{"dima", "retest", "zebra"}, 0)
+	got := matchedQueryTerms("Heads up: the Orfit external retest is on Thursday, Dima will send it.", "", []string{"dima", "retest", "zebra"}, 0)
 	if strings.Join(got, ",") != "dima,retest" {
 		t.Fatalf("matched terms = %v", got)
 	}
-	got = matchedQueryTerms("anything", []string{"alpha", "beta", "gamma"}, 0b101)
+	got = matchedQueryTerms("anything", "", []string{"alpha", "beta", "gamma"}, 0b101)
 	if strings.Join(got, ",") != "alpha,gamma" {
 		t.Fatalf("mask-derived terms = %v", got)
+	}
+}
+
+func TestTokenHelpersFoldLikeTheIndex(t *testing.T) {
+	text := "Experience: résumé of Dima's work, CV_Youssef_RÉSUMÉ.pdf"
+	if got := matchedQueryTerms(text, "", []string{"dima", "resume"}, 0); strings.Join(got, ",") != "dima,resume" {
+		t.Fatalf("folded terms not matched: %v", got)
+	}
+	if got := matchedQueryTerms("plain body", "CV_Youssef_résumé.pdf", []string{"resume"}, 0); strings.Join(got, ",") != "resume" {
+		t.Fatalf("a title-only term must count: %v", got)
+	}
+	words, hit := emphasisWords("see résumé here", []string{"resume"})
+	if len(words) != 3 || hit[0] || !hit[1] || hit[2] {
+		t.Fatalf("emphasis words = %v %v", words, hit)
+	}
+	if got := termCloseness("résumé then, much later, dima", []string{"resume", "dima"}); got != len("résumé then, much later, dima") {
+		t.Fatalf("closeness must see the folded word: %d", got)
+	}
+	start, end := matchPassageSpan(strings.Repeat("filler ", 100)+"the résumé is here"+strings.Repeat(" filler", 100), []string{"resume"}, 120)
+	if start != 700+4 || end != 700+4+len("résumé") {
+		t.Fatalf("passage span = %d..%d", start, end)
 	}
 }

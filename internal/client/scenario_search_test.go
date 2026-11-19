@@ -46,9 +46,8 @@ func searchScenarios() []searchScenario {
 		{name: "tiiny-pocket", query: "tiiny pocket", first: "orion-article"},
 		{name: "ag-presentations", query: "AG presentations", topGlob: "slack-samira-*", topN: 4, minTop: 2},
 		{name: "okta-sign-in", query: "okta sign in", present: []string{"okta-login"}},
-		// The corpus has no preview-resume capture until Task 11 adds one with a
-		// "Resume"-folded title; flip this row then.
-		{name: "resume-folding", query: "resume", present: []string{"preview-resume"}, knownGap: "titles/folding not indexed yet", gapProblem: "preview-resume is missing"},
+		// Folded tokens: the capture says "résumé", the query says "resume".
+		{name: "resume-folding", query: "resume", present: []string{"preview-resume"}},
 		{name: "pentest", query: "pentest", present: []string{"notion-pentest-plan"}, within: 5, topGlob: "slack-dima-*", topN: 5, minTop: 1, absent: []string{"blur-self"}},
 		{name: "saturday-summary", query: "saturday", summary: "chronicle:day:2026-11-14", scopeOnly: true, present: []string{"slack-dima-2"}},
 		{name: "buildwise-packet", query: "buildwise packet url", first: "note-buildwise"},
@@ -98,8 +97,9 @@ func TestSearchScenario(t *testing.T) {
 				}
 				if len(item.MatchedTerms) == 0 {
 					problems = append(problems, fmt.Sprintf("MCP row %s reports no matched terms", label))
-				} else if !excerptHasTerm(item.Excerpt, item.MatchedTerms) {
-					problems = append(problems, fmt.Sprintf("MCP row %s excerpt %q shows none of %v", label, firstBytes(item.Excerpt, 60), item.MatchedTerms))
+				} else if !excerptHasTerm(item.Excerpt, item.MatchedTerms) && !excerptHasTerm(item.WindowTitle, item.MatchedTerms) {
+					// A term found only in the window title shows in window_title.
+					problems = append(problems, fmt.Sprintf("MCP row %s excerpt %q and title %q show none of %v", label, firstBytes(item.Excerpt, 60), item.WindowTitle, item.MatchedTerms))
 				}
 			}
 			for _, summary := range response.Summaries {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/appidentity"
+	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/search"
 	"github.com/hazcod/blur/internal/storage/durable"
@@ -28,6 +29,8 @@ type recordingStore struct {
 	failPartial bool
 	rollupCalls []rollupCall
 	recapPages  int
+	// onRead is called for every source text read through the store.
+	onRead func()
 	// recapForever makes ListChronicles return one synthetic row and a fresh
 	// cursor on every call, so only the page bound can stop the loop.
 	recapForever bool
@@ -68,6 +71,13 @@ func (r *recordingStore) ListChronicles(ctx context.Context, start, end time.Tim
 		return []chronicle.Summary{row}, row.HourID, nil
 	}
 	return r.Store.ListChronicles(ctx, start, end, after, limit)
+}
+
+func (r *recordingStore) GetSourceEvidence(ctx context.Context, id string) (capture.Evidence, bool, error) {
+	if r.onRead != nil {
+		r.onRead()
+	}
+	return r.Store.GetSourceEvidence(ctx, id)
 }
 
 func (r *recordingStore) exactQueries() []search.ExactQuery {
@@ -435,7 +445,7 @@ func TestSearchSummariesReadBoundedRollupsAndRecapPages(t *testing.T) {
 }
 
 func TestSearchSummaryFailureDegradesInsteadOfHidingCaptureMatches(t *testing.T) {
-	corpus, c, _ := recordingClient(t)
+	corpus, _, _ := recordingClient(t)
 	broken := &brokenRecaps{Store: corpus.store}
 	c2 := NewClient(broken)
 	c2.askNow = func() time.Time { return corpus.now }
@@ -444,7 +454,6 @@ func TestSearchSummaryFailureDegradesInsteadOfHidingCaptureMatches(t *testing.T)
 	if err != nil || len(page.Hits) == 0 || len(page.Summaries) != 0 || !page.CoverageLimited {
 		t.Fatalf("hits=%d summaries=%d coverageLimited=%t err=%v", len(page.Hits), len(page.Summaries), page.CoverageLimited, err)
 	}
-	_ = c
 }
 
 type brokenRecaps struct{ *durable.Store }

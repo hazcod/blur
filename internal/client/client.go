@@ -1342,10 +1342,13 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int) 
 	if err != nil {
 		return MemorySearchPage{}, err
 	}
+	for i := range hits {
+		hits[i].Relaxed, hits[i].Semantic = page.relaxed[hits[i].SourceID], page.semantic[hits[i].SourceID]
+	}
+	reorderByCloseness(hits, page, plan.Terms)
 	hits, taskMore := mergeTaskSearchHits(hits, taskPage, limit)
 	relaxed := false
 	for i := range hits {
-		hits[i].Relaxed = hits[i].Task == nil && page.relaxed[hits[i].SourceID]
 		relaxed = relaxed || hits[i].Relaxed
 		fillSearchPresentation(&hits[i], terms)
 	}
@@ -1384,7 +1387,7 @@ func fillSearchPresentation(hit *SearchHit, terms []string) {
 	}
 	hit.Excerpt, hit.ExcerptStart, hit.ExcerptEnd = QueryExcerptSpan(hit.Text, terms, semanticStart, semanticEnd, searchExcerptBytes)
 	if hit.Task == nil {
-		hit.MatchedTerms = matchedQueryTerms(hit.Text, terms, hit.matchedMask)
+		hit.MatchedTerms = matchedQueryTerms(hit.Text, hit.WindowTitle, terms, hit.matchedMask)
 	}
 }
 

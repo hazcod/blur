@@ -239,7 +239,7 @@ func QueryExcerptSpan(text string, terms []string, semanticStart, semanticEnd, m
 func queryMatchSpan(text string, terms []string, semanticStart, semanticEnd, maxBytes int) (int, int) {
 	start, end := 0, 0
 	if len(terms) > 0 && len(terms) <= search.MaxTerms {
-		start, end = search.MatchPassage(text, terms, max(1, maxBytes/2))
+		start, end = matchPassageSpan(text, terms, max(1, maxBytes/2))
 		if start == 0 && end >= len(text) {
 			start, end = 0, 0 // the whole text is the passage: nothing to centre on
 		}
@@ -248,91 +248,4 @@ func queryMatchSpan(text string, terms []string, semanticStart, semanticEnd, max
 		start, end = semanticStart, min(semanticEnd, semanticStart+maxBytes)
 	}
 	return start, end
-}
-
-// matchedQueryTerms lists which query terms a capture matched. The index mask
-// is authoritative when it reports one; otherwise the text is tokenised the
-// way the index does (Unicode letters and digits, lowercased).
-func matchedQueryTerms(text string, terms []string, mask uint32) []string {
-	if len(terms) == 0 {
-		return nil
-	}
-	var out []string
-	if mask != 0 {
-		for i, term := range terms {
-			if i < 32 && mask&(1<<uint(i)) != 0 {
-				out = append(out, term)
-			}
-		}
-		return out
-	}
-	want := make(map[string]bool, len(terms))
-	for _, term := range terms {
-		want[term] = true
-	}
-	seen := map[string]bool{}
-	tokenStart := -1
-	flush := func(offset int) {
-		if tokenStart < 0 {
-			return
-		}
-		if token := strings.ToLower(text[tokenStart:offset]); want[token] {
-			seen[token] = true
-		}
-		tokenStart = -1
-	}
-	for offset, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			if tokenStart < 0 {
-				tokenStart = offset
-			}
-		} else {
-			flush(offset)
-		}
-		if len(seen) == len(want) {
-			break
-		}
-	}
-	flush(len(text))
-	for _, term := range terms {
-		if seen[term] {
-			out = append(out, term)
-		}
-	}
-	return out
-}
-
-// emphasisWords reports, for each space-separated word of a preview, whether
-// it contains a query term, so a surface can emphasise the match. Terms match
-// whole tokens, the same way the index does.
-func emphasisWords(excerpt string, terms []string) (words []string, hit []bool) {
-	if excerpt == "" {
-		return nil, nil
-	}
-	want := make(map[string]bool, len(terms))
-	for _, term := range terms {
-		want[term] = true
-	}
-	words = strings.Fields(excerpt)
-	hit = make([]bool, len(words))
-	for i, word := range words {
-		tokenStart := -1
-		check := func(offset int) {
-			if tokenStart >= 0 && want[strings.ToLower(word[tokenStart:offset])] {
-				hit[i] = true
-			}
-			tokenStart = -1
-		}
-		for offset, r := range word {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) {
-				if tokenStart < 0 {
-					tokenStart = offset
-				}
-			} else {
-				check(offset)
-			}
-		}
-		check(len(word))
-	}
-	return words, hit
 }

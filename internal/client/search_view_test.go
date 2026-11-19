@@ -137,3 +137,22 @@ func TestSearchPageRendersClosestMatchesDividerSummariesAndPreviews(t *testing.T
 		t.Errorf("rows must show the excerpt, not the full capture:\n%s", text)
 	}
 }
+
+func TestExcerptRunsClipUnbrokenTokensSoTheRowCannotStretch(t *testing.T) {
+	token := "https://evidence.buildwise.example/packets/" + strings.Repeat("0123456789abcdef", 12)
+	runs := excerptRuns("open the packet "+token+" now retest", []string{"retest"})
+	for _, run := range runs {
+		for _, word := range strings.Fields(run.text) {
+			if n := len([]rune(word)); n > searchWordRunes+1 { // the clip adds one ellipsis rune
+				t.Fatalf("a %d rune token survived in %q", n, run.text)
+			}
+		}
+	}
+	var joined []string
+	for _, run := range runs {
+		joined = append(joined, run.text)
+	}
+	if !strings.Contains(strings.Join(joined, " "), "retest") || !strings.Contains(strings.Join(joined, " "), "https://evidence") {
+		t.Fatalf("clipping lost the surrounding words: %v", joined)
+	}
+}

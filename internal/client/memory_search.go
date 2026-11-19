@@ -3,11 +3,10 @@ package client
 import (
 	"context"
 	"errors"
-	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/appidentity"
@@ -64,7 +63,15 @@ type MemorySummaryHit struct {
 // query terms.
 type naturalPage struct {
 	search.ExactPage
+	// relaxed marks sources that carry only some of the query terms, or were
+	// added by the optional meaning step.
 	relaxed map[string]bool
+	// semantic marks the sources the meaning step added after the core rows.
+	semantic map[string]bool
+	// rankers keeps each group's ranking input (false: all-terms, true:
+	// majority-term) so the page can be re-ordered by term closeness once its
+	// rows are hydrated, without reading any further source.
+	rankers map[bool]lookupRankInput
 }
 
 // searchPoolSize is how many ranked candidates one index query returns.
@@ -136,7 +143,8 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 		exact = append(exact, hit)
 	}
 	sort.Slice(exact, func(i, j int) bool { return exact[i].SourceID < exact[j].SourceID }) // deterministic input
-	exact, err = c.rankSearchGroup(ctx, plan, terms, exact, false)
+	rankers := map[bool]lookupRankInput{}
+	exact, rankers[false], err = c.rankSearchGroup(ctx, plan, terms, exact, false)
 	if err != nil {
 		return naturalPage{}, err
 	}
@@ -178,7 +186,7 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 			partial = append(partial, hit)
 		}
 		sort.Slice(partial, func(i, j int) bool { return partial[i].SourceID < partial[j].SourceID })
-		partial, err = c.rankSearchGroup(ctx, plan, terms, partial, true)
+		partial, rankers[true], err = c.rankSearchGroup(ctx, plan, terms, partial, true)
 		if err != nil {
 			return naturalPage{}, err
 		}
@@ -186,17 +194,41 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 			relaxed[hit.SourceID] = true
 		}
 	}
-	merged.Hits = append(append(make([]search.IndexHit, 0, len(exact)+len(partial)), exact...), partial...)
+	core := append(append(make([]search.IndexHit, 0, len(exact)+len(partial)), exact...), partial...)
+	merged.Hits = core
 	merged.Bytes = 0
+	semanticAdded := map[string]bool{}
 
-	if !plan.Literal {
+	// The optional meaning step runs only behind the user's own gates (a
+	// selected local model or the enabled memory index, both inside
+	// hybridPage) and never for a keyword query that already has exact rows:
+	// the exact core is authoritative. When it runs it can only append: core
+	// rows keep their order and flags, additions follow them flagged as
+	// closest matches, and summary rows are untouched.
+	if !plan.Literal && len(core) < limit && (len(core) == 0 || naturalLanguageRecallQuery(question)) {
 		minimumScore := float32(.3)
 		if plan.MatchOnly {
 			minimumScore = .55
 		}
-		merged, err = c.hybridPage(ctx, question, merged, semantic.Query{Limit: min(limit, semantic.MaxResults), AppIDs: plan.AppIDs, Domains: plan.Domains, Start: start, End: end, ScopeSourceIDs: scopeSources}, limit, minimumScore)
+		extra, err := c.hybridPage(ctx, question, search.ExactPage{Rows: merged.Rows, Nodes: merged.Nodes, Hits: slices.Clone(core), IndexingPending: merged.IndexingPending, CoverageLimited: merged.CoverageLimited, HasMore: merged.HasMore}, semantic.Query{Limit: min(limit, semantic.MaxResults), AppIDs: plan.AppIDs, Domains: plan.Domains, Start: start, End: end, ScopeSourceIDs: scopeSources}, limit, minimumScore)
 		if err != nil {
 			return naturalPage{}, err
+		}
+		merged.Rows, merged.Nodes = extra.Rows, extra.Nodes
+		merged.IndexingPending = merged.IndexingPending || extra.IndexingPending
+		merged.CoverageLimited = merged.CoverageLimited || extra.CoverageLimited
+		merged.HasMore = merged.HasMore || extra.HasMore
+		known := make(map[string]bool, len(core))
+		for _, hit := range core {
+			known[hit.SourceID] = true
+		}
+		for _, hit := range extra.Hits {
+			if known[hit.SourceID] {
+				continue
+			}
+			known[hit.SourceID] = true
+			merged.Hits = append(merged.Hits, hit)
+			relaxed[hit.SourceID], semanticAdded[hit.SourceID] = true, true
 		}
 	}
 	if len(merged.Hits) > limit {
@@ -207,42 +239,34 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 	for _, hit := range merged.Hits {
 		merged.Bytes += hit.Bytes
 	}
-	return naturalPage{ExactPage: merged, relaxed: relaxed}, nil
+	return naturalPage{ExactPage: merged, relaxed: relaxed, semantic: semanticAdded, rankers: rankers}, nil
 }
 
 // rankSearchGroup orders one candidate group with the Ask lookup ranking:
-// matched-term count, term rarity (read only for a majority-term group, where
-// terms differ), term closeness, then capture time newest first. Entity and
-// speech boosts apply only when the query carries them. Nothing is demoted or
-// dropped here.
-func (c *Client) rankSearchGroup(ctx context.Context, plan assistant.Plan, terms []string, hits []search.IndexHit, rarity bool) ([]search.IndexHit, error) {
-	if len(hits) < 2 {
-		return hits, nil
-	}
+// entity and messaging boosts only when the query carries them, then matched
+// terms, term rarity (read only for a majority-term group, where terms differ)
+// and capture time newest first. Term closeness joins as a tie-break after
+// hydration (see reorderByCloseness), never by reading more sources. Nothing
+// is demoted or dropped here.
+func (c *Client) rankSearchGroup(ctx context.Context, plan assistant.Plan, terms []string, hits []search.IndexHit, rarity bool) ([]search.IndexHit, lookupRankInput, error) {
 	in := lookupRankInput{entityMask: lookupEntityMask(plan.Entity, terms), speech: questionHasSpeechVerb(plan.Question)}
+	if len(hits) < 2 {
+		return hits, in, nil
+	}
 	if rarity {
 		in.rarity = make([]float64, len(terms))
 		for i, term := range terms {
 			df, err := c.termDocumentFrequency(ctx, term)
 			if err != nil {
-				return nil, err
+				return nil, in, err
 			}
 			in.rarity[i] = lookupTermRarity(df, lookupRarityTotal)
 		}
 	}
-	if len(terms) >= 2 {
-		// With one term every hit's closeness is that term's own width, so the
-		// reads would change nothing.
-		closeness, err := c.readTermCloseness(ctx, hits, terms)
-		if err != nil {
-			return nil, err
-		}
-		in.closeness = func(hit search.IndexHit) int { return closeness[hit.SourceID] }
-	}
 	if in.speech {
 		facts, err := c.readLookupFacts(ctx, hits)
 		if err != nil {
-			return nil, err
+			return nil, in, err
 		}
 		in.isMessaging = func(id string) bool { return facts[id].conversational }
 	}
@@ -253,87 +277,46 @@ func (c *Client) rankSearchGroup(ctx context.Context, plan assistant.Plan, terms
 		}
 		return at
 	}
-	return rankLookupHits(hits, in), nil
+	return rankLookupHits(hits, in), in, nil
 }
 
-// readTermCloseness reads each candidate once, inside the same aggregate byte
-// ceiling hydration uses, and scores how tightly its query terms sit together.
-// Candidates past the budget are unscored and rank after scored ones.
-func (c *Client) readTermCloseness(ctx context.Context, hits []search.IndexHit, terms []string) (map[string]int, error) {
-	scores := make(map[string]int, len(hits))
-	used := 0
+// reorderByCloseness applies the closeness tie-break to the rows that are
+// already hydrated for this page: within each group it re-runs the group's own
+// ranking with closeness (the tightest window holding the query terms) added
+// between term rarity and capture time. It reads no source beyond the page's
+// own hydration, so it can only reorder rows that tie on every stronger key.
+func reorderByCloseness(hits []SearchHit, page naturalPage, terms []string) {
+	if len(terms) < 2 {
+		return
+	}
+	closeness := make(map[string]int, len(hits))
 	for _, hit := range hits {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if hit.Bytes < 1 || hit.Bytes > MaxSearchBytes-used {
+		closeness[hit.SourceID] = termCloseness(hit.Text, terms)
+	}
+	for _, relaxed := range []bool{false, true} {
+		in, ok := page.rankers[relaxed]
+		if !ok {
 			continue
 		}
-		source, found, err := storage.ReadSourceEvidence(ctx, c.data, hit.SourceID)
-		if err != nil {
-			return nil, err
+		in.closeness = func(hit search.IndexHit) int { return closeness[hit.SourceID] }
+		var positions []int
+		var group []search.IndexHit
+		byID := map[string]SearchHit{}
+		for i, hit := range hits {
+			if hit.Task != nil || page.relaxed[hit.SourceID] != relaxed || page.semantic[hit.SourceID] {
+				continue
+			}
+			positions = append(positions, i)
+			group = append(group, search.IndexHit{SourceID: hit.SourceID, MatchedTerms: hit.matchedMask, CapturedAt: hit.CapturedAt})
+			byID[hit.SourceID] = hit
 		}
-		if !found {
+		if len(group) < 2 {
 			continue
 		}
-		used += hit.Bytes
-		scores[hit.SourceID] = termCloseness(source.Text(), terms)
-	}
-	return scores, nil
-}
-
-// termCloseness is the byte width of the tightest window of text that holds
-// every query term the text contains. Zero means no term occurs (unknown).
-func termCloseness(text string, terms []string) int {
-	index := make(map[string]int, len(terms))
-	for i, term := range terms {
-		index[term] = i
-	}
-	type occurrence struct{ start, end, term int }
-	var found []occurrence
-	present := map[int]bool{}
-	tokenStart := -1
-	flush := func(offset int) {
-		if tokenStart < 0 {
-			return
-		}
-		if i, ok := index[strings.ToLower(text[tokenStart:offset])]; ok {
-			found = append(found, occurrence{tokenStart, offset, i})
-			present[i] = true
-		}
-		tokenStart = -1
-	}
-	for offset, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			if tokenStart < 0 {
-				tokenStart = offset
-			}
-		} else {
-			flush(offset)
+		for i, ranked := range rankLookupHits(group, in) {
+			hits[positions[i]] = byID[ranked.SourceID]
 		}
 	}
-	flush(len(text))
-	if len(found) == 0 {
-		return 0
-	}
-	need, have, left := len(present), 0, 0
-	counts := make(map[int]int, need)
-	best := math.MaxInt
-	for _, occ := range found {
-		if counts[occ.term] == 0 {
-			have++
-		}
-		counts[occ.term]++
-		for have == need {
-			best = min(best, occ.end-found[left].start)
-			counts[found[left].term]--
-			if counts[found[left].term] == 0 {
-				have--
-			}
-			left++
-		}
-	}
-	return max(best, 1)
 }
 
 // searchSummaries returns day and week rollups and hour recaps whose window
@@ -351,8 +334,14 @@ func (c *Client) searchSummaries(ctx context.Context, plan assistant.Plan, terms
 		if len(terms) == 0 {
 			return nil, nil
 		}
+		// Thirty local calendar days in the configured chronicle zone, the
+		// same zone the recap rollups are dated in.
+		zone, zoneErr := loadZone(localZoneName())
+		if zoneErr != nil {
+			zone = time.UTC
+		}
 		now := c.askClock()
-		start, end = now.AddDate(0, 0, -searchSummaryDefaultDays), now.Add(time.Minute)
+		start, end = now.In(zone).AddDate(0, 0, -searchSummaryDefaultDays), now.Add(time.Minute)
 	} else {
 		start, end = plan.Scope.Start, plan.Scope.End
 	}
@@ -364,7 +353,7 @@ func (c *Client) searchSummaries(ctx context.Context, plan assistant.Plan, terms
 	}
 	minMatches := lookupMajorityTerms(len(terms))
 	matches := func(text string) bool {
-		return len(terms) == 0 || len(matchedQueryTerms(text, terms, 0)) >= minMatches
+		return len(terms) == 0 || len(matchedQueryTerms(text, "", terms, 0)) >= minMatches
 	}
 	intersects := func(from, to time.Time) bool { return from.Before(end) && to.After(start) }
 	var found []MemorySummaryHit

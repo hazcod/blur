@@ -104,10 +104,19 @@ type lookupRankInput struct {
 	limit int
 }
 
-// rankLookupHits orders a lookup candidate pool: entity matched, messaging-app
-// boost when the question has a speech verb, matched-term count, term rarity
-// sum, optional term closeness, then capture time with the newest first. Source ID is the final
-// deterministic tie-break.
+// rankLookupHits orders a candidate pool. The full order is, first to last:
+//
+//  1. entity matched (only when the plan names an entity),
+//  2. messaging-app boost (only when the question has a speech verb),
+//  3. matched-term count, more first,
+//  4. term rarity sum, rarer first,
+//  5. term closeness, tighter first (only when the closeness hook is set; Ask
+//     leaves it nil, Search sets it from rows it has already read),
+//  6. capture time, newest first,
+//  7. source ID, ascending, as the deterministic final tie-break.
+//
+// Hits the demote hook marks are dropped before the pool is cut, unless
+// nothing else is left.
 func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHit {
 	type key struct {
 		entity, messaging bool

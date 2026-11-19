@@ -26,7 +26,6 @@ import (
 const (
 	// Local hydration and external response limits serve different purposes.
 	maxMCPReadSourceBytes    = MaxSearchBytes
-	maxMCPReadTextBytes      = 2048
 	maxMCPReadOutputBytes    = 16 << 10
 	maxMCPReadSnapshotIDs    = 3
 	maxMCPReadSnapshotChunk  = 4096
@@ -1309,15 +1308,4 @@ func decodeMCPReadParams(raw []byte) (mcpSearchParams, error) {
 		return mcpSearchParams{}, ErrInvalidRequest
 	}
 	return params, nil
-}
-
-func truncateMCPReadText(value string) (string, bool) {
-	if len(value) <= maxMCPReadTextBytes {
-		return value, false
-	}
-	cut := maxMCPReadTextBytes
-	for cut > 0 && !utf8.RuneStart(value[cut]) {
-		cut--
-	}
-	return value[:cut], true
 }

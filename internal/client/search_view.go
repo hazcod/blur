@@ -15,6 +15,9 @@ import (
 // runs short keeps the right edge ragged by a few characters, not a line.
 const searchRunWords = 3
 
+// searchWordRunes is the longest unbroken token a preview run shows.
+const searchWordRunes = 40
+
 type excerptRun struct {
 	text  string
 	match bool
@@ -26,6 +29,11 @@ func excerptRuns(excerpt string, terms []string) []excerptRun {
 	words, hit := emphasisWords(excerpt, terms)
 	if len(words) == 0 {
 		return nil
+	}
+	// A run is a label that cannot wrap inside itself, so one unbroken token
+	// (a URL, a hash) is clipped rather than allowed to stretch the row.
+	for i, word := range words {
+		words[i], _ = boundedPreview(word, searchWordRunes)
 	}
 	var runs []excerptRun
 	var plain []string

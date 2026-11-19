@@ -107,6 +107,13 @@ func TestMCPSearchHappyPathCarriesSummariesRelaxedAndSightings(t *testing.T) {
 			t.Fatalf("first row lacks %q: %v", field, first)
 		}
 	}
+	if first["window_title"] != "Dima Vermeulen (DM) - Cresco - Slack" {
+		t.Fatalf("the saved window title must reach the row: %v", first["window_title"])
+	}
+	page, err := corpus.client.SearchMemoryPageContext(context.Background(), "dima retest")
+	if err != nil || len(page.Hits) == 0 || page.Hits[0].WindowTitle != "Dima Vermeulen (DM) - Cresco - Slack" || !strings.Contains(searchHitCaption(page.Hits[0]), "Slack · Dima Vermeulen (DM) - Cresco - Slack · ") {
+		t.Fatalf("the native header must show the title: %+v err=%v", page.Hits, err)
+	}
 	if _, has := first["text"]; has {
 		t.Fatal("search rows are previews: full text must not be returned")
 	}
