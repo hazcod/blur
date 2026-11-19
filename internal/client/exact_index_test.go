@@ -229,7 +229,7 @@ func TestMCPReturnsRelevantPassageFromLargePage(t *testing.T) {
 	if err := json.Unmarshal(raw, &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Results) != 1 || !strings.Contains(response.Results[0].Text, "zzztailneedle") || len(response.Results[0].Text) > maxMCPReadTextBytes || !response.Results[0].Truncated {
+	if len(response.Results) != 1 || !strings.Contains(response.Results[0].Excerpt, "zzztailneedle") || len(response.Results[0].Excerpt) > searchExcerptBytes {
 		t.Fatal("MCP dropped the large source or its tail passage", response)
 	}
 }

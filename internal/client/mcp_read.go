@@ -14,19 +14,16 @@ import (
 
 	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/appidentity"
-	"github.com/hazcod/blur/internal/assistant"
 	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/knowledge"
 	"github.com/hazcod/blur/internal/knowledge/enrich"
 	"github.com/hazcod/blur/internal/localapi"
-	"github.com/hazcod/blur/internal/search"
 	"github.com/hazcod/blur/internal/storage"
 	"github.com/hazcod/blur/internal/tasks"
 )
 
 const (
-	maxMCPReadResults = 8
 	// Local hydration and external response limits serve different purposes.
 	maxMCPReadSourceBytes    = MaxSearchBytes
 	maxMCPReadTextBytes      = 2048
@@ -44,18 +41,6 @@ const (
 	maxMCPWorkingMemoryItems = 8
 	maxMCPWorkingExcerpt     = 1600
 )
-
-type mcpSearchParams struct {
-	Query string `json:"query"`
-	Limit int    `json:"limit"`
-}
-
-type mcpSearchResponse struct {
-	Results         []SearchHit `json:"results"`
-	Truncated       bool        `json:"truncated"`
-	IndexingPending bool        `json:"indexing_pending,omitempty"`
-	CoverageLimited bool        `json:"coverage_limited,omitempty"`
-}
 
 type mcpSnapshotParams struct {
 	SourceIDs         []string       `json:"source_ids"`
@@ -339,7 +324,7 @@ func (c *Client) HandleMCPRead(ctx context.Context, method string, raw json.RawM
 	switch method {
 	case localapi.RPCSearchMemory:
 		searchParams, err = decodeMCPReadParams(raw)
-		if err != nil || searchParams.Limit < 1 || searchParams.Limit > maxMCPReadResults || len(searchParams.Query) > MaxQueryBytes || !utf8.ValidString(searchParams.Query) || strings.IndexByte(searchParams.Query, 0) >= 0 || strings.TrimSpace(searchParams.Query) == "" {
+		if err != nil || searchParams.Limit < 1 || searchParams.Limit > maxMCPSearchResults || len(searchParams.Query) > MaxQueryBytes || !utf8.ValidString(searchParams.Query) || strings.IndexByte(searchParams.Query, 0) >= 0 || strings.TrimSpace(searchParams.Query) == "" {
 			return nil, ErrInvalidRequest
 		}
 	case localapi.RPCGetSnapshots:
@@ -419,72 +404,7 @@ func (c *Client) HandleMCPRead(ctx context.Context, method string, raw json.RawM
 	case localapi.RPCListTasks:
 		return c.listMCPTasks(ctx, epoch, taskParams)
 	}
-	page, err := c.memorySearchPage(ctx, searchParams.Query, searchParams.Limit, true)
-	if err != nil {
-		return nil, err
-	}
-	response := mcpSearchResponse{Results: make([]SearchHit, 0, len(page.Hits)), Truncated: page.HasMore, IndexingPending: page.IndexingPending, CoverageLimited: page.CoverageLimited}
-	var validation assistant.Result
-	used := 0
-	for _, hit := range page.Hits {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		cost := len(hit.Text) + len(hit.AppID) + len(hit.Domain)
-		if cost < 1 || cost > maxMCPReadSourceBytes-used {
-			response.Truncated = true
-			break
-		}
-		used += cost
-		if hit.Task != nil {
-			validation.Targets = append(validation.Targets, assistant.TargetRef{Kind: "task", ID: hit.Task.ID, Revision: hit.Task.Revision, SourceID: hit.SourceID})
-			validation.Sources = append(validation.Sources, assistant.Evidence{SourceID: hit.SourceID, Text: hit.Text})
-		}
-		text := hit.Text
-		if hit.MatchEnd > 0 {
-			if hit.MatchStart < 0 || hit.MatchEnd <= hit.MatchStart || hit.MatchEnd > len(text) || !utf8.ValidString(text[hit.MatchStart:hit.MatchEnd]) {
-				return nil, ErrInvalidRequest
-			}
-			text = text[hit.MatchStart:hit.MatchEnd]
-		}
-		if len(text) > maxMCPReadTextBytes {
-			start, end := search.MatchPassage(text, page.terms, maxMCPReadTextBytes)
-			if end > start {
-				text = text[start:end]
-			}
-		}
-		text, clipped := truncateMCPReadText(text)
-		item := SearchHit{TimeUnknown: hit.TimeUnknown, CapturedAt: hit.CapturedAt, SourceID: hit.SourceID, AppID: hit.AppID, Domain: hit.Domain, Text: text, Partial: hit.Partial, Truncated: clipped || len(text) != len(hit.Text) || hit.Partial}
-		response.Truncated = response.Truncated || item.Truncated
-		response.Results = append(response.Results, item)
-		encoded, err := json.Marshal(response)
-		if err != nil {
-			return nil, ErrInvalidRequest
-		}
-		if len(encoded) > maxMCPReadOutputBytes {
-			response.Results = response.Results[:len(response.Results)-1]
-			response.Truncated = true
-			break
-		}
-	}
-	if err := c.validateTaskTargets(ctx, validation); err != nil {
-		return nil, err
-	}
-
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	var encoded []byte
-	if !c.PublishMemoryRead(epoch, func() {
-		encoded, err = json.Marshal(response)
-	}) {
-		return nil, ErrMemoryChanging
-	}
-	if err != nil || len(encoded) > maxMCPReadOutputBytes {
-		clear(encoded)
-		return nil, ErrInvalidRequest
-	}
-	return encoded, nil
+	return c.searchMCPMemory(ctx, epoch, searchParams)
 }
 
 func decodeMCPChronicleParams(raw []byte) (mcpChronicleParams, error) {

@@ -1124,6 +1124,16 @@ type SearchHit struct {
 	MatchStart  int                          `json:"match_start,omitempty"`
 	MatchEnd    int                          `json:"match_end,omitempty"`
 	Document    assistant.DocumentProvenance `json:"-"`
+
+	// Search presentation. The shared search core sets these for both the
+	// native Search page and MCP search_memory; they are not wire fields.
+	WindowTitle  string   `json:"-"` // Task 11: window title
+	Excerpt      string   `json:"-"` // bounded preview; Text keeps the full capture
+	ExcerptStart int      `json:"-"` // emphasised span inside Excerpt
+	ExcerptEnd   int      `json:"-"`
+	Relaxed      bool     `json:"-"` // matched some but not all query terms
+	MatchedTerms []string `json:"-"`
+	matchedMask  uint32
 }
 
 func (c *Client) Today(date string) (TodayView, error) {
@@ -1252,11 +1262,16 @@ func (c *Client) SearchMemoryContext(ctx context.Context, query string) ([]Searc
 }
 
 type MemorySearchPage struct {
-	Hits            []SearchHit
+	Hits []SearchHit
+	// Summaries are index rows over day, week and hour recaps. They never
+	// count against the capture limit.
+	Summaries       []MemorySummaryHit
 	IndexingPending bool
 	CoverageLimited bool
 	HasMore         bool
-	terms           []string
+	// Relaxed reports that some hits matched only some of the query terms.
+	Relaxed bool
+	terms   []string
 }
 
 func (c *Client) searchMemoryContext(ctx context.Context, query string, limit int) ([]SearchHit, error) {
@@ -1283,14 +1298,14 @@ func (c *Client) searchMemoryPageContext(ctx context.Context, query string, limi
 		return MemorySearchPage{}, err
 	}
 	defer done()
-	return c.memorySearchPage(operation, query, limit, false)
+	return c.memorySearchPage(operation, query, limit)
 }
 
 // memorySearchPage is shared by the public Search and MCP operation owners.
 // Each caller holds one Client lifetime operation through its whole response;
 // this helper must not add nested admission or reset their timing budgets.
-func (c *Client) memorySearchPage(ctx context.Context, query string, limit int, lookahead bool) (MemorySearchPage, error) {
-	if c == nil || ctx == nil {
+func (c *Client) memorySearchPage(ctx context.Context, query string, limit int) (MemorySearchPage, error) {
+	if c == nil || ctx == nil || limit < 1 || limit > MaxSearchResults {
 		return MemorySearchPage{}, ErrInvalidRequest
 	}
 	c.aiPolicyMu.RLock()
@@ -1300,11 +1315,7 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int, 
 	if !stable {
 		return MemorySearchPage{}, ErrMemoryChanging
 	}
-	candidates := limit
-	if lookahead {
-		candidates = min(MaxSearchResults, limit+1)
-	}
-	page, plan, err := c.naturalSearchPage(ctx, query, candidates)
+	page, plan, err := c.naturalSearchPage(ctx, query, limit)
 	if err != nil {
 		return MemorySearchPage{}, err
 	}
@@ -1312,8 +1323,8 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int, 
 		page.HasMore = true
 		page.Hits = page.Hits[:limit]
 	}
-	page = boundSearchHydration(page)
-	hits, err := c.hydrateSearchPage(ctx, page)
+	page.ExactPage = boundSearchHydration(page.ExactPage)
+	hits, err := c.hydrateSearchPage(ctx, page.ExactPage)
 	if err != nil {
 		return MemorySearchPage{}, err
 	}
@@ -1323,11 +1334,26 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int, 
 	if len(hits) > 0 && c.localAI != nil {
 		taskPlan.Literal = true
 	}
-	taskPage, err := c.naturalTaskSearch(ctx, taskPlan, candidates)
+	taskPage, err := c.naturalTaskSearch(ctx, taskPlan, limit)
 	if err != nil {
 		return MemorySearchPage{}, err
 	}
 	hits, taskMore := mergeTaskSearchHits(hits, taskPage, limit)
+	relaxed := false
+	for i := range hits {
+		hits[i].Relaxed = hits[i].Task == nil && page.relaxed[hits[i].SourceID]
+		relaxed = relaxed || hits[i].Relaxed
+		fillSearchPresentation(&hits[i], terms)
+	}
+	// Summaries are an optional index over derived recaps; a failure reading
+	// them must not hide capture matches, only mark the page incomplete.
+	summaries, summaryErr := c.searchSummaries(ctx, plan, terms)
+	if summaryErr != nil {
+		if ctx.Err() != nil {
+			return MemorySearchPage{}, ctx.Err()
+		}
+		summaries = nil
+	}
 	c.aiPolicyMu.RLock()
 	defer c.aiPolicyMu.RUnlock()
 	if c.aiPolicyEpoch != policyEpoch {
@@ -1339,7 +1365,23 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int, 
 	if !c.MemoryReadCurrent(epoch) {
 		return MemorySearchPage{}, ErrMemoryChanging
 	}
-	return MemorySearchPage{Hits: hits, IndexingPending: page.IndexingPending, CoverageLimited: page.CoverageLimited || taskPage.historyIncomplete || taskPage.semanticIssue != "", HasMore: page.HasMore || taskMore, terms: plan.Terms}, nil
+	return MemorySearchPage{Hits: hits, Summaries: summaries, IndexingPending: page.IndexingPending, CoverageLimited: page.CoverageLimited || taskPage.historyIncomplete || taskPage.semanticIssue != "" || summaryErr != nil, HasMore: page.HasMore || taskMore, Relaxed: relaxed, terms: plan.Terms}, nil
+}
+
+// fillSearchPresentation sets the preview, matched terms and emphasised span
+// of one hit from its full text. The text itself is left untouched.
+func fillSearchPresentation(hit *SearchHit, terms []string) {
+	if hit.Excerpt != "" {
+		return
+	}
+	semanticStart, semanticEnd := hit.MatchStart, hit.MatchEnd
+	if hit.Task != nil {
+		semanticStart, semanticEnd = 0, 0
+	}
+	hit.Excerpt, hit.ExcerptStart, hit.ExcerptEnd = QueryExcerptSpan(hit.Text, terms, semanticStart, semanticEnd, searchExcerptBytes)
+	if hit.Task == nil {
+		hit.MatchedTerms = matchedQueryTerms(hit.Text, terms, hit.matchedMask)
+	}
 }
 
 func (c *Client) hydrateSearchPage(ctx context.Context, page search.ExactPage) ([]SearchHit, error) {
@@ -1371,7 +1413,7 @@ func (c *Client) hydrateSearchPage(ctx context.Context, page search.ExactPage) (
 		if err != nil {
 			return nil, err
 		}
-		result := SearchHit{TimeUnknown: unknown, CapturedAt: at, SourceID: observation.SourceID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), MatchStart: hit.MatchStart, MatchEnd: hit.MatchEnd, Truncated: observation.Truncated(), Partial: observation.Truncated()}
+		result := SearchHit{TimeUnknown: unknown, CapturedAt: at, SourceID: observation.SourceID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), MatchStart: hit.MatchStart, MatchEnd: hit.MatchEnd, Truncated: observation.Truncated(), Partial: observation.Truncated(), matchedMask: hit.MatchedTerms}
 		if provenance, ok := observation.Provenance(); ok {
 			result.Document = assistant.DocumentProvenance{
 				EditionID: provenance.EditionID, FamilyID: provenance.FamilyID, Publication: provenance.Publication,

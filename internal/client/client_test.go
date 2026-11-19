@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -804,16 +805,16 @@ func TestHandleMCPReadReturnsOnlyBoundedSanitizedMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	var response struct {
-		Results   []SearchHit `json:"results"`
-		Truncated bool        `json:"truncated"`
+		Results   []mcpSearchItem `json:"results"`
+		Truncated bool            `json:"truncated"`
 	}
 	if err := json.Unmarshal(got, &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Results) != 2 || len(response.Results[0].Text) > 2048 || !response.Results[0].Truncated || !response.Truncated {
-		t.Fatalf("MCP response was not bounded/truncated: count=%d textBytes=%d itemTruncated=%t responseTruncated=%t", len(response.Results), len(response.Results[0].Text), response.Results[0].Truncated, response.Truncated)
+	if len(response.Results) != 2 || len(response.Results[0].Excerpt) > searchExcerptBytes || response.Results[0].Excerpt == "" || !response.Truncated || len(got) > maxMCPReadOutputBytes {
+		t.Fatalf("MCP response was not bounded/truncated: count=%d excerptBytes=%d responseTruncated=%t bytes=%d", len(response.Results), len(response.Results[0].Excerpt), response.Truncated, len(got))
 	}
-	if data.query.TopK != 3 || data.query.MaxRows != 3 || len(data.readSourceIDs) != 2 || data.readSourceIDs[0] != first.ContentID() || data.readSourceIDs[1] != second.ContentID() {
+	if data.query.TopK != searchPoolSize(2) || data.query.MaxRows != searchRowBudget(2) || len(data.readSourceIDs) != 2 || !slices.Contains(data.readSourceIDs, first.ContentID()) || !slices.Contains(data.readSourceIDs, second.ContentID()) {
 		t.Fatalf("MCP read escaped candidate/source budget: query=%+v hydrated=%v", data.query, data.readSourceIDs)
 	}
 }
@@ -1175,7 +1176,7 @@ func TestHandleMCPReadRejectsUnsupportedOrInvalidRequestsBeforeSearch(t *testing
 	for _, test := range []struct {
 		method string
 		params string
-	}{{"delete_all", `{}`}, {"get_today", `{}`}, {"search_memory", `{"query":"safe","limit":9}`}, {"search_memory", `{"query":"safe","unknown":true}`}, {"search_memory", `{"query":""}`}} {
+	}{{"delete_all", `{}`}, {"get_today", `{}`}, {"search_memory", `{"query":"safe","limit":31}`}, {"search_memory", `{"query":"safe","limit":0}`}, {"search_memory", `{"query":"safe","limit":-1}`}, {"search_memory", `{"query":"safe","unknown":true}`}, {"search_memory", `{"query":""}`}} {
 		if _, err := client.HandleMCPRead(context.Background(), test.method, json.RawMessage(test.params)); err == nil {
 			t.Errorf("accepted MCP read method=%q params=%s", test.method, test.params)
 		}

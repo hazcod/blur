@@ -93,6 +93,10 @@ type lookupRankInput struct {
 	rarity []float64
 	// capturedAt resolves a capture time for hits the index did not date.
 	capturedAt func(search.IndexHit) time.Time
+	// closeness, when set, scores how tightly a hit's matched terms sit
+	// together (smaller is tighter; zero or less is unknown and ranks last). It
+	// breaks ties after term rarity and before capture time. Ask leaves it nil.
+	closeness func(search.IndexHit) int
 	// demote marks hits that are chrome rather than substance (sign-in pages).
 	// Marked hits are dropped before the pool is cut, unless nothing else is left.
 	demote func(search.IndexHit) bool
@@ -102,13 +106,14 @@ type lookupRankInput struct {
 
 // rankLookupHits orders a lookup candidate pool: entity matched, messaging-app
 // boost when the question has a speech verb, matched-term count, term rarity
-// sum, then capture time with the newest first. Source ID is the final
+// sum, optional term closeness, then capture time with the newest first. Source ID is the final
 // deterministic tie-break.
 func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHit {
 	type key struct {
 		entity, messaging bool
 		matched           int
 		rarity            float64
+		closeness         int
 		at                time.Time
 	}
 	keys := make(map[string]key, len(hits))
@@ -120,6 +125,12 @@ func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHi
 		for i, weight := range in.rarity {
 			if hit.MatchedTerms&(1<<uint(i)) != 0 {
 				k.rarity += weight
+			}
+		}
+		k.closeness = math.MaxInt
+		if in.closeness != nil {
+			if value := in.closeness(hit); value > 0 {
+				k.closeness = value
 			}
 		}
 		if k.at.IsZero() && in.capturedAt != nil {
@@ -141,6 +152,9 @@ func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHi
 		}
 		if a.rarity != b.rarity {
 			return a.rarity > b.rarity
+		}
+		if a.closeness != b.closeness {
+			return a.closeness < b.closeness
 		}
 		if !a.at.Equal(b.at) {
 			return a.at.After(b.at)
