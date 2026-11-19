@@ -21,13 +21,19 @@ import (
 )
 
 const (
-	maxSearchQueryBytes  = 512
-	defaultSearchLimit   = 5
-	maxSearchResults     = 8
-	maxSearchTextBytes   = 2048
-	maxSearchOutputBytes = 16 << 10
-	maxStdioLineBytes    = 64 << 10
-	maxToolArgsBytes     = 2 << 10
+	maxSearchQueryBytes = 512
+	defaultSearchLimit  = 5
+	maxSearchResults    = 8
+	// search_memory pages are previews, so they may be longer than the 8-row
+	// reads of the other tools.
+	defaultMemorySearchLimit = 20
+	maxMemorySearchResults   = 30
+	maxSearchExcerptBytes    = 240
+	maxSearchSummaryRows     = 5
+	maxSearchSummarySources  = 8
+	maxSearchOutputBytes     = 16 << 10
+	maxStdioLineBytes        = 64 << 10
+	maxToolArgsBytes         = 2 << 10
 )
 
 var ErrUnavailable = errors.New("blur local memory unavailable")
@@ -44,26 +50,43 @@ type searchMemoryInput struct {
 }
 
 type searchMemoryOutput struct {
-	IndexingPending bool              `json:"indexing_pending,omitempty"`
-	CoverageLimited bool              `json:"coverage_limited,omitempty"`
-	Results         []searchMemoryHit `json:"results"`
-	Truncated       bool              `json:"truncated"`
+	IndexingPending bool               `json:"indexing_pending,omitempty"`
+	CoverageLimited bool               `json:"coverage_limited,omitempty"`
+	Relaxed         bool               `json:"relaxed,omitempty"`
+	Results         []searchMemoryHit  `json:"results"`
+	Summaries       []searchMemorySumm `json:"summaries,omitempty"`
+	Truncated       bool               `json:"truncated"`
 }
 
 type searchMemoryHit struct {
-	TimeUnknown bool   `json:"capture_time_unknown,omitempty"`
-	CapturedAt  string `json:"captured_at,omitempty"`
-	Partial     bool   `json:"partial_capture,omitempty"`
-	SourceID    string `json:"source_id"`
-	AppID       string `json:"app_id"`
-	Domain      string `json:"domain,omitempty"`
-	Text        string `json:"text"`
-	Truncated   bool   `json:"truncated,omitempty"`
+	SourceID      string   `json:"source_id"`
+	AppID         string   `json:"app_id"`
+	WindowTitle   string   `json:"window_title,omitempty"`
+	Domain        string   `json:"domain,omitempty"`
+	TimeUnknown   bool     `json:"capture_time_unknown,omitempty"`
+	CapturedAt    string   `json:"captured_at,omitempty"`
+	LastSeenAt    string   `json:"last_seen_at,omitempty"`
+	SightingCount int64    `json:"sighting_count,omitempty"`
+	Partial       bool     `json:"partial_capture,omitempty"`
+	Excerpt       string   `json:"excerpt"`
+	MatchedTerms  []string `json:"matched_terms,omitempty"`
+	PartialMatch  bool     `json:"partial_match,omitempty"`
 }
 
-const searchInputSchema = `{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","minLength":1,"maxLength":512,"description":"A natural-language memory query; app, website, and time phrases narrow results. Quote text or code for literal matches."},"limit":{"type":"integer","minimum":1,"maximum":8,"description":"Maximum results to return; defaults to 5."}},"required":["query"]}`
+type searchMemorySumm struct {
+	ID        string   `json:"id"`
+	Level     string   `json:"level"`
+	Period    string   `json:"period"`
+	Start     string   `json:"start"`
+	End       string   `json:"end"`
+	Excerpt   string   `json:"excerpt"`
+	SourceIDs []string `json:"source_ids"`
+	Dirty     bool     `json:"dirty,omitempty"`
+}
 
-const searchOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"results":{"type":"array","maxItems":8,"items":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","maxLength":64},"app_id":{"type":"string","maxLength":128},"domain":{"type":"string","maxLength":253},"text":{"type":"string","maxLength":2048},"truncated":{"type":"boolean"},"captured_at":{"type":"string","maxLength":40,"format":"date-time"},"partial_capture":{"type":"boolean"},"capture_time_unknown":{"type":"boolean"}},"required":["source_id","app_id","text"]}},"truncated":{"type":"boolean"},"indexing_pending":{"type":"boolean"},"coverage_limited":{"type":"boolean"}},"required":["results","truncated"]}`
+const searchInputSchema = `{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","minLength":1,"maxLength":512,"description":"A natural-language memory query; app, website, and time phrases narrow results. Quote text or code for literal matches."},"limit":{"type":"integer","minimum":1,"maximum":30,"description":"Maximum capture rows to return; defaults to 20. Summary rows are extra."}},"required":["query"]}`
+
+const searchOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"results":{"type":"array","maxItems":30,"items":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","maxLength":64},"app_id":{"type":"string","maxLength":128},"window_title":{"type":"string","maxLength":256},"domain":{"type":"string","maxLength":253},"captured_at":{"type":"string","maxLength":40,"format":"date-time"},"last_seen_at":{"type":"string","maxLength":40,"format":"date-time"},"sighting_count":{"type":"integer","minimum":0},"excerpt":{"type":"string","maxLength":240},"matched_terms":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":64}},"partial_match":{"type":"boolean"},"partial_capture":{"type":"boolean"},"capture_time_unknown":{"type":"boolean"}},"required":["source_id","app_id","excerpt"]}},"summaries":{"type":"array","maxItems":5,"items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","maxLength":64},"level":{"type":"string","enum":["hour","day","week"]},"period":{"type":"string","maxLength":18},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"excerpt":{"type":"string","maxLength":240},"source_ids":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":64}},"dirty":{"type":"boolean"}},"required":["id","level","period","start","end","excerpt","source_ids"]}},"relaxed":{"type":"boolean"},"truncated":{"type":"boolean"},"indexing_pending":{"type":"boolean"},"coverage_limited":{"type":"boolean"}},"required":["results","truncated"]}`
 
 const snapshotInputSchema = `{"type":"object","additionalProperties":false,"properties":{"source_ids":{"type":"array","items":{"type":"string","pattern":"^[0-9a-f]{64}$"},"minItems":1,"maxItems":3,"uniqueItems":true,"description":"Source IDs from search_memory results."},"offsets":{"type":"object","additionalProperties":{"type":"integer","minimum":0},"description":"Optional byte offset for each source_id, using next_offset_bytes from the prior response."},"max_bytes_per_source":{"type":"integer","minimum":4,"maximum":4096,"default":4096}},"required":["source_ids"]}`
 
@@ -186,7 +209,7 @@ func New(reader RPCReader) *mcp.Server {
 	server.AddTool(&mcp.Tool{
 		Name:         "search_memory",
 		Title:        "Search Blur memory",
-		Description:  "Search locally saved captures, notes, tasks and reminders by topic, app, website or time. Natural-language queries use exact text and configured local meaning search; quoted text and code stay literal. Results are returned to the MCP host and may be sent to its configured model provider.",
+		Description:  "Search locally saved captures, notes, tasks and reminders by topic, app, website or time. Keywords are ANDed; when too few captures match every keyword, the closest matches (some keywords only) are appended and flagged partial_match. Quoted text and code stay literal. Each excerpt is a short preview, not the capture: open get_snapshots with the source_id before quoting exact wording, numbers or times. Summary rows are indexes over recaps, not evidence: read one with get_chronicle using its level and period. For questions about what happened in a time range, prefer get_recent_activity, get_working_memory or get_chronicle. Results are returned to the MCP host and may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(searchInputSchema),
 		OutputSchema: json.RawMessage(searchOutputSchema),
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld},
@@ -1290,12 +1313,12 @@ func RunStdio(ctx context.Context, reader RPCReader) error {
 func searchMemory(ctx context.Context, reader RPCReader, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	input, err := decodeSearchInput(request)
 	if err != nil {
-		return toolError("Search needs a non-empty query of at most 512 bytes and a limit from 1 to 8."), nil
+		return toolError("Search needs a non-empty query of at most 512 bytes and a limit from 1 to 30."), nil
 	}
 	if reader == nil || ctx == nil || ctx.Err() != nil {
 		return toolError("Blur local memory is unavailable."), nil
 	}
-	limit := defaultSearchLimit
+	limit := defaultMemorySearchLimit
 	if input.Limit != nil {
 		limit = *input.Limit
 	}
@@ -1320,6 +1343,13 @@ func searchMemory(ctx context.Context, reader RPCReader, request *mcp.CallToolRe
 	}
 	count := len(output.Results)
 	summary := searchSummary(count, output.Truncated)
+	if len(output.Summaries) > 0 {
+		summary += " " + strconv.Itoa(len(output.Summaries)) + " recap summaries are indexes: read them with get_chronicle."
+	}
+	if output.Relaxed {
+		summary += " Closest matches that lack some keywords are included and flagged partial_match."
+	}
+	summary += " Excerpts are previews; open get_snapshots before quoting."
 	if output.IndexingPending {
 		summary += " Some saved memory is still being indexed."
 	}
@@ -1346,7 +1376,7 @@ func decodeSearchInput(request *mcp.CallToolRequest) (searchMemoryInput, error) 
 	if decodeJSON(request.Params.Arguments, &input) != nil || !utf8.ValidString(input.Query) || strings.IndexByte(input.Query, 0) >= 0 || len(input.Query) == 0 || len(input.Query) > maxSearchQueryBytes || strings.TrimSpace(input.Query) == "" {
 		return searchMemoryInput{}, ErrUnavailable
 	}
-	if input.Limit != nil && (*input.Limit < 1 || *input.Limit > maxSearchResults) {
+	if input.Limit != nil && (*input.Limit < 1 || *input.Limit > maxMemorySearchResults) {
 		return searchMemoryInput{}, ErrUnavailable
 	}
 	return input, nil
@@ -1366,38 +1396,77 @@ func decodeJSON(data []byte, target any) error {
 }
 
 func boundSearchOutput(input searchMemoryOutput, limit int) (searchMemoryOutput, bool) {
-	output := searchMemoryOutput{Results: make([]searchMemoryHit, 0, min(len(input.Results), limit)), Truncated: input.Truncated, IndexingPending: input.IndexingPending, CoverageLimited: input.CoverageLimited}
-	used := 0
+	output := searchMemoryOutput{Results: make([]searchMemoryHit, 0, min(len(input.Results), limit)), Truncated: input.Truncated, IndexingPending: input.IndexingPending, CoverageLimited: input.CoverageLimited, Relaxed: input.Relaxed}
 	for _, hit := range input.Results {
 		if len(output.Results) >= limit {
 			output.Truncated = true
 			break
 		}
-		if !validOutputText(hit.SourceID, 64) || !validOutputText(hit.AppID, 128) || (hit.Domain != "" && !validOutputText(hit.Domain, 253)) || !utf8.ValidString(hit.Text) || strings.IndexByte(hit.Text, 0) >= 0 {
+		if !validOutputText(hit.SourceID, 64) || !validOutputText(hit.AppID, 128) || (hit.Domain != "" && !validOutputText(hit.Domain, 253)) || (hit.WindowTitle != "" && !validOutputText(hit.WindowTitle, 256)) || !utf8.ValidString(hit.Excerpt) || strings.IndexByte(hit.Excerpt, 0) >= 0 || hit.SightingCount < 0 {
 			output.Truncated = true
 			continue
 		}
 		if hit.TimeUnknown {
 			hit.CapturedAt = ""
 		}
-		if hit.CapturedAt != "" {
-			if _, err := time.Parse(time.RFC3339Nano, hit.CapturedAt); err != nil || len(hit.CapturedAt) > 40 {
-				output.Truncated = true
+		valid := true
+		for _, stamp := range []*string{&hit.CapturedAt, &hit.LastSeenAt} {
+			if *stamp == "" {
 				continue
 			}
+			if _, err := time.Parse(time.RFC3339Nano, *stamp); err != nil || len(*stamp) > 40 {
+				valid = false
+			}
 		}
-		if len(hit.Text) > maxSearchTextBytes {
-			hit.Text = hit.Text[:validUTF8Cut(hit.Text, maxSearchTextBytes)]
-			hit.Truncated = true
-		}
-		cost := len(hit.SourceID) + len(hit.AppID) + len(hit.Domain) + len(hit.Text) + len(hit.CapturedAt)
-		if cost > maxSearchOutputBytes-used {
+		if !valid {
 			output.Truncated = true
+			continue
+		}
+		if len(hit.Excerpt) > maxSearchExcerptBytes {
+			hit.Excerpt = hit.Excerpt[:validUTF8Cut(hit.Excerpt, maxSearchExcerptBytes)]
+		}
+		if len(hit.MatchedTerms) > 16 {
+			hit.MatchedTerms = hit.MatchedTerms[:16]
+		}
+		for _, term := range hit.MatchedTerms {
+			if !validOutputText(term, 64) {
+				valid = false
+			}
+		}
+		if !valid {
+			output.Truncated = true
+			continue
+		}
+		output.Truncated = output.Truncated || hit.Partial
+		output.Results = append(output.Results, hit)
+	}
+	for _, summary := range input.Summaries {
+		if len(output.Summaries) >= maxSearchSummaryRows {
 			break
 		}
-		used += cost
-		output.Truncated = output.Truncated || hit.Truncated || hit.Partial
-		output.Results = append(output.Results, hit)
+		// A recap is derived text: without capture source IDs it is not shown.
+		if !validOutputText(summary.ID, 64) || (summary.Level != "hour" && summary.Level != "day" && summary.Level != "week") || !validOutputText(summary.Period, 18) || !utf8.ValidString(summary.Excerpt) || strings.IndexByte(summary.Excerpt, 0) >= 0 || len(summary.SourceIDs) == 0 {
+			continue
+		}
+		if _, err := time.Parse(time.RFC3339Nano, summary.Start); err != nil {
+			continue
+		}
+		if _, err := time.Parse(time.RFC3339Nano, summary.End); err != nil {
+			continue
+		}
+		if len(summary.Excerpt) > maxSearchExcerptBytes {
+			summary.Excerpt = summary.Excerpt[:validUTF8Cut(summary.Excerpt, maxSearchExcerptBytes)]
+		}
+		if len(summary.SourceIDs) > maxSearchSummarySources {
+			summary.SourceIDs = summary.SourceIDs[:maxSearchSummarySources]
+		}
+		valid := true
+		for _, id := range summary.SourceIDs {
+			valid = valid && validOutputText(id, 64)
+		}
+		if valid {
+			output.Summaries = append(output.Summaries, summary)
+		}
 	}
 	encoded, err := json.Marshal(output)
 	if err != nil || len(encoded) > maxSearchOutputBytes {
