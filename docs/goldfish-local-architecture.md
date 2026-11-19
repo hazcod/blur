@@ -374,6 +374,25 @@ Inside the recall goal:
 - Background visibility: rollup counters joined the Settings panel; voice,
   meeting and open-loop jobs still report nothing there.
 
+### Update 2026-11-19: search parity
+
+Merged on `main`: window titles on every capture (redacted, bounded, indexed
+with weight 2, exposed as `window_title`); diacritic folding and possessive
+stripping in the one tokenizer used by index, queries and the planner;
+background re-index of existing stores after the format bump (open no longer
+blocks; `indexing_pending` until done); a shared ranked search core for the
+native Search page and MCP `search_memory` (all-terms, then flagged
+majority-term "closest matches"; matched terms, rarity, closeness, recency);
+summary rows from day/week rollups and hour recaps; match-centred excerpts;
+`search_memory` limits raised to Goldfish's (default 20, max 30) under the
+16 KiB budget; a second harness of search queries over both surfaces.
+
+Still open for search: a vector index over Library pages (Goldfish embeds
+Wiki pages; Blur's optional meaning index covers captures only), lowercase
+entity detection in the planner, and re-tokenization of capture parts
+published before the format bump. Open-path cost: queuing the re-index is
+still O(N) in receipts (about 0.7 s per 1,000 captures measured).
+
 Outside the goal (not started): morning/evening briefs and contextual nudges,
 inline writing assistance and learned writing rules, time-rule editing UI,
 attention items from observed calendars and mail, chat threads/inbox, and
