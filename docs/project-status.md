@@ -30,7 +30,7 @@ Blur is designed as the alternative to handing a model all of your data. Memory 
 
 ## Build and run
 
-Requires Go 1.27.3 (module language version 1.27). Dependencies are listed in
+Requires Go 1.27.4 (module language version 1.27). Dependencies are listed in
 `go.mod`; shipped targets are checked with cgo disabled.
 
 ```sh
