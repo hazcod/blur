@@ -185,12 +185,15 @@ func (r Request) EffectiveIndexBytes() int {
 	return r.IndexBytes
 }
 
-func termScore(text, appID, domain string, wanted []string) int {
+// termScore weighs each wanted term by the best field it appears in: app 3,
+// domain 2, window title 2, text 1. Every wanted term must appear somewhere.
+// The durable index's searchIndexWeight must agree with these weights.
+func termScore(text, appID, domain, title string, wanted []string) int {
 	seen := make(map[string]int, len(wanted))
 	for _, field := range []struct {
 		s      string
 		weight int
-	}{{text, 1}, {appID, 3}, {domain, 2}} {
+	}{{text, 1}, {appID, 3}, {domain, 2}, {title, 2}} {
 		for _, token := range tokens(field.s) {
 			for _, term := range wanted {
 				if token == term && field.weight > seen[term] {
@@ -292,7 +295,7 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 			text := observation.Text()
 			appID := observation.AppID()
 			domain := observation.Domain()
-			if !found || len(text)+len(appID)+len(domain) != hit.Bytes || termScore(text, appID, domain, wanted) != hit.Score || appFilter != "" && appID != appFilter || domainFilter != "" && domain != domainFilter {
+			if !found || len(text)+len(appID)+len(domain) != hit.Bytes || termScore(text, appID, domain, observation.Title(), wanted) != hit.Score || appFilter != "" && appID != appFilter || domainFilter != "" && domain != domainFilter {
 				return Response{}, ErrIndexCorrupt
 			}
 			response.ScannedBytes += hit.Bytes
@@ -377,7 +380,7 @@ func (e *Engine) Search(ctx context.Context, request Request) (Response, error) 
 			if appFilter != "" && appID != appFilter || domainFilter != "" && domain != domainFilter {
 				continue
 			}
-			if score := termScore(text, appID, domain, wanted); score > 0 {
+			if score := termScore(text, appID, domain, o.Title(), wanted); score > 0 {
 				matched++
 				result := Result{SourceID: sourceID, AppID: appID, Domain: domain, Score: score, Snippet: snippet(text, request.SnippetBytes), ProvenanceKind: "raw_sanitized_observation"}
 				response.Results = append(response.Results, result)

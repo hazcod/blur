@@ -13,18 +13,24 @@ type focusFields struct {
 	FocusedRole string `json:"focused_role,omitempty"`
 	FocusedName string `json:"focused_name,omitempty"`
 	FocusedPath string `json:"focused_path,omitempty"`
+
+	// WindowTitle is the sanitized title of the window the capture came from
+	// (search parity: window titles), at most 256 bytes. It rides with the
+	// breadcrumb because both are optional per-capture context.
+	WindowTitle string `json:"window_title,omitempty"`
 }
 
 const (
-	maxFocusFieldBytes = 120
-	maxFocusRoleBytes  = 64
+	maxFocusFieldBytes  = 120
+	maxFocusRoleBytes   = 64
+	maxWindowTitleBytes = 256
 )
 
 func (f focusFields) valid() bool {
 	for _, v := range []struct {
 		value string
 		max   int
-	}{{f.FocusedRole, maxFocusRoleBytes}, {f.FocusedName, maxFocusFieldBytes}, {f.FocusedPath, maxFocusFieldBytes}} {
+	}{{f.FocusedRole, maxFocusRoleBytes}, {f.FocusedName, maxFocusFieldBytes}, {f.FocusedPath, maxFocusFieldBytes}, {f.WindowTitle, maxWindowTitleBytes}} {
 		if len(v.value) > v.max || !utf8.ValidString(v.value) || strings.IndexByte(v.value, 0) >= 0 {
 			return false
 		}
@@ -51,6 +57,7 @@ func withFocusProperties(schema, arrayKey string) json.RawMessage {
 	itemProperties["focused_role"] = map[string]any{"type": "string", "maxLength": maxFocusRoleBytes, "description": "Accessibility role of the control that had keyboard focus."}
 	itemProperties["focused_name"] = map[string]any{"type": "string", "maxLength": maxFocusFieldBytes, "description": "Label of the focused control, never its contents."}
 	itemProperties["focused_path"] = map[string]any{"type": "string", "maxLength": maxFocusFieldBytes, "description": "Labels of up to three enclosing elements, outermost first, joined by ' > '."}
+	itemProperties["window_title"] = map[string]any{"type": "string", "maxLength": maxWindowTitleBytes, "description": "Title of the window the capture came from; empty when none was recorded."}
 	encoded, err := json.Marshal(root)
 	if err != nil {
 		return json.RawMessage(schema)

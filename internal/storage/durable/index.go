@@ -26,12 +26,35 @@ const (
 	searchIndexDomain  byte = 0x12
 	searchIndexReverse byte = 0x7f
 
-	searchIndexFormatVersion   byte = 4
-	searchIndexPageRows             = 64
-	searchIndexPageHeader           = 2
-	searchIndexRefBytes             = 1 + sha256.Size + 4 + 1
-	searchIndexMaxRefs              = search.InlineObservationTerms + 2
-	searchIndexReverseKeyBytes      = 2 + sha256.Size
+	// searchIndexFormatVersion is the version of what the observation index
+	// contains, stamped in its ready marker. Version 5 adds the window-title
+	// field (bit 0x08) and folds diacritics and possessives in
+	// search.NormalizeTokens. A store whose marker is older is rebuilt by
+	// ensureSearchIndex: the index is cleared and every retained observation
+	// is queued through the pending-index backfill, which indexes it in the
+	// background. Bump it whenever field bits or tokenization change.
+	searchIndexFormatVersion byte = 5
+	// searchIndexStructureVersion is the version byte of the page, tree and
+	// reverse-link encodings. It is independent of the content version above
+	// so a content-only bump never makes an existing record undecodable (the
+	// capture-part index shares these encodings).
+	searchIndexStructureVersion byte = 4
+
+	searchIndexPageRows        = 64
+	searchIndexPageHeader      = 2
+	searchIndexRefBytes        = 1 + sha256.Size + 4 + 1
+	searchIndexMaxRefs         = search.InlineObservationTerms + 2
+	searchIndexReverseKeyBytes = 2 + sha256.Size
+)
+
+// Posting field bits: which fields of a source contain the term. A term found
+// in several fields carries several bits.
+const (
+	searchFieldText   byte = 0x01
+	searchFieldApp    byte = 0x02
+	searchFieldDomain byte = 0x04
+	searchFieldTitle  byte = 0x08
+	searchFieldMask        = searchFieldText | searchFieldApp | searchFieldDomain | searchFieldTitle
 )
 
 var (
@@ -95,10 +118,10 @@ func encodeSearchIndexPage(postings []searchIndexPosting) ([]byte, error) {
 	}
 	ordered := append([]searchIndexPosting(nil), postings...)
 	sort.Slice(ordered, func(i, j int) bool { return searchIndexPostingLess(ordered[i], ordered[j]) })
-	encoded := []byte{searchIndexFormatVersion, byte(len(ordered))}
+	encoded := []byte{searchIndexStructureVersion, byte(len(ordered))}
 	var previous []byte
 	for i, posting := range ordered {
-		if !validHash(posting.sourceID) || posting.fields&^byte(0x07) != 0 || i > 0 && !searchIndexPostingLess(ordered[i-1], posting) {
+		if !validHash(posting.sourceID) || posting.fields&^searchFieldMask != 0 || i > 0 && !searchIndexPostingLess(ordered[i-1], posting) {
 			return nil, ErrCorrupt
 		}
 		id, err := hex.DecodeString(posting.sourceID)
@@ -122,7 +145,7 @@ func encodeSearchIndexPage(postings []searchIndexPosting) ([]byte, error) {
 
 func decodeSearchIndexPage(encoded []byte) ([]searchIndexPosting, error) {
 	maxEncoded := searchIndexPageHeader + searchIndexPageRows*(1+sha256.Size+1)
-	if len(encoded) < searchIndexPageHeader || len(encoded) > maxEncoded || encoded[0] != searchIndexFormatVersion || int(encoded[1]) > searchIndexPageRows {
+	if len(encoded) < searchIndexPageHeader || len(encoded) > maxEncoded || encoded[0] != searchIndexStructureVersion || int(encoded[1]) > searchIndexPageRows {
 		return nil, ErrCorrupt
 	}
 	count := int(encoded[1])
@@ -147,7 +170,7 @@ func decodeSearchIndexPage(encoded []byte) ([]searchIndexPosting, error) {
 		offset += suffixBytes
 		fields := encoded[offset]
 		offset++
-		if fields&^byte(0x07) != 0 {
+		if fields&^searchFieldMask != 0 {
 			clear(id)
 			clear(previous)
 			return nil, ErrCorrupt
@@ -182,12 +205,12 @@ func encodeSearchIndexReverse(sourceBytes int, refs []searchIndexRef) ([]byte, e
 		return bytes.Compare(ordered[i].digest[:], ordered[j].digest[:]) < 0
 	})
 	encoded := make([]byte, 7+len(ordered)*searchIndexRefBytes)
-	encoded[0] = searchIndexFormatVersion
+	encoded[0] = searchIndexStructureVersion
 	binary.BigEndian.PutUint32(encoded[1:5], uint32(sourceBytes))
 	binary.BigEndian.PutUint16(encoded[5:7], uint16(len(ordered)))
 	position := 7
 	for i, ref := range ordered {
-		if !validSearchIndexKind(ref.kind) || ref.fields&^byte(0x07) != 0 || i > 0 && ordered[i-1].kind == ref.kind && ordered[i-1].digest == ref.digest {
+		if !validSearchIndexKind(ref.kind) || ref.fields&^searchFieldMask != 0 || i > 0 && ordered[i-1].kind == ref.kind && ordered[i-1].digest == ref.digest {
 			clear(encoded)
 			return nil, ErrCorrupt
 		}
@@ -205,7 +228,7 @@ func decodeSearchIndexReverse(encoded []byte) (int, []searchIndexRef, error) {
 		_, sourceBytes, refs, err := decodePagedSearchReverse(encoded)
 		return sourceBytes, refs, err
 	}
-	if len(encoded) < 7 || encoded[0] != searchIndexFormatVersion {
+	if len(encoded) < 7 || encoded[0] != searchIndexStructureVersion {
 		return 0, nil, ErrCorrupt
 	}
 	sourceBytesValue := binary.BigEndian.Uint32(encoded[1:5])
@@ -221,7 +244,7 @@ func decodeSearchIndexReverse(encoded []byte) (int, []searchIndexRef, error) {
 		copy(ref.digest[:], encoded[position+1:position+1+sha256.Size])
 		ref.page = binary.BigEndian.Uint32(encoded[position+1+sha256.Size : position+1+sha256.Size+4])
 		ref.fields = encoded[position+searchIndexRefBytes-1]
-		if !validSearchIndexKind(ref.kind) || ref.fields&^byte(0x07) != 0 || i > 0 && !searchIndexRefLess(refs[len(refs)-1], ref) {
+		if !validSearchIndexKind(ref.kind) || ref.fields&^searchFieldMask != 0 || i > 0 && !searchIndexRefLess(refs[len(refs)-1], ref) {
 			clear(ref.digest[:])
 			return 0, nil, ErrCorrupt
 		}
@@ -288,14 +311,14 @@ func observationSearchTerms(observation capture.SanitizedObservation) (map[strin
 }
 
 func observationSearchTermsLimit(observation capture.SanitizedObservation, limit int) (map[string]byte, error) {
-	return searchFieldTermsLimit(observation.Text(), observation.AppID(), observation.Domain(), limit)
+	return searchFieldTermsLimit(observation.Text(), observation.AppID(), observation.Domain(), observation.Title(), limit)
 }
-func searchFieldTermsLimit(text, app, domain string, limit int) (map[string]byte, error) {
+func searchFieldTermsLimit(text, app, domain, title string, limit int) (map[string]byte, error) {
 	terms := make(map[string]byte)
 	fields := []struct {
 		value string
 		mask  byte
-	}{{text, 0x01}, {app, 0x02}, {domain, 0x04}}
+	}{{text, searchFieldText}, {app, searchFieldApp}, {domain, searchFieldDomain}, {title, searchFieldTitle}}
 	for _, field := range fields {
 		normalized, err := search.NormalizeTokens(field.value, limit)
 		if err != nil {
@@ -672,6 +695,13 @@ func (s *Store) ensureSearchIndex(ctx context.Context) error {
 						return tx.failLocked(err)
 					}
 				}
+				// A rebuild only queues work receipts. The post-commit inline
+				// indexing used for fresh captures would tokenize every
+				// retained observation before open returns; leaving the
+				// receipts pending hands that work to the background index
+				// controller (IndexPendingExact), and searches report
+				// IndexingPending until it finishes.
+				tx.exactInline = nil
 				return nil
 			}); err != nil {
 				return err
@@ -767,7 +797,13 @@ func decodeSearchIndexState(reader bolt.Reader, store *Store, maxBytes int) (int
 	envelope := plain
 	decoded, err := store.open(store.exactStateKey(), store.exactNamespace("search-index-state-v1"), envelope)
 	clear(envelope)
-	if err != nil || len(decoded) != 2 || decoded[0] != searchIndexFormatVersion || decoded[1] != 1 {
+	// The observation index is rebuilt on a content-version bump, so its marker
+	// must be current. The capture-part index is not rebuilt: its marker may
+	// still carry the structure version it was written at, and its pages stay
+	// decodable (see capturePartIndexStateReader).
+	current := len(decoded) == 2 && (decoded[0] == searchIndexFormatVersion ||
+		store.captureSearch && decoded[0] >= searchIndexStructureVersion && decoded[0] < searchIndexFormatVersion)
+	if err != nil || !current || decoded[1] != 1 {
 		clear(decoded)
 		return used, false, false, ErrCorrupt
 	}
@@ -1143,7 +1179,7 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 		}
 	}
 	for {
-		if searchIndexTopKProven(result.Hits, query.TopK, streams, minTermMatches) {
+		if searchIndexTopKProven(result.Hits, query.TopK, streams, minTermMatches, query.PartialOnly) {
 			result.HasMore = matchedCount > len(result.Hits)
 			for _, stream := range streams {
 				result.HasMore = result.HasMore || !stream.exhausted
@@ -1216,7 +1252,7 @@ func searchIndexNoMoreMatches(streams []searchIndexSearchStream, minTermMatches 
 	return active < minTermMatches
 }
 
-func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream, minTermMatches int) bool {
+func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream, minTermMatches int, partialOnly bool) bool {
 	if len(hits) < topK {
 		return false
 	}
@@ -1245,9 +1281,12 @@ func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchInd
 		}
 		return kth.Score == threshold && kth.SourceID <= maxCursorID
 	}
-	// Partial query: an unseen source appears in at least minTermMatches of the
-	// remaining term streams, so its score cannot exceed their largest cursor
-	// scores, and (on a tie) its ID cannot precede the earliest cursor.
+	// Partial query: an unseen source sits behind the cursor in every active
+	// term stream that holds it, and it may be held by all of them, so its
+	// score is bounded by the sum of every active term cursor score. A
+	// partial-only query excludes sources holding every term, so there the
+	// bound is the sum of the largest len(terms)-1 cursor scores. On a tie its
+	// ID cannot precede the earliest cursor (conservative: any cursor may bind).
 	var scores []int
 	minCursorID := ""
 	for _, stream := range streams {
@@ -1261,7 +1300,11 @@ func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchInd
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(scores)))
 	threshold := 0
-	for _, score := range scores[:min(minTermMatches, len(scores))] {
+	limit := len(scores)
+	if partialOnly {
+		limit = min(limit, terms-1)
+	}
+	for _, score := range scores[:limit] {
 		threshold += score
 	}
 	if kth.Score > threshold {

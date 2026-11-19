@@ -79,14 +79,16 @@ func newSearchIndexTreeNodeID() ([sha256.Size]byte, error) {
 	return id, nil
 }
 
+// searchIndexWeight is the best field weight a posting carries: app 3, domain
+// and window title 2, body text 1. It must agree with search.termScore.
 func searchIndexWeight(fields byte) int {
-	if fields&0x02 != 0 {
+	if fields&searchFieldApp != 0 {
 		return 3
 	}
-	if fields&0x04 != 0 {
+	if fields&(searchFieldDomain|searchFieldTitle) != 0 {
 		return 2
 	}
-	if fields&0x01 != 0 {
+	if fields&searchFieldText != 0 {
 		return 1
 	}
 	return 0
@@ -130,14 +132,14 @@ func encodeSearchIndexTreeNode(node searchIndexTreeNode) ([]byte, error) {
 			return nil, ErrCorrupt
 		}
 		if len(node.postings) == 0 {
-			return []byte{searchIndexFormatVersion, searchIndexTreeLeaf, 0, 0}, nil
+			return []byte{searchIndexStructureVersion, searchIndexTreeLeaf, 0, 0}, nil
 		}
 		page, err := encodeSearchIndexPage(node.postings)
 		if err != nil {
 			return nil, err
 		}
 		encoded := make([]byte, searchIndexTreeHeaderBytes+len(page))
-		encoded[0], encoded[1] = searchIndexFormatVersion, searchIndexTreeLeaf
+		encoded[0], encoded[1] = searchIndexStructureVersion, searchIndexTreeLeaf
 		encoded[2] = byte(len(node.postings) >> 8)
 		encoded[3] = byte(len(node.postings))
 		copy(encoded[searchIndexTreeHeaderBytes:], page)
@@ -158,7 +160,7 @@ func encodeSearchIndexTreeNode(node searchIndexTreeNode) ([]byte, error) {
 		}
 	}
 	encoded := make([]byte, searchIndexTreeHeaderBytes+searchIndexTreeSiblingBytes+len(node.children)*searchIndexTreeChildBytes)
-	encoded[0], encoded[1] = searchIndexFormatVersion, searchIndexTreeBranch
+	encoded[0], encoded[1] = searchIndexStructureVersion, searchIndexTreeBranch
 	encoded[2] = byte(len(node.children) >> 8)
 	encoded[3] = byte(len(node.children))
 	position := searchIndexTreeHeaderBytes
@@ -205,7 +207,7 @@ var searchIndexTreeInfinity = func() [searchIndexTreeOrderBytes]byte {
 }()
 
 func decodeSearchIndexTreeNode(encoded []byte, kind byte) (searchIndexTreeNode, error) {
-	if len(encoded) < searchIndexTreeHeaderBytes || encoded[0] != searchIndexFormatVersion || (!validSearchIndexKind(kind) && kind != captureIndexVisit) {
+	if len(encoded) < searchIndexTreeHeaderBytes || encoded[0] != searchIndexStructureVersion || (!validSearchIndexKind(kind) && kind != captureIndexVisit) {
 		return searchIndexTreeNode{}, ErrCorrupt
 	}
 	count := int(encoded[2])<<8 | int(encoded[3])

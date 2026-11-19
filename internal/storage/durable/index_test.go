@@ -156,6 +156,79 @@ func TestDurableSearchMinimumTermMatchesSurvivesAnExhaustedOrEmptyTermStream(t *
 	}
 }
 
+func TestDurablePartialSearchTopKProofBoundsEveryActiveTermStream(t *testing.T) {
+	store, err := OpenDurable(t.TempDir()+"/search.db", durableTestKey(t, 0x7e), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	letters := func(n int) string {
+		word := []byte("zzzz")
+		for i := range word {
+			word[i] = byte('a' + n%26)
+			n /= 26
+		}
+		return string(word)
+	}
+	// Every posting weighs 1 (body text only). Source IDs are content hashes, so
+	// search for texts whose IDs sort as: partial < fillers < three-term < all.
+	// Streams: alfa[partial, all] bravo[partial, three, all] charlie[f1, three, all]
+	// delta[f2, three, all]. After one advance per stream the cursors are all at
+	// weight 1 and the partial hit (score 2) is the earliest cursor, so a proof
+	// that sums only the top MinTermMatches cursors (2) would stop with the pool
+	// full while the three-term source (score 3, behind every cursor) is unseen.
+	var partial, filler1, filler2, three, all capture.SanitizedObservation
+	found := false
+	for n := 0; n < 20000 && !found; n++ {
+		partial = indexObservation(t, "editor.app", "docs.example", "alfa bravo "+letters(n)+"p")
+		filler1 = indexObservation(t, "editor.app", "docs.example", "charlie "+letters(n)+"f")
+		filler2 = indexObservation(t, "editor.app", "docs.example", "delta "+letters(n)+"g")
+		three = indexObservation(t, "editor.app", "docs.example", "bravo charlie delta "+letters(n)+"t")
+		all = indexObservation(t, "editor.app", "docs.example", "alfa bravo charlie delta "+letters(n)+"a")
+		found = partial.ContentID() < filler1.ContentID() && partial.ContentID() < filler2.ContentID() &&
+			filler1.ContentID() < three.ContentID() && filler2.ContentID() < three.ContentID() &&
+			three.ContentID() < all.ContentID()
+	}
+	if !found {
+		t.Fatal("no source ID ordering found for the regression layout")
+	}
+	for _, observation := range []capture.SanitizedObservation{all, three, filler2, partial, filler1} {
+		if err := store.PutObservation(context.Background(), observation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	terms := []string{"alfa", "bravo", "charlie", "delta"}
+	page, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: terms, MinTermMatches: 2, PartialOnly: true,
+		TopK: 1, MaxRows: 64, MaxBytes: search.MaxIndexBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Hits) != 1 || page.Hits[0].SourceID != three.ContentID() || page.Hits[0].Score != 3 {
+		t.Fatalf("partial-only top-1 page=%+v, want the three-term source %s (score 3) ahead of the two-term source %s", page, three.ContentID(), partial.ContentID())
+	}
+	if !page.HasMore {
+		t.Fatalf("partial-only top-1 page=%+v, want HasMore because the two-term source also matches", page)
+	}
+	ranked, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: terms, MinTermMatches: 2, PartialOnly: true,
+		TopK: 2, MaxRows: 64, MaxBytes: search.MaxIndexBytes,
+	})
+	if err != nil || len(ranked.Hits) != 2 || ranked.Hits[0].SourceID != three.ContentID() || ranked.Hits[1].SourceID != partial.ContentID() {
+		t.Fatalf("partial-only top-2 page=%+v err=%v, want three-term then two-term source", ranked, err)
+	}
+	// Control: the all-terms branch is unchanged on the same store.
+	control, err := store.SearchExact(context.Background(), search.ExactQuery{
+		Terms: terms, MinTermMatches: len(terms),
+		TopK: 1, MaxRows: 64, MaxBytes: search.MaxIndexBytes,
+	})
+	if err != nil || len(control.Hits) != 1 || control.Hits[0].SourceID != all.ContentID() || control.Hits[0].Score != 4 {
+		t.Fatalf("all-terms control page=%+v err=%v, want the four-term source %s ranked first", control, err, all.ContentID())
+	}
+}
+
 func TestDurableSearchUsesDeterministicRankAndSourceIDTieBreak(t *testing.T) {
 	observations := []capture.SanitizedObservation{
 		indexObservation(t, "editor.app", "docs.example", "alpha beta first"),
@@ -1774,7 +1847,7 @@ func TestDurableIndexDeleteRemovesPostingsAndRollsBackAtomically(t *testing.T) {
 	}
 }
 
-func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
+func TestDurableIndexPagesAndQueuesRebuildOnReopenThenBackfillFinishes(t *testing.T) {
 	path := t.TempDir() + "/search.db"
 	store, err := OpenDurable(path, durableTestKey(t, 0x77), CreateNew)
 	if err != nil {
@@ -1821,6 +1894,7 @@ func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
 		t.Fatalf("rebuild old observation set: %v", err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
+	requirePendingThenDrained(t, store)
 	response, err := search.New(store).Search(context.Background(), search.Request{Query: "alpha beta", ResultLimit: 100, SnippetBytes: 32, ResponseBytes: 64 << 10, ScanLimit: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -1828,6 +1902,28 @@ func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
 	if len(response.Results) != 64 || response.Truncated {
 		t.Fatalf("rebuilt multi-page index result count=%d truncated=%t, want 64 exact results", len(response.Results), response.Truncated)
 	}
+}
+
+// requirePendingThenDrained asserts the contract of a rebuild: opening the
+// store returns with the retained observations queued as pending index work
+// (searches would report IndexingPending), and the background indexer then
+// finishes it.
+func requirePendingThenDrained(t *testing.T, store *Store) {
+	t.Helper()
+	ctx := context.Background()
+	if pending, err := store.ExactIndexPending(ctx); err != nil || !pending {
+		t.Fatalf("a rebuilt index must report pending work after open: pending=%t err=%v", pending, err)
+	}
+	for rounds := 0; rounds < 1000; rounds++ {
+		more, err := store.IndexPendingExact(ctx, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !more {
+			return
+		}
+	}
+	t.Fatal("pending index work did not drain")
 }
 
 func TestDurableIndexRebuildsLegacyFormatBeforeReturning(t *testing.T) {
@@ -1863,6 +1959,7 @@ func TestDurableIndexRebuildsLegacyFormatBeforeReturning(t *testing.T) {
 		t.Fatalf("rebuild index from legacy format: %v", err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
+	requirePendingThenDrained(t, store)
 	response, err := search.New(store).Search(context.Background(), search.Request{
 		Query: "alpha beta", ResultLimit: 2, SnippetBytes: 64,
 		ResponseBytes: 4096, ScanLimit: 1,
@@ -1923,6 +2020,7 @@ func TestDurableIndexMaxTermRebuildFitsBoundedBatch(t *testing.T) {
 		t.Fatalf("rebuild a max-term observation in the bounded batch: %v", err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
+	requirePendingThenDrained(t, store)
 	response, err := search.New(store).Search(context.Background(), search.Request{
 		Query: common[0], ResultLimit: 2, SnippetBytes: 64,
 		ResponseBytes: 4096, ScanLimit: 1,
