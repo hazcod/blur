@@ -544,6 +544,9 @@ func topicNamePhrases(terms []string) []string {
 // came from, lowercased but otherwise as typed. Terms without a source word
 // keep their folded form.
 func originalSpellingTerms(terms []string, question string) ([]string, bool) {
+	// An apostrophe is not a word character here, so "José's" splits into
+	// "José" and "s": the possessive never enters the original spelling and
+	// "Atlas's" maps to "atlas", identical to the folded term (no extra query).
 	words := strings.FieldsFunc(question, func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !search.IsCombiningAccent(r)
 	})
