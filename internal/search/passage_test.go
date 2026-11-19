@@ -53,6 +53,14 @@ func TestMatchPassageFoldsBothSides(t *testing.T) {
 	}
 }
 
+func TestMatchPassageKeepsCombiningMarksInsideWords(t *testing.T) {
+	long := strings.Repeat("unrelated filler. ", 400) + "Then José shared the résumé with us. " + strings.Repeat("more filler. ", 400)
+	start, end := MatchPassage(long, []string{"jose", "resume"}, 128)
+	if start <= 0 || end <= start || end-start > 128 || !strings.Contains(long[start:end], "José shared the résumé") {
+		t.Fatal(start, end)
+	}
+}
+
 func FuzzMatchPassageOffsets(f *testing.F) {
 	f.Add("beginning 日本語 résumé tail", "résumé", 64)
 	f.Add("a a a alpha beta", "alpha", 8)

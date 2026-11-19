@@ -35,7 +35,7 @@ func MatchPassage(text string, terms []string, maxBytes int) (start, end int) {
 		tokenStart = -1
 	}
 	for offset, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || tokenStart >= 0 && IsCombiningAccent(r) {
 			if tokenStart < 0 {
 				tokenStart = offset
 			}
