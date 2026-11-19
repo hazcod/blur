@@ -36,6 +36,31 @@ func TestMatchPassagePreservesUnicodeBoundariesAndNoMatch(t *testing.T) {
 	}
 }
 
+func TestMatchPassageFoldsBothSides(t *testing.T) {
+	text := "Notes from José about the résumé"
+	for _, terms := range [][]string{{"jose", "resume"}, {"josé", "résumé"}, {"JOSE", "Résumé"}} {
+		if start, end := MatchPassage(text, terms, 1024); start != 0 || end != len(text) {
+			t.Fatal(terms, start, end)
+		}
+	}
+	long := strings.Repeat("unrelated filler. ", 400) + "Then José shared the résumé with us. " + strings.Repeat("more filler. ", 400)
+	start, end := MatchPassage(long, []string{"jose", "resume"}, 128)
+	if start <= 0 || end <= start || end-start > 128 || !strings.Contains(long[start:end], "José shared the résumé") {
+		t.Fatal(start, end)
+	}
+	if start, end := MatchPassage(long, []string{"missing"}, 128); start != 0 || end != 0 {
+		t.Fatal(start, end)
+	}
+}
+
+func TestMatchPassageKeepsCombiningMarksInsideWords(t *testing.T) {
+	long := strings.Repeat("unrelated filler. ", 400) + "Then José shared the résumé with us. " + strings.Repeat("more filler. ", 400)
+	start, end := MatchPassage(long, []string{"jose", "resume"}, 128)
+	if start <= 0 || end <= start || end-start > 128 || !strings.Contains(long[start:end], "José shared the résumé") {
+		t.Fatal(start, end)
+	}
+}
+
 func FuzzMatchPassageOffsets(f *testing.F) {
 	f.Add("beginning 日本語 résumé tail", "résumé", 64)
 	f.Add("a a a alpha beta", "alpha", 8)

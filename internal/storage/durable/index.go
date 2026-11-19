@@ -800,7 +800,10 @@ func decodeSearchIndexState(reader bolt.Reader, store *Store, maxBytes int) (int
 	// The observation index is rebuilt on a content-version bump, so its marker
 	// must be current. The capture-part index is not rebuilt: its marker may
 	// still carry the structure version it was written at, and its pages stay
-	// decodable (see capturePartIndexStateReader).
+	// decodable (see capturePartIndexStateReader). The capture-part marker is
+	// never upgraded to the new format version, so this relaxed branch is
+	// permanent, and parts published before a version bump keep the old
+	// tokenization until they are re-published.
 	current := len(decoded) == 2 && (decoded[0] == searchIndexFormatVersion ||
 		store.captureSearch && decoded[0] >= searchIndexStructureVersion && decoded[0] < searchIndexFormatVersion)
 	if err != nil || !current || decoded[1] != 1 {

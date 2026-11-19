@@ -48,8 +48,11 @@ func voiceRecallTopicMatch(text string, topics map[string]bool) bool {
 	if len(topics) == 0 {
 		return true
 	}
-	for _, word := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
-		if topics[word] {
+	// Plan terms are in the index's folded space, so fold each word of the
+	// meeting text the same way ("Réunion" matches "reunion"). Combining marks
+	// stay inside a word so decomposed text folds like composed text.
+	for _, word := range strings.FieldsFunc(text, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !search.IsCombiningAccent(r) }) {
+		if topics[search.FoldWord(word)] {
 			return true
 		}
 	}

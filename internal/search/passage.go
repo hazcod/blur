@@ -1,7 +1,6 @@
 package search
 
 import (
-	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -16,6 +15,9 @@ func MatchPassage(text string, terms []string, maxBytes int) (start, end int) {
 	}
 	wanted := make(map[string]int, len(terms))
 	for _, term := range terms {
+		// Both sides are compared in the index's folded space; terms as given
+		// may still be accented or capitalised. Offsets stay in the original.
+		term = FoldWord(term)
 		if _, seen := wanted[term]; !seen {
 			wanted[term] = len(wanted)
 		}
@@ -27,13 +29,13 @@ func MatchPassage(text string, terms []string, maxBytes int) (start, end int) {
 		if tokenStart < 0 {
 			return
 		}
-		if index, found := wanted[strings.ToLower(text[tokenStart:offset])]; found {
+		if index, found := wanted[FoldWord(text[tokenStart:offset])]; found {
 			matches = append(matches, occurrence{tokenStart, offset, index})
 		}
 		tokenStart = -1
 	}
 	for offset, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || tokenStart >= 0 && IsCombiningAccent(r) {
 			if tokenStart < 0 {
 				tokenStart = offset
 			}

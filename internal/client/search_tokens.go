@@ -55,7 +55,9 @@ func termSpans(text string, wanted map[string]int) (spans []wordSpan, indexes []
 		tokenStart = -1
 	}
 	for offset, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		// A combining mark belongs to the word it follows: the index folds
+		// before splitting, so decomposed "résumé" is one word "resume".
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || tokenStart >= 0 && search.IsCombiningAccent(r) {
 			if tokenStart < 0 {
 				tokenStart = offset
 			}

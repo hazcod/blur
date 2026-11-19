@@ -183,6 +183,13 @@ func FoldWord(word string) string {
 	return string(runes)
 }
 
+// IsCombiningAccent reports whether r is a combining diacritical mark (U+0300
+// to U+036F), the range foldDiacritics removes or recomposes. Text scanners
+// that locate index words in the source keep such a mark inside the word it
+// follows, because the index folds (and recomposes) before it splits words, so
+// decomposed "résumé" is the single word "resume".
+func IsCombiningAccent(r rune) bool { return r >= 0x0300 && r <= 0x036f }
+
 // foldDiacritics removes combining accents that follow a Latin or Greek base
 // letter so accented and plain spellings index alike. Other scripts keep their
 // marks (Cyrillic "й", Japanese dakuten, Hangul and Indic vowel signs change
@@ -203,7 +210,7 @@ func foldDiacritics(value string) string {
 	out.Grow(len(value))
 	var base rune
 	for _, r := range norm.NFD.String(value) {
-		if r >= 0x0300 && r <= 0x036f && (unicode.Is(unicode.Latin, base) || unicode.Is(unicode.Greek, base)) {
+		if IsCombiningAccent(r) && (unicode.Is(unicode.Latin, base) || unicode.Is(unicode.Greek, base)) {
 			continue
 		}
 		base = r

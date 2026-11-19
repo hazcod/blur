@@ -1033,7 +1033,7 @@ func (c *Client) outstandingEntityEvidence(ctx context.Context, plan assistant.P
 		}
 	}
 	if repository, ok := c.inferredRepository(); ok {
-		entities, err := repository.FindInferredKnowledge(ctx, plan.Entity)
+		entities, err := findInferredKnowledgeFolded(ctx, repository, plan.Entity)
 		if err != nil {
 			return nil, nil, err
 		}
