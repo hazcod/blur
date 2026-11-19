@@ -1143,7 +1143,7 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 		}
 	}
 	for {
-		if searchIndexTopKProven(result.Hits, query.TopK, streams, minTermMatches) {
+		if searchIndexTopKProven(result.Hits, query.TopK, streams, minTermMatches, query.PartialOnly) {
 			result.HasMore = matchedCount > len(result.Hits)
 			for _, stream := range streams {
 				result.HasMore = result.HasMore || !stream.exhausted
@@ -1216,7 +1216,7 @@ func searchIndexNoMoreMatches(streams []searchIndexSearchStream, minTermMatches 
 	return active < minTermMatches
 }
 
-func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream, minTermMatches int) bool {
+func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchIndexSearchStream, minTermMatches int, partialOnly bool) bool {
 	if len(hits) < topK {
 		return false
 	}
@@ -1245,9 +1245,12 @@ func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchInd
 		}
 		return kth.Score == threshold && kth.SourceID <= maxCursorID
 	}
-	// Partial query: an unseen source appears in at least minTermMatches of the
-	// remaining term streams, so its score cannot exceed their largest cursor
-	// scores, and (on a tie) its ID cannot precede the earliest cursor.
+	// Partial query: an unseen source sits behind the cursor in every active
+	// term stream that holds it, and it may be held by all of them, so its
+	// score is bounded by the sum of every active term cursor score. A
+	// partial-only query excludes sources holding every term, so there the
+	// bound is the sum of the largest len(terms)-1 cursor scores. On a tie its
+	// ID cannot precede the earliest cursor (conservative: any cursor may bind).
 	var scores []int
 	minCursorID := ""
 	for _, stream := range streams {
@@ -1261,7 +1264,11 @@ func searchIndexTopKProven(hits []search.IndexHit, topK int, streams []searchInd
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(scores)))
 	threshold := 0
-	for _, score := range scores[:min(minTermMatches, len(scores))] {
+	limit := len(scores)
+	if partialOnly {
+		limit = min(limit, terms-1)
+	}
+	for _, score := range scores[:limit] {
 		threshold += score
 	}
 	if kth.Score > threshold {
