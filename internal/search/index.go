@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -94,10 +96,15 @@ type ExactIndex interface {
 	SearchExact(context.Context, ExactQuery) (ExactPage, error)
 }
 
-// NormalizeTokens applies Unicode lowercase mapping, splits on every rune
-// except Unicode letters and digits, removes duplicates, and sorts by UTF-8
-// byte order. It deliberately does not apply locale-specific stemming,
-// transliteration, or language-dependent normalization.
+// NormalizeTokens applies Unicode lowercase mapping, folds Latin and Greek
+// diacritics ("résumé" becomes "resume"), drops a trailing possessive 's or
+// ’s ("Dima's" becomes "dima"), splits on every rune except Unicode letters
+// and digits, removes duplicates, and sorts by UTF-8 byte order. It
+// deliberately does not apply locale-specific stemming or transliteration.
+//
+// This is the one tokenizer for both the exact index and queries, so a change
+// here changes what an index must contain: bump the durable index format
+// version with it (internal/storage/durable).
 func NormalizeTokens(value string, limit int) ([]string, error) {
 	if limit <= 0 || !utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
 		return nil, ErrInvalidRequest
@@ -115,9 +122,23 @@ func NormalizeTokens(value string, limit int) ([]string, error) {
 		}
 		return nil
 	}
-	for _, r := range strings.ToLower(value) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+	runes := []rune(foldDiacritics(strings.ToLower(value)))
+	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if isWord(r) {
 			token.WriteRune(r)
+			continue
+		}
+		// A possessive is an apostrophe and "s" that end a word: ' or ’
+		// right after letters/digits, then s, then anything but a letter or
+		// digit. "Dima's" -> "dima"; "it'sa", "'s" and "Dima's2" are kept.
+		if (r == '\'' || r == '\u2019') && token.Len() > 0 && i+1 < len(runes) && runes[i+1] == 's' &&
+			(i+2 == len(runes) || !isWord(runes[i+2])) {
+			i++
+			if err := flush(); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if err := flush(); err != nil {
@@ -133,4 +154,33 @@ func NormalizeTokens(value string, limit int) ([]string, error) {
 	}
 	sort.Strings(terms)
 	return terms, nil
+}
+
+// foldDiacritics removes combining accents that follow a Latin or Greek base
+// letter so accented and plain spellings index alike. Other scripts keep their
+// marks (Cyrillic "й", Japanese dakuten, Hangul and Indic vowel signs change
+// meaning), and canonical composition is restored afterwards so those texts
+// tokenize exactly as before. The input is already lowercase.
+func foldDiacritics(value string) string {
+	ascii := true
+	for i := 0; i < len(value); i++ {
+		if value[i] >= utf8.RuneSelf {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	var base rune
+	for _, r := range norm.NFD.String(value) {
+		if r >= 0x0300 && r <= 0x036f && (unicode.Is(unicode.Latin, base) || unicode.Is(unicode.Greek, base)) {
+			continue
+		}
+		base = r
+		out.WriteRune(r)
+	}
+	return norm.NFC.String(out.String())
 }
