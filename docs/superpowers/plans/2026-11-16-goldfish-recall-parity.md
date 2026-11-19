@@ -150,7 +150,7 @@
 
 ### Task 13: Search parity record and canonical build
 
-- [ ] Update `docs/goldfish-feature-parity.md` ("Search and assistant recall": titles, folding, relaxed matches, summary rows, excerpts, limits) and the "Remaining gaps" list in `docs/goldfish-local-architecture.md`; `make macos-app-stable`; verify signature; do not launch.
+- [x] Update `docs/goldfish-feature-parity.md` ("Search and assistant recall": titles, folding, relaxed matches, summary rows, excerpts, limits) and the "Remaining gaps" list in `docs/goldfish-local-architecture.md`; `make macos-app-stable`; verify signature; do not launch.
 
 ### Task 10: Parity record and canonical build
 
