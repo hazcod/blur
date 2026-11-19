@@ -544,12 +544,9 @@ func topicNamePhrases(terms []string) []string {
 // came from, lowercased but otherwise as typed. Terms without a source word
 // keep their folded form.
 func originalSpellingTerms(terms []string, question string) ([]string, bool) {
-	var words []string
-	for _, word := range strings.FieldsFunc(question, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !unicode.Is(unicode.Mn, r)
-	}) {
-		words = append(words, word)
-	}
+	words := strings.FieldsFunc(question, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !search.IsCombiningAccent(r)
+	})
 	original, changed := make([]string, len(terms)), false
 	for index, term := range terms {
 		original[index] = term
