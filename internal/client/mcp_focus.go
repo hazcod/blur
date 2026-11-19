@@ -15,10 +15,16 @@ type mcpFocusFields struct {
 	FocusedRole string `json:"focused_role,omitempty"`
 	FocusedName string `json:"focused_name,omitempty"`
 	FocusedPath string `json:"focused_path,omitempty"`
+
+	// WindowTitle is the sanitized title of the window the capture came from
+	// (search parity: window titles); empty when none was recorded. It rides
+	// with the breadcrumb: both are optional context that yields to the byte
+	// budget (trimWorkingMemoryFocus).
+	WindowTitle string `json:"window_title,omitempty"`
 }
 
 func focusFieldsOf(evidence capture.Evidence) mcpFocusFields {
-	return mcpFocusFields{FocusedRole: evidence.FocusedRole(), FocusedName: evidence.FocusedName(), FocusedPath: evidence.FocusedPath()}
+	return mcpFocusFields{FocusedRole: evidence.FocusedRole(), FocusedName: evidence.FocusedName(), FocusedPath: evidence.FocusedPath(), WindowTitle: evidence.Title()}
 }
 
 // trimWorkingMemoryFocus drops breadcrumbs, last item first, only when the

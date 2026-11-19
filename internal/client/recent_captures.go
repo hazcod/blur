@@ -144,7 +144,7 @@ func recentDayCaptures(ctx context.Context, reader ObservationWindowReader, date
 			return nil, ErrInvalidRequest
 		}
 		out = append(out, RecentCapture{
-			SearchHit:  SearchHit{SourceID: observation.SourceID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), Truncated: observation.Truncated()},
+			SearchHit:  SearchHit{SourceID: observation.SourceID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), Truncated: observation.Truncated(), WindowTitle: observation.Title()},
 			CapturedAt: page.CapturedAt[index],
 		})
 		if len(out) == maxRecentDayCaptures {

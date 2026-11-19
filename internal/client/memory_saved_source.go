@@ -34,7 +34,7 @@ func (d *desktop) revealSavedMemorySource(sourceID string) {
 		if err != nil {
 			return
 		}
-		hit := SearchHit{SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(), Text: source.Text(), CapturedAt: at, TimeUnknown: unknown, Partial: source.Truncated(), Truncated: source.Truncated()}
+		hit := SearchHit{SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(), Text: source.Text(), CapturedAt: at, TimeUnknown: unknown, Partial: source.Truncated(), Truncated: source.Truncated(), WindowTitle: source.Title()}
 		d.app.Post(func() {
 			if generation != d.memoryGeneration {
 				return

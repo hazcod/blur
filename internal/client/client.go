@@ -308,7 +308,7 @@ func (c *Client) ChronicleSourcesPage(ctx context.Context, hourID, after string,
 				text = text[:len(text)-1]
 			}
 		}
-		result = append(result, SearchHit{SourceID: id, AppID: observation.AppID(), Domain: observation.Domain(), Text: text, Truncated: truncated || observation.Truncated(), Partial: observation.Truncated()})
+		result = append(result, SearchHit{SourceID: id, AppID: observation.AppID(), Domain: observation.Domain(), Text: text, Truncated: truncated || observation.Truncated(), Partial: observation.Truncated(), WindowTitle: observation.Title()})
 	}
 	next := ""
 	if end < len(summary.SourceIDs) && end > 0 {
@@ -437,7 +437,7 @@ func (c *Client) ChronicleSource(ctx context.Context, sourceID string) (SearchHi
 	if !found {
 		return SearchHit{}, ErrInvalidRequest
 	}
-	return SearchHit{SourceID: sourceID, AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), Truncated: observation.Truncated(), Partial: observation.Truncated()}, nil
+	return SearchHit{SourceID: sourceID, AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), Truncated: observation.Truncated(), Partial: observation.Truncated(), WindowTitle: observation.Title()}, nil
 }
 
 // CaptureChanges returns a coalesced, payload-free signal for newly persisted
@@ -1124,6 +1124,11 @@ type SearchHit struct {
 	MatchStart  int                          `json:"match_start,omitempty"`
 	MatchEnd    int                          `json:"match_end,omitempty"`
 	Document    assistant.DocumentProvenance `json:"-"`
+
+	// WindowTitle is the sanitized title of the window the capture came from
+	// ("Dima, Dziga (DM) - Cresco - Slack"); empty when none was recorded.
+	// Search parity (window titles), kept apart from the fields above.
+	WindowTitle string `json:"window_title,omitempty"`
 }
 
 func (c *Client) Today(date string) (TodayView, error) {
@@ -1371,7 +1376,7 @@ func (c *Client) hydrateSearchPage(ctx context.Context, page search.ExactPage) (
 		if err != nil {
 			return nil, err
 		}
-		result := SearchHit{TimeUnknown: unknown, CapturedAt: at, SourceID: observation.SourceID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), MatchStart: hit.MatchStart, MatchEnd: hit.MatchEnd, Truncated: observation.Truncated(), Partial: observation.Truncated()}
+		result := SearchHit{TimeUnknown: unknown, CapturedAt: at, SourceID: observation.SourceID(), AppID: observation.AppID(), Domain: observation.Domain(), Text: observation.Text(), MatchStart: hit.MatchStart, MatchEnd: hit.MatchEnd, Truncated: observation.Truncated(), Partial: observation.Truncated(), WindowTitle: observation.Title()}
 		if provenance, ok := observation.Provenance(); ok {
 			result.Document = assistant.DocumentProvenance{
 				EditionID: provenance.EditionID, FamilyID: provenance.FamilyID, Publication: provenance.Publication,
