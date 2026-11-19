@@ -89,7 +89,7 @@ func (c *Client) browseSavedMemory(ctx context.Context, after memoryBrowseCursor
 		if err != nil {
 			return err
 		}
-		page.items = append(page.items, memoryBrowseItem{SearchHit: SearchHit{SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(), Text: source.Text(), CapturedAt: at, TimeUnknown: unknown, Partial: source.Truncated(), Truncated: source.Truncated()}})
+		page.items = append(page.items, memoryBrowseItem{SearchHit: SearchHit{SourceID: source.SourceID(), AppID: source.AppID(), Domain: source.Domain(), Text: source.Text(), CapturedAt: at, TimeUnknown: unknown, Partial: source.Truncated(), Truncated: source.Truncated(), WindowTitle: source.Title()}})
 		return nil
 	}
 	appendOlderSource := func(source capture.Evidence, at time.Time) error {

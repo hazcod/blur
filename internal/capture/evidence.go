@@ -119,6 +119,16 @@ func (e Evidence) FocusedPath() string {
 	}
 	return ""
 }
+
+// Title is the sanitized window title of a single-observation source. A
+// multipart capture carries none.
+func (e Evidence) Title() string {
+	if e.kind == 1 {
+		return e.observation.Title()
+	}
+	return ""
+}
+
 func (e Evidence) RedactionVersion() int {
 	if e.kind == 1 {
 		return e.observation.RedactionVersion()

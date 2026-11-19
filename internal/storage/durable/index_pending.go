@@ -48,7 +48,7 @@ func encodePagedSearchReverse(progress pagedSearchProgress, sourceBytes int, ref
 }
 
 func decodePagedSearchReverse(encoded []byte) (pagedSearchProgress, int, []searchIndexRef, error) {
-	if len(encoded) < 20 || encoded[0] != searchPagedReverseVersion || encoded[13] != searchIndexFormatVersion {
+	if len(encoded) < 20 || encoded[0] != searchPagedReverseVersion || encoded[13] != searchIndexStructureVersion {
 		return pagedSearchProgress{}, 0, nil, ErrCorrupt
 	}
 	progress := pagedSearchProgress{binary.BigEndian.Uint32(encoded[1:5]), binary.BigEndian.Uint32(encoded[5:9]), binary.BigEndian.Uint32(encoded[9:13])}
@@ -380,7 +380,7 @@ func (s *Store) readSearchTermProof(reader bolt.Reader, sourceID string, digest 
 	}
 	plain, err := s.open(key, s.exactNamespace("search-proof-v1"), encoded)
 	defer clear(plain)
-	if err != nil || len(plain) != 2 || plain[0] != 1 || plain[1] == 0 || plain[1]&^byte(0x07) != 0 {
+	if err != nil || len(plain) != 2 || plain[0] != 1 || plain[1] == 0 || plain[1]&^searchFieldMask != 0 {
 		return searchIndexRef{}, false, used, false, ErrCorrupt
 	}
 	return searchIndexRef{kind: searchIndexTerm, digest: digest, fields: plain[1]}, true, used, false, nil

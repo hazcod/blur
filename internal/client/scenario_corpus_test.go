@@ -65,9 +65,12 @@ func (c *scenarioCorpus) evidenceLabels(sourceID, text string, hour bool) []stri
 
 type scenarioCapture struct {
 	label, app, domain string
-	at                 string // local Europe/Brussels "2006-01-02 15:04"
-	text               string
-	sightings          []time.Duration // later visits; default {2m}
+	// title is the window title the capture was recorded with, seeded through
+	// the title-aware path (capture.SanitizedObservation.WithTitle).
+	title     string
+	at        string // local Europe/Brussels "2006-01-02 15:04"
+	text      string
+	sightings []time.Duration // later visits; default {2m}
 }
 
 const scenarioTimeLayout = "2006-01-02 15:04"
@@ -126,61 +129,65 @@ func scenarioTerminalVenice() string {
 func scenarioCaptures() []scenarioCapture {
 	dmSidebar := []string{"Dima Vermeulen", "Samira Peeters", "Chloe Britton", "Youssef Bey"}
 	return []scenarioCapture{
-		{label: "slack-dima-1", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-14 10:12",
+		{label: "slack-dima-1", title: "Dima Vermeulen (DM) - Cresco - Slack", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-14 10:12",
 			text: slackScreen("Dima Vermeulen", dmSidebar,
 				"Dima Vermeulen  10:08", "Morning! Did Cresco IT approve the pentest access request yet?",
 				"Niels Hofmans  10:10", "Yes, the VPN profile is in. I will start recon on the portal today.",
 				"Dima Vermeulen  10:11", "Great, ping me when the first findings draft is ready.")},
-		{label: "slack-dima-2", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-14 16:40",
+		{label: "slack-dima-2", title: "Dima Vermeulen (DM) - Cresco - Slack", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-14 16:40",
 			text: slackScreen("Dima Vermeulen", dmSidebar,
 				"Niels Hofmans  16:31", "Draft findings are in the shared folder: 3 high and 5 medium issues.",
 				"Dima Vermeulen  16:36", "Thanks, I will go through them over the weekend.",
 				"Dima Vermeulen  16:37", "No rush, the client wants the final report end of next week.")},
-		{label: "slack-dima-retest", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-15 14:47",
+		{label: "slack-dima-retest", title: "Dima Vermeulen (DM) - Cresco - Slack", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-15 14:47",
 			text: slackScreen("Dima Vermeulen", dmSidebar,
 				"Dima Vermeulen  14:41", "Hi Niels, the client fixed the two critical issues from the report.",
 				"Dima Vermeulen  14:42", "Heads up: the Orfit external retest is scheduled for Thursday 20 November, I will send the scope tomorrow",
 				"Niels Hofmans  14:45", "Perfect, I will block Thursday in my calendar.")},
-		{label: "slack-samira-1", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-13 11:05",
+		{label: "slack-samira-1", title: "Samira Peeters (DM) - Cresco - Slack", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-13 11:05",
 			text: slackScreen("Samira Peeters", dmSidebar,
 				"Samira Peeters  11:00", "Hey Niels, can you help me with the AG presentations?",
 				"Samira Peeters  11:01", "The deadline is end of day Friday, the client wants the deck for the AG meeting.",
 				"Niels Hofmans  11:03", "Sure, send me the outline and I will draft the security slides.")},
-		{label: "slack-samira-2", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-14 09:20",
+		{label: "slack-samira-2", title: "Samira Peeters (DM) - Cresco - Slack", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-14 09:20",
 			text: slackScreen("Samira Peeters", dmSidebar,
 				"Samira Peeters  09:15", "I started the AG presentations deck, still missing the threat model slide.",
 				"Niels Hofmans  09:18", "I will send my pentest summary slide this afternoon.")},
-		{label: "slack-samira-3", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-15 10:30",
+		{label: "slack-samira-3", title: "Samira Peeters (DM) - Cresco - Slack", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-15 10:30",
 			text: slackScreen("Samira Peeters", dmSidebar,
 				"Samira Peeters  10:26", "Reminder: the AG presentations are due end of day Friday.",
 				"Niels Hofmans  10:29", "On it, I am sending the draft deck tonight.")},
-		{label: "slack-samira-4", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-15 17:05",
+		{label: "slack-samira-4", title: "Samira Peeters (DM) - Cresco - Slack", app: "com.tinyspeck.slackmacgap", domain: "app.slack.com", at: "2026-11-15 17:05",
 			text: slackScreen("Samira Peeters", dmSidebar,
 				"Samira Peeters  17:01", "Got the deck, it looks good. Can you shorten the agenda slide?",
 				"Samira Peeters  17:02", "The AG presentations review with the client is on Monday.")},
-		{label: "mail-inbox", app: "com.apple.mail", at: "2026-11-14 08:50",
+		{label: "mail-inbox", title: "Inbox - Cresco (12 messages)", app: "com.apple.mail", at: "2026-11-14 08:50",
 			text: "Mail\nFile Edit View Mailbox Message Format Window Help\nMailboxes\nInbox 12\nFlagged\nDrafts\nSent\nArchive\nInbox - Cresco\nBart Janssens  Invoice October  08:12  Please find the invoice for October attached.\nChloe Britton  Consultant reporting  08:31  Hi Niels, can you send me the consultant reporting template by Wednesday?\nCresco IT  VPN certificate renewal  07:58  Your VPN certificate expires in 14 days.\nOkta  New sign-in to your account  07:40  We noticed a new sign-in from Brussels.\n"},
-		{label: "mail-chloe", app: "com.apple.mail", at: "2026-11-14 08:55",
+		{label: "mail-chloe", title: "Consultant reporting", app: "com.apple.mail", at: "2026-11-14 08:55",
 			text: "Mail\nFile Edit View Mailbox Message Format Window Help\nInbox - Cresco\nFrom: Chloe Britton <chloe.britton@cresco.example>\nTo: Niels Hofmans\nSubject: Consultant reporting\nDate: 14 November 2026 at 08:31\nHi Niels,\nCan you send me the consultant reporting template by Wednesday? I need it to consolidate the hours from the pentest team.\nThanks,\nChloe\nReply  Reply All  Forward  Archive  Trash\n"},
-		{label: "orion-article", app: "com.kagi.kagimacOS", domain: "tiiny.ai", at: "2026-11-16 10:07", sightings: []time.Duration{7 * time.Minute},
+		{label: "orion-article", title: "Tiiny Pocket | Personal AI Infrastructure for Local LLMs", app: "com.kagi.kagimacOS", domain: "tiiny.ai", at: "2026-11-16 10:07", sightings: []time.Duration{7 * time.Minute},
 			text: scenarioOrionArticle()},
-		{label: "terminal-venice", app: "com.apple.Terminal", at: "2026-11-12 15:22", text: scenarioTerminalVenice()},
-		{label: "notion-pentest-plan", app: "notion.id", domain: "notion.so", at: "2026-11-16 15:05",
+		{label: "terminal-venice", title: "niels@mbp: ~/Source/infra — zsh", app: "com.apple.Terminal", at: "2026-11-12 15:22", text: scenarioTerminalVenice()},
+		{label: "notion-pentest-plan", title: "Pentest planning Q4", app: "notion.id", domain: "notion.so", at: "2026-11-16 15:05",
 			text: "Pentest planning Q4\nNotion\nShare  Updates  Favorite\nOwner: Niels Hofmans\nGoals\n- External retest for Orfit\n- Idelux local project report\n- Buildwise evidence packet\nMilestones\n- Scope agreed with client\n- Testing window booked\n- Report review with Dima\n"},
-		{label: "okta-login", app: "com.kagi.kagimacOS", domain: "cresco.okta.com", at: "2026-11-15 09:00",
+		{label: "okta-login", title: "Sign in to Cresco", app: "com.kagi.kagimacOS", domain: "cresco.okta.com", at: "2026-11-15 09:00",
 			text: "Cresco Okta\nSign in to Cresco — Dima pentest portal — Username — Password — Keep me signed in\nSign in\nNeed help signing in?\n"},
-		{label: "blur-self", app: appidentity.BundleID, at: "2026-11-16 15:20",
+		{label: "blur-self", title: "Ask Blur", app: appidentity.BundleID, at: "2026-11-16 15:20",
 			text: "Blur\nAsk Blur\nAsk Blur: what did Dima say about the pentest retest\nSearching your saved memory...\n"},
-		{label: "teams-idelux", app: "com.microsoft.teams2", at: "2026-11-15 14:10",
+		{label: "teams-idelux", title: "Idelux project channel | Microsoft Teams", app: "com.microsoft.teams2", at: "2026-11-15 14:10",
 			text: "Microsoft Teams\nChat  Teams  Calendar  Calls\nIdelux project channel\nIdelux local project — need to report, testing period 20–21 October\nReply  Reactions\nFiles  Wiki  Planner\n"},
-		{label: "preview-programme", app: "com.apple.Preview", at: "2026-11-15 16:30",
+		{label: "preview-programme", title: "security-first-2026-programme.pdf", app: "com.apple.Preview", at: "2026-11-15 16:30",
 			text: "Preview\nFile Edit View Go Tools Window Help\nsecurity-first-2026-programme.pdf\nSecurity First 2026 Brussels programme\nYoussef Bey project lead\nPage 1 of 6\nKeynote 09:30  Workshops 11:00  Closing 16:00\n"},
-		{label: "finder-downloads", app: "com.apple.finder", at: "2026-11-15 09:30",
+		{label: "finder-downloads", title: "Downloads", app: "com.apple.finder", at: "2026-11-15 09:30",
 			text: "Finder\nFile Edit View Go Window Help\nFavorites\nAirDrop\nRecents\nApplications\nDownloads\nDownloads — 14 items\nName  Date Modified  Size\nreport-draft.pdf  Yesterday  1.2 MB\nprogramme.pdf  Yesterday  800 KB\n"},
-		{label: "sublime-sync-1", app: "com.sublimetext.4", at: "2026-11-09 14:00",
+		{label: "sublime-sync-1", title: "segments.go — blur sync segments", app: "com.sublimetext.4", at: "2026-11-09 14:00",
 			text: "Sublime Text\nFile Edit Selection Find View Goto Tools Project Window Help\nsegments.go - blur sync segments\npackage sync\n// sealed segment folder sync: seal, upload, verify manifest\nfunc SealSegment(dir string) error {\n\treturn nil\n}\n"},
-		{label: "terminal-sync-2", app: "com.apple.Terminal", at: "2026-11-10 16:00",
+		{label: "terminal-sync-2", title: "niels@mbp: ~/Source/blur — zsh", app: "com.apple.Terminal", at: "2026-11-10 16:00",
 			text: "niels@mbp ~/Source/blur % go test ./internal/sync -run Segments -count=1\nblur sync segments: sealed 12 segments, manifest verified\nok  \tgithub.com/hazcod/blur/internal/sync\t0.842s\nniels@mbp ~/Source/blur % \n"},
+		// Folding scenario: the title and body spell "résumé" with accents, a
+		// query for "resume" must still find it.
+		{label: "preview-resume", title: "CV_Youssef_résumé.pdf", app: "com.apple.Preview", at: "2026-11-14 11:20",
+			text: "Preview\nFile Edit View Go Tools Window Help\nCV_Youssef_résumé.pdf\nYoussef Bey\nSecurity consultant, Brussels\nrésumé\nExperience: penetration testing, red team engagements, client reporting\nPage 1 of 2\n"},
 	}
 }
 
@@ -241,6 +248,12 @@ func newScenarioCorpus(t *testing.T) *scenarioCorpus {
 		observation, err := capture.SanitizeObservation(seed.app, seed.domain, seed.text, capture.MaxObservationTextBytes)
 		if err != nil {
 			t.Fatalf("%s: %v", seed.label, err)
+		}
+		if seed.title == "" {
+			t.Fatalf("%s: every corpus capture needs a window title", seed.label)
+		}
+		if observation = observation.WithTitle(seed.title); observation.Title() != seed.title {
+			t.Fatalf("%s: the sanitizer changed the fixture title %q to %q", seed.label, seed.title, observation.Title())
 		}
 		if observation.Truncated() || observation.Text() != seed.text {
 			t.Fatalf("%s: sanitizer changed the fixture text (redacted or truncated)", seed.label)

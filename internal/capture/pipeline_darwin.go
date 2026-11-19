@@ -218,6 +218,7 @@ func readDarwinAX(ctx context.Context, source *darwin.Adapter, probe platform.Ca
 	// captured separately for per-value revalidation without exposing a title.
 	rootElement := frame.nativeRootID
 	frame.focus = darwinFocusReader(source, probe, rootElement)
+	frame.title = darwinTitleReader(source, probe, rootElement)
 	wrapAXValues(frame.roots, func(ctx context.Context, max int, value func(context.Context, int) (string, error)) (string, error) {
 		var text string
 		verifyErr := source.WithVerifiedTarget(ctx, probe.TargetID, func(ctx context.Context, pid int32) error {

@@ -180,6 +180,29 @@ func readLinuxATSPI(ctx context.Context, source *platformlinux.Adapter, probe pl
 	if err != nil {
 		return frame, err
 	}
+	// Best-effort window title: the captured window's accessible name, read
+	// only while it is still the verified, non-private target.
+	frame.title = func(ctx context.Context) string {
+		var title string
+		err := source.WithVerifiedTarget(ctx, probe.TargetID, func(ctx context.Context, target platformlinux.FocusedContext) error {
+			if target.Conn != focused.Conn || target.WindowBus != focused.WindowBus || target.WindowPath != focused.WindowPath {
+				return platform.ErrInvalidLease
+			}
+			if err := verifyLinuxBrowserWindow(ctx, target, probe.AppID); err != nil {
+				return err
+			}
+			var name string
+			if err := target.Conn.Object(target.WindowBus, target.WindowPath).CallWithContext(ctx, atspiAccessibleIface+".GetName", 0).Store(&name); err != nil {
+				return err
+			}
+			title = name
+			return nil
+		})
+		if err != nil || len(title) > 1024 || !utf8.ValidString(title) {
+			return ""
+		}
+		return title
+	}
 	wrapAXValues(frame.roots, func(ctx context.Context, max int, value func(context.Context, int) (string, error)) (string, error) {
 		var text string
 		readErr := source.WithVerifiedTarget(ctx, probe.TargetID, func(ctx context.Context, target platformlinux.FocusedContext) error {

@@ -273,6 +273,10 @@ func TestDerivedIndexFailureNeverRollsBackAcceptedSource(t *testing.T) {
 	if err := s.ensureSearchIndex(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// A rebuild queues the retained sources; the background indexer finishes them.
+	if pending, err := s.IndexPendingExact(ctx, 100); err != nil || pending {
+		t.Fatal("rebuild backfill did not finish", pending, err)
+	}
 	page, err := s.SearchExact(ctx, largePageQuery("zzztailneedle"))
 	if err != nil || len(page.Hits) != 1 || page.IndexingPending {
 		t.Fatal("saved source could not be reindexed", page, err)

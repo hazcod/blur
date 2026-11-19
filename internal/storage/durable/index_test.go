@@ -1847,7 +1847,7 @@ func TestDurableIndexDeleteRemovesPostingsAndRollsBackAtomically(t *testing.T) {
 	}
 }
 
-func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
+func TestDurableIndexPagesAndQueuesRebuildOnReopenThenBackfillFinishes(t *testing.T) {
 	path := t.TempDir() + "/search.db"
 	store, err := OpenDurable(path, durableTestKey(t, 0x77), CreateNew)
 	if err != nil {
@@ -1894,6 +1894,7 @@ func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
 		t.Fatalf("rebuild old observation set: %v", err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
+	requirePendingThenDrained(t, store)
 	response, err := search.New(store).Search(context.Background(), search.Request{Query: "alpha beta", ResultLimit: 100, SnippetBytes: 32, ResponseBytes: 64 << 10, ScanLimit: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -1901,6 +1902,28 @@ func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
 	if len(response.Results) != 64 || response.Truncated {
 		t.Fatalf("rebuilt multi-page index result count=%d truncated=%t, want 64 exact results", len(response.Results), response.Truncated)
 	}
+}
+
+// requirePendingThenDrained asserts the contract of a rebuild: opening the
+// store returns with the retained observations queued as pending index work
+// (searches would report IndexingPending), and the background indexer then
+// finishes it.
+func requirePendingThenDrained(t *testing.T, store *Store) {
+	t.Helper()
+	ctx := context.Background()
+	if pending, err := store.ExactIndexPending(ctx); err != nil || !pending {
+		t.Fatalf("a rebuilt index must report pending work after open: pending=%t err=%v", pending, err)
+	}
+	for rounds := 0; rounds < 1000; rounds++ {
+		more, err := store.IndexPendingExact(ctx, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !more {
+			return
+		}
+	}
+	t.Fatal("pending index work did not drain")
 }
 
 func TestDurableIndexRebuildsLegacyFormatBeforeReturning(t *testing.T) {
@@ -1936,6 +1959,7 @@ func TestDurableIndexRebuildsLegacyFormatBeforeReturning(t *testing.T) {
 		t.Fatalf("rebuild index from legacy format: %v", err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
+	requirePendingThenDrained(t, store)
 	response, err := search.New(store).Search(context.Background(), search.Request{
 		Query: "alpha beta", ResultLimit: 2, SnippetBytes: 64,
 		ResponseBytes: 4096, ScanLimit: 1,
@@ -1996,6 +2020,7 @@ func TestDurableIndexMaxTermRebuildFitsBoundedBatch(t *testing.T) {
 		t.Fatalf("rebuild a max-term observation in the bounded batch: %v", err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
+	requirePendingThenDrained(t, store)
 	response, err := search.New(store).Search(context.Background(), search.Request{
 		Query: common[0], ResultLimit: 2, SnippetBytes: 64,
 		ResponseBytes: 4096, ScanLimit: 1,
