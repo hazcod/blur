@@ -18,7 +18,6 @@ import (
 	"github.com/golang-gui/goui/style"
 	"github.com/golang-gui/goui/theme/modern"
 	"github.com/golang-gui/goui/ui"
-	"github.com/hazcod/blur/internal/acceptance"
 	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/appidentity"
 	"github.com/hazcod/blur/internal/assistant"
@@ -518,7 +517,7 @@ func newDesktop(app ui.App, client *Client, captureController *ingest.Controller
 	if client == nil {
 		prefs.CaptureEnabled = false
 	}
-	d := &desktop{app: app, client: client, capture: captureController, preferences: prefs, page: "Today", settingsGroup: settingsGroupCapture, date: localDate, dateDraft: localDate, reportStart: localDate, reportEnd: localDate, reportZone: localZoneName(), answers: make(map[string]string), knowledgeKind: knowledge.Project, dashboardOpen: acceptance.Enabled}
+	d := &desktop{app: app, client: client, capture: captureController, preferences: prefs, page: "Today", settingsGroup: settingsGroupCapture, date: localDate, dateDraft: localDate, reportStart: localDate, reportEnd: localDate, reportZone: localZoneName(), answers: make(map[string]string), knowledgeKind: knowledge.Project, dashboardOpen: dashboardOpenAtLaunch()}
 	if client != nil && captureController != nil {
 		client.SetCaptureStateReader(func() (bool, time.Time) { return captureController.Running(), time.Time{} })
 	}
