@@ -122,8 +122,8 @@ func NormalizeTokens(value string, limit int) ([]string, error) {
 		}
 		return nil
 	}
-	runes := []rune(foldDiacritics(strings.ToLower(value)))
-	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	runes := []rune(FoldLower(value))
+	isWord := isTokenRune
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		if isWord(r) {
@@ -133,8 +133,7 @@ func NormalizeTokens(value string, limit int) ([]string, error) {
 		// A possessive is an apostrophe and "s" that end a word: ' or ’
 		// right after letters/digits, then s, then anything but a letter or
 		// digit. "Dima's" -> "dima"; "it'sa", "'s" and "Dima's2" are kept.
-		if (r == '\'' || r == '\u2019') && token.Len() > 0 && i+1 < len(runes) && runes[i+1] == 's' &&
-			(i+2 == len(runes) || !isWord(runes[i+2])) {
+		if token.Len() > 0 && isPossessiveAt(runes, i) {
 			i++
 			if err := flush(); err != nil {
 				return nil, err
@@ -154,6 +153,34 @@ func NormalizeTokens(value string, limit int) ([]string, error) {
 	}
 	sort.Strings(terms)
 	return terms, nil
+}
+
+func isTokenRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+
+// FoldLower is the shared case and diacritic fold of every token.
+func FoldLower(value string) string { return foldDiacritics(strings.ToLower(value)) }
+
+// isPossessiveAt reports whether runes[i] starts a possessive: an apostrophe
+// (' or ’) and "s" that end a word. "Dima's" -> "dima"; "it'sa", "'s" and
+// "Dima's2" are not possessives. The caller guarantees a word precedes i.
+func isPossessiveAt(runes []rune, i int) bool {
+	return (runes[i] == '\'' || runes[i] == '’') && i+1 < len(runes) && runes[i+1] == 's' &&
+		(i+2 == len(runes) || !isTokenRune(runes[i+2]))
+}
+
+// FoldWord returns the NormalizeTokens form of a single word: lowercase,
+// diacritics folded, trailing possessive removed. Callers that match words
+// against NormalizeTokens output (the assistant planner) must compare in this
+// space. NormalizeTokens shares foldLower and isPossessiveAt with it, so the
+// rule has one definition.
+func FoldWord(word string) string {
+	runes := []rune(FoldLower(word))
+	for i := 1; i < len(runes); i++ {
+		if isTokenRune(runes[i-1]) && isPossessiveAt(runes, i) {
+			return string(runes[:i])
+		}
+	}
+	return string(runes)
 }
 
 // foldDiacritics removes combining accents that follow a Latin or Greek base

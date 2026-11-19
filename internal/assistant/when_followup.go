@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/hazcod/blur/internal/search"
 )
 
 // maxWhenCaptures bounds how many capture times one "when" answer lists.
@@ -40,8 +42,9 @@ func NameMentions(text, name string) int {
 	start := -1
 	count := func(end int) {
 		if start >= 0 {
-			if n, ok := want[strings.ToLower(text[start:end])]; ok {
-				want[strings.ToLower(text[start:end])] = n + 1
+			key := search.FoldLower(text[start:end])
+			if n, ok := want[key]; ok {
+				want[key] = n + 1
 			}
 			start = -1
 		}
