@@ -241,7 +241,9 @@ func TestSearchAndMCPDiscloseIncompleteCoverage(t *testing.T) {
 					}
 				}
 			} else {
-				query = "compiler"
+				// A keyword query with exact hits never consults the meaning step, so
+				// only a natural-language question can find it unavailable.
+				query = "what was the compiler review?"
 				o, _ := capture.SanitizeObservation("com.apple.safari", "example.com", "Compiler review", 512)
 				if err := s.PutObservationAt(ctx, o, now); err != nil {
 					t.Fatal(err)
