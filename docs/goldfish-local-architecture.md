@@ -395,9 +395,10 @@ running an older build cannot import sync segments that contain them and stops
 at the first such segment until it is upgraded (nothing is lost). Upgrade all
 synced Macs together.
 
-Still open for search: a vector index over Library pages (Goldfish embeds
-Wiki pages; Blur's optional meaning index covers captures only), lowercase
-entity detection in the planner, and re-tokenization of capture parts
+Still open for search: a folded-name index for the Library so an unaccented
+question finds an accented entry (today only the accented spelling matches),
+a vector index over Library pages (Goldfish embeds Wiki pages; Blur's optional
+meaning index covers captures only), lowercase entity detection in the planner, and re-tokenization of capture parts
 published before the format bump. Open-path cost: queuing the re-index is
 still O(N) in receipts (about 0.7 s per 1,000 captures measured).
 
