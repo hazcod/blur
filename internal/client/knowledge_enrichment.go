@@ -5,11 +5,13 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/assistant"
 	"github.com/hazcod/blur/internal/knowledge"
 	"github.com/hazcod/blur/internal/knowledge/enrich"
+	"github.com/hazcod/blur/internal/search"
 )
 
 func (c *localAIController) SetLibraryRuntime(sources enrich.Sources, repository enrich.Repository, options enrich.Options) {
@@ -258,11 +260,35 @@ func (c *Client) inferredEntityEvidence(ctx context.Context, plan assistant.Plan
 	if !ok || strings.TrimSpace(plan.Entity) == "" {
 		return nil, nil
 	}
-	entities, err := repository.FindInferredKnowledge(ctx, plan.Entity)
+	entities, err := findInferredKnowledgeFolded(ctx, repository, plan.Entity)
 	if err != nil {
 		return nil, err
 	}
 	return c.inferredEntitiesEvidence(ctx, plan, entities, true)
+}
+
+// findInferredKnowledgeFolded looks a Library name up as typed and in the
+// folded spelling. The stored name index is lowercase-only and never migrated,
+// so "José" and "Jose" are different keys and both spellings must be offered.
+func findInferredKnowledgeFolded(ctx context.Context, repository enrich.Repository, name string) ([]knowledge.Entity, error) {
+	entities, err := repository.FindInferredKnowledge(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	folded := search.FoldLower(name)
+	if knowledge.NormalizeExact(folded) == knowledge.NormalizeExact(name) {
+		return entities, nil
+	}
+	more, err := repository.FindInferredKnowledge(ctx, folded)
+	if err != nil {
+		return nil, err
+	}
+	for _, entity := range more {
+		if !slices.ContainsFunc(entities, func(have knowledge.Entity) bool { return have.ID == entity.ID }) {
+			entities = append(entities, entity)
+		}
+	}
+	return entities, nil
 }
 
 func (c *Client) inferredEntitiesEvidence(ctx context.Context, plan assistant.Plan, entities []knowledge.Entity, includeSources bool) ([]assistant.Evidence, error) {
@@ -362,7 +388,7 @@ func (c *Client) inferredTopicEvidence(ctx context.Context, plan assistant.Plan)
 	if !ok || len(plan.Terms) == 0 {
 		return nil, false, nil, nil
 	}
-	queries := topicKnowledgeQueries(plan.Terms)
+	queries := topicKnowledgeQueries(plan.Terms, plan.Question)
 	entities := make([]knowledge.Entity, 0, maxTopicKnowledgeCandidates)
 	limited := false
 	if batch, ok := repository.(inferredKnowledgeBatchSearcher); ok {
@@ -462,31 +488,79 @@ func (c *Client) inferredTopicEvidence(ctx context.Context, plan assistant.Plan)
 	return evidence, limited, ids, nil
 }
 
-func topicKnowledgeQueries(terms []string) []string {
-	seen := make(map[string]bool, 12)
-	queries := make([]string, 0, 12)
+const maxTopicKnowledgeQueries = 12
+
+// topicKnowledgeQueries builds the exact-name queries for a topic question.
+// Plan terms are folded (diacritics removed, possessives stripped) but the
+// durable Library name index is keyed by knowledge.NormalizeExact, which only
+// lowercases, and is never migrated. A Library entity stored as "José Müller"
+// therefore needs the original spelling and one stored as "Jose Muller" needs
+// the folded one, so the result is the deduplicated union of both spellings,
+// interleaved so the best phrase of each comes first, within the same bound.
+func topicKnowledgeQueries(terms []string, question string) []string {
+	folded := topicNamePhrases(terms)
+	original := folded
+	if raw, changed := originalSpellingTerms(terms, question); changed {
+		original = topicNamePhrases(raw)
+	}
+	seen := make(map[string]bool, maxTopicKnowledgeQueries)
+	queries := make([]string, 0, maxTopicKnowledgeQueries)
 	add := func(value string) {
 		value = strings.TrimSpace(value)
-		if value == "" || seen[value] || len(queries) == 12 {
+		if value == "" || seen[value] || len(queries) == maxTopicKnowledgeQueries {
 			return
 		}
 		seen[value] = true
 		queries = append(queries, value)
 	}
+	for index := 0; index < max(len(folded), len(original)); index++ {
+		if index < len(folded) {
+			add(folded[index])
+		}
+		if index < len(original) {
+			add(original[index])
+		}
+	}
+	return queries
+}
+
+// topicNamePhrases lists candidate name phrases for terms in priority order.
+func topicNamePhrases(terms []string) []string {
+	var phrases []string
 	// Longer phrases prefer exact multiword Library names. Reverse order helps
 	// when a project is the final noun in a natural-language question.
 	for width := min(3, len(terms)); width >= 2; width-- {
 		for start := len(terms) - width; start >= 0; start-- {
-			add(strings.Join(terms[start:start+width], " "))
+			phrases = append(phrases, strings.Join(terms[start:start+width], " "))
 		}
 	}
 	for index := len(terms) - 1; index >= 0; index-- {
-		add(terms[index])
+		phrases = append(phrases, terms[index])
 	}
-	if len(queries) < 12 {
-		for index := 0; index < len(terms); index++ {
-			add(terms[index])
+	return phrases
+}
+
+// originalSpellingTerms maps each folded plan term back to the question word it
+// came from, lowercased but otherwise as typed. Terms without a source word
+// keep their folded form.
+func originalSpellingTerms(terms []string, question string) ([]string, bool) {
+	var words []string
+	for _, word := range strings.FieldsFunc(question, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !unicode.Is(unicode.Mn, r)
+	}) {
+		words = append(words, word)
+	}
+	original, changed := make([]string, len(terms)), false
+	for index, term := range terms {
+		original[index] = term
+		for _, word := range words {
+			if search.FoldWord(word) == term {
+				if lower := strings.ToLower(word); lower != term {
+					original[index], changed = lower, true
+				}
+				break
+			}
 		}
 	}
-	return queries
+	return original, changed
 }
