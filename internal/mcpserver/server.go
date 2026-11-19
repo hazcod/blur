@@ -855,7 +855,7 @@ func boundWorkingMemoryOutput(output workingMemoryOutput, input workingMemoryInp
 	seen := make(map[string]bool, len(output.Items))
 	previous := end
 	for _, item := range output.Items {
-		if !item.focusFields.valid() {
+		if !item.valid() {
 			return false
 		}
 		if len(item.SourceID) != 64 || strings.ToLower(item.SourceID) != item.SourceID || seen[item.SourceID] || !validOutputText(item.AppID, 128) || strings.EqualFold(item.AppID, appidentity.BundleID) || item.Domain != "" && !validOutputText(item.Domain, 253) || !validOutputText(item.Content, 1600) {
@@ -1271,7 +1271,7 @@ func boundSnapshotOutput(input snapshotOutput, request snapshotInput) (snapshotO
 	seen := map[string]bool{}
 	used := 0
 	for _, item := range input.Snapshots {
-		if !item.focusFields.valid() {
+		if !item.valid() {
 			return snapshotOutput{}, false
 		}
 		_, sourceIDErr := hex.DecodeString(item.SourceID)

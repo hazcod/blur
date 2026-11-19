@@ -199,7 +199,7 @@ func boundReadSessionOutput(output readSessionOutput, input readSessionInput, li
 	}
 	seen := map[string]bool{}
 	for _, item := range output.Captures {
-		if !item.focusFields.valid() {
+		if !item.valid() {
 			return false
 		}
 		if !validSourceIDText(item.SourceID) || seen[item.SourceID] || !validOutputText(item.AppID, 128) || strings.EqualFold(item.AppID, appidentity.BundleID) || item.Domain != "" && !validOutputText(item.Domain, 253) || !validOptionalTimestamp(item.CapturedAt) || item.LastSeenAt == "" || !validOptionalTimestamp(item.LastSeenAt) || !utf8.ValidString(item.Content) || strings.IndexByte(item.Content, 0) >= 0 || len(item.Content) > chunk || item.OffsetBytes != 0 || item.NextOffsetBytes != len(item.Content) {

@@ -173,22 +173,6 @@ func (c *scenarioCorpus) turnFor(question string, result assistant.Result) assis
 	return assistant.Turn{Question: question, Answer: result.Answer.Text, Plan: result.Plan, General: result.General, SourceIDs: slices.Clone(result.Answer.SourceIDs), SourceDigests: assistant.EvidenceDigests(result.Sources)}
 }
 
-// entryFlow runs text through the same entry router the quick panel uses.
-func (c *scenarioCorpus) entryFlow(ctx context.Context, mode scenarioMode, input string) (EntryResolution, *assistant.Result, error) {
-	resolved, err := c.client.ResolveEntry(ctx, input, EntryState{}, "Europe/Brussels")
-	if err != nil {
-		return resolved, nil, err
-	}
-	if resolved.Answer != nil {
-		return resolved, resolved.Answer, nil
-	}
-	if resolved.Action.Kind == intent.Ask {
-		result, err := c.service(mode).AskWithHistoryMode(ctx, resolved.Action.Text, nil, resolved.Action.Mode)
-		return resolved, &result, err
-	}
-	return resolved, nil, nil
-}
-
 func (s recallScenario) evaluate(c *scenarioCorpus, out scenarioOutcome) []string {
 	problems := append([]string(nil), out.notes...)
 	if out.err != nil {

@@ -13,7 +13,7 @@ func demoteAuthenticationPages(question string, items []assistant.Evidence) []as
 	}
 	kept := make([]assistant.Evidence, 0, len(items))
 	for _, item := range items {
-		if !(item.Layer == assistant.LayerSource && isAuthenticationPageEvidence(item)) {
+		if item.Layer != assistant.LayerSource || !isAuthenticationPageEvidence(item) {
 			kept = append(kept, item)
 		}
 	}

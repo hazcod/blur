@@ -305,9 +305,8 @@ func TestHandleMCPPromisesCombinesOpenLoopsAndTasksNewestFirst(t *testing.T) {
 	for _, it := range out.Items {
 		kinds = append(kinds, it.Kind+":"+it.ID)
 	}
-	want := []string{"reminder:" + reminder.ID, "open_loop:loop-scope", "task:" + open.ID}
 	// The Dima loop was captured 2026-11-15 14:47 local, newer than the 2-day-old task.
-	want = []string{"reminder:" + reminder.ID, "open_loop:loop-scope", "task:" + open.ID}
+	want := []string{"reminder:" + reminder.ID, "open_loop:loop-scope", "task:" + open.ID}
 	if strings.Join(kinds, ",") != strings.Join(want, ",") || !strings.Contains(out.Note, "not verified outcomes") {
 		t.Fatalf("open promises = %v note=%q", kinds, out.Note)
 	}

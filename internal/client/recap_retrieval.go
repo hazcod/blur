@@ -15,10 +15,7 @@ const maxRecapChroniclePages = 32 // the supported 31-day range holds at most 74
 // Recaps sample the requested period rather than the latest few captures.
 // Full originals stay available to the source inspector; model packing has its
 // own much smaller budget. At most eight raw 1 MiB records are retained.
-func (c *Client) recapEvidence(ctx context.Context, plan assistant.Plan, start, end time.Time, segments []activity.Segment) ([]assistant.Evidence, bool, error) {
-	return c.recapEvidenceWithDiagnosis(ctx, plan, start, end, segments, nil)
-}
-
+//
 // recapEvidenceWithDiagnosis also reports how many in-scope day or week
 // rollups are waiting to be regenerated.
 func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.Plan, start, end time.Time, segments []activity.Segment, diagnosis *assistant.Diagnosis) ([]assistant.Evidence, bool, error) {

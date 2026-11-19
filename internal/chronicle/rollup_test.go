@@ -146,7 +146,8 @@ func TestRollupInputDropsOldestFirstAndKeepsOrder(t *testing.T) {
 func TestRollupInputHashAndSourceUnion(t *testing.T) {
 	a := NewRollupInput(RollupLevelDay, []RollupChild{{ID: "hour:20261115T09Z", Text: "one", SourceIDs: []string{rollupSourceID(1), rollupSourceID(2)}}, {ID: "hour:20261115T10Z", Text: "two", SourceIDs: []string{rollupSourceID(2), rollupSourceID(3)}}})
 	b := NewRollupInput(RollupLevelDay, []RollupChild{{ID: "hour:20261115T09Z", Text: "one"}, {ID: "hour:20261115T10Z", Text: "three"}})
-	if a.Hash() == b.Hash() || len(a.Hash()) != 64 || a.Hash() != a.Hash() {
+	again := NewRollupInput(RollupLevelDay, []RollupChild{{ID: "hour:20261115T09Z", Text: "one", SourceIDs: []string{rollupSourceID(1), rollupSourceID(2)}}, {ID: "hour:20261115T10Z", Text: "two", SourceIDs: []string{rollupSourceID(2), rollupSourceID(3)}}})
+	if a.Hash() == b.Hash() || len(a.Hash()) != 64 || a.Hash() != again.Hash() {
 		t.Fatal("hash does not track child text")
 	}
 	if got := a.SourceIDs(); len(got) != 3 || !sortedUniqueIDs(got) {
