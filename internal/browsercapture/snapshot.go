@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hazcod/blur/internal/browserprivacy"
 	"github.com/hazcod/blur/internal/capture"
 )
 
@@ -69,6 +70,12 @@ func Sanitize(page Snapshot, enabled bool, now time.Time) (capture.SanitizedObse
 	observation, err := capture.SanitizeObservation(SafariBundleID, domain, text, MaxPageBytes)
 	if err != nil {
 		return capture.SanitizedObservation{}, ErrRejected
+	}
+	// The page title is also its own searchable field. It was already part of
+	// the text above; WithTitle redacts and bounds it again and drops it when
+	// it cannot be made safe, so a title never fails the page.
+	if title := strings.TrimSpace(page.Title); title != "" && !browserprivacy.IsPrivateWindowTitle(title) {
+		observation = observation.WithTitle(title)
 	}
 	return observation, nil
 }

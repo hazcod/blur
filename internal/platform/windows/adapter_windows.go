@@ -25,3 +25,15 @@ func (nativeBackend) Foreground(ctx context.Context) (FocusedTarget, error) {
 func (nativeBackend) Subscribe(ctx context.Context) (eventSubscription, error) {
 	return newNativeEventSubscription(ctx)
 }
+
+// WindowTitle returns the bounded title of a window handle obtained from
+// WithVerifiedTarget, or "" when it cannot be read. It exists so the capture
+// package can record the title of the window it just captured; callers must
+// have verified the target first and must redact the result.
+func (*Adapter) WindowTitle(window uintptr) string {
+	title, err := foregroundWindowTitle(window)
+	if err != nil {
+		return ""
+	}
+	return title
+}

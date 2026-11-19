@@ -29,6 +29,12 @@ type windowsVerifiedSource interface {
 	WithVerifiedTarget(context.Context, string, func(context.Context, platformwindows.FocusedTarget) error) error
 }
 
+// windowsTitleSource is implemented by the native Windows adapter. Sources
+// without it (test doubles) simply record no window title.
+type windowsTitleSource interface {
+	WindowTitle(window uintptr) string
+}
+
 type windowsAXNode struct {
 	element     windowsAXElement
 	releaseOnce sync.Once
@@ -295,6 +301,24 @@ func readWindowsAX(ctx context.Context, source windowsVerifiedSource, probe plat
 	}
 	if frame.cleanup == nil || captured.Window == 0 {
 		return rawFrame{}, errors.New("capture: Windows accessibility frame unavailable")
+	}
+	if titles, ok := source.(windowsTitleSource); ok {
+		// Best effort: the title is read only while the captured foreground
+		// window is still the verified target, and any failure yields "".
+		frame.title = func(ctx context.Context) string {
+			var title string
+			err := source.WithVerifiedTarget(ctx, probe.TargetID, func(_ context.Context, current platformwindows.FocusedTarget) error {
+				if current != captured || current.Private || current.Secure || current.Elevated {
+					return platform.ErrInvalidLease
+				}
+				title = titles.WindowTitle(current.Window)
+				return nil
+			})
+			if err != nil {
+				return ""
+			}
+			return title
+		}
 	}
 	wrapAXValues(frame.roots, func(ctx context.Context, max int, read func(context.Context, int) (string, error)) (string, error) {
 		operationCtx, cancel := windowsOperationContext(ctx, limits.MaxDuration)

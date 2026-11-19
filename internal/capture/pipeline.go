@@ -125,6 +125,9 @@ type SanitizedObservation struct {
 	focusedRole string
 	focusedName string
 	focusedPath string
+	// Window title (title.go). Redacted and bounded like the text; not part of
+	// the content ID.
+	title string
 }
 
 const MaxObservationTextBytes = 1 << 20
@@ -136,6 +139,11 @@ const (
 	// redaction counts. It is written only when a breadcrumb exists, so every
 	// record without one stays byte-identical to version 1.
 	observationRecordVersionFocus = 2
+	// observationRecordVersionTitle appends a window-title trailer (2-byte
+	// length, then the title) after the focus trailer, which is then always
+	// present, possibly with three zero lengths. It is written only when a
+	// title exists, so version 1 and 2 records stay byte-identical.
+	observationRecordVersionTitle = 3
 	observationRecordHeaderBytes  = 49
 )
 
@@ -167,6 +175,7 @@ func (o SanitizedObservation) Clone() SanitizedObservation {
 	o.focusedRole = strings.Clone(o.focusedRole)
 	o.focusedName = strings.Clone(o.focusedName)
 	o.focusedPath = strings.Clone(o.focusedPath)
+	o.title = strings.Clone(o.title)
 	return o
 }
 
@@ -208,8 +217,11 @@ func MarshalAuthenticatedObservation(o SanitizedObservation) ([]byte, error) {
 	for _, count := range o.redactionCounts {
 		total += 5 + len(count.Rule)
 	}
-	if o.hasFocus() {
+	if o.hasFocus() || o.hasTitle() {
 		total += 3 + len(o.focusedRole) + len(o.focusedName) + len(o.focusedPath)
+	}
+	if o.hasTitle() {
+		total += 2 + len(o.title)
 	}
 	if total > MaxAuthenticatedObservationBytes {
 		return nil, captureError(InvalidObservation, nil)
@@ -217,7 +229,9 @@ func MarshalAuthenticatedObservation(o SanitizedObservation) ([]byte, error) {
 
 	encoded := make([]byte, total)
 	encoded[0] = observationRecordVersion
-	if o.hasFocus() {
+	if o.hasTitle() {
+		encoded[0] = observationRecordVersionTitle
+	} else if o.hasFocus() {
 		encoded[0] = observationRecordVersionFocus
 	}
 	if o.truncated {
@@ -245,7 +259,7 @@ func MarshalAuthenticatedObservation(o SanitizedObservation) ([]byte, error) {
 		copy(encoded[offset:], count.Rule)
 		offset += len(count.Rule)
 	}
-	if o.hasFocus() {
+	if o.hasFocus() || o.hasTitle() {
 		encoded[offset] = byte(len(o.focusedRole))
 		encoded[offset+1] = byte(len(o.focusedName))
 		encoded[offset+2] = byte(len(o.focusedPath))
@@ -255,6 +269,12 @@ func MarshalAuthenticatedObservation(o SanitizedObservation) ([]byte, error) {
 		copy(encoded[offset:], o.focusedName)
 		offset += len(o.focusedName)
 		copy(encoded[offset:], o.focusedPath)
+		offset += len(o.focusedPath)
+	}
+	if o.hasTitle() {
+		binary.BigEndian.PutUint16(encoded[offset:offset+2], uint16(len(o.title)))
+		offset += 2
+		copy(encoded[offset:], o.title)
 	}
 	return encoded, nil
 }
@@ -267,7 +287,7 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 		return empty, captureError(InvalidObservation, nil)
 	}
 	if len(encoded) < observationRecordHeaderBytes || len(encoded) > MaxAuthenticatedObservationBytes ||
-		(encoded[0] != observationRecordVersion && encoded[0] != observationRecordVersionFocus) || encoded[1]&^byte(1) != 0 {
+		(encoded[0] != observationRecordVersion && encoded[0] != observationRecordVersionFocus && encoded[0] != observationRecordVersionTitle) || encoded[1]&^byte(1) != 0 {
 		return invalid()
 	}
 	appLength := binary.BigEndian.Uint32(encoded[4:8])
@@ -302,14 +322,19 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 		offset += ruleLength
 	}
 	countsEnd := offset
-	var focusRole, focusName, focusPath string
-	if encoded[0] == observationRecordVersionFocus {
+	var focusRole, focusName, focusPath, title string
+	if encoded[0] == observationRecordVersionFocus || encoded[0] == observationRecordVersionTitle {
 		if len(encoded)-offset < 3 {
 			return invalid()
 		}
 		roleLength, nameLength, pathLength := int(encoded[offset]), int(encoded[offset+1]), int(encoded[offset+2])
 		offset += 3
-		if roleLength > maxProfileRoleLen || nameLength > MaxFocusFieldBytes || pathLength > MaxFocusFieldBytes || roleLength+nameLength+pathLength != len(encoded)-offset {
+		trailer := 0
+		if encoded[0] == observationRecordVersionTitle {
+			trailer = 2
+		}
+		if roleLength > maxProfileRoleLen || nameLength > MaxFocusFieldBytes || pathLength > MaxFocusFieldBytes || roleLength+nameLength+pathLength+trailer > len(encoded)-offset ||
+			trailer == 0 && roleLength+nameLength+pathLength != len(encoded)-offset {
 			return invalid()
 		}
 		focusRole = string(encoded[offset : offset+roleLength])
@@ -318,6 +343,15 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 		offset += nameLength
 		focusPath = string(encoded[offset : offset+pathLength])
 		offset += pathLength
+		if trailer != 0 {
+			titleLength := int(binary.BigEndian.Uint16(encoded[offset : offset+2]))
+			offset += 2
+			if titleLength == 0 || titleLength > MaxTitleBytes || titleLength != len(encoded)-offset {
+				return invalid()
+			}
+			title = string(encoded[offset : offset+titleLength])
+			offset += titleLength
+		}
 	}
 	if offset != len(encoded) {
 		return invalid()
@@ -344,6 +378,7 @@ func RestoreAuthenticatedObservation(encoded []byte) (SanitizedObservation, erro
 		focusedRole:      focusRole,
 		focusedName:      focusName,
 		focusedPath:      focusPath,
+		title:            title,
 	}
 	if o.Validate() != nil {
 		return invalid()
@@ -426,7 +461,7 @@ func (o SanitizedObservation) Validate() error {
 			return invalid()
 		}
 	}
-	if !validFocusFields(o.focusedRole, o.focusedName, o.focusedPath) {
+	if !validFocusFields(o.focusedRole, o.focusedName, o.focusedPath) || !validTitle(o.title) {
 		return invalid()
 	}
 	if o.contentID != contentID(o) {
@@ -459,6 +494,9 @@ type rawFrame struct {
 	// focus optionally reads the focused-element breadcrumb (focus.go). It is
 	// best effort and never fails a capture.
 	focus func(context.Context) (rawFocus, bool)
+	// title optionally reads the foreground window's title (title.go). Best
+	// effort: it never fails or delays a capture and returns "" on any error.
+	title func(context.Context) string
 }
 type rawNode struct {
 	role          string
@@ -798,6 +836,13 @@ func (p Pipeline) Capture(ctx context.Context) (SanitizedObservation, error) {
 		// A breadcrumb that does not validate is dropped; it never fails a capture.
 		if labelled := observation.withFocusRaw(role, name, path); labelled.Validate() == nil {
 			observation = labelled
+		}
+	}
+	// Title last, same rules: own 100 ms budget, empty on any failure. Secure,
+	// elevated and private windows never reach this point.
+	if title := readTitleForCapture(parent, frame.title, browser); title != "" {
+		if titled := observation.withTitleRaw(title); titled.Validate() == nil {
+			observation = titled
 		}
 	}
 	return observation, nil

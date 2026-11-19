@@ -65,6 +65,32 @@ func TestSanitizeRejectsUnapprovedOrNonCurrentPage(t *testing.T) {
 	}
 }
 
+func TestSanitizeRecordsPageTitleAsWindowTitle(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	page := Snapshot{
+		Browser: SafariBundleID, URL: "https://tiiny.ai/pocket", Title: "Tiiny Pocket | Personal AI Infrastructure for Local LLMs",
+		Text: "Body", Active: true, PrivacyKnown: true, CapturedAt: now,
+	}
+	observation, err := Sanitize(page, true, now)
+	if err != nil || observation.Title() != page.Title {
+		t.Fatalf("title = %q err=%v", observation.Title(), err)
+	}
+	// The title still leads the text, so earlier captures keep their identity.
+	if !strings.HasPrefix(observation.Text(), page.Title+"\n") {
+		t.Fatalf("text = %q", observation.Text())
+	}
+	page.Title = "Reset password: hunter2hunter2"
+	redacted, err := Sanitize(page, true, now)
+	if err != nil || strings.Contains(redacted.Title(), "hunter2") || redacted.Validate() != nil {
+		t.Fatalf("secret page title survived: %q %v", redacted.Title(), err)
+	}
+	page.Title = ""
+	none, err := Sanitize(page, true, now)
+	if err != nil || none.Title() != "" {
+		t.Fatalf("empty title: %q %v", none.Title(), err)
+	}
+}
+
 func withSnapshot(page Snapshot, mutate func(*Snapshot)) Snapshot {
 	mutate(&page)
 	return page
