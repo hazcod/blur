@@ -209,7 +209,7 @@ func ValidateRollup(r Rollup) error {
 		return ErrInvalid
 	}
 	for _, id := range r.ChildIDs {
-		if r.Level == RollupLevelDay && !validHourID(id) || r.Level == RollupLevelWeek && !(strings.HasPrefix(id, "day:") && ValidDayKey(id[len("day:"):])) {
+		if r.Level == RollupLevelDay && !validHourID(id) || r.Level == RollupLevelWeek && (!strings.HasPrefix(id, "day:") || !ValidDayKey(id[len("day:"):])) {
 			return ErrInvalid
 		}
 	}

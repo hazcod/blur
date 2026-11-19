@@ -178,10 +178,10 @@ func dayPartAnchor(ws []word, i int, now time.Time) (day time.Time, label string
 		k++
 	}
 	if k < len(ws) && k > i+1 {
-		switch cue := ws[k].s; {
-		case cue == "yesterday":
+		switch cue := ws[k].s; cue {
+		case "yesterday":
 			return named(-1, "yesterday")
-		case cue == "today":
+		case "today":
 			return named(0, "this")
 		default:
 			if wd, isDay := weekdayWords[cue]; isDay {
