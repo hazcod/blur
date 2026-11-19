@@ -1774,7 +1774,7 @@ func TestDurableIndexDeleteRemovesPostingsAndRollsBackAtomically(t *testing.T) {
 	}
 }
 
-func TestDurableIndexPagesAndRebuildsBeforeReopenReturns(t *testing.T) {
+func TestDurableIndexPagesAndQueuesRebuildOnReopenThenBackfillFinishes(t *testing.T) {
 	path := t.TempDir() + "/search.db"
 	store, err := OpenDurable(path, durableTestKey(t, 0x77), CreateNew)
 	if err != nil {
