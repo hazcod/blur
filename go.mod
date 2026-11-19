@@ -14,7 +14,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/sys v0.50.0
-	golang.org/x/text v0.41.0
+	golang.org/x/text v0.44.0
 )
 
 require (
@@ -30,7 +30,7 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/image v0.45.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
 
