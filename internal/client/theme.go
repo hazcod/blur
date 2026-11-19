@@ -72,6 +72,7 @@ const (
 	styleDayTitle       = "day-title"
 	styleSectionTitle   = "section-title"
 	styleMeta           = "meta"
+	styleMatch          = "match"
 	styleBrand          = "sidebar-brand"
 	styleNav            = "nav"
 	styleNavSelected    = "nav-selected"
@@ -170,6 +171,8 @@ func themeRules(options modern.Options) []style.Rule {
 		style.Name(styleBrand).ForegroundColor(p.ink).FontFamily(serif).FontSize(20).FontWeight(style.FontWeightBold),
 		style.Name(styleSectionTitle).ForegroundColor(p.ink).FontFamily(family).FontSize(base+2).FontWeight(style.FontWeightBold),
 		style.Name(styleMeta).ForegroundColor(p.inkMuted).FontFamily(family).FontSize(base-1),
+		// A matched search word: primary ink in bold, never the accent.
+		style.Name(styleMatch).ForegroundColor(p.ink).FontFamily(family).FontSize(base).FontWeight(style.FontWeightBold),
 
 		// Surfaces.
 		style.Name(styleHairline).BackgroundColor(p.hairline).BorderWidth(0).Radius(0),

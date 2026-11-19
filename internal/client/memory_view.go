@@ -103,10 +103,24 @@ func (d *desktop) memoryResultViews() []ui.View {
 		if len(d.searchHits) > 0 {
 			rows = append(rows, wrapLabel("Matching sources").Style(styleSectionTitle))
 		}
+		closest := false
 		for _, hit := range d.searchHits {
-			rows = append(rows, hairline(), d.memorySourceRow(hit))
+			if hit.Relaxed && !closest {
+				closest = true
+				rows = append(rows, searchDivider())
+			} else {
+				rows = append(rows, hairline())
+			}
+			rows = append(rows, d.memorySourceRow(hit))
 		}
-		if d.searchComplete && !d.searchFailed && len(d.searchHits) == 0 {
+		if len(d.searchSummaries) > 0 {
+			rows = append(rows, hairline(), wrapLabel("Summaries").Style(styleMeta))
+			for _, summary := range d.searchSummaries {
+				rows = append(rows, summaryRow(summary, d.searchTerms), hairline())
+			}
+			rows = rows[:len(rows)-1]
+		}
+		if d.searchComplete && !d.searchFailed && len(d.searchHits) == 0 && len(d.searchSummaries) == 0 {
 			rows = append(rows, wrapLabel("No matching saved memory found. Try another topic or a question.").Style(modern.MutedText))
 		}
 		if d.searchIndexingPending && d.searchComplete {
@@ -218,6 +232,9 @@ func (d *desktop) memorySourceRow(hit SearchHit) ui.View {
 	if hit.Task != nil {
 		return d.taskCard(*hit.Task)
 	}
+	if usesSearchPreview(hit) {
+		return d.searchPreviewRow(hit)
+	}
 	previewText := hit.Text
 	caption := sourceKind(hit)
 	noteHeading := false
@@ -275,6 +292,11 @@ func (d *desktop) memorySourceRow(hit SearchHit) ui.View {
 			d.app.RequestUpdate()
 		})))
 	}
+	return d.withSourceActions(hit, rows)
+}
+
+// withSourceActions appends the delete controls every source row carries.
+func (d *desktop) withSourceActions(hit SearchHit, rows []ui.View) ui.View {
 	if d.client != nil && d.client.CanDeleteSource() {
 		id := hit.SourceID
 		if d.pendingDelete == id {
@@ -305,4 +327,37 @@ func memorySourceIcon(kind string, tokens palette) ui.View {
 			p.DrawLine(geometry.Point{X: 6, Y: 11}, geometry.Point{X: 11, Y: 11}, 1.2, ink)
 		}
 	}).MinSize(18, 20).MaxSize(18, 20)
+}
+
+// searchPreviewRow is a capture search row: "App · Title · date time", the
+// preview with its matched words emphasised, and the full capture one click
+// away. The full text stays the source of truth for the detail view.
+func (d *desktop) searchPreviewRow(hit SearchHit) ui.View {
+	expanded := d.expandedSourceID == hit.SourceID
+	var body ui.View
+	if expanded {
+		body = wrapLabel(hit.Text)
+	} else {
+		body = excerptView(hit.Excerpt, hit.MatchedTerms)
+	}
+	rows := []ui.View{d.memorySourceHeading(hit, searchHitCaption(hit)), body}
+	if hit.Partial {
+		rows = append(rows, wrapLabel("Only part of the original content was captured.").Style(styleMeta))
+	}
+	if strings.Join(strings.Fields(hit.Text), " ") != strings.Join(strings.Fields(hit.Excerpt), " ") {
+		label := "Read full source"
+		if expanded {
+			label = "Show preview"
+		}
+		id := hit.SourceID
+		rows = append(rows, hug(flatButton(label).OnClick(func() {
+			if d.expandedSourceID == id {
+				d.expandedSourceID = ""
+			} else {
+				d.expandedSourceID = id
+			}
+			d.app.RequestUpdate()
+		})))
+	}
+	return d.withSourceActions(hit, rows)
 }

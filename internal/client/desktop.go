@@ -134,7 +134,7 @@ func (d *desktop) watchCaptureChanges(done <-chan struct{}) {
 					// rows even when Search is not currently visible.
 					for _, hit := range d.searchHits {
 						if hit.Task != nil {
-							d.searchHits, d.searchComplete = nil, false
+							d.searchHits, d.searchSummaries, d.searchComplete = nil, nil, false
 							if d.page == "Ask" && !d.loading {
 								d.runSearch()
 							}
@@ -444,6 +444,8 @@ type desktop struct {
 	knowledgeSuggestStatus        string
 	knowledgeAccepting            bool
 	searchHits                    []SearchHit
+	searchSummaries               []MemorySummaryHit
+	searchTerms                   []string
 	expandedSourceID              string
 	expandedAnswer                bool
 	searchComplete                bool
@@ -878,6 +880,7 @@ func (d *desktop) askView() ui.View {
 			d.askQuestion, d.query = value, value
 			d.askResult = nil
 			d.searchHits, d.searchComplete, d.searchFailed = nil, false, false
+			d.searchSummaries = nil
 			d.searchIndexingPending, d.searchCoverageLimited = false, false
 			d.expandedAnswer, d.memoryUI.meetingDetail = false, false
 			d.expandedSourceID, d.status = "", ""
@@ -2373,6 +2376,7 @@ func (d *desktop) deleteSource(id string) {
 					d.searchHits[i] = SearchHit{}
 				}
 				d.searchHits = filtered
+				d.searchSummaries = nil // recaps derived from a deleted source are erased with it
 				d.memoryUI.request++
 				d.memoryUI.page, d.memoryUI.loaded, d.memoryUI.loading = memoryBrowsePage{}, false, false
 				d.memoryUI.previous = nil
@@ -2437,16 +2441,14 @@ func (d *desktop) runSearch() {
 			if !d.client.PublishMemoryRead(memoryEpoch, func() {
 				d.loading = false
 				d.searchHits = hits
+				d.searchSummaries, d.searchTerms = page.Summaries, page.terms
 				d.searchIndexingPending = page.IndexingPending
 				d.searchCoverageLimited = page.CoverageLimited
 				d.searchComplete, d.searchFailed = true, err != nil
 				if err != nil {
 					d.status = friendlyError(err)
 				} else {
-					d.status = fmt.Sprintf("%d result(s)", len(hits))
-					if page.HasMore {
-						d.status += "; more matches are available. Narrow the search to see them."
-					}
+					d.status = searchStatusLine(len(hits), len(page.Summaries), page.Relaxed, page.HasMore)
 				}
 			}) {
 				d.loading = false
@@ -3682,7 +3684,7 @@ func (d *desktop) invalidateMemoryViews() {
 	d.chronicleSources = nil
 	d.chronicleSourcesLoading = false
 	d.clearKnowledgeSuggestions()
-	d.searchHits = nil
+	d.searchHits, d.searchSummaries = nil, nil
 	d.searchComplete, d.searchFailed, d.searchCoverageLimited = false, false, false
 	d.expandedSourceID = ""
 	d.library = knowledge.Page{}
@@ -3768,7 +3770,7 @@ func (d *desktop) deleteAllMemory() {
 					d.status = "Could not finish deleting memory. Completed deletions are permanent; capture remains paused. Retry to continue. " + friendlyError(err)
 					d.markCapturePaused(wasCapturing)
 					d.today = TodayView{}
-					d.searchHits = nil
+					d.searchHits, d.searchSummaries = nil, nil
 					d.askResult = nil
 					d.expandedAnswer = false
 					d.library = knowledge.Page{}
@@ -3785,7 +3787,7 @@ func (d *desktop) deleteAllMemory() {
 			} else {
 				d.markCapturePaused(wasCapturing)
 				d.today = TodayView{}
-				d.searchHits = nil
+				d.searchHits, d.searchSummaries = nil, nil
 				d.askResult = nil
 				d.expandedAnswer = false
 				d.pendingDelete = ""
