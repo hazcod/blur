@@ -212,7 +212,7 @@ func TestNaturalSearchAndMCPUseCancellationHistory(t *testing.T) {
 	params, _ := json.Marshal(mcpSearchParams{Query: query, Limit: 5})
 	wire, err := c.HandleMCPRead(ctx, localapi.RPCSearchMemory, params)
 	var response mcpSearchResponse
-	if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Text, "Task state event: cancelled") {
+	if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Excerpt, "Task state event: cancelled") {
 		t.Fatalf("MCP omitted the cancellation event: %s %v", wire, err)
 	}
 	answer, err := c.AskMemory(ctx, "Which tasks were cancelled yesterday?")
@@ -241,7 +241,9 @@ func TestSearchAndMCPDiscloseIncompleteCoverage(t *testing.T) {
 					}
 				}
 			} else {
-				query = "compiler"
+				// A keyword query with exact hits never consults the meaning step, so
+				// only a natural-language question can find it unavailable.
+				query = "what was the compiler review?"
 				o, _ := capture.SanitizeObservation("com.apple.safari", "example.com", "Compiler review", 512)
 				if err := s.PutObservationAt(ctx, o, now); err != nil {
 					t.Fatal(err)
@@ -391,7 +393,7 @@ func TestMixedLiteralTaskQueryKeepsUnquotedReminderGrammar(t *testing.T) {
 	params, _ := json.Marshal(mcpSearchParams{Query: query, Limit: 5})
 	wire, err := c.HandleMCPRead(ctx, localapi.RPCSearchMemory, params)
 	var response mcpSearchResponse
-	if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Text, "Compiler review") {
+	if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Excerpt, "Compiler review") {
 		t.Fatalf("MCP lost mixed literal task query: %s %v", wire, err)
 	}
 }
@@ -435,7 +437,7 @@ func TestTaskStateHistoryUsesSharedLastWeekScope(t *testing.T) {
 			params, _ := json.Marshal(mcpSearchParams{Query: tc.query, Limit: 5})
 			wire, err := c.HandleMCPRead(ctx, localapi.RPCSearchMemory, params)
 			var response mcpSearchResponse
-			if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Text, "Task state event:") {
+			if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Excerpt, "Task state event:") {
 				t.Fatalf("MCP shared task period lost: %s %v", wire, err)
 			}
 		})
@@ -457,7 +459,7 @@ func TestSearchFindsAcceptedTaskTitlesBeyondQueryTokenLimit(t *testing.T) {
 		params, _ := json.Marshal(mcpSearchParams{Query: query, Limit: 5})
 		wire, err := c.HandleMCPRead(ctx, localapi.RPCSearchMemory, params)
 		var response mcpSearchResponse
-		if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Text, "Compiler") {
+		if err != nil || json.Unmarshal(wire, &response) != nil || len(response.Results) != 1 || !strings.Contains(response.Results[0].Excerpt, "Compiler") {
 			t.Fatalf("accepted task title missing from MCP: %s %v", wire, err)
 		}
 	}

@@ -34,7 +34,7 @@ func (d *desktop) submitMemoryQuery() {
 	u := &d.memoryUI
 	u.meetingDetail, u.answerInput = false, ""
 	d.query = d.askQuestion
-	d.searchHits, d.searchComplete, d.searchFailed = nil, false, false
+	d.searchHits, d.searchSummaries, d.searchComplete, d.searchFailed = nil, nil, false, false
 	d.askResult = nil
 	d.askSourcesExpanded = false
 	if strings.TrimSpace(d.askQuestion) == "" {

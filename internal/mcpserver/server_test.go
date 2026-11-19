@@ -41,7 +41,8 @@ func TestMCPExposesBoundedReadOnlyMemoryTools(t *testing.T) {
 			for i := range 9 {
 				response.Results = append(response.Results, map[string]any{
 					"source_id": fmt.Sprintf("source-%d", i), "app_id": "com.example.editor",
-					"domain": "", "text": strings.Repeat("launch decision ", 150),
+					"domain": "", "captured_at": "2026-11-16T10:00:00Z", "excerpt": strings.Repeat("launch decision ", 30),
+					"matched_terms": []string{"launch"},
 				})
 			}
 			encoded, err := json.Marshal(response)
@@ -91,8 +92,19 @@ func TestMCPExposesBoundedReadOnlyMemoryTools(t *testing.T) {
 		t.Fatalf("query schema = %#v, want byte limit %d", properties["query"], maxSearchQueryBytes)
 	}
 	limitSchema, ok := properties["limit"].(map[string]any)
-	if !ok || limitSchema["maximum"] != float64(maxSearchResults) {
-		t.Fatalf("limit schema = %#v, want maximum %d", properties["limit"], maxSearchResults)
+	if !ok || limitSchema["maximum"] != float64(maxMemorySearchResults) || limitSchema["minimum"] != float64(1) {
+		t.Fatalf("limit schema = %#v, want 1..%d", properties["limit"], maxMemorySearchResults)
+	}
+	for _, phrase := range []string{"get_snapshots", "get_chronicle", "get_recent_activity", "get_working_memory", "partial_match", "ANDed"} {
+		if !strings.Contains(byName["search_memory"].Description, phrase) {
+			t.Fatalf("search_memory description must mention %q: %s", phrase, byName["search_memory"].Description)
+		}
+	}
+	outSchema, _ := json.Marshal(byName["search_memory"].OutputSchema)
+	for _, field := range []string{"window_title", "excerpt", "matched_terms", "partial_match", "summaries", "relaxed", "sighting_count", "last_seen_at"} {
+		if !strings.Contains(string(outSchema), `"`+field+`"`) {
+			t.Fatalf("search_memory output schema lacks %q", field)
+		}
 	}
 	args := map[string]any{"query": "launch", "limit": 2}
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search_memory", Arguments: args})
@@ -108,16 +120,15 @@ func TestMCPExposesBoundedReadOnlyMemoryTools(t *testing.T) {
 	}
 	var output struct {
 		Results []struct {
-			SourceID  string `json:"source_id"`
-			Text      string `json:"text"`
-			Truncated bool   `json:"truncated"`
+			SourceID string `json:"source_id"`
+			Excerpt  string `json:"excerpt"`
 		} `json:"results"`
 		Truncated bool `json:"truncated"`
 	}
 	if err := json.Unmarshal(encoded, &output); err != nil {
 		t.Fatal(err)
 	}
-	if len(output.Results) != 2 || output.Results[0].SourceID != "source-0" || len(output.Results[0].Text) > maxSearchTextBytes || !output.Results[0].Truncated || !output.Truncated || calls != 1 || len(encoded) > maxSearchOutputBytes {
+	if len(output.Results) != 2 || output.Results[0].SourceID != "source-0" || len(output.Results[0].Excerpt) > maxSearchExcerptBytes || !output.Truncated || calls != 1 || len(encoded) > maxSearchOutputBytes {
 		t.Fatalf("MCP output=%+v, authenticated RPC calls=%d", output, calls)
 	}
 	bad, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search_memory", Arguments: map[string]any{"query": strings.Repeat("x", maxSearchQueryBytes+1)}})
@@ -127,9 +138,13 @@ func TestMCPExposesBoundedReadOnlyMemoryTools(t *testing.T) {
 	if !bad.IsError || calls != 1 {
 		t.Fatalf("oversized query result=%+v, RPC calls=%d; want local tool error and no RPC", bad, calls)
 	}
-	badLimit, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search_memory", Arguments: map[string]any{"query": "launch", "limit": 9}})
+	badLimit, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search_memory", Arguments: map[string]any{"query": "launch", "limit": 31}})
 	if err != nil || !badLimit.IsError || calls != 1 {
 		t.Fatalf("oversized result limit=%+v RPC calls=%d err=%v; want local error and no RPC", badLimit, calls, err)
+	}
+	zeroLimit, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search_memory", Arguments: map[string]any{"query": "launch", "limit": 0}})
+	if err != nil || !zeroLimit.IsError || calls != 1 {
+		t.Fatalf("zero result limit=%+v RPC calls=%d err=%v; want local error and no RPC", zeroLimit, calls, err)
 	}
 	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "delete_memory"}); err == nil {
 		t.Fatal("mutation tool unexpectedly exists")

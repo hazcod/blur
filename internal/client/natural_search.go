@@ -15,16 +15,16 @@ import (
 	"github.com/hazcod/blur/internal/storage"
 )
 
-func (c *Client) naturalSearchPage(ctx context.Context, question string, limit int) (search.ExactPage, assistant.Plan, error) {
+func (c *Client) naturalSearchPage(ctx context.Context, question string, limit int) (naturalPage, assistant.Plan, error) {
 	if c == nil || c.data == nil || ctx == nil || limit < 1 || limit > MaxSearchResults || len(question) > MaxQueryBytes || !utf8.ValidString(question) || strings.ContainsRune(question, 0) || strings.TrimSpace(question) == "" {
-		return search.ExactPage{}, assistant.Plan{}, ErrInvalidRequest
+		return naturalPage{}, assistant.Plan{}, ErrInvalidRequest
 	}
 	if err := ctx.Err(); err != nil {
-		return search.ExactPage{}, assistant.Plan{}, err
+		return naturalPage{}, assistant.Plan{}, err
 	}
 	apps, err := c.KnownApps(ctx)
 	if ctx.Err() != nil {
-		return search.ExactPage{}, assistant.Plan{}, ctx.Err()
+		return naturalPage{}, assistant.Plan{}, ctx.Err()
 	}
 	// Static aliases and literal topic search remain usable with no historical
 	// app directory. Unrecognized names stay topic terms, never broader filters.
@@ -33,12 +33,12 @@ func (c *Client) naturalSearchPage(ctx context.Context, question string, limit i
 	}
 	plan, err := assistant.PlanSearch(question, c.askClock(), apps)
 	if err != nil {
-		return search.ExactPage{}, plan, ErrInvalidRequest
+		return naturalPage{}, plan, ErrInvalidRequest
 	}
 	if len(plan.Terms) == 0 && plan.Scope.IsZero() && len(plan.AppIDs)+len(plan.Domains) == 0 {
 		plan.Terms, err = search.NormalizeTokens(question, search.MaxTerms)
 		if err != nil || len(plan.Terms) == 0 {
-			return search.ExactPage{}, plan, ErrInvalidRequest
+			return naturalPage{}, plan, ErrInvalidRequest
 		}
 	}
 	bounded := !plan.Scope.IsZero()
@@ -46,43 +46,24 @@ func (c *Client) naturalSearchPage(ctx context.Context, question string, limit i
 	if bounded {
 		start, end := plan.Scope.Start, plan.Scope.End
 		if end.Equal(start) {
-			return search.ExactPage{}, plan, nil
+			return naturalPage{}, plan, nil
 		}
 		if !end.After(start) || end.Sub(start) > storage.MaxObservationWindow {
-			return search.ExactPage{}, plan, ErrActivityLimit
+			return naturalPage{}, plan, ErrActivityLimit
 		}
 		if _, ok := c.data.(ActivityData); ok {
 			segments, err = c.windowSegments(ctx, start, end, MaxActivityReportSegments)
 			if err != nil {
-				return search.ExactPage{}, plan, err
+				return naturalPage{}, plan, err
 			}
 		}
 	}
 	if len(plan.Terms) > 0 {
-		if !bounded && len(plan.AppIDs)+len(plan.Domains) == 0 {
-			page, err := c.searchExactTerms(ctx, plan.Terms, limit, 0, limit)
-			if err != nil {
-				return search.ExactPage{}, plan, err
-			}
-			if plan.Literal {
-				return page, plan, nil
-			}
-			page, err = c.hybridPage(ctx, question, page, semantic.Query{Limit: limit}, limit)
-			return page, plan, err
-		}
-		pool := limit
-		if bounded {
-			pool = max(pool, planLookupPool)
-		}
-		rows := min(search.MaxIndexRows, pool*16)
-		if !bounded && len(plan.AppIDs)+len(plan.Domains) == 0 {
-			rows = pool
-		}
-		page, err := c.planSearchCandidates(ctx, plan, bounded, segments, limit, pool, rows)
+		page, err := c.rankedSearchPage(ctx, question, plan, bounded, segments, limit)
 		return page, plan, err
 	}
 	page, err := c.browseSearchScope(ctx, plan, limit)
-	return page, plan, err
+	return naturalPage{ExactPage: page}, plan, err
 }
 
 func (c *Client) browseSearchScope(ctx context.Context, plan assistant.Plan, limit int) (search.ExactPage, error) {

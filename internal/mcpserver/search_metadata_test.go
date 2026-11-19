@@ -19,7 +19,7 @@ func TestMCPPreservesVisitTimePartialCoverageAndPendingIndex(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	serverSide, clientSide := mcp.NewInMemoryTransports()
 	server := New(searchMetadataReader(func(context.Context, string, json.RawMessage) (json.RawMessage, error) {
-		return json.RawMessage(`{"results":[{"source_id":"source-one","app_id":"reader.app","text":"Mira owns the rollback.","captured_at":"2026-11-12T14:00:00Z","partial_capture":true},{"source_id":"source-two","app_id":"reader.app","text":"Legacy memory with unknown capture time.","capture_time_unknown":true}],"truncated":false,"indexing_pending":true,"coverage_limited":true}`), nil
+		return json.RawMessage(`{"results":[{"source_id":"source-one","app_id":"reader.app","excerpt":"Mira owns the rollback.","captured_at":"2026-11-12T14:00:00Z","partial_capture":true},{"source_id":"source-two","app_id":"reader.app","excerpt":"Legacy memory with unknown capture time.","capture_time_unknown":true}],"truncated":false,"indexing_pending":true,"coverage_limited":true}`), nil
 	}))
 	done := make(chan error, 1)
 	go func() { done <- server.Run(ctx, serverSide) }()
