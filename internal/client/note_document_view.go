@@ -275,11 +275,20 @@ func (d *desktop) exportNoteDocumentMarkdownUsing(stage func(string, string) (*s
 	if text == "" || d.noteUI.transferring {
 		return
 	}
-	choose := d.noteUI.chooseExport
-	if choose == nil {
-		choose = chooseMarkdownExport
+	name := markdownNoteFilename(text)
+	if choose := d.noteUI.chooseExport; choose != nil {
+		path, err := choose(name)
+		d.continueNoteDocumentMarkdownExport(path, err, stage)
+		return
 	}
-	path, err := choose(markdownNoteFilename(text))
+	requestMarkdownExport(d.app, name, func(path string, err error) {
+		d.continueNoteDocumentMarkdownExport(path, err, stage)
+	})
+}
+
+// continueNoteDocumentMarkdownExport runs on the UI thread once the save
+// location is known; platform pickers may deliver it from a callback.
+func (d *desktop) continueNoteDocumentMarkdownExport(path string, err error, stage func(string, string) (*stagedMarkdownExport, error)) {
 	if errors.Is(err, errMarkdownExportCancelled) {
 		return
 	}

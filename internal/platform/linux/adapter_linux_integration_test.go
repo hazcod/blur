@@ -95,11 +95,13 @@ type syntheticAccessible struct {
 	name string
 }
 
-func (a syntheticAccessible) GetRole() uint32 { return a.role }
+func (a syntheticAccessible) GetRole() (uint32, *dbus.Error) { return a.role, nil }
 
-func (a syntheticAccessible) GetName() string { return a.name }
+func (a syntheticAccessible) GetName() (string, *dbus.Error) { return a.name, nil }
 
-func (a syntheticAccessible) GetParent() (string, dbus.ObjectPath) { return a.bus, a.path }
+func (a syntheticAccessible) GetParent() (string, dbus.ObjectPath, *dbus.Error) {
+	return a.bus, a.path, nil
+}
 
 func startPrivateTestBus(t *testing.T) string {
 	t.Helper()
@@ -221,7 +223,7 @@ func TestAdapterPrivateDBusFocusAndSuspendLifecycle(t *testing.T) {
 		t.Fatal("cannot emit synthetic focus event")
 	}
 	event, err := adapter.Next(ctx)
-	if err != nil || event.Kind != "focus" || event.TargetID == "" || strings.Contains(fmt.Sprint(event), syntheticPayload) {
+	if err != nil || event.Kind != "frontmost_app_changed" || event.TargetID == "" || strings.Contains(fmt.Sprint(event), syntheticPayload) {
 		t.Fatalf("synthetic focus event leaked payload or failed: event=%#v err=%v", event, err)
 	}
 	probe, err := adapter.Probe(ctx)
@@ -257,6 +259,134 @@ func TestAdapterPrivateDBusFocusAndSuspendLifecycle(t *testing.T) {
 	}
 	if !registry.countsAtLeast(atspiSubscriptions(), 2) {
 		t.Fatal("resume did not re-register passive AT-SPI events")
+	}
+}
+
+func TestAdapterWindowActivationBootstrapsFocusTarget(t *testing.T) {
+	sessionAddress := startPrivateTestBus(t)
+	atspiAddress := startPrivateTestBus(t)
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", sessionAddress)
+
+	session, err := dbus.ConnectSessionBus()
+	if err != nil {
+		t.Fatal("cannot connect synthetic session bus")
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	if err := session.Export(syntheticA11yBus{address: atspiAddress}, a11ySessionPath, a11ySessionIface); err != nil {
+		t.Fatal("cannot export synthetic AT-SPI bus locator")
+	}
+	requestSyntheticName(t, session, a11ySessionService)
+
+	registryConn := connectSyntheticBus(t, atspiAddress)
+	if err := registryConn.Export(newSyntheticRegistry(), a11yRegistryPath, a11yRegistryIface); err != nil {
+		t.Fatal("cannot export synthetic AT-SPI registry")
+	}
+	requestSyntheticName(t, registryConn, a11yRegistry)
+
+	appConn := connectSyntheticBus(t, atspiAddress)
+	appName := appConn.Names()[0]
+	windowPath := dbus.ObjectPath("/fixture/window")
+	if err := appConn.Export(syntheticAccessible{bus: appName, path: "/org/a11y/atspi/null", role: 69}, windowPath, a11yAccessible); err != nil {
+		t.Fatal("cannot export synthetic window")
+	}
+
+	adapter := New()
+	t.Cleanup(func() { _ = adapter.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if report, err := adapter.Capability(ctx); err != nil || report.State != "available" {
+		t.Fatalf("private fixture capability = %#v, err=%v", report, err)
+	}
+
+	// GTK4 applications emit no focus event on activation; the activation
+	// source itself bootstraps the capture target.
+	if err := appConn.Emit(windowPath, atspiWindowActivateSignal, syntheticPayload); err != nil {
+		t.Fatal("cannot emit synthetic window activation")
+	}
+	event, err := adapter.Next(ctx)
+	if err != nil || event.Kind != "frontmost_app_changed" || event.TargetID == "" || strings.Contains(fmt.Sprint(event), syntheticPayload) {
+		t.Fatalf("window activation did not bootstrap a target: event=%#v err=%v", event, err)
+	}
+	probe, err := adapter.Probe(ctx)
+	if err != nil || probe.TargetID != event.TargetID || probe.Private || probe.Elevated || strings.Contains(fmt.Sprint(probe), syntheticPayload) {
+		t.Fatalf("activated probe failed or leaked payload: probe=%#v err=%v", probe, err)
+	}
+
+	// Re-activating the same window is a plain content signal.
+	if err := appConn.Emit(windowPath, atspiWindowActivateSignal, syntheticPayload); err != nil {
+		t.Fatal("cannot emit second synthetic window activation")
+	}
+	refresh, err := adapter.Next(ctx)
+	if err != nil || refresh.Kind != "focused_context_changed" || refresh.TargetID != event.TargetID {
+		t.Fatalf("re-activation did not refresh the active window: event=%#v err=%v", refresh, err)
+	}
+
+	// A different window of the same application bootstraps a new target.
+	secondPath := dbus.ObjectPath("/fixture/window2")
+	if err := appConn.Export(syntheticAccessible{bus: appName, path: "/org/a11y/atspi/null", role: 69}, secondPath, a11yAccessible); err != nil {
+		t.Fatal("cannot export second synthetic window")
+	}
+	if err := appConn.Emit(secondPath, atspiWindowActivateSignal, syntheticPayload); err != nil {
+		t.Fatal("cannot emit synthetic activation of second window")
+	}
+	switched, err := adapter.Next(ctx)
+	if err != nil || switched.Kind != "focused_context_changed" || switched.TargetID == "" || switched.TargetID == event.TargetID {
+		t.Fatalf("second window activation did not bootstrap a new target: event=%#v err=%v", switched, err)
+	}
+	probe, err = adapter.Probe(ctx)
+	if err != nil || probe.TargetID != switched.TargetID || probe.Private || probe.Elevated {
+		t.Fatalf("probe after window switch does not match the new target: probe=%#v err=%v", probe, err)
+	}
+}
+
+func TestAdapterFocusFromApplicationRootResolvesWindow(t *testing.T) {
+	sessionAddress := startPrivateTestBus(t)
+	atspiAddress := startPrivateTestBus(t)
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", sessionAddress)
+
+	session, err := dbus.ConnectSessionBus()
+	if err != nil {
+		t.Fatal("cannot connect synthetic session bus")
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	if err := session.Export(syntheticA11yBus{address: atspiAddress}, a11ySessionPath, a11ySessionIface); err != nil {
+		t.Fatal("cannot export synthetic AT-SPI bus locator")
+	}
+	requestSyntheticName(t, session, a11ySessionService)
+
+	registryConn := connectSyntheticBus(t, atspiAddress)
+	if err := registryConn.Export(newSyntheticRegistry(), a11yRegistryPath, a11yRegistryIface); err != nil {
+		t.Fatal("cannot export synthetic AT-SPI registry")
+	}
+	requestSyntheticName(t, registryConn, a11yRegistry)
+
+	appConn := connectSyntheticBus(t, atspiAddress)
+	appName := appConn.Names()[0]
+	rootPath := dbus.ObjectPath("/fixture/approot")
+	if err := appConn.Export(syntheticAccessible{bus: appName, path: "/org/a11y/atspi/null", role: 75}, rootPath, a11yAccessible); err != nil {
+		t.Fatal("cannot export synthetic application root")
+	}
+
+	adapter := New()
+	t.Cleanup(func() { _ = adapter.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if report, err := adapter.Capability(ctx); err != nil || report.State != "available" {
+		t.Fatalf("private fixture capability = %#v, err=%v", report, err)
+	}
+
+	// Firefox-family browsers source focus events at the application root,
+	// whose parent is the AT-SPI null object.
+	if err := appConn.Emit(rootPath, atspiFocusSignal, syntheticPayload); err != nil {
+		t.Fatal("cannot emit synthetic focus event")
+	}
+	event, err := adapter.Next(ctx)
+	if err != nil || event.Kind != "frontmost_app_changed" || event.TargetID == "" || strings.Contains(fmt.Sprint(event), syntheticPayload) {
+		t.Fatalf("application-root focus did not resolve a target: event=%#v err=%v", event, err)
+	}
+	probe, err := adapter.Probe(ctx)
+	if err != nil || probe.TargetID != event.TargetID || probe.Private || probe.Elevated {
+		t.Fatalf("probe after application-root focus does not match: probe=%#v err=%v", probe, err)
 	}
 }
 

@@ -35,7 +35,7 @@ func captureMenuDetail(running, known bool, appID string, excluded, included []s
 		}
 		return ""
 	case ingest.HealthIdle:
-		return "resting while this Mac is idle"
+		return "resting while " + thisDevice + " is idle"
 	case ingest.HealthEmpty:
 		return "last app exposed no readable text"
 	case ingest.HealthBrowserUnavailable:

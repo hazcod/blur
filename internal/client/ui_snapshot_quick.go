@@ -48,8 +48,8 @@ func uiSnapshotQuickStates() []uiSnapshotQuickState {
 		// which quickPanelShowsDayPreview renders the day.
 		{"preview", func(d *desktop) {
 			d.quickPreview, d.quickPanelPinned = true, false
-			d.today = TodayView{State: "ready", Snapshot: uiSnapshotQuickToday()}
-			d.hourlySummaries = uiSnapshotQuickSummaries()
+			d.today, d.todayLoadedDate = TodayView{State: "ready", Snapshot: uiSnapshotQuickToday()}, d.date
+			d.hourlySummaries, d.hourlyLoadedDate = uiSnapshotQuickSummaries(), d.date
 		}},
 	}
 }
@@ -84,6 +84,7 @@ func (d *desktop) resetQuickSnapshotState() {
 	d.quickUI.savedFlash, d.quickUI.expandedTurns = false, nil
 	d.quickPreview, d.quickPanelPinned = false, true
 	d.today, d.todayLoading, d.hourlySummaries = TodayView{}, false, nil
+	d.todayLoadedDate, d.hourlyLoadedDate = "", ""
 }
 
 // uiSnapshotQuickSteps returns one snapshot step per quick-panel state. Each

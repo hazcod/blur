@@ -1,3 +1,5 @@
+//go:build darwin || (linux && (amd64 || arm64))
+
 package main
 
 import (
@@ -9,6 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 const maxPersistentLogBytes = 4 << 20
@@ -69,7 +73,7 @@ func (w *persistentLogWriter) rotate() error {
 		return errors.New("persistent log rotation reopen failed")
 	}
 	if w.stderrRedirected {
-		if err := syscall.Dup2(int(next.Fd()), 2); err != nil {
+		if err := unix.Dup2(int(next.Fd()), 2); err != nil {
 			_ = next.Close()
 			_ = os.Remove(w.path)
 			_ = os.Rename(w.path+".1", w.path)
@@ -97,7 +101,8 @@ func (w *persistentLogWriter) Close() {
 }
 
 // configurePersistentLogging keeps app and runtime stderr diagnostics available
-// when Blur is launched from Finder or LaunchServices, where no terminal exists.
+// when Blur is launched from Finder, LaunchServices or a desktop launcher, where
+// no terminal exists.
 func configurePersistentLogging() (func(), error) {
 	directory, err := blurLogsDirectory()
 	if err != nil {
@@ -106,8 +111,8 @@ func configurePersistentLogging() (func(), error) {
 	path := filepath.Join(directory, "blur.log")
 	output, openErr := openPersistentLog(directory, path)
 	if openErr != nil && !acceptance.Enabled {
-		// Finder-launched apps should keep diagnostics even if Library/Logs is
-		// unavailable. The cache fallback is still private to this user and
+		// Launcher-started apps should keep diagnostics even if the preferred log
+		// directory is unavailable. The cache fallback is still private to this user and
 		// bounded/rotated exactly like the preferred log location.
 		cacheDirectory, cacheErr := os.UserCacheDir()
 		if cacheErr == nil && cacheDirectory != "" {
@@ -121,7 +126,7 @@ func configurePersistentLogging() (func(), error) {
 	}
 	persistentLogDirectory = directory
 	slog.SetDefault(slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: applog.Level()})))
-	if err := syscall.Dup2(int(output.file.Fd()), 2); err != nil {
+	if err := unix.Dup2(int(output.file.Fd()), 2); err != nil {
 		slog.Warn("runtime stderr redirection unavailable", "result", "application logging remains active")
 	} else {
 		output.stderrRedirected = true
@@ -208,9 +213,5 @@ func blurLogsDirectory() (string, error) {
 	if persistentLogDirectory != "" {
 		return persistentLogDirectory, nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return "", errors.New("user home directory unavailable")
-	}
-	return filepath.Join(home, "Library", "Logs", "Blur"), nil
+	return defaultLogsDirectory()
 }

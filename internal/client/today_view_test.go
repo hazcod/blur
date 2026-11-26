@@ -107,3 +107,55 @@ func TestTodayMountedEmptyStateUsesOnlyVisibleRecapsAndTasks(t *testing.T) {
 		})
 	}
 }
+
+func TestTodayRefreshKeepsShownDayWithoutPlaceholders(t *testing.T) {
+	c, _, _ := todayTaskClient(t)
+	const day = "2026-11-12"
+	for _, test := range []struct {
+		name       string
+		view       TodayView
+		loadedDate string
+		want       string
+		wantAbsent []string
+	}{
+		{
+			name: "empty day refresh", view: TodayView{State: "empty"}, loadedDate: day,
+			want:       "No recaps or tasks for this day yet.",
+			wantAbsent: []string{"Loading recaps and tasks…", "Checking completed hours…"},
+		},
+		{
+			name: "saved task refresh", view: TodayView{State: "ready", Tasks: []tasks.Item{{Title: "Review Atlas", State: tasks.Open}}}, loadedDate: day,
+			want:       "Review Atlas",
+			wantAbsent: []string{"Loading recaps and tasks…", "Checking completed hours…"},
+		},
+		{
+			name: "another day still loading", view: TodayView{State: "empty"}, loadedDate: "2026-11-11",
+			want:       "Loading recaps and tasks…",
+			wantAbsent: []string{"No recaps or tasks for this day yet."},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d := &desktop{client: c, date: day, today: test.view, todayLoading: true, todayLoadedDate: test.loadedDate, hourlyLoading: true, hourlyLoadedDate: test.loadedDate}
+			text := mountedTodayText(t, d)
+			if !strings.Contains(text, test.want) {
+				t.Fatalf("Today omits %q:\n%s", test.want, text)
+			}
+			for _, absent := range test.wantAbsent {
+				if strings.Contains(text, absent) {
+					t.Fatalf("Today shows %q during refresh:\n%s", absent, text)
+				}
+			}
+		})
+	}
+}
+
+func TestQuickPreviewRefreshKeepsShownRecap(t *testing.T) {
+	d := &desktop{date: "2026-11-12", todayLoading: true, todayLoadedDate: "2026-11-12"}
+	if d.todayAwaitingFirstLoad() {
+		t.Fatal("refresh of the shown day reports a first load")
+	}
+	d.todayLoadedDate = ""
+	if !d.todayAwaitingFirstLoad() {
+		t.Fatal("first load does not report awaiting data")
+	}
+}

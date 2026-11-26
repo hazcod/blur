@@ -18,8 +18,8 @@ const (
 	maxRunningAppChoice = 40
 )
 
-// The platform helpers return nothing off macOS, so the add menu then offers
-// only the (unavailable) picker and the rows fall back to the raw identifier.
+// Off macOS the name lookup returns nothing, so rows show the raw identifier
+// unless the app was added from the running-apps menu in this session.
 var appNames = struct {
 	sync.Mutex
 	byID map[string]string
@@ -148,9 +148,12 @@ func (d *desktop) addAppMenu(draft *string) ui.View {
 		return draftContains(d.includedAppsDraft, id) || draftContains(d.excludedAppsDraft, id)
 	}
 	var items []*ui.MenuItemView
-	for _, app := range addableApps(darwin.RunningApplications(), inList, maxRunningAppChoice) {
+	for _, app := range addableApps(d.runningCaptureApps(), inList, maxRunningAppChoice) {
 		app := app
 		items = append(items, ui.MenuItem(app.Name, func() { add(app) }))
+	}
+	if !supportsApplicationChooser() {
+		return ui.MenuButton("Add app").Menu(items...).Enabled(!d.loading && len(items) > 0)
 	}
 	items = append(items, ui.MenuItem("Choose from Applications…", func() {
 		app, err := darwin.ChooseApplication()

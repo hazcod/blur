@@ -18,7 +18,6 @@ import (
 	"github.com/golang-gui/goui/style"
 	"github.com/golang-gui/goui/theme/modern"
 	"github.com/golang-gui/goui/ui"
-	"github.com/hazcod/blur/internal/acceptance"
 	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/appidentity"
 	"github.com/hazcod/blur/internal/assistant"
@@ -68,6 +67,7 @@ func RunDesktopWithSetupIssue(client *Client, setupIssue error, captureControlle
 			}
 		})
 		if d == nil {
+			rememberDesktopApp(app)
 			var controller *ingest.Controller
 			if len(captureControllers) > 0 {
 				controller = captureControllers[0]
@@ -425,10 +425,12 @@ type desktop struct {
 	justAdded                     *knowledge.Entity
 	today                         TodayView
 	todayLoading                  bool
+	todayLoadedDate               string
 	todayRefreshPending           bool
 	todayRequestID                uint64
 	hourlySummaries               []chronicle.Summary
 	hourlyLoading                 bool
+	hourlyLoadedDate              string
 	hourlyError                   bool
 	chronicleSourcesRequestID     uint64
 	hourlyRequestID               uint64
@@ -518,7 +520,7 @@ func newDesktop(app ui.App, client *Client, captureController *ingest.Controller
 	if client == nil {
 		prefs.CaptureEnabled = false
 	}
-	d := &desktop{app: app, client: client, capture: captureController, preferences: prefs, page: "Today", settingsGroup: settingsGroupCapture, date: localDate, dateDraft: localDate, reportStart: localDate, reportEnd: localDate, reportZone: localZoneName(), answers: make(map[string]string), knowledgeKind: knowledge.Project, dashboardOpen: acceptance.Enabled}
+	d := &desktop{app: app, client: client, capture: captureController, preferences: prefs, page: "Today", settingsGroup: settingsGroupCapture, date: localDate, dateDraft: localDate, reportStart: localDate, reportEnd: localDate, reportZone: localZoneName(), answers: make(map[string]string), knowledgeKind: knowledge.Project, dashboardOpen: dashboardOpenAtLaunch()}
 	if client != nil && captureController != nil {
 		client.SetCaptureStateReader(func() (bool, time.Time) { return captureController.Running(), time.Time{} })
 	}
@@ -1452,10 +1454,10 @@ func (d *desktop) todayView() ui.View {
 		}
 	}
 	showHourlyRecaps := d.client != nil && d.client.CanViewChronicles()
-	if showHourlyRecaps && (len(d.hourlySummaries) > 0 || d.hourlyLoading || d.hourlyError) {
+	if showHourlyRecaps && (len(d.hourlySummaries) > 0 || d.hourlyAwaitingFirstLoad() || d.hourlyError) {
 		blocks = append(blocks, d.hourlyChroniclesView())
 	}
-	if d.todayLoading {
+	if d.todayAwaitingFirstLoad() {
 		blocks = append(blocks, wrapLabel("Loading recaps and tasks…").Style(modern.MutedText))
 	} else {
 		if len(d.today.Tasks) > 0 {
@@ -1489,7 +1491,7 @@ func (d *desktop) todayView() ui.View {
 		if !todayHasUsefulItems(d.today, hasRecaps) {
 			if d.client == nil || d.client.data == nil {
 				blocks = append(blocks, wrapLabel("Encrypted local storage is unavailable. Recaps and tasks will appear when storage is ready.").Style(modern.MutedText))
-			} else if !showHourlyRecaps || (!d.hourlyLoading && !d.hourlyError) {
+			} else if !showHourlyRecaps || (!d.hourlyAwaitingFirstLoad() && !d.hourlyError) {
 				blocks = append(blocks, wrapLabel("No recaps or tasks for this day yet.").Style(modern.MutedText))
 			}
 		}
@@ -1822,7 +1824,7 @@ func (d *desktop) loadToday() bool {
 				if err != nil {
 					d.status = "Today could not be read from encrypted storage."
 				} else {
-					d.today = view
+					d.today, d.todayLoadedDate = view, date
 				}
 				if d.status == "Loading your local day…" || d.status == "Loading selected day…" {
 					d.status = ""
@@ -1841,9 +1843,21 @@ func (d *desktop) loadToday() bool {
 	return true
 }
 
+// todayAwaitingFirstLoad reports a Today load for a day whose data is not on
+// screen yet. Refreshes of the shown day keep the current content instead of
+// replacing it with a placeholder, which flickered during live capture.
+func (d *desktop) todayAwaitingFirstLoad() bool {
+	return d.todayLoading && d.todayLoadedDate != d.date
+}
+
+// hourlyAwaitingFirstLoad is todayAwaitingFirstLoad for hourly recaps.
+func (d *desktop) hourlyAwaitingFirstLoad() bool {
+	return d.hourlyLoading && d.hourlyLoadedDate != d.date
+}
+
 func (d *desktop) loadChronicles(date string) {
 	if d.client == nil || !d.client.CanViewChronicles() {
-		d.hourlySummaries = nil
+		d.hourlySummaries, d.hourlyLoadedDate = nil, ""
 		return
 	}
 	d.hourlyRequestID++
@@ -1865,7 +1879,7 @@ func (d *desktop) loadChronicles(date string) {
 				if err != nil {
 					d.hourlySummaries, d.hourlyError = nil, true
 				} else {
-					d.hourlySummaries, d.hourlyError = rows, false
+					d.hourlySummaries, d.hourlyError, d.hourlyLoadedDate = rows, false, date
 				}
 			}) {
 				return
@@ -1877,12 +1891,13 @@ func (d *desktop) loadChronicles(date string) {
 
 func (d *desktop) hourlyChroniclesView() ui.View {
 	rows := []ui.View{wrapLabel("Hourly recaps").Style(styleSectionTitle)}
-	if d.hourlyLoading {
+	awaiting := d.hourlyAwaitingFirstLoad()
+	if awaiting {
 		rows = append(rows, wrapLabel("Checking completed hours…").Style(modern.MutedText))
 	}
-	if d.hourlyError && !d.hourlyLoading {
+	if d.hourlyError && !awaiting {
 		rows = append(rows, wrapLabel("Hourly recaps could not be read. Try again.").Style(modern.MutedText))
-	} else if len(d.hourlySummaries) == 0 && !d.hourlyLoading {
+	} else if len(d.hourlySummaries) == 0 && !awaiting {
 		rows = append(rows, wrapLabel("Completed-hour recaps appear here when local summaries are enabled.").Style(modern.MutedText))
 	}
 	for _, summary := range d.hourlySummaries {
@@ -3671,9 +3686,9 @@ func (d *desktop) invalidateMemoryViews() {
 	d.todayRequestID++
 	d.hourlyRequestID++
 	d.todayLoading = false
-	d.today = TodayView{}
+	d.today, d.todayLoadedDate = TodayView{}, ""
 	d.hourlyLoading, d.hourlyError = false, false
-	d.hourlySummaries = nil
+	d.hourlySummaries, d.hourlyLoadedDate = nil, ""
 	d.expandedChronicleID = ""
 	d.chronicleSources = nil
 	d.chronicleSourcesLoading = false
@@ -3763,7 +3778,7 @@ func (d *desktop) deleteAllMemory() {
 				} else {
 					d.status = "Could not finish deleting memory. Completed deletions are permanent; capture remains paused. Retry to continue. " + friendlyError(err)
 					d.markCapturePaused(wasCapturing)
-					d.today = TodayView{}
+					d.today, d.todayLoadedDate = TodayView{}, ""
 					d.searchHits = nil
 					d.askResult = nil
 					d.expandedAnswer = false
@@ -3780,7 +3795,7 @@ func (d *desktop) deleteAllMemory() {
 				}
 			} else {
 				d.markCapturePaused(wasCapturing)
-				d.today = TodayView{}
+				d.today, d.todayLoadedDate = TodayView{}, ""
 				d.searchHits = nil
 				d.askResult = nil
 				d.expandedAnswer = false

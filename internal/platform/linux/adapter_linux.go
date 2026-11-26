@@ -323,38 +323,88 @@ func (a *Adapter) handleEventSignal(conn *dbus.Conn, signal *dbus.Signal) {
 	if focused, ok := focusRefFromSignal(signal); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), a11yEventTimeout)
 		defer cancel()
-		window, err := findATSPIWindow(ctx, conn, focused)
-		if err != nil {
-			a.tracker.clear()
-			return
-		}
-		appID, elevated, err := atspiProcessMetadata(ctx, conn, focused.busName)
-		if err != nil {
-			a.tracker.clear()
-			return
-		}
-		private := isPrivateLinuxApp(appID) || IsPrivateBrowserWindow(ctx, conn, window.busName, window.path, appID)
-		event, err := a.tracker.updateWithStatus(focused, window, appID, private, elevated)
-		if err != nil {
-			return
-		}
-		a.enqueue(event)
+		a.adoptFocusedWindow(ctx, conn, focused)
 		return
 	}
-	if !atspiRefreshSignal(signal) {
-		return
-	}
-	active, ok := a.tracker.current()
-	if !ok || signal.Sender != active.window.busName || !validObjectPath(signal.Path) {
+	if signal.Name != atspiWindowActivateSignal || !atspiRefreshSignal(signal) {
+		// Text and children changes only update the current document; capture
+		// reads them through the periodic refresh, as the darwin pipeline does.
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), a11yEventTimeout)
 	defer cancel()
-	window, err := findATSPIWindow(ctx, conn, atspiObjectRef{busName: signal.Sender, path: signal.Path})
-	if err != nil || window != active.window {
+	a.handleWindowActivation(ctx, conn, atspiObjectRef{busName: signal.Sender, path: signal.Path})
+}
+
+// adoptionKind picks the ingest event kind for a new target from the same
+// vocabulary the darwin adapter uses, so the capture service schedules an
+// immediate capture instead of counting the event as skipped.
+func adoptionKind(previousAppID string, hadPrevious bool, appID string) string {
+	if !hadPrevious || previousAppID != appID {
+		return "frontmost_app_changed"
+	}
+	return "focused_context_changed"
+}
+
+// adoptFocusedWindow verifies the focused object's window and owning app, then
+// adopts the target and enqueues a focus event. A failed verification closes
+// attribution to the previously seen source.
+func (a *Adapter) adoptFocusedWindow(ctx context.Context, conn *dbus.Conn, focused atspiObjectRef) {
+	window, err := findATSPIWindow(ctx, conn, focused)
+	if err != nil {
+		a.tracker.clear()
 		return
 	}
-	a.enqueue(platform.CaptureEvent{Kind: "content", TargetID: active.token})
+	appID, elevated, err := atspiProcessMetadata(ctx, conn, focused.busName)
+	if err != nil {
+		a.tracker.clear()
+		return
+	}
+	if transientDesktopFocus(appID) {
+		return
+	}
+	private := isPrivateLinuxApp(appID) || IsPrivateBrowserWindow(ctx, conn, window.busName, window.path, appID)
+	previous, hadPrevious := a.tracker.current()
+	event, err := a.tracker.updateWithStatus(focused, window, appID, private, elevated)
+	if err != nil {
+		return
+	}
+	event.Kind = adoptionKind(previous.appID, hadPrevious, appID)
+	a.enqueue(event)
+}
+
+// handleWindowActivation treats a window activation as this desktop's focus
+// signal. GTK4 applications emit no focus event when their window becomes
+// active, so the activation source is adopted directly. The source is the
+// window or application root named by the D-Bus header; the event body is
+// never consulted. A re-activation of the active window keeps its target and
+// schedules a fresh capture.
+func (a *Adapter) handleWindowActivation(ctx context.Context, conn *dbus.Conn, source atspiObjectRef) {
+	window, err := findATSPIWindow(ctx, conn, source)
+	if err != nil {
+		a.tracker.clear()
+		return
+	}
+	if active, ok := a.tracker.current(); ok && window == active.window {
+		a.enqueue(platform.CaptureEvent{Kind: "focused_context_changed", TargetID: active.token})
+		return
+	}
+	appID, elevated, err := atspiProcessMetadata(ctx, conn, window.busName)
+	if err != nil {
+		a.tracker.clear()
+		return
+	}
+	if transientDesktopFocus(appID) {
+		return
+	}
+	private := isPrivateLinuxApp(appID) || IsPrivateBrowserWindow(ctx, conn, window.busName, window.path, appID)
+	previous, hadPrevious := a.tracker.current()
+	event, err := a.tracker.updateWithStatus(window, window, appID, private, elevated)
+	if err != nil {
+		return
+	}
+	event.Kind = adoptionKind(previous.appID, hadPrevious, appID)
+	a.enqueue(event)
 }
 
 func (a *Adapter) enqueue(event platform.CaptureEvent) {
@@ -393,6 +443,13 @@ func findATSPIWindow(ctx context.Context, conn *dbus.Conn, start atspiObjectRef)
 		}
 		parent := atspiObjectRef{busName: busName, path: path}
 		if path == "/org/a11y/atspi/null" || !validATSPISender(parent.busName) || !validObjectPath(parent.path) {
+			// Some applications (Firefox-family browsers) source their focus
+			// event at the application root, whose parent is the AT-SPI null
+			// object. Adopt that root as the capture anchor; any other rootless
+			// object fails closed.
+			if role == 75 {
+				return current, nil
+			}
 			return atspiObjectRef{}, errors.New("AT-SPI window unavailable")
 		}
 		current = parent

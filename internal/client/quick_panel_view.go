@@ -138,7 +138,7 @@ func (d *desktop) quickPanelBody() ui.View {
 }
 
 func (d *desktop) quickPreviewRows() []ui.View {
-	if d.todayLoading {
+	if d.todayAwaitingFirstLoad() {
 		return []ui.View{wrapLabel("Updating your local recap…").Style(styleQuickMeta)}
 	}
 	var rows []ui.View

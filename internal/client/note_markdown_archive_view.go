@@ -14,11 +14,21 @@ func (d *desktop) exportSavedMarkdownNotes() {
 	if d == nil || d.client == nil || d.memoryUI.notesExporting || d.memoryUI.loading || d.client.data == nil {
 		return
 	}
-	choose := d.memoryUI.chooseNotesExport
-	if choose == nil {
-		choose = chooseMarkdownArchive
+	const name = "Blur Notes.zip"
+	if choose := d.memoryUI.chooseNotesExport; choose != nil {
+		path, err := choose(name)
+		d.continueSavedMarkdownNotesExport(path, err)
+		return
 	}
-	path, err := choose("Blur Notes.zip")
+	requestMarkdownArchive(d.app, name, d.continueSavedMarkdownNotesExport)
+}
+
+// continueSavedMarkdownNotesExport runs on the UI thread once the archive
+// location is known; platform pickers may deliver it from a callback.
+func (d *desktop) continueSavedMarkdownNotesExport(path string, err error) {
+	if d.memoryUI.notesExporting || d.memoryUI.loading {
+		return
+	}
 	if errors.Is(err, errMarkdownArchiveCancelled) {
 		return
 	}
