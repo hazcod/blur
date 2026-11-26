@@ -176,7 +176,7 @@ func (d *desktop) quickPanelBodyEstimate() float32 {
 				rows += min(len(group.items), quickPanelPreviewRows-rows)
 			}
 		}
-		if d.todayLoading {
+		if d.todayAwaitingFirstLoad() {
 			return quickPanelStatusLine
 		}
 		return float32(rows*22 + titles*26)
@@ -211,7 +211,7 @@ func (d *desktop) quickPanelHairline() bool {
 }
 
 func quickPreviewHasRows(d *desktop) bool {
-	if d.todayLoading {
+	if d.todayAwaitingFirstLoad() {
 		return false
 	}
 	for _, group := range d.currentQuickPreviewGroups() {

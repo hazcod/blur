@@ -42,6 +42,17 @@ Extract the archive and run `./blur` from its directory. For a user-local instal
 
 Blur uses AT-SPI2 to read accessible text from the focused app and Secret Service to protect its database key. It does not unlock a locked keyring for you. If capture or startup is unavailable, check the session, accessibility services and keyring first. Live Linux desktop validation is still pending.
 
+On Linux:
+
+- **Capture settings** list running accessible apps under **Add app**. Apps are identified by their executable name, such as `firefox`. Flatpak apps currently share one identity and are not listed.
+- **Copy** uses the desktop clipboard while Blur is running.
+- **Sync folder** and **Markdown export** use the desktop file chooser (the XDG desktop portal, or zenity/kdialog when no portal is available).
+- **Reminders** appear through your desktop's notification service. Blur must be running for a reminder to fire; one-time reminders that come due while Blur is closed are marked as elapsed rather than shown late.
+- **Claude integration**: after you allow it in **Privacy → Claude integration**, point Claude at the `blur` executable with the `mcp` argument.
+- **Logs**: when started from a desktop launcher, diagnostics go to `~/.local/state/Blur/Logs/blur.log` (or `$XDG_STATE_HOME/Blur/Logs`). When started from a terminal, they stay in the terminal.
+- If encrypted storage cannot be opened, Blur shows a recovery window with copyable diagnostics instead of exiting.
+- Not yet available on Linux: the tray/menu bar item, the global quick-ask shortcut, and the macOS-only features (notch panel, Safari extension, Apple Intelligence, voice notes).
+
 ## Start with local memory
 
 1. Review the capture settings and exclude sensitive apps and sites before starting capture.

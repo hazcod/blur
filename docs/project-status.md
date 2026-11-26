@@ -296,7 +296,12 @@ remains open. Linux has a private-bus,
 event-driven AT-SPI2 adapter and bounded reader, wired to the Linux amd64/X11
 and arm64/X11 desktops. Runtime validation against real AT-SPI desktops remains
 open; this work was tested with synthetic/unit fixtures and cross-compilation
-only.
+only. The Linux desktop shell also provides clipboard copy, portal file
+choosers for the sync folder and Markdown export, freedesktop reminder
+notifications scheduled in-process while Blur runs, the `blur mcp` bridge,
+the storage recovery window, launcher-session logs under `$XDG_STATE_HOME`,
+and an AT-SPI running-app list for capture settings. The tray item and global
+quick-ask shortcut are not implemented on Linux.
 Known macOS, Linux, and Windows browsers contribute only their active
 foreground Accessibility tree; address-bar, tab, toolbar, and form-entry
 roles are filtered, editable text/search controls and their descendants are

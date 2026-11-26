@@ -360,6 +360,9 @@ func (a *Adapter) adoptFocusedWindow(ctx context.Context, conn *dbus.Conn, focus
 		a.tracker.clear()
 		return
 	}
+	if transientDesktopFocus(appID) {
+		return
+	}
 	private := isPrivateLinuxApp(appID) || IsPrivateBrowserWindow(ctx, conn, window.busName, window.path, appID)
 	previous, hadPrevious := a.tracker.current()
 	event, err := a.tracker.updateWithStatus(focused, window, appID, private, elevated)
@@ -389,6 +392,9 @@ func (a *Adapter) handleWindowActivation(ctx context.Context, conn *dbus.Conn, s
 	appID, elevated, err := atspiProcessMetadata(ctx, conn, window.busName)
 	if err != nil {
 		a.tracker.clear()
+		return
+	}
+	if transientDesktopFocus(appID) {
 		return
 	}
 	private := isPrivateLinuxApp(appID) || IsPrivateBrowserWindow(ctx, conn, window.busName, window.path, appID)
