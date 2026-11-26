@@ -25,6 +25,16 @@ func runLinuxMain() int {
 		printVersion(os.Stdout)
 		return 0
 	}
+	// Desktop launchers have no terminal, so keep bounded, user-private
+	// diagnostics on disk. Claude owns the bridge's stdio; its errors go there.
+	if !stderrIsTerminal() && !(len(os.Args) == 2 && os.Args[1] == "mcp") {
+		closeLog, err := configurePersistentLogging()
+		if err != nil {
+			slog.Error("persistent log setup failed")
+		} else {
+			defer closeLog()
+		}
+	}
 	// Claude launches `blur mcp` with stdio attached; it never opens the store.
 	if len(os.Args) == 2 && os.Args[1] == "mcp" {
 		if err := runMCPCommand(); err != nil {
