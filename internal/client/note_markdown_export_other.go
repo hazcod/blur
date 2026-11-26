@@ -1,8 +1,14 @@
-//go:build !darwin
+//go:build !darwin && !linux
 
 package client
 
-func chooseMarkdownExport(string) (string, error)  { return "", ErrNotConfigured }
-func supportsMarkdownExport() bool                 { return false }
-func chooseMarkdownArchive(string) (string, error) { return "", ErrNotConfigured }
-func supportsMarkdownArchiveExport() bool          { return false }
+import "github.com/golang-gui/goui/ui"
+
+func supportsMarkdownExport() bool        { return false }
+func supportsMarkdownArchiveExport() bool { return false }
+func requestMarkdownExport(_ ui.App, _ string, done func(string, error)) {
+	done("", ErrNotConfigured)
+}
+func requestMarkdownArchive(_ ui.App, _ string, done func(string, error)) {
+	done("", ErrNotConfigured)
+}
