@@ -81,15 +81,11 @@ func applicationName(ctx context.Context, conn *dbus.Conn, ref atspiObjectRef, f
 	return name
 }
 
-// desktopInfrastructure reports shell, input-method and portal processes that
-// register with AT-SPI but are not apps a person would choose. It also hides
-// xdg-dbus-proxy: Flatpak apps currently share that executable identity, so
-// offering one would silently select every Flatpak app. It affects only the
-// picker, never capture.
+// desktopInfrastructure reports processes that register with AT-SPI but are
+// not apps a person would choose: desktop chrome, portals, and
+// xdg-dbus-proxy. Flatpak apps currently share that executable identity, so
+// offering it would silently select every Flatpak app. It affects only the
+// picker.
 func desktopInfrastructure(id string) bool {
-	switch id {
-	case "gnome-shell", "mutter-x11-frames", "plasmashell", "kwin_x11", "kwin_wayland", "xfce4-panel", "xdg-dbus-proxy":
-		return true
-	}
-	return strings.HasPrefix(id, "ibus-") || strings.HasPrefix(id, "xdg-desktop-portal")
+	return transientDesktopFocus(id) || id == "xdg-dbus-proxy" || strings.HasPrefix(id, "xdg-desktop-portal")
 }

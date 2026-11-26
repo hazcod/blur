@@ -116,6 +116,19 @@ func isPrivateLinuxApp(appID string) bool {
 	return appID == "blur"
 }
 
+// transientDesktopFocus reports desktop chrome that briefly takes AT-SPI focus
+// while a person works in another app: window frames during a move or resize,
+// the shell, and input-method popups. Their focus is not an app switch, so
+// capture keeps the current target instead of reading the chrome. Portal
+// dialogs and Flatpak's xdg-dbus-proxy are real app content and are not listed.
+func transientDesktopFocus(appID string) bool {
+	switch appID {
+	case "mutter-x11-frames", "gnome-shell", "plasmashell", "kwin_x11", "kwin_wayland", "xfce4-panel":
+		return true
+	}
+	return strings.HasPrefix(appID, "ibus-")
+}
+
 func isPrivateLinuxBrowserWindow(appID, title string, titleErr error) bool {
 	if !appidentity.IsBrowserApp(appID) {
 		return false
