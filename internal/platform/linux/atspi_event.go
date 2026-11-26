@@ -16,6 +16,7 @@ import (
 )
 
 const atspiFocusSignal = "org.a11y.atspi.Event.Focus.Focus"
+const atspiWindowActivateSignal = "org.a11y.atspi.Event.Window.Activate"
 const a11yAccessible = "org.a11y.atspi.Accessible"
 
 type atspiSubscription struct {
@@ -113,6 +114,19 @@ func validLinuxAppID(value string) bool {
 
 func isPrivateLinuxApp(appID string) bool {
 	return appID == "blur"
+}
+
+// transientDesktopFocus reports desktop chrome that briefly takes AT-SPI focus
+// while a person works in another app: window frames during a move or resize,
+// the shell, and input-method popups. Their focus is not an app switch, so
+// capture keeps the current target instead of reading the chrome. Portal
+// dialogs and Flatpak's xdg-dbus-proxy are real app content and are not listed.
+func transientDesktopFocus(appID string) bool {
+	switch appID {
+	case "mutter-x11-frames", "gnome-shell", "plasmashell", "kwin_x11", "kwin_wayland", "xfce4-panel":
+		return true
+	}
+	return strings.HasPrefix(appID, "ibus-")
 }
 
 func isPrivateLinuxBrowserWindow(appID, title string, titleErr error) bool {
@@ -286,8 +300,17 @@ func atspiRole(role uint32) (name string, sensitive bool) {
 		return "AXSeparator", false
 	case 51:
 		return "AXSlider", false
+	case 52:
+		// Spin buttons accept user-entered numeric text just like form
+		// entries; prune them before requesting values or descendants.
+		return "AXTextField", true
 	case 54:
 		return "AXStatusBar", false
+	case 60:
+		// Terminals echo everything the user types and every command
+		// response, including credentials and tokens. Prune them before
+		// requesting values or descendants.
+		return "AXTextArea", true
 	case 61:
 		return "AXTextArea", true
 	case 63:
@@ -298,12 +321,19 @@ func atspiRole(role uint32) (name string, sensitive bool) {
 		return "AXParagraph", false
 	case 75:
 		return "AXApplication", false
+	case 76:
+		// Autocomplete entries hold user-entered text like form entries;
+		// prune them before requesting values or descendants.
+		return "AXTextField", true
 	case 79:
 		return "AXTextField", true
 	case 87:
 		return "AXGroup", false
 	case 88:
 		return "AXLink", false
+	case 94:
+		// Document text is the user's editable document content.
+		return "AXTextArea", true
 	case 95:
 		return "AXWebArea", false
 	default:

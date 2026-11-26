@@ -17,6 +17,7 @@ import (
 const (
 	atspiAccessibleIface = "org.a11y.atspi.Accessible"
 	atspiTextIface       = "org.a11y.atspi.Text"
+	atspiStateActive     = 1
 	atspiStateFocused    = 12
 	atspiMaxInterfaces   = 64
 )
@@ -106,7 +107,19 @@ func (n *atspiAXNode) value(ctx context.Context, max int) (string, error) {
 	if !hasText {
 		return "", nil
 	}
-	textObject := n.conn.Object(n.bus, n.path)
+	return readATSPITextValue(ctx, n.conn, n.bus, n.path, max)
+}
+
+// readATSPITextValue reads the bounded live text of one accessible through
+// its org.a11y.atspi.Text interface.
+func readATSPITextValue(ctx context.Context, conn *dbus.Conn, bus string, path dbus.ObjectPath, max int) (string, error) {
+	if conn == nil {
+		return "", errors.New("capture: AT-SPI text unavailable")
+	}
+	if max <= 0 {
+		return "", errAXValueTruncated
+	}
+	textObject := conn.Object(bus, path)
 	var characterCount int32
 	if err := textObject.CallWithContext(ctx, atspiTextIface+".GetCharacterCount", 0).Store(&characterCount); err != nil || characterCount < 0 {
 		return "", errors.New("capture: AT-SPI text length unavailable")
@@ -170,9 +183,19 @@ func readLinuxATSPI(ctx context.Context, source *platformlinux.Adapter, probe pl
 			root.release()
 			return err
 		}
-		frame, err = collectAXFrame(ctx, root, limits)
-		if err != nil {
-			return err
+		if atspiWalkerAvailable(ctx, target.Conn, target.WindowBus, target.WindowPath) {
+			frame, err = collectAXFrame(ctx, root, limits)
+			if err != nil {
+				return err
+			}
+		} else {
+			// GTK4 publishes its tree through the AT-SPI cache instead of
+			// the per-object walker protocol.
+			root.release()
+			frame, err = collectLinuxCacheFrame(ctx, target, limits)
+			if err != nil {
+				return err
+			}
 		}
 		focused = target
 		return verifyATSPIFocus(ctx, target.Conn, target.FocusedBus, target.FocusedPath)
@@ -237,6 +260,12 @@ func verifyLinuxBrowserWindow(ctx context.Context, target platformlinux.FocusedC
 	return nil
 }
 
+// verifyATSPIFocus confirms the target is still the current one before or
+// around a read. AT-SPI returns states as a 64-bit bitmask split across
+// uint32 words. Widget-level targets carry the focused state; window-level
+// targets from activation events carry the active state, which AT-SPI
+// documents as the window counterpart of focused. Decorations that carry
+// neither fail closed.
 func verifyATSPIFocus(ctx context.Context, conn *dbus.Conn, bus string, path dbus.ObjectPath) error {
 	if conn == nil || !platformlinux.ValidAccessibleObject(bus, path) {
 		return platform.ErrInvalidLease
@@ -245,10 +274,15 @@ func verifyATSPIFocus(ctx context.Context, conn *dbus.Conn, bus string, path dbu
 	if err := conn.Object(bus, path).CallWithContext(ctx, atspiAccessibleIface+".GetState", 0).Store(&states); err != nil || len(states) > 128 {
 		return platform.ErrInvalidLease
 	}
-	for _, state := range states {
-		if state == atspiStateFocused {
-			return nil
-		}
+	if atspiStateSetHas(states, atspiStateFocused) || atspiStateSetHas(states, atspiStateActive) {
+		return nil
 	}
 	return platform.ErrInvalidLease
+}
+
+// atspiStateSetHas tests one state bit in AT-SPI's uint32-word bitmask. An
+// out-of-range word means the state is absent, not an error.
+func atspiStateSetHas(states []uint32, state int) bool {
+	word, bit := state/32, uint(state%32)
+	return word >= 0 && word < len(states) && states[word]&(1<<bit) != 0
 }

@@ -364,13 +364,19 @@ func (d *desktop) syncToggle(enable bool) {
 	d.app.RequestUpdate()
 }
 
-// syncChooseFolder runs on the AppKit main thread (a button click).
+// syncChooseFolder runs on the UI thread (a button click).
 func (d *desktop) syncChooseFolder() {
 	service := d.client.replica
 	home, _ := os.UserHomeDir()
-	path, bookmark, err := darwin.ChooseFolder(darwin.DefaultFolderStart(home, service.state.Get().FolderPath))
+	requestSyncFolder(d.app, darwin.DefaultFolderStart(home, service.state.Get().FolderPath), d.syncFolderChosen)
+}
+
+// syncFolderChosen runs on the UI thread once the picker returns; platform
+// pickers may deliver the result from a callback.
+func (d *desktop) syncFolderChosen(path string, bookmark []byte, err error) {
+	service := d.client.replica
 	switch {
-	case errors.Is(err, darwin.ErrFolderPickerCancelled):
+	case errors.Is(err, errSyncFolderCancelled):
 		return
 	case err != nil:
 		d.sync.message = "The folder could not be opened. Choose another one."

@@ -165,3 +165,20 @@ func TestOnlyBlurItselfIsAlwaysPrivate(t *testing.T) {
 		}
 	}
 }
+
+func TestTransientDesktopFocusKeepsRealApps(t *testing.T) {
+	for id, want := range map[string]bool{
+		"mutter-x11-frames":      true,
+		"gnome-shell":            true,
+		"ibus-extension-gtk3":    true,
+		"xdg-dbus-proxy":         false,
+		"xdg-desktop-portal-gtk": false,
+		"gnome-text-editor":      false,
+		"firefox":                false,
+		"blur":                   false,
+	} {
+		if got := transientDesktopFocus(id); got != want {
+			t.Errorf("transientDesktopFocus(%q) = %v, want %v", id, got, want)
+		}
+	}
+}
