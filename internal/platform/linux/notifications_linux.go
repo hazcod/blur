@@ -353,10 +353,9 @@ const (
 // dbusNotifications talks to org.freedesktop.Notifications on the session bus.
 // It sends only the fixed summary and the task title the person wrote.
 type dbusNotifications struct {
-	mu     sync.Mutex
-	conn   *dbus.Conn
-	signal chan *dbus.Signal
-	out    chan notificationEvent
+	mu   sync.Mutex
+	conn *dbus.Conn
+	out  chan notificationEvent
 }
 
 func newDBusNotifications() *dbusNotifications {
