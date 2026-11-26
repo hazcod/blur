@@ -152,7 +152,7 @@ func captureHealthCopy(health ingest.Health, running bool) string {
 	case ingest.HealthExcluded:
 		state = "The current context is excluded by capture scope or privacy policy."
 	case ingest.HealthIdle:
-		state = "Capture is resting while this Mac is idle; it resumes when you return."
+		state = "Capture is resting while " + thisDevice + " is idle; it resumes when you return."
 	case ingest.HealthPermission:
 		state = "Accessibility permission is required."
 		if detail := nativeReadIssueCopy(health.ReadIssue); detail != "" {
