@@ -67,6 +67,7 @@ func RunDesktopWithSetupIssue(client *Client, setupIssue error, captureControlle
 			}
 		})
 		if d == nil {
+			rememberDesktopApp(app)
 			var controller *ingest.Controller
 			if len(captureControllers) > 0 {
 				controller = captureControllers[0]
