@@ -80,8 +80,21 @@ func validQuestionRow(row questionRow) bool {
 // live source are dropped, in the same transaction as the write, so a late
 // answer cannot re-link a source that was just erased.
 func (s *Store) AppendQuestion(ctx context.Context, record storage.QuestionRecord) error {
+	_, _, err := s.appendQuestion(ctx, record, nil, false)
+	return err
+}
+
+func (s *Store) AppendQuestionAtRead(ctx context.Context, record storage.QuestionRecord, epoch uint64) (uint64, bool, error) {
+	return s.appendQuestion(ctx, record, &epoch, false)
+}
+
+func (s *Store) AppendQuestionAtVoiceRead(ctx context.Context, record storage.QuestionRecord, epoch uint64) (uint64, bool, error) {
+	return s.appendQuestion(ctx, record, &epoch, true)
+}
+
+func (s *Store) appendQuestion(ctx context.Context, record storage.QuestionRecord, expected *uint64, voice bool) (uint64, bool, error) {
 	if ctx == nil || !storage.ValidQuestionText(record.Question) || !validQuestionKind(record.PlanKind) || !validCaptureTime(record.AskedAt) {
-		return &storage.StoreError{Code: storage.Invalid}
+		return 0, false, &storage.StoreError{Code: storage.Invalid}
 	}
 	cited := make([]string, 0, len(record.SourceIDs))
 	for _, id := range record.SourceIDs {
@@ -93,7 +106,17 @@ func (s *Store) AppendQuestion(ctx context.Context, record storage.QuestionRecor
 	if len(cited) > storage.MaxQuestionSources {
 		cited = cited[:storage.MaxQuestionSources]
 	}
-	return s.Update(ctx, func(tx *Tx) error {
+	var next uint64
+	var accepted bool
+	err := s.Update(ctx, func(tx *Tx) error {
+		// Update owns publicationMu through commit and epoch advancement.
+		current := s.state.publicationEpoch
+		if voice {
+			current = s.state.voicePublicationEpoch
+		}
+		if expected != nil && current != *expected {
+			return nil
+		}
 		admission := &chronicleAdmissionReader{Reader: tx.writer}
 		defer admission.close()
 		live := cited[:0:0]
@@ -107,8 +130,19 @@ func (s *Store) AppendQuestion(ctx context.Context, record storage.QuestionRecor
 			}
 		}
 		admission.close()
-		return tx.appendQuestion(questionRow{Question: record.Question, AskedAt: record.AskedAt.UTC().UnixNano(), PlanKind: record.PlanKind, Sources: live})
+		if err := tx.appendQuestion(questionRow{Question: record.Question, AskedAt: record.AskedAt.UTC().UnixNano(), PlanKind: record.PlanKind, Sources: live}); err != nil {
+			return err
+		}
+		next, accepted = current, true
+		if !voice {
+			next++
+		}
+		return nil
 	})
+	if err != nil {
+		return 0, false, err
+	}
+	return next, accepted, nil
 }
 
 // ListQuestions returns up to limit of the newest questions, oldest first.

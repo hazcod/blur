@@ -162,6 +162,13 @@ func decodeLinkedResponse(raw string, input []Evidence) ([]Proposal, error) {
 	}
 	for i, proposal := range suggestions {
 		id, found := labels[proposal.SourceID]
+		// Background derivation reads one immutable source at a time. If the
+		// model omits its label there is no attribution choice: bind the sole
+		// supplied source here. Never rebind an explicit foreign label or guess
+		// between multiple inputs.
+		if proposal.SourceID == "" && len(input) == 1 {
+			id, found = input[0].SourceID, true
+		}
 		if !found {
 			return nil, fmt.Errorf("%w: source citation is not in the request", model.ErrOllamaResponse)
 		}
@@ -325,7 +332,7 @@ func quoteBareEvidenceIDs(raw string) string {
 // those fixed protocol keys outside JSON strings; all values and semantics
 // remain subject to the strict decoder and source validator below.
 func quoteKnownBareJSONKeys(raw string) string {
-	known := map[string]struct{}{"suggestions": {}, "kind": {}, "name": {}, "fact": {}, "open_work": {}, "source_id": {}}
+	known := map[string]struct{}{"suggestions": {}, "summary": {}, "kind": {}, "name": {}, "fact": {}, "open_work": {}, "source_id": {}}
 	var out bytes.Buffer
 	inString, escaped := false, false
 	for i := 0; i < len(raw); {

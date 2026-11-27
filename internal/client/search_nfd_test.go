@@ -1,8 +1,12 @@
 package client
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/hazcod/blur/internal/capture"
 )
 
 // macOS file names and some pasted text are decomposed (NFD): "résumé" is the
@@ -40,5 +44,37 @@ func TestNFDTextCentresAndEmphasisesLikeComposedText(t *testing.T) {
 	}
 	if matched := matchedQueryTerms("José notes", "", []string{"jose", "other"}, 0); len(matched) != 1 || matched[0] != "jose" {
 		t.Fatalf("matched terms missed decomposed word: %v", matched)
+	}
+}
+
+// "ø" and "ß" have no canonical decomposition; the index spells them plainly,
+// so a plain query finds the capture and the preview highlights the original
+// spelling at its original offsets.
+func TestSearchFindsLettersWithoutDecompositionThroughEncryptedStore(t *testing.T) {
+	ctx := context.Background()
+	store := foldAskStore(t)
+	text := "Søren Krag reviewed Strauß contract"
+	observation, err := capture.SanitizeObservation("com.apple.Notes", "", text, capture.MaxObservationTextBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservationAt(ctx, observation, time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	scenarioIndex(t, store)
+	c := NewClient(store)
+	defer c.Close()
+	for _, query := range []string{"soren strauss", "Søren Strauß", "SOREN STRAUSS"} {
+		hits, err := c.SearchMemoryContext(ctx, query)
+		if err != nil || len(hits) != 1 || hits[0].SourceID != observation.ContentID() {
+			t.Fatalf("query %d bytes found %d hits: %v", len(query), len(hits), err)
+		}
+		hit := hits[0]
+		if got := strings.Join(hit.MatchedTerms, ","); !strings.Contains(got, "soren") || !strings.Contains(got, "strauss") {
+			t.Fatalf("matched terms %q", got)
+		}
+		if hit.ExcerptEnd <= hit.ExcerptStart || hit.ExcerptEnd > len(hit.Excerpt) || !strings.HasPrefix(hit.Excerpt[hit.ExcerptStart:], "Søren") {
+			t.Fatalf("preview emphasis not on the original spelling: %q %d-%d", hit.Excerpt, hit.ExcerptStart, hit.ExcerptEnd)
+		}
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
-	"sort"
 	"time"
 
 	"github.com/hazcod/blur/internal/activity"
@@ -16,7 +15,7 @@ const (
 	activityNamespace       = "activity"
 	activitySourceNamespace = "activity-src"
 	maxActivityIDs          = 64
-	maxSegmentsPerSource    = 64
+	legacyActivitySourceIDs = 64
 	maxActivityRecordBytes  = 16 << 10
 )
 
@@ -33,7 +32,11 @@ func (s *Store) PutActivitySegment(ctx context.Context, segment activity.Segment
 		return &storage.StoreError{Code: storage.Invalid}
 	}
 	defer clear(encoded)
-	return s.Update(ctx, func(tx *Tx) error {
+	duplicate := false
+	err = s.Update(ctx, func(tx *Tx) error {
+		if err := tx.validateActivitySources(segment, false); err != nil {
+			return err
+		}
 		key := s.logicalKey(groupRecord, kindIndex, "index:"+activityNamespace, segment.ID)
 		defer clear(key)
 		found, err := tx.writer.Has(key)
@@ -41,46 +44,34 @@ func (s *Store) PutActivitySegment(ctx context.Context, segment activity.Segment
 			return mapStorePhysicalError(err)
 		}
 		if found {
-			return &storage.StoreError{Code: storage.Duplicate}
+			duplicate = true
+			return tx.discardPendingActivity(segment.ID)
 		}
 		merged, err := tx.coalesceActivitySegment(segment)
 		if err != nil {
 			return err
 		}
 		if merged {
-			return nil
+			return tx.discardPendingActivity(segment.ID)
 		}
-		stored := encoded
-		kept := make([]string, 0, len(segment.SourceIDs))
 		for _, sourceID := range segment.SourceIDs {
-			linked, err := tx.trackActivitySource(sourceID, segment.ID)
+			_, err := tx.trackActivitySource(sourceID, segment.ID)
 			if err != nil {
 				return err
 			}
-			if linked {
-				kept = append(kept, sourceID)
-			}
-		}
-		if len(kept) != len(segment.SourceIDs) {
-			// A source already cited by maxSegmentsPerSource segments (for
-			// example a static screen seen across many sessions) must not make
-			// the write fail forever. Persist the time accounting without that
-			// content link; such a segment holds no content to cascade-delete.
-			unlinked := segment
-			unlinked.SourceIDs = kept
-			stored, err = json.Marshal(unlinked)
-			if err != nil || len(stored) > maxActivityRecordBytes {
-				clear(stored)
-				return &storage.StoreError{Code: storage.Invalid}
-			}
-			defer clear(stored)
-			segment = unlinked
 		}
 		if err := tx.addActivityDay(segment); err != nil {
 			return err
 		}
-		return tx.PutIndexRecord(activityNamespace, segment.ID, stored)
+		if err := tx.PutIndexRecord(activityNamespace, segment.ID, encoded); err != nil {
+			return err
+		}
+		return tx.discardPendingActivity(segment.ID)
 	})
+	if err == nil && duplicate {
+		return &storage.StoreError{Code: storage.Duplicate}
+	}
+	return err
 }
 
 // coalesceActivitySegment keeps repeated identical observations from creating
@@ -90,20 +81,15 @@ func (tx *Tx) coalesceActivitySegment(next activity.Segment) (bool, error) {
 	if tx == nil || len(next.SourceIDs) != 1 {
 		return false, nil
 	}
-	encoded, found, err := tx.readIndexValue(activitySourceNamespace, next.SourceIDs[0], 8192)
-	if err != nil || !found {
+	list, err := tx.activitySourceList(activitySourceNamespace, next.SourceIDs[0])
+	if err != nil {
 		return false, err
 	}
-	var ids []string
-	if json.Unmarshal(encoded, &ids) != nil || len(ids) > maxSegmentsPerSource {
-		clear(encoded)
-		return false, ErrCorrupt
+	ids := append([]string(nil), list.Legacy...)
+	if list.Last != "" {
+		ids = append(ids, list.Last)
 	}
-	clear(encoded)
-	for i, id := range ids {
-		if !validOpaqueID(id) || i > 0 && ids[i-1] >= id {
-			return false, ErrCorrupt
-		}
+	for _, id := range ids {
 		priorBytes, found, err := tx.readIndexValue(activityNamespace, id, maxActivityRecordBytes)
 		if err != nil {
 			return false, err
@@ -141,61 +127,30 @@ func (tx *Tx) coalesceActivitySegment(next activity.Segment) (bool, error) {
 }
 
 func (tx *Tx) trackActivitySource(sourceID, segmentID string) (bool, error) {
-	encoded, found, err := tx.readIndexValue(activitySourceNamespace, sourceID, 8192)
-	if err != nil {
-		return false, err
-	}
-	var ids []string
-	if found {
-		if json.Unmarshal(encoded, &ids) != nil || len(ids) > maxSegmentsPerSource {
-			clear(encoded)
-			return false, ErrCorrupt
-		}
-		clear(encoded)
-	}
-	index := sort.SearchStrings(ids, segmentID)
-	if index < len(ids) && ids[index] == segmentID {
-		return false, ErrCorrupt
-	}
-	if len(ids) >= maxSegmentsPerSource {
-		return false, nil
-	}
-	ids = append(ids, "")
-	copy(ids[index+1:], ids[index:])
-	ids[index] = segmentID
-	encoded, err = json.Marshal(ids)
-	if err != nil {
-		return false, ErrCorrupt
-	}
-	defer clear(encoded)
-	if err := tx.PutIndexRecord(activitySourceNamespace, sourceID, encoded); err != nil {
-		return false, err
-	}
-	return true, nil
+	err := tx.trackActivityLink(activitySourceNamespace, activitySourceNodesNamespace, sourceID, segmentID)
+	return err == nil, err
 }
 
 func (tx *Tx) removeActivitySource(sourceID string) error {
-	_, err := tx.removeActivitySourceBatch(sourceID, maxSegmentsPerSource)
+	complete, err := tx.removeActivitySourceBatch(sourceID, 8)
+	if err == nil && !complete {
+		return ErrTransactionBudget
+	}
 	return err
 }
 
 func (tx *Tx) removeActivitySourceBatch(sourceID string, limit int) (bool, error) {
-	encoded, found, err := tx.readIndexValue(activitySourceNamespace, sourceID, 8192)
-	if err != nil || !found {
-		return !found, err
+	if complete, err := tx.removePendingActivitySourceBatch(sourceID, limit); err != nil || !complete {
+		return false, err
 	}
-	var ids []string
-	if json.Unmarshal(encoded, &ids) != nil || len(ids) > maxSegmentsPerSource {
-		clear(encoded)
-		return false, ErrCorrupt
+	list, err := tx.activitySourceList(activitySourceNamespace, sourceID)
+	if err != nil {
+		return false, err
 	}
-	clear(encoded)
-	for i, id := range ids {
-		if i >= limit {
-			break
-		}
-		if !validOpaqueID(id) || i > 0 && ids[i-1] >= id {
-			return false, ErrCorrupt
+	for removed := 0; removed < limit && list.Count > 0; removed++ {
+		id := list.First
+		if len(list.Legacy) > 0 {
+			id = list.Legacy[0]
 		}
 		segmentBytes, found, err := tx.readIndexValue(activityNamespace, id, maxActivityRecordBytes)
 		if err != nil {
@@ -228,41 +183,16 @@ func (tx *Tx) removeActivitySourceBatch(sourceID string, limit int) (bool, error
 		if err := tx.deleteKnowledgeRecord(activityNamespace, id); err != nil {
 			return false, err
 		}
+		list, err = tx.activitySourceList(activitySourceNamespace, sourceID)
+		if err != nil {
+			return false, err
+		}
 	}
-	return len(ids) <= limit, nil
+	return list.Count == 0, nil
 }
 
 func (tx *Tx) untrackActivitySource(sourceID, segmentID string) error {
-	encoded, found, err := tx.readIndexValue(activitySourceNamespace, sourceID, 8192)
-	if err != nil || !found {
-		return err
-	}
-	var ids []string
-	if json.Unmarshal(encoded, &ids) != nil || len(ids) > maxSegmentsPerSource {
-		clear(encoded)
-		return ErrCorrupt
-	}
-	clear(encoded)
-	for i, id := range ids {
-		if !validOpaqueID(id) || i > 0 && ids[i-1] >= id {
-			return ErrCorrupt
-		}
-	}
-	index := sort.SearchStrings(ids, segmentID)
-	if index >= len(ids) || ids[index] != segmentID {
-		return ErrCorrupt
-	}
-	copy(ids[index:], ids[index+1:])
-	ids = ids[:len(ids)-1]
-	if len(ids) == 0 {
-		return tx.deleteKnowledgeRecord(activitySourceNamespace, sourceID)
-	}
-	encoded, err = json.Marshal(ids)
-	if err != nil {
-		return ErrCorrupt
-	}
-	defer clear(encoded)
-	return tx.PutIndexRecord(activitySourceNamespace, sourceID, encoded)
+	return tx.untrackActivityLink(activitySourceNamespace, activitySourceNodesNamespace, sourceID, segmentID)
 }
 
 // GetActivitySegments reads only caller-selected IDs and is bounded to 64

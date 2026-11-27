@@ -49,12 +49,12 @@ func TestMCPParityRejectsInvalidRequestsBeforeReading(t *testing.T) {
 func TestMCPTimeReportRejectsOverlongCustomRange(t *testing.T) {
 	zone, _ := time.LoadLocation("Europe/Brussels")
 	now := time.Date(2026, 11, 16, 15, 30, 0, 0, zone)
-	if _, _, err := mcpReportRange(mcpTimeReportParams{From: "2026-10-01", To: "2026-11-01"}, now, zone); err == nil {
-		t.Fatal("32-day range accepted")
+	if _, _, err := mcpReportRange(mcpTimeReportParams{From: "2024-01-01", To: "2025-02-04"}, now, zone); err == nil {
+		t.Fatal("401-day range accepted")
 	}
-	start, end, err := mcpReportRange(mcpTimeReportParams{From: "2026-10-02", To: "2026-11-01"}, now, zone)
-	if err != nil || end.Sub(start) < 31*24*time.Hour-time.Hour {
-		t.Fatalf("31-day range = %v %v err=%v", start, end, err)
+	start, end, err := mcpReportRange(mcpTimeReportParams{From: "2024-01-01", To: "2025-02-03"}, now, zone)
+	if err != nil || end.Sub(start) < 400*24*time.Hour-time.Hour {
+		t.Fatalf("400-day range = %v %v err=%v", start, end, err)
 	}
 	for period, want := range map[string][2]string{
 		"this_week": {"2026-11-16", "2026-11-22"}, "last_week": {"2026-11-09", "2026-11-15"},

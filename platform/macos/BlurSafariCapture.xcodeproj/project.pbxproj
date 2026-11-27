@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		23A0E50B66F83D44BC993D3F /* SafariServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D8F7BBDC3A947A243A8D3E2C /* SafariServices.framework */; };
 		273EF0533EE6FE887C8BC940 /* ExtensionHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21F7C74DDFF40BFF40C89C3 /* ExtensionHandler.swift */; };
+		F00120261122000000000001 /* CaptureProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00120261122000000000002 /* CaptureProtocol.swift */; };
 		4B3C9D382131BE6DC5D8C025 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5B5BB4BD98FF57CF833FC335 /* Security.framework */; };
 		888F97B2F2C3F98D195EC45B /* CryptoKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 748155E0B0BCCB01128127DC /* CryptoKit.framework */; };
 		D64257C501EA530C4F51FC20 /* Injected.js in Resources */ = {isa = PBXBuildFile; fileRef = 5D500E78B42784BEC0A659B8 /* Injected.js */; };
@@ -19,6 +20,7 @@
 		5D500E78B42784BEC0A659B8 /* Injected.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = Injected.js; sourceTree = "<group>"; };
 		748155E0B0BCCB01128127DC /* CryptoKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CryptoKit.framework; path = System/Library/Frameworks/CryptoKit.framework; sourceTree = SDKROOT; };
 		A21F7C74DDFF40BFF40C89C3 /* ExtensionHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionHandler.swift; sourceTree = "<group>"; };
+		F00120261122000000000002 /* CaptureProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureProtocol.swift; sourceTree = "<group>"; };
 		D8F7BBDC3A947A243A8D3E2C /* SafariServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SafariServices.framework; path = System/Library/Frameworks/SafariServices.framework; sourceTree = SDKROOT; };
 		FFBD415F2EE69DBAB9645546 /* BlurSafariCapture.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BlurSafariCapture.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -49,6 +51,7 @@
 			isa = PBXGroup;
 			children = (
 				A21F7C74DDFF40BFF40C89C3 /* ExtensionHandler.swift */,
+				F00120261122000000000002 /* CaptureProtocol.swift */,
 				1D0A57CDE2B6EAFDBB8F1BC4 /* Resources */,
 			);
 			path = SafariExtension;
@@ -150,6 +153,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				273EF0533EE6FE887C8BC940 /* ExtensionHandler.swift in Sources */,
+				F00120261122000000000001 /* CaptureProtocol.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -18,7 +18,7 @@ func validManualNoteTime(note ManualNoteInput) bool {
 }
 
 // RecordTimes resolves immutable evidence provenance. Transcript offsets belong
-// to the recording origin and retain the 8h audio bound. Explicit manual-note
+// to the recording origin and must fit duration and wall-clock representation. Manual-note
 // times are independent wall times; legacy At remains relative to creation.
 // No source text, source timestamp, note offset or metadata is rewritten.
 func RecordTimes(m Meeting, r Record) (start, end time.Time, err error) {
@@ -28,7 +28,7 @@ func RecordTimes(m Meeting, r Record) (start, end time.Time, err error) {
 	switch r.Kind {
 	case TranscriptFinal:
 		e := r.Event
-		if e.Kind != Final || e.SessionID != m.ID || e.Start < 0 || e.End < e.Start || e.End > DefaultLimits().MaxDuration {
+		if e.Kind != Final || e.SessionID != m.ID || e.Start < 0 || e.End < e.Start || e.End > MaxCaptureDuration {
 			return time.Time{}, time.Time{}, ErrInvalid
 		}
 		origin := m.TranscriptOrigin()

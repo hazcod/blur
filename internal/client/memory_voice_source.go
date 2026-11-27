@@ -26,8 +26,10 @@ func (d *desktop) readMemoryVoiceSource(sourceID string) {
 	if !ok {
 		return
 	}
-	epoch, stable := d.client.BeginMemoryRead()
+	read, stable := d.client.beginVoicePublication()
 	if !stable {
+		d.status = voiceReadChangedCopy
+		d.app.RequestUpdate()
 		return
 	}
 	u := &d.memoryUI
@@ -53,13 +55,15 @@ func (d *desktop) readMemoryVoiceSource(sourceID string) {
 				return
 			}
 			d.meetingUI.reading = false
-			if !d.client.PublishMemoryRead(epoch, func() {
+			if !read.publish(d.client, func() {
 				if err != nil || !found {
 					d.status = "This voice note is no longer available."
 				} else {
 					d.selectMemoryMeeting(meeting)
 				}
 			}) {
+				d.status = voiceReadChangedCopy
+				d.app.RequestUpdate()
 				return
 			}
 			if err == nil && found {

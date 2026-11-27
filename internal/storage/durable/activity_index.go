@@ -16,16 +16,17 @@ const (
 	activityDayNamespace     = "activity-day"
 	activityDayRefNamespace  = "activity-day-ref"
 	activityDayPageSize      = 64
-	maxActivityDayPages      = 64
-	maxActivityDaySegments   = activityDayPageSize * maxActivityDayPages
 	maxActivityRangeDates    = 33
 	maxActivityRangeSegments = activity.MaxReportSegments
 	maxActivityRangeBytes    = 8 << 20
 )
 
 type activityDayMeta struct {
-	Pages int `json:"pages"`
-	Count int `json:"count"`
+	Version int `json:"version,omitempty"`
+	Pages   int `json:"pages"`
+	Count   int `json:"count"`
+	First   int `json:"first,omitempty"`
+	Last    int `json:"last,omitempty"`
 }
 
 // ListActivitySegmentsForDate pages the segments whose WallStart falls on the
@@ -35,73 +36,35 @@ func (s *Store) ListActivitySegmentsForDate(ctx context.Context, date, after str
 	if ctx == nil || !validTodayDate(date) || limit < 1 || limit > maxActivityIDs || after != "" && !validOpaqueID(after) {
 		return nil, "", &storage.StoreError{Code: storage.Invalid}
 	}
-	if s == nil || s.state == nil {
-		return nil, "", &storage.StoreError{Code: storage.Closed}
-	}
 	var segments []activity.Segment
 	var next string
 	err := s.view(ctx, func(reader bolt.Reader) error {
-		metaBytes, found, err := s.readIndexValueReader(reader, activityDayNamespace, date, 128)
+		encoded, found, err := s.readIndexValueReader(reader, activityDayNamespace, date, 256)
 		if err != nil || !found {
 			return err
 		}
-		var meta activityDayMeta
-		if json.Unmarshal(metaBytes, &meta) != nil || meta.Pages < 1 || meta.Pages > maxActivityDayPages || meta.Count < 1 || meta.Count > maxActivityDaySegments {
-			clear(metaBytes)
-			return ErrCorrupt
+		meta, err := decodeActivityDayMeta(encoded)
+		clear(encoded)
+		if err != nil {
+			return err
 		}
-		clear(metaBytes)
-		foundCursor := after == ""
-		selected := make([]string, 0, limit+1)
-		seenIDs := make(map[string]struct{}, meta.Count)
-		for page := 0; page < meta.Pages && len(selected) <= limit; page++ {
-			pageID := activityDayPageID(date, page)
-			pageBytes, exists, err := s.readIndexValueReader(reader, activityDayNamespace, pageID, 8192)
+		ids, err := s.activityDayIDs(reader, date, after, meta, limit+1)
+		if err != nil {
+			return err
+		}
+		more := len(ids) > limit
+		if more {
+			ids = ids[:limit]
+		}
+		segments = make([]activity.Segment, 0, len(ids))
+		used := 0
+		for _, id := range ids {
+			var segment activity.Segment
+			found, err := s.readActivitySegmentReader(reader, id, &segment)
 			if err != nil {
 				return err
 			}
-			if !exists {
-				return ErrCorrupt
-			}
-			var ids []string
-			if json.Unmarshal(pageBytes, &ids) != nil || !validActivityDayIDs(ids) {
-				clear(pageBytes)
-				return ErrCorrupt
-			}
-			clear(pageBytes)
-			for _, id := range ids {
-				if _, duplicate := seenIDs[id]; duplicate {
-					return ErrCorrupt
-				}
-				seenIDs[id] = struct{}{}
-				if !foundCursor {
-					if id == after {
-						foundCursor = true
-					}
-					continue
-				}
-				selected = append(selected, id)
-				if len(selected) > limit {
-					break
-				}
-			}
-		}
-		if !foundCursor {
-			return &storage.StoreError{Code: storage.Invalid}
-		}
-		more := len(selected) > limit
-		if more {
-			selected = selected[:limit]
-		}
-		segments = make([]activity.Segment, 0, len(selected))
-		used := 0
-		for _, id := range selected {
-			var segment activity.Segment
-			found, err := s.readActivitySegmentReader(reader, id, &segment)
-			if err != nil || !found {
-				return ErrCorrupt
-			}
-			if activityUTCDate(segment) != date {
+			if !found || activityUTCDate(segment) != date {
 				return ErrCorrupt
 			}
 			encoded, err := json.Marshal(segment)
@@ -115,8 +78,8 @@ func (s *Store) ListActivitySegmentsForDate(ctx context.Context, date, after str
 			}
 			segments = append(segments, segment)
 		}
-		if more && len(selected) > 0 {
-			next = selected[len(selected)-1]
+		if more && len(ids) > 0 {
+			next = ids[len(ids)-1]
 		}
 		return nil
 	})
@@ -138,58 +101,46 @@ func (s *Store) ListActivitySegmentsForDates(ctx context.Context, dates []string
 			return nil, &storage.StoreError{Code: storage.Invalid}
 		}
 	}
-	if s == nil || s.state == nil {
-		return nil, &storage.StoreError{Code: storage.Closed}
-	}
 	segments := make([]activity.Segment, 0)
-	err := s.view(ctx, func(reader bolt.Reader) error {
-		seen := make(map[string]struct{})
+	// Reports retain a separate bounded read budget; larger accepted days
+	// remain available through ListActivitySegmentsForDate pagination.
+	err := s.viewWithReadLimit(ctx, bolt.MaxReadTransactionOps, func(reader bolt.Reader) error {
+		seen := make(map[string]bool)
 		used := 0
 		for _, date := range dates {
-			metaBytes, found, err := s.readIndexValueReader(reader, activityDayNamespace, date, 128)
+			encoded, found, err := s.readIndexValueReader(reader, activityDayNamespace, date, 256)
 			if err != nil {
 				return err
 			}
 			if !found {
 				continue
 			}
-			var meta activityDayMeta
-			if json.Unmarshal(metaBytes, &meta) != nil || meta.Pages < 1 || meta.Pages > maxActivityDayPages || meta.Count < 1 || meta.Count > maxActivityDaySegments {
-				clear(metaBytes)
+			meta, err := decodeActivityDayMeta(encoded)
+			clear(encoded)
+			if err != nil {
+				return err
+			}
+			if meta.Count > limit-len(segments) {
+				return &storage.StoreError{Code: storage.Invalid}
+			}
+			ids, err := s.activityDayIDs(reader, date, "", meta, meta.Count+1)
+			if err != nil {
+				return err
+			}
+			if len(ids) != meta.Count {
 				return ErrCorrupt
 			}
-			clear(metaBytes)
-			var dayIDs []string
-			for page := 0; page < meta.Pages; page++ {
-				pageBytes, exists, err := s.readIndexValueReader(reader, activityDayNamespace, activityDayPageID(date, page), 8192)
+			for _, id := range ids {
+				if seen[id] {
+					return ErrCorrupt
+				}
+				seen[id] = true
+				var segment activity.Segment
+				found, err := s.readActivitySegmentReader(reader, id, &segment)
 				if err != nil {
 					return err
 				}
-				if !exists {
-					return ErrCorrupt
-				}
-				var ids []string
-				if json.Unmarshal(pageBytes, &ids) != nil || !validActivityDayIDs(ids) || len(ids) == 0 {
-					clear(pageBytes)
-					return ErrCorrupt
-				}
-				clear(pageBytes)
-				dayIDs = append(dayIDs, ids...)
-			}
-			if len(dayIDs) != meta.Count {
-				return ErrCorrupt
-			}
-			for _, id := range dayIDs {
-				if _, duplicate := seen[id]; duplicate {
-					return ErrCorrupt
-				}
-				seen[id] = struct{}{}
-				if len(segments) >= limit {
-					return &storage.StoreError{Code: storage.Invalid}
-				}
-				var segment activity.Segment
-				ok, err := s.readActivitySegmentReader(reader, id, &segment)
-				if err != nil || !ok || activityUTCDate(segment) != date || segment.Validate() != nil {
+				if !found || activityUTCDate(segment) != date {
 					return ErrCorrupt
 				}
 				encoded, err := json.Marshal(segment)
@@ -239,102 +190,120 @@ func validActivityDayIDs(ids []string) bool {
 
 func (tx *Tx) addActivityDay(segment activity.Segment) error {
 	date := activityUTCDate(segment)
-	metaBytes, found, err := tx.readIndexValue(activityDayNamespace, date, 128)
+	encoded, found, err := tx.readIndexValue(activityDayNamespace, date, 256)
 	if err != nil {
 		return err
 	}
-	meta := activityDayMeta{}
+	meta := activityDayMeta{Version: 2, Pages: 1}
 	if found {
-		if json.Unmarshal(metaBytes, &meta) != nil || meta.Pages < 1 || meta.Pages > maxActivityDayPages || meta.Count < 1 || meta.Count > maxActivityDaySegments {
-			clear(metaBytes)
-			return ErrCorrupt
+		meta, err = decodeActivityDayMeta(encoded)
+		clear(encoded)
+		if err != nil {
+			return err
+		}
+		meta, err = tx.migrateActivityDay(date, meta)
+		if err != nil {
+			return err
+		}
+	} else {
+		if err := tx.PutIndexRecord(activityDayLinksNamespace, activityDayPageID(date, 0), mustJSON(activityDayLink{Before: -1, After: -1})); err != nil {
+			return err
 		}
 	}
-	if found && meta.Count == maxActivityDaySegments {
-		return &storage.StoreError{Code: storage.Invalid}
-	}
-	clear(metaBytes)
-	page := 0
-	if meta.Pages == 0 {
-		meta.Pages = 1
-	} else {
-		page = meta.Pages - 1
-	}
+	page := meta.Last
 	pageID := activityDayPageID(date, page)
 	pageBytes, pageFound, err := tx.readIndexValue(activityDayNamespace, pageID, 8192)
 	if err != nil {
 		return err
 	}
 	var ids []string
-	if pageFound {
-		if json.Unmarshal(pageBytes, &ids) != nil || !validActivityDayIDs(ids) {
-			clear(pageBytes)
-			return ErrCorrupt
-		}
-	}
-	if found && !pageFound {
-		return ErrCorrupt
-	}
-	clear(pageBytes)
-	if len(ids) == activityDayPageSize {
-		if meta.Pages >= maxActivityDayPages {
-			return &storage.StoreError{Code: storage.Invalid}
-		}
-		page = meta.Pages
-		meta.Pages++
-		pageID = activityDayPageID(date, page)
-		ids = nil
-	}
-	ids = append(ids, segment.ID)
-	encoded, err := json.Marshal(ids)
-	if err != nil {
-		return ErrCorrupt
-	}
-	if err := tx.PutIndexRecord(activityDayNamespace, pageID, encoded); err != nil {
-		clear(encoded)
-		return err
-	}
-	clear(encoded)
-	if err := tx.PutIndexRecord(activityDayRefNamespace, segment.ID, []byte(pageID)); err != nil {
-		return err
-	}
-	meta.Count++
-	encoded, err = json.Marshal(meta)
-	if err != nil {
-		return ErrCorrupt
-	}
-	defer clear(encoded)
-	return tx.PutIndexRecord(activityDayNamespace, date, encoded)
-}
-
-func (tx *Tx) removeActivityDay(segment activity.Segment) error {
-	refBytes, found, err := tx.readIndexValue(activityDayRefNamespace, segment.ID, 64)
-	if err != nil || !found {
-		return ErrCorrupt
-	}
-	pageID := string(refBytes)
-	clear(refBytes)
-	date := activityUTCDate(segment)
-	pageNumber := -1
-	for i := 0; i < maxActivityDayPages; i++ {
-		if activityDayPageID(date, i) == pageID {
-			pageNumber = i
-			break
-		}
-	}
-	if pageNumber < 0 {
-		return ErrCorrupt
-	}
-	pageBytes, found, err := tx.readIndexValue(activityDayNamespace, pageID, 8192)
-	if err != nil || !found {
-		return ErrCorrupt
-	}
-	var ids []string
-	if json.Unmarshal(pageBytes, &ids) != nil || !validActivityDayIDs(ids) {
+	if pageFound && (json.Unmarshal(pageBytes, &ids) != nil || !validActivityDayIDs(ids) || len(ids) == 0) {
 		clear(pageBytes)
 		return ErrCorrupt
 	}
 	clear(pageBytes)
+	if found && !pageFound {
+		return ErrCorrupt
+	}
+	if len(ids) == activityDayPageSize {
+		oldLink, err := tx.activityDayLink(date, page, meta)
+		if err != nil || oldLink.After != -1 {
+			if err != nil {
+				return err
+			}
+			return ErrCorrupt
+		}
+		page = meta.Pages
+		if page == int(^uint(0)>>1) {
+			return ErrCorrupt
+		}
+		meta.Pages++
+		oldLink.After = page
+		if err := tx.PutIndexRecord(activityDayLinksNamespace, pageID, mustJSON(oldLink)); err != nil {
+			return err
+		}
+		pageID = activityDayPageID(date, page)
+		if err := tx.PutIndexRecord(activityDayLinksNamespace, pageID, mustJSON(activityDayLink{Before: meta.Last, After: -1})); err != nil {
+			return err
+		}
+		meta.Last = page
+		ids = nil
+	}
+	if meta.Count == int(^uint(0)>>1) {
+		return ErrCorrupt
+	}
+	ids = append(ids, segment.ID)
+	if err := tx.PutIndexRecord(activityDayNamespace, pageID, mustJSON(ids)); err != nil {
+		return err
+	}
+	if err := tx.PutIndexRecord(activityDayRefNamespace, segment.ID, []byte(pageID)); err != nil {
+		return err
+	}
+	meta.Count++
+	return tx.PutIndexRecord(activityDayNamespace, date, mustJSON(meta))
+}
+
+func (tx *Tx) removeActivityDay(segment activity.Segment) error {
+	ref, found, err := tx.readIndexValue(activityDayRefNamespace, segment.ID, 64)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrCorrupt
+	}
+	pageID := string(ref)
+	clear(ref)
+	date := activityUTCDate(segment)
+	page, err := parseActivityDayPageID(date, pageID)
+	if err != nil {
+		return err
+	}
+	encoded, found, err := tx.readIndexValue(activityDayNamespace, date, 256)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrCorrupt
+	}
+	meta, err := decodeActivityDayMeta(encoded)
+	clear(encoded)
+	if err != nil || page >= meta.Pages {
+		return ErrCorrupt
+	}
+	meta, err = tx.migrateActivityDay(date, meta)
+	if err != nil {
+		return err
+	}
+	encoded, found, err = tx.readIndexValue(activityDayNamespace, pageID, 8192)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	valid := found && json.Unmarshal(encoded, &ids) == nil && validActivityDayIDs(ids) && len(ids) > 0
+	clear(encoded)
+	if !valid {
+		return ErrCorrupt
+	}
 	index := -1
 	for i, id := range ids {
 		if id == segment.ID {
@@ -345,47 +314,67 @@ func (tx *Tx) removeActivityDay(segment activity.Segment) error {
 	if index < 0 {
 		return ErrCorrupt
 	}
-	copy(ids[index:], ids[index+1:])
-	ids = ids[:len(ids)-1]
-	metaBytes, found, err := tx.readIndexValue(activityDayNamespace, date, 128)
-	if err != nil || !found {
-		return ErrCorrupt
-	}
-	var meta activityDayMeta
-	if json.Unmarshal(metaBytes, &meta) != nil || meta.Pages < 1 || meta.Pages > maxActivityDayPages || meta.Count < 1 || pageNumber >= meta.Pages {
-		clear(metaBytes)
-		return ErrCorrupt
-	}
-	clear(metaBytes)
+	ids = append(ids[:index], ids[index+1:]...)
 	meta.Count--
-	if meta.Count == 0 {
-		for page := 0; page < meta.Pages; page++ {
-			if err := tx.deleteKnowledgeRecord(activityDayNamespace, activityDayPageID(date, page)); err != nil {
+	if len(ids) == 0 {
+		link, err := tx.activityDayLink(date, page, meta)
+		if err != nil {
+			return err
+		}
+		if link.Before == -1 {
+			if meta.First != page {
+				return ErrCorrupt
+			}
+			meta.First = link.After
+		} else {
+			prior, err := tx.activityDayLink(date, link.Before, meta)
+			if err != nil || prior.After != page {
+				if err != nil {
+					return err
+				}
+				return ErrCorrupt
+			}
+			prior.After = link.After
+			if err := tx.PutIndexRecord(activityDayLinksNamespace, activityDayPageID(date, link.Before), mustJSON(prior)); err != nil {
 				return err
 			}
+		}
+		if link.After == -1 {
+			if meta.Last != page {
+				return ErrCorrupt
+			}
+			meta.Last = link.Before
+		} else {
+			next, err := tx.activityDayLink(date, link.After, meta)
+			if err != nil || next.Before != page {
+				if err != nil {
+					return err
+				}
+				return ErrCorrupt
+			}
+			next.Before = link.Before
+			if err := tx.PutIndexRecord(activityDayLinksNamespace, activityDayPageID(date, link.After), mustJSON(next)); err != nil {
+				return err
+			}
+		}
+		if err := tx.deleteKnowledgeRecord(activityDayNamespace, pageID); err != nil {
+			return err
+		}
+		if err := tx.deleteKnowledgeRecord(activityDayLinksNamespace, pageID); err != nil {
+			return err
+		}
+	} else if err := tx.PutIndexRecord(activityDayNamespace, pageID, mustJSON(ids)); err != nil {
+		return err
+	}
+	if meta.Count == 0 {
+		if meta.First != -1 || meta.Last != -1 {
+			return ErrCorrupt
 		}
 		if err := tx.deleteKnowledgeRecord(activityDayNamespace, date); err != nil {
 			return err
 		}
-	} else {
-		encoded, err := json.Marshal(ids)
-		if err != nil {
-			return ErrCorrupt
-		}
-		if err := tx.PutIndexRecord(activityDayNamespace, pageID, encoded); err != nil {
-			clear(encoded)
-			return err
-		}
-		clear(encoded)
-		encoded, err = json.Marshal(meta)
-		if err != nil {
-			return ErrCorrupt
-		}
-		if err := tx.PutIndexRecord(activityDayNamespace, date, encoded); err != nil {
-			clear(encoded)
-			return err
-		}
-		clear(encoded)
+	} else if err := tx.PutIndexRecord(activityDayNamespace, date, mustJSON(meta)); err != nil {
+		return err
 	}
 	return tx.deleteKnowledgeRecord(activityDayRefNamespace, segment.ID)
 }

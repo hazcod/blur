@@ -70,6 +70,8 @@ type safariCaptureBridge struct {
 	previousGrantUntil   time.Time
 	clock                func() time.Time
 	onStatus             func(string)
+	onObservation        func(capture.SanitizedObservation, time.Time)
+	onDocument           func(capture.CaptureSummary, bool)
 	renewCancel          context.CancelFunc
 	renewDone            chan struct{}
 	server               *browsercapture.UnixServer
@@ -235,7 +237,7 @@ func (b *safariCaptureBridge) Start(ctx context.Context) error {
 	clear(encoded)
 	clear(grant.Credential)
 	b.enabled.Store(true)
-	receiver, err := browsercapture.NewReceiver(grants, b.store, b.enabled.Load, time.Now, safariCapturePreferencePolicy(b.preferences))
+	receiver, err := newSafariPageReceiver(grants, b.store, b.preferences, b.enabled.Load, time.Now, b.onObservation, b.onDocument)
 	if err != nil {
 		b.enabled.Store(false)
 		_ = grants.Revoke(grant.ID)
@@ -362,6 +364,14 @@ func (a *LocalApp) CaptureController(source *darwin.Adapter) *ingest.Controller 
 				bridge := newSafariCaptureBridge(a.store, func(status string) { setSafariStatus(a.Client, status) })
 				if bridge != nil {
 					bridge.preferences = a.Client.preferences
+					bridge.onObservation = func(observation capture.SanitizedObservation, at time.Time) {
+						a.Client.NotifyCaptureChanged()
+						a.notifyChronicleEvidence(observation, at)
+					}
+					bridge.onDocument = func(summary capture.CaptureSummary, fresh bool) {
+						a.Client.NotifyCaptureChanged()
+						a.notifyDocumentEvidence(summary, fresh)
+					}
 				}
 				if err := bridge.Start(ctx); err != nil {
 					slog.Warn("Safari page capture could not start; native app capture remains active")

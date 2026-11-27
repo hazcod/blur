@@ -22,7 +22,7 @@ const (
 	maxSessionLimit   = 20
 	maxSessionWindow  = 24 * time.Hour
 	maxWikiListLimit  = 50
-	maxReportDays     = 31
+	maxReportDays     = 400
 	maxPromiseLimit   = 50
 	maxPromiseQuery   = 512
 	maxReportBuckets  = 16
@@ -39,7 +39,7 @@ const listWikiInputSchema = `{"type":"object","additionalProperties":false,"prop
 
 const listWikiOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"entries":{"type":"array","maxItems":50,"items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","maxLength":128},"kind":{"type":"string","enum":["person","project","topic","place","workflow"]},"name":{"type":"string","maxLength":256},"aliases":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":128}},"summary":{"type":"string","maxLength":160},"fact_count":{"type":"integer","minimum":0},"open_loop_count":{"type":"integer","minimum":0}},"required":["id","kind","name","aliases","fact_count","open_loop_count"]}},"total":{"type":"integer","minimum":0},"truncated":{"type":"boolean"}},"required":["entries","total","truncated"]}`
 
-const timeReportInputSchema = `{"type":"object","additionalProperties":false,"properties":{"period":{"type":"string","enum":["today","yesterday","this_week","last_week","last_7_days","last_30_days"],"description":"Named local-calendar period; weeks start Monday. Defaults to today."},"from":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"First local date, inclusive; use with to instead of period."},"to":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"Last local date, inclusive; at most 31 days from from."}}}`
+const timeReportInputSchema = `{"type":"object","additionalProperties":false,"properties":{"period":{"type":"string","enum":["today","yesterday","this_week","last_week","last_7_days","last_30_days"],"description":"Named local-calendar period; weeks start Monday. Defaults to today."},"from":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"First local date, inclusive; use with to instead of period."},"to":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"Last local date, inclusive; at most 400 days from from."}}}`
 
 const timeReportOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"from":{"type":"string","maxLength":10},"to":{"type":"string","maxLength":10},"total_seconds":{"type":"integer","minimum":0},"buckets":{"type":"array","maxItems":16,"items":{"type":"object","additionalProperties":false,"properties":{"app_id":{"type":"string","maxLength":128},"name":{"type":"string","maxLength":256},"seconds":{"type":"integer","minimum":0},"by_day":{"type":"object","additionalProperties":{"type":"integer","minimum":0}},"domains":{"type":"array","maxItems":5,"items":{"type":"object","additionalProperties":false,"properties":{"domain":{"type":"string","maxLength":253},"seconds":{"type":"integer","minimum":0}},"required":["domain","seconds"]}}},"required":["app_id","name","seconds","by_day"]}},"omitted_buckets":{"type":"integer","minimum":0},"omitted_bucket_seconds":{"type":"integer","minimum":0},"top_segments":{"type":"array","maxItems":20,"items":{"type":"object","additionalProperties":false,"properties":{"app_id":{"type":"string","maxLength":128},"domain":{"type":"string","maxLength":253},"title":{"type":"string","maxLength":128},"seconds":{"type":"integer","minimum":0},"source_ids":{"type":"array","maxItems":8,"items":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"required":["seconds","source_ids"]}},"omitted_segments_seconds":{"type":"integer","minimum":0},"note":{"type":"string","maxLength":1024}},"required":["from","to","total_seconds","buckets","top_segments","omitted_segments_seconds","note"]}`
 
@@ -72,7 +72,7 @@ func registerParityTools(server *mcp.Server, reader RPCReader, openWorld *bool) 
 	server.AddTool(&mcp.Tool{
 		Name:         "get_time_report",
 		Title:        "Read tracked screen time",
-		Description:  "Report tracked foreground screen time for a local-calendar period or date range of at most 31 days, grouped by app and, for browsers, by website, with per-day seconds and the longest segments with source IDs. Use it for questions like how long was I in an app or on a site this week. It is tracked time on this computer, not a timesheet or billable hours, and Blur does not classify time into projects. Results returned to the MCP host may be sent to its configured model provider.",
+		Description:  "Report tracked foreground screen time for a local-calendar period or date range of at most 400 days, grouped by app and, for browsers, by website, with per-day seconds and the longest segments with source IDs. Use it for questions like how long was I in an app or on a site this week. It is tracked time on this computer, not a timesheet or billable hours, and Blur does not classify time into projects. Results returned to the MCP host may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(timeReportInputSchema),
 		OutputSchema: json.RawMessage(timeReportOutputSchema),
 		Annotations:  annotations,
@@ -396,7 +396,7 @@ func boundTimeReportOutput(output timeReportOutput) bool {
 func getTimeReport(ctx context.Context, reader RPCReader, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var input timeReportInput
 	if parityArguments(request, true, &input) != nil || !validTimeReportInput(input) {
-		return toolError("Time report accepts one period (today, yesterday, this_week, last_week, last_7_days or last_30_days) or inclusive from and to dates (YYYY-MM-DD) at most 31 days apart."), nil
+		return toolError("Time report accepts one period (today, yesterday, this_week, last_week, last_7_days or last_30_days) or inclusive from and to dates (YYYY-MM-DD) at most 400 days apart."), nil
 	}
 	var output timeReportOutput
 	if !callParity(ctx, reader, localapi.RPCGetTimeReport, localapi.GetTimeReportParams{Period: input.Period, From: input.From, To: input.To}, &output, localapi.MaxRPCSnapshotResponseBytes) {

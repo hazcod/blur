@@ -117,55 +117,53 @@ be presented as successful recording.
 
 ## Memory bounds and snapshots
 
-Zero-valued limits use `DefaultLimits()`. Callers can lower the limits but cannot
-raise these hard ceilings:
+Production repositories implement `RecordLookup`, an authenticated durable
+stable-key index. With this port, zero configured cumulative limits impose no
+session count or text ceiling. The engine keeps only a live tail of up to 20
+finals and 20 notes, each with a 128KiB text budget, one partial per configured
+track, one exact pending record, and checked counters/per-track timestamps.
+Complete history is read through `Repository.MeetingRecords` in bounded pages.
+`Snapshot` is a live view, not an export of the complete recording.
 
-| Resource | Ceiling |
+| Resource | Bound |
 | --- | ---: |
 | Configured tracks | 8 |
 | Active partials | One per configured track |
-| Transcript segments, including active segment slots | 32,768 |
 | One transcript event | 16 KiB UTF-8 |
-| Aggregate final and active/pending transcript text | 16 MiB |
-| Authored manual notes | 256 |
 | One manual note | 64 KiB UTF-8 |
-| Aggregate manual-note text | 1 MiB |
 | Source reference | 256 bytes |
 | Session/segment ID | 64 bytes |
 | Track ID | 32 bytes |
-| Transcript relative time range | 8 hours |
+| Transcript relative time | Checked `time.Duration` representation |
+| Persisted source time | Checked canonical Unix-nanosecond representation |
 
-The engine serializes admission and applies backpressure synchronously. It does
-not create a goroutine per event or queue PCM/text internally. A pending final
-replaces its superseded partial instead of retaining both against the aggregate
-budget. Input strings are cloned on admission so a short accepted substring
-cannot retain an arbitrarily large backing input allocation.
+These single-record bounds remain protocol/work bounds. Supporting one native
+result larger than 16KiB or one authored note larger than 64KiB requires a separate
+multipart evidence protocol; increasing total captured history does not raise
+those individual limits.
 
-The transcript envelope accommodates normal long meetings with short native
-utterance finals: 32,768 segments permit one final about every 0.88 seconds over
-eight hours, while 16 MiB leaves room for verbose text without tying the whole
-meeting to a single stored observation's smaller cap. Each source record remains
-incremental. These are finite safeguards, not a guarantee for arbitrary speech
-segmentation or text expansion. The synthetic scale test sends 10,000 short
-finals and checks one bounded append per final without rewriting prior text.
+Before any old timestamp is rejected, durable identity lookup distinguishes an
+exact existing record, a conflicting payload, a deleted stable key and a new
+key. The same check applies to hot-tail duplicates, so an erased source cannot
+be acknowledged from stale RAM. Partials for an existing finalized key remain
+out of order. A transient identity-read failure or failed write keeps one exact
+pending payload for retry. Identity-read retries repeat lookup and normal order
+and budget admission before attempting an append. Admission and lookup use a synchronous gate, so event producers receive
+backpressure and controls can invalidate callback epochs during a slow lookup.
 
-Finalized keys and receipts are never evicted by this slice. Reaching a cap
-returns `ErrLimit` and a visible failed state instead of releasing old conflict
-metadata and later treating a retry as new evidence. A future paging/eviction
-design must preserve the sink's strict idempotency/conflict checks at the stable
-key before changing this choice.
+Callers can supply explicit nonzero cumulative work budgets. Legacy sinks that
+lack durable lookup retain finite `DefaultLimits()` budgets (32,768 transcript
+segments, 16MiB transcript text, 256 notes, 1MiB note text) and complete in-memory
+key history within those bounds; this compatibility path does not back the
+production repository. Neither path silently truncates persisted evidence.
 
-Snapshots copy every slice and pending-record pointer. Strings are immutable Go
-values, so a caller cannot mutate the session by changing its snapshot. Each
-snapshot is bounded; an external caller retaining arbitrarily many snapshots
-owns that additional memory.
-
-A full long-meeting snapshot can still allocate substantial metadata and take
-time to copy. UI integration must use bounded previews/paging and avoid taking a
-complete eight-hour snapshot on every partial or every 800 ms refresh tick. A
-dedicated preview/read API and durable history paging remain integration work;
-the scale test takes one terminal snapshot rather than hiding quadratic caller
-work behind a fast append path.
+All accepted strings are cloned so a small substring cannot retain an
+arbitrarily large caller allocation. Hot-tail eviction clears old references.
+Snapshots copy slices and the pending pointer; callers that retain repeated
+snapshots own that extra memory. The continuation regression crosses the former
+session count and byte ceilings while checking bounded hot state, and encrypted
+repository/controller integration covers exact retries, restart, deletion,
+long offsets, tail restoration and complete paged retrieval.
 
 ## Verification and implementation rulings
 
@@ -210,7 +208,8 @@ append-order record paging, and explicit deletion. `PutMeeting` creates revision
 1 with expected revision 0; subsequent updates use the stored revision plus one.
 The start clock and track list cannot change after creation. `RecordCount` is
 repository-owned and incremental appends do not advance the public metadata
-revision. The durable implementation permits at most 4,096 live meeting headers.
+revision. The durable catalog pages meeting headers from disk without a total
+session cap; its ordinals retain the existing 48-bit representation bound.
 
 Each final/manual note commits as one existing sanitized observation, its exact
 relative native time span, and a stable keyed receipt in the same encrypted
@@ -218,14 +217,20 @@ transaction. Per-record opaque domains keep identical utterances in different
 segments distinct. Authenticated keyed original-payload digests detect conflicts
 even when two inputs redact to the same saved text. The original unredacted text
 is never stored by this adapter. Redaction expansion that exceeds the per-record
-limit is rejected; text is never shortened to fit. The stored aggregate byte
-limits count sanitized text. Partials never reach durable storage.
+limit is rejected; text is never shortened to fit. Session history has no total
+segment, note, or text-byte cap. Counters, ordinals, durations and wall timestamps
+retain their checked representation bounds. Partials never reach durable storage.
 
 A successful append completes that source's exact search index without a model,
 so existing Ask/Search can retrieve the saved evidence. Raw transcript finals do
 not create Today tasks or action candidates. If indexing fails after the primary
 commit, append reports failure; replaying the same key completes the durable
 index receipt without duplicating evidence.
+
+`LookupRecord` authenticates stable-key identity, original-payload conflicts,
+live source membership, and erasure fences before the engine rejects an old
+timestamp. It also finishes an existing pending exact-index receipt before
+returning success, without creating or restoring evidence.
 
 Read pages have at most 50 rows and 256 KiB of serialized metadata/text, default
 64 KiB. Each page scans at most 256 ordinal slots, so deletions can yield an empty
@@ -234,6 +239,14 @@ preserve the last consumed sequence, including an empty tail. If a single record
 does not fit the requested budget, the read returns `ErrLimit` rather than
 truncating or silently stalling. Use these pages for UI tail updates instead of
 copying full engine snapshots repeatedly.
+
+Ready-agenda startup uses `ReadyAgendaTail`: one snapshot authenticates Ready
+state with no recording clock, end clock or prior finals, then probes at most
+256 descending ordinal slots for at most 20 live rows/128 KiB. Returned rows are
+in ascending order; `Cursor` is the last allocated ordinal including erased
+slots. `Older` reports live evidence outside this display tail, including work
+stopped by deletion holes or its byte budget. Full history remains available
+through `MeetingRecords` pages.
 
 Source erasure atomically removes its record/span links and creates an opaque
 key fence. Removing the last source also removes and fences meeting metadata.
@@ -260,7 +273,8 @@ separate recording origin. A Ready agenda with no saved finals can acquire that
 origin once; it cannot change afterward, and existing legacy transcript origins
 cannot be rebased. Starting a yesterday-created agenda therefore admits native
 transcript offsets from zero while keeping its earlier notes and source capture
-timestamps intact. The eight-hour limit applies to transcript duration.
+timestamps intact. Transcript offsets and resolved source times must fit their
+checked duration and Unix-nanosecond representations.
 
 New manual notes carry an explicit `RecordedAt` wall timestamp and `At=0`, frozen
 once per note ID for uncertain-write retries. This timestamp may precede a newly

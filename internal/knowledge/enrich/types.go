@@ -27,6 +27,9 @@ const (
 	MaxCorrectionBytes   = 512
 	Version              = "library-v8"
 	FailureInvalidOutput = "invalid_output"
+	// OutputDecoderRevision admits one bounded repair pass after a decoder
+	// change, without discarding already completed same-model derivation.
+	OutputDecoderRevision = 1
 )
 
 var (
@@ -39,12 +42,18 @@ var (
 )
 
 type Progress struct {
-	SourceID   string   `json:"source_id"`
-	ModelKey   string   `json:"model_key"`
-	Next       int      `json:"next"`
-	Complete   bool     `json:"complete"`
-	Suppressed bool     `json:"suppressed,omitempty"`
-	Entities   []string `json:"entities,omitempty"`
+	CompactionParts   int      `json:"compaction_parts,omitempty"`
+	CompactionSlots   int      `json:"compaction_slots,omitempty"`
+	CompactionVersion uint32   `json:"compaction_version,omitempty"`
+	Compaction        string   `json:"compaction,omitempty"`
+	ClaimsLimited     bool     `json:"claims_limited,omitempty"`
+	OutputRevision    uint32   `json:"output_revision,omitempty"`
+	SourceID          string   `json:"source_id"`
+	ModelKey          string   `json:"model_key"`
+	Next              int      `json:"next"`
+	Complete          bool     `json:"complete"`
+	Suppressed        bool     `json:"suppressed,omitempty"`
+	Entities          []string `json:"entities,omitempty"`
 	// Declined is terminal only for this source and ModelKey. Next remains the
 	// last committed prefix; Complete stays false because the tail was not read.
 	Declined    bool   `json:"declined,omitempty"`
@@ -52,6 +61,12 @@ type Progress struct {
 }
 
 type Chunk struct {
+	PreserveClaims     bool
+	SpanBytes          int // Zero retains legacy chunk framing; compaction adapts to admission.
+	CompactionVersion  uint32
+	Compaction         string
+	ClaimsLimited      bool
+	OutputRevision     uint32
 	SourceID, ModelKey string
 	Start, End, Next   int
 	Complete           bool
@@ -61,7 +76,24 @@ type Chunk struct {
 	RetryInvalid       bool
 }
 
+// CompactionBlock retains one source span's generated view. There is no
+// whole-source summary size or fixed maximum number of summaries.
+type CompactionBlock struct {
+	SourceID, ModelKey      string
+	Index, Start, End, Next int
+	Text                    string
+}
+type CompactionPage struct {
+	Blocks  []CompactionBlock
+	Next    int
+	HasMore bool
+}
+type CompactionReader interface {
+	ListSourceCompactions(context.Context, string, int, int) (CompactionPage, error)
+}
+
 type Checkpoint struct {
+	OutputRevision  uint32 `json:"output_revision,omitempty"`
 	After           string `json:"after,omitempty"`
 	ModelKey        string `json:"model_key"`
 	Complete        bool   `json:"complete"` // Legacy observation directory only.
@@ -84,6 +116,7 @@ type Repository interface {
 	PutEnrichmentCheckpoint(context.Context, Checkpoint) error
 	ListInferredKnowledge(context.Context, PageRequest) (knowledge.Page, error)
 	GetInferredKnowledge(context.Context, string) (knowledge.Entity, bool, error)
+	ListInferredFactsPage(context.Context, string, knowledge.FactPageRequest) (knowledge.FactPage, error)
 	FindInferredKnowledge(context.Context, string) ([]knowledge.Entity, error)
 	CorrectInferredFact(context.Context, string, string, string) error
 	DismissInferredFact(context.Context, string, string) error
@@ -138,6 +171,12 @@ func ModelKey(digest string) string {
 }
 
 func ValidProgress(progress Progress) bool {
+	if progress.CompactionParts < 0 || progress.CompactionSlots < progress.CompactionParts || progress.CompactionSlots > capture.MaxObservationTextBytes {
+		return false
+	}
+	if !(progress.CompactionVersion == 1 && progress.CompactionParts > 0 && progress.Compaction == "") && !ValidCompaction(progress.CompactionVersion, progress.Compaction) {
+		return false
+	}
 	if !ValidHash(progress.SourceID) || !ValidHash(progress.ModelKey) || progress.Next < 0 || progress.Next > capture.MaxObservationTextBytes || len(progress.Entities) > MaxSourceEntities || progress.Declined && progress.Complete || progress.FailureCode != "" && (!progress.Declined || progress.FailureCode != FailureInvalidOutput) {
 		return false
 	}
@@ -151,25 +190,44 @@ func ValidProgress(progress Progress) bool {
 	return true
 }
 
+func ValidCompaction(version uint32, text string) bool {
+	if version == 0 {
+		return text == ""
+	}
+	if version != 1 || len(text) == 0 || len(text) > derive.MaxCompactionBlockTextBytes || strings.TrimSpace(text) != text || !utf8.ValidString(text) {
+		return false
+	}
+	for _, r := range text {
+		if r < 0x20 && r != '\n' && r != '\t' || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func ValidCorrection(text string) bool {
 	return len(text) > 0 && len(text) <= MaxCorrectionBytes && strings.TrimSpace(text) == text && utf8.ValidString(text) && !strings.ContainsRune(text, 0)
 }
 
 func NextChunk(text string, start int) (end, next int, complete bool, err error) {
-	if !utf8.ValidString(text) || len(text) > capture.MaxObservationTextBytes || start < 0 || start > len(text) || start < len(text) && !utf8.RuneStart(text[start]) {
+	return NextSizedChunk(text, start, ChunkBytes)
+}
+
+func NextSizedChunk(text string, start, size int) (end, next int, complete bool, err error) {
+	if size < utf8.UTFMax || size > derive.MaxEvidenceItemBytes || !utf8.ValidString(text) || len(text) > capture.MaxObservationTextBytes || start < 0 || start > len(text) || start < len(text) && !utf8.RuneStart(text[start]) {
 		return 0, 0, false, ErrInvalid
 	}
 	if start == len(text) {
 		return start, start, true, nil
 	}
-	end = min(start+ChunkBytes, len(text))
+	end = min(start+size, len(text))
 	for end < len(text) && !utf8.RuneStart(text[end]) {
 		end--
 	}
 	if end == len(text) {
 		return end, end, true, nil
 	}
-	next = end - ChunkOverlap
+	next = max(start+1, end-min(ChunkOverlap, size/4))
 	for next < end && !utf8.RuneStart(text[next]) {
 		next++
 	}

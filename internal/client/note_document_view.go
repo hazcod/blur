@@ -56,10 +56,27 @@ func (d *desktop) invalidateNoteDocumentView() {
 	u.discardPending, u.pendingNew, u.pendingSource = false, false, ""
 }
 
+// A new authored draft has no stored source for a memory mutation to erase.
+// Keep that writing while retiring every read/transfer receipt. Stored note
+// revisions still take the full invalidation path so deletion wins over late
+// reads and saves.
+func (d *desktop) invalidateNoteDocumentMemoryView() {
+	u := &d.noteUI
+	var draft string
+	if u.open && !u.loading && !u.saving && u.document.ID == "" && u.sourceID == "" {
+		draft = u.draft
+	}
+	d.invalidateNoteDocumentView()
+	if strings.TrimSpace(draft) != "" {
+		u.open, u.draft = true, draft
+	}
+}
+
 func (d *desktop) newNoteDocument() {
 	if d.noteUI.saving {
 		return
 	}
+	d.clearRecapSources()
 	if (d.noteUI.open || d.memoryUI.recap.resumeEditor) && d.noteDocumentDirty() {
 		d.noteUI.open, d.memoryUI.recap.resumeEditor = true, false
 		d.noteUI.discardPending, d.noteUI.pendingNew, d.noteUI.pendingSource = true, true, ""
@@ -77,6 +94,7 @@ func (d *desktop) openNoteDocument(sourceID string) {
 	if d == nil || d.client == nil || sourceID == "" || d.noteUI.saving {
 		return
 	}
+	d.clearRecapSources()
 	u := &d.noteUI
 	if (u.open || d.memoryUI.recap.resumeEditor) && d.noteDocumentDirty() {
 		u.open, d.memoryUI.recap.resumeEditor = true, false

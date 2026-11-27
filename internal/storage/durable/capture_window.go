@@ -26,6 +26,13 @@ func (s *Store) ListSourceEvidenceWindow(ctx context.Context, request storage.Ob
 	if ctx == nil || !storage.ValidObservationWindow(request) {
 		return storage.SourceEvidenceWindow{}, &storage.StoreError{Code: storage.Invalid}
 	}
+	if s == nil || s.state == nil {
+		return storage.SourceEvidenceWindow{}, &storage.StoreError{Code: storage.Closed}
+	}
+	// Keep legacy and multipart sources in one stable publication epoch while
+	// their independently bounded read quanta are accumulated and ranked.
+	s.state.publicationMu.RLock()
+	defer s.state.publicationMu.RUnlock()
 	group, cursorPart := request.BeforeSourceID, int64(-1)
 	if group != "" {
 		err := s.view(ctx, func(r bolt.Reader) error {
@@ -59,7 +66,7 @@ func (s *Store) ListSourceEvidenceWindow(ctx context.Context, request storage.Ob
 	}
 	legacyRequest := request
 	legacyRequest.BeforeSourceID = group
-	legacy, err := s.ListObservationWindow(ctx, legacyRequest)
+	legacy, err := s.listObservationWindow(ctx, legacyRequest)
 	if err != nil {
 		return storage.SourceEvidenceWindow{}, err
 	}
@@ -104,138 +111,110 @@ func (s *Store) ListSourceEvidenceWindow(ctx context.Context, request storage.Ob
 func (s *Store) captureWindowItems(ctx context.Context, request storage.ObservationWindowRequest, cursorGroup string, cursorPart int64) ([]sourceWindowItem, bool, bool, error) {
 	var items []sourceWindowItem
 	var pending, more bool
-	err := s.viewWithReadLimit(ctx, bolt.MaxReadTransactionOps, func(reader bolt.Reader) error {
+	start, end := request.Start.UTC(), request.End.UTC()
+	if err := s.view(ctx, func(reader bolt.Reader) error {
 		var err error
 		pending, err = s.captureIndexPendingReader(reader)
+		return err
+	}); err != nil {
+		return nil, false, false, err
+	}
+	cursor := newObservationTimelineScanCursor(start, end)
+	seen := map[string]bool{}
+	candidates := make([]captureWindowCandidate, 0, request.Limit+1)
+	keep := request.Limit + 1
+	for !cursor.done {
+		if err := ctx.Err(); err != nil {
+			return nil, false, false, err
+		}
+		rows, next, err := s.observationTimelineQuantum(ctx, captureTimelineNS, cursor)
 		if err != nil {
-			return err
+			return nil, false, false, err
 		}
-		start, end := request.Start.UTC(), request.End.UTC()
-		lastHour := start.Truncate(time.Hour)
-		seen := map[string]bool{}
-		var candidates []captureWindowCandidate
-		reads, inspected := 0, 0
-		for hour := end.Add(-time.Nanosecond).Truncate(time.Hour); !hour.Before(lastHour); hour = hour.Add(-time.Hour) {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if reads >= maxObservationTimelineReads {
-				return &storage.StoreError{Code: storage.Incomplete}
-			}
-			reads++
-			hourID := observationTimelineHourID(hour)
-			encoded, found, err := s.readIndexValueReader(reader, captureTimelineNS, hourID, 9)
-			if err != nil {
-				return err
-			}
-			if !found {
-				continue
-			}
-			meta, err := decodeObservationTimelineMeta(encoded)
-			clear(encoded)
-			if err != nil {
-				return err
-			}
-			if meta.count > maxObservationTimelineRows-inspected {
-				return &storage.StoreError{Code: storage.Incomplete}
-			}
-			hourCount := 0
-			hourSeen := map[string]bool{}
-			for index := 0; index < meta.pages; index++ {
-				if err := ctx.Err(); err != nil {
-					return err
+		cursor = next
+		if len(rows) == 0 {
+			continue
+		}
+		err = s.viewWithReadLimit(ctx, bolt.MaxReadTransactionOps, func(reader bolt.Reader) error {
+			for _, row := range rows {
+				if seen[row.id] {
+					continue
 				}
-				if reads >= maxObservationTimelineReads {
-					return &storage.StoreError{Code: storage.Incomplete}
-				}
-				reads++
-				encoded, found, err := s.readIndexValueReader(reader, captureTimelineNS, observationTimelinePageID(hourID, index), maxObservationTimelinePage)
+				edition, summary, live, err := s.captureLiveReader(reader, row.id)
 				if err != nil {
 					return err
 				}
-				if !found {
-					return ErrCorrupt
+				if !live {
+					continue
 				}
-				rows, err := decodeObservationTimelinePage(encoded, hourID)
-				clear(encoded)
+				header := summary.Header()
+				if request.AppID != "" && header.AppID() != request.AppID || request.Domain != "" && header.Domain() != request.Domain {
+					continue
+				}
+				excluded := false
+				for _, app := range request.ExcludeAppIDs {
+					excluded = excluded || app == header.AppID()
+				}
+				if excluded {
+					continue
+				}
+				var actual time.Time
+				var budget search.ExactPage
+				hour := row.at.Truncate(time.Hour)
+				err = s.captureSightingInWindowBudget(ctx, reader, row.id, edition, maxTime(start, hour), minTime(end, hour.Add(time.Hour)), &actual, &budget, search.MaxIndexBytes)
+				if errors.Is(err, search.ErrIndexUnavailable) {
+					pending = true
+					continue
+				}
 				if err != nil {
 					return err
 				}
-				hourCount += len(rows)
-				if hourCount > meta.count {
+				if actual.IsZero() {
+					continue
+				}
+				if actual.After(row.at) {
 					return ErrCorrupt
 				}
-				for _, row := range rows {
-					if hourSeen[row.id] {
-						return ErrCorrupt
-					}
-					hourSeen[row.id] = true
-					if seen[row.id] {
-						continue
-					}
-					if reads+4 >= maxObservationTimelineReads {
-						return &storage.StoreError{Code: storage.Incomplete}
-					}
-					reads += 4
-					edition, summary, live, err := s.captureLiveReader(reader, row.id)
-					if err != nil {
-						return err
-					}
-					if !live {
-						continue
-					}
-					header := summary.Header()
-					if request.AppID != "" && header.AppID() != request.AppID || request.Domain != "" && header.Domain() != request.Domain {
-						continue
-					}
-					excluded := false
-					for _, app := range request.ExcludeAppIDs {
-						excluded = excluded || app == header.AppID()
-					}
-					if excluded {
-						continue
-					}
-					var actual time.Time
-					var budget search.ExactPage
-					err = s.captureSightingInWindowBudget(ctx, reader, row.id, edition, maxTime(start, hour), minTime(end, hour.Add(time.Hour)), &actual, &budget, search.MaxIndexBytes)
-					if errors.Is(err, search.ErrIndexUnavailable) {
-						pending = true
-						continue
-					}
-					if err != nil {
-						return err
-					}
-					if actual.IsZero() {
-						continue
-					}
-					if actual.After(row.at) {
-						return ErrCorrupt
-					}
-					seen[row.id] = true
-					if !request.BeforeCapturedAt.IsZero() && (actual.After(request.BeforeCapturedAt) || actual.Equal(request.BeforeCapturedAt) && row.id > cursorGroup) {
-						continue
-					}
-					if actual.Equal(request.BeforeCapturedAt) && row.id == cursorGroup && cursorPart < 0 {
-						continue
-					}
-					row.at = actual
-					candidates = append(candidates, row)
+				seen[row.id] = true
+				if !request.BeforeCapturedAt.IsZero() && (actual.After(request.BeforeCapturedAt) || actual.Equal(request.BeforeCapturedAt) && row.id > cursorGroup) {
+					continue
+				}
+				if actual.Equal(request.BeforeCapturedAt) && row.id == cursorGroup && cursorPart < 0 {
+					continue
+				}
+				if edition.IndexPart == 0 {
+					pending = true
+					more = true
+					continue
+				}
+				if edition.IndexPart < summary.PartCount() {
+					pending = true
+				}
+				row.at = actual
+				candidates = append(candidates, row)
+				if len(candidates) > keep {
+					sort.Slice(candidates, func(i, j int) bool {
+						if !candidates[i].at.Equal(candidates[j].at) {
+							return candidates[i].at.After(candidates[j].at)
+						}
+						return candidates[i].id > candidates[j].id
+					})
+					candidates = candidates[:keep]
 				}
 			}
-			if hourCount != meta.count {
-				return ErrCorrupt
-			}
-			inspected += hourCount
-			if len(candidates) > request.Limit {
-				break
-			}
-		}
-		sort.Slice(candidates, func(i, j int) bool {
-			if !candidates[i].at.Equal(candidates[j].at) {
-				return candidates[i].at.After(candidates[j].at)
-			}
-			return candidates[i].id > candidates[j].id
+			return nil
 		})
+		if err != nil {
+			return nil, false, false, err
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].at.Equal(candidates[j].at) {
+			return candidates[i].at.After(candidates[j].at)
+		}
+		return candidates[i].id > candidates[j].id
+	})
+	err := s.viewWithReadLimit(ctx, bolt.MaxReadTransactionOps, func(reader bolt.Reader) error {
 		bytes := 0
 		for _, candidate := range candidates {
 			edition, summary, live, err := s.captureLiveReader(reader, candidate.id)

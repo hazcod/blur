@@ -118,7 +118,7 @@ final class MeetingAudioSession: @unchecked Sendable {
             }
             guard event.kind == "transcript" || event.kind == "preview", let track = event.track, configuration.tracks.contains(track),
                   let segment = event.segmentID, meetingIdentifier(segment), let revision = event.revision, revision > 0,
-                  let start = event.startMS, let end = event.endMS, start >= 0, end >= start, end <= 86400000,
+                  let start = event.startMS, let end = event.endMS, start >= 0, end >= start, end <= meetingAudioMaximumMilliseconds,
                   let text = event.text, !text.isEmpty, text.utf8.count <= 16384, let final = event.final, final == (event.kind == "transcript"),
                   state == "running" || state == "starting" || state == "stopping" && final else { return true }
             // Admission and enqueue are atomic with epoch invalidation, so a

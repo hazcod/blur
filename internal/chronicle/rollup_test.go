@@ -122,7 +122,7 @@ func TestRollupInputDropsOldestFirstAndKeepsOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(prompt.User, "(earlier hours omitted)") || len(prompt.User) > MaxRollupInputBytes+200 {
+	if !strings.Contains(prompt.User, "(input coverage limited;") || len(prompt.User) > MaxRollupInputBytes+200 {
 		t.Fatalf("prompt marker/size wrong: %d bytes", len(prompt.User))
 	}
 	first := input.Children[0]
@@ -164,7 +164,7 @@ func TestRollupInputHashAndSourceUnion(t *testing.T) {
 		many = append(many, child)
 	}
 	bounded := NewRollupInput(RollupLevelDay, many).SourceIDs()
-	if len(bounded) != MaxRollupSources || !sortedUniqueIDs(bounded) {
+	if len(bounded) != MaxRollupGeneratedSources || !sortedUniqueIDs(bounded) {
 		t.Fatalf("bounded union = %d", len(bounded))
 	}
 	for h := 0; h < 10; h++ {

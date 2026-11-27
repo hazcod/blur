@@ -78,6 +78,7 @@ type Worker struct {
 	// rollupMu serializes rollup passes; rollupBackfilled is guarded by it.
 	rollupMu         sync.Mutex
 	rollupBackfilled bool
+	rollupContinue   bool // guarded by rollupMu; bounded historical work remains
 	rollupKick       chan struct{}
 }
 

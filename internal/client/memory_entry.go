@@ -31,6 +31,7 @@ func (d *desktop) submitMemoryQuery() {
 		return
 	}
 	d.cancelVoiceRecapForNavigation()
+	d.clearRecapSources()
 	u := &d.memoryUI
 	u.meetingDetail, u.answerInput = false, ""
 	d.query = d.askQuestion

@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/localzone"
 	"github.com/hazcod/blur/internal/notes"
 	"github.com/hazcod/blur/internal/tasks"
 	"github.com/hazcod/blur/internal/today"
@@ -255,6 +256,14 @@ func (s *Store) noteSnapshot(ctx context.Context, date, zone string, at time.Tim
 		preview := truncateNoteText(strings.ReplaceAll(strings.ReplaceAll(text, "\n", " "), "\r", " "), today.MaxTextBytes)
 		return today.Build(today.Input{Date: date, Zone: zone, GeneratedAt: at, GenerationID: "note-" + sourceID, Evidence: []today.Evidence{{SourceID: sourceID, At: at, Change: preview, ChangeOrigin: today.ChangeOriginUser}}})
 	}
+	// Earlier builds persisted Go's machine-local alias. Upgrade only a
+	// compatible calendar day, retaining every existing derived item/source.
+	if snapshot.Zone == "Local" && snapshot.Date == date {
+		location, err := time.LoadLocation(zone)
+		if err == nil && snapshot.GeneratedAt.In(location).Format("2006-01-02") == date {
+			snapshot.Zone = zone
+		}
+	}
 	if snapshot.Zone != zone || snapshot.Date != date {
 		return today.Snapshot{}, ErrInvalidNote
 	}
@@ -294,7 +303,7 @@ func (s *Store) noteSnapshot(ctx context.Context, date, zone string, at time.Tim
 }
 
 func localDate(at time.Time) (string, string) {
-	zone := time.Local.String()
+	zone := localzone.Name()
 	location, err := time.LoadLocation(zone)
 	if err != nil {
 		location = time.UTC

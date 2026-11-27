@@ -133,8 +133,8 @@ func (s *Service) captureDocumentCurrent(ctx context.Context) (bool, HealthState
 		segments, err := s.activity.Apply(activity.Event{Kind: activity.Seen, Monotonic: now.Sub(s.activityEpoch).Nanoseconds(), Wall: now.UTC(), SourceID: receipt.SourceID, AppID: summary.Header().AppID(), Domain: summary.Header().Domain()})
 		if err == nil {
 			s.enqueueActivity(segments)
-			if err := s.flushPendingActivity(ctx); err != nil && ctx.Err() != nil {
-				return true, state, false, ctx.Err()
+			if err := s.flushPendingActivity(ctx); err != nil {
+				return true, HealthStorageError, false, activityWriteError(ctx, err)
 			}
 		}
 	}

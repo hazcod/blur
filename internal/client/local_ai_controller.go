@@ -271,7 +271,11 @@ func (c *localAIController) SetBackgroundSummaries(ctx context.Context, enabled 
 	c.mu.Lock()
 	c.settings = settings
 	previous := c.replaceChronicleWorkerLocked()
+	previousLibrary := c.replaceLibraryWorkerLocked()
 	c.mu.Unlock()
+	if previousLibrary != nil {
+		previousLibrary.Close()
+	}
 	if previous != nil {
 		previous.Close()
 	}

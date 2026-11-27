@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -19,6 +21,15 @@ type meetingDeleteNotices struct {
 	clientNoticePort
 	removeError error
 	allCalls    int
+	removeCalls [][]string
+}
+
+func (p *meetingDeleteNotices) Remove(ctx context.Context, ids []string) error {
+	p.removeCalls = append(p.removeCalls, append([]string(nil), ids...))
+	if p.removeError != nil {
+		return p.removeError
+	}
+	return p.clientNoticePort.Remove(ctx, ids)
 }
 
 func (p *meetingDeleteNotices) RemoveAll(ctx context.Context) error {
@@ -73,6 +84,8 @@ func TestDeleteMeetingCancelsNativeLinkedRemindersBeforeErasingEvidence(t *testi
 	if len(port.pending) != 2 {
 		t.Fatal("fixture did not queue both notices", port.pending)
 	}
+	unrelatedID := reminders.NotificationID(unrelated.Item)
+	beforeUnrelated := port.pending[unrelatedID]
 	port.removeError = errors.New("fixture notification removal failed")
 	if err := c.DeleteMeeting(ctx, m.ID); !errors.Is(err, port.removeError) {
 		t.Fatalf("meeting deletion ignored failed native cancellation: %v", err)
@@ -85,6 +98,9 @@ func TestDeleteMeetingCancelsNativeLinkedRemindersBeforeErasingEvidence(t *testi
 	}
 	if log, err := store.Tombstones(ctx); err != nil || len(log) != 0 {
 		t.Fatalf("failed native guard recorded a deletion intent: %+v, %v", log, err)
+	}
+	if port.allCalls != 0 || len(port.pending) != 2 || len(port.removeCalls) != 1 || !slices.Equal(port.removeCalls[0], []string{reminders.NotificationID(linked.Item)}) {
+		t.Fatalf("failed targeted cancellation touched unrelated native notices: calls=%v all=%d pending=%v", port.removeCalls, port.allCalls, port.pending)
 	}
 	port.removeError = nil
 	if err := c.DeleteMeeting(ctx, m.ID); err != nil {
@@ -112,6 +128,9 @@ func TestDeleteMeetingCancelsNativeLinkedRemindersBeforeErasingEvidence(t *testi
 		if notice.ID != reminders.NotificationID(unrelated.Item) {
 			t.Fatalf("deleted meeting reminder remained scheduled: %+v", notice)
 		}
+	}
+	if port.allCalls != 0 || port.queued != 2 || !reflect.DeepEqual(port.pending[unrelatedID], beforeUnrelated) {
+		t.Fatalf("unrelated native reminder was cleared, changed or rebuilt: all=%d queued=%d notice=%+v", port.allCalls, port.queued, port.pending[unrelatedID])
 	}
 	log, err := store.Tombstones(ctx)
 	if err != nil || len(log) != 1 || log[0].SourceID != row.SourceID {

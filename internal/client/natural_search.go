@@ -31,7 +31,7 @@ func (c *Client) naturalSearchPage(ctx context.Context, question string, limit i
 	if err != nil {
 		apps = nil
 	}
-	plan, err := assistant.PlanSearch(question, c.askClock(), apps)
+	plan, err := assistant.PlanSearch(question, c.AskTime(), apps)
 	if err != nil {
 		return naturalPage{}, plan, ErrInvalidRequest
 	}
@@ -48,14 +48,8 @@ func (c *Client) naturalSearchPage(ctx context.Context, question string, limit i
 		if end.Equal(start) {
 			return naturalPage{}, plan, nil
 		}
-		if !end.After(start) || end.Sub(start) > storage.MaxObservationWindow {
+		if !end.After(start) {
 			return naturalPage{}, plan, ErrActivityLimit
-		}
-		if _, ok := c.data.(ActivityData); ok {
-			segments, err = c.windowSegments(ctx, start, end, MaxActivityReportSegments)
-			if err != nil {
-				return naturalPage{}, plan, err
-			}
 		}
 	}
 	if len(plan.Terms) > 0 {
@@ -73,37 +67,98 @@ func (c *Client) browseSearchScope(ctx context.Context, plan assistant.Plan, lim
 	}
 	start, end := plan.Scope.Start, plan.Scope.End
 	if plan.Scope.IsZero() {
-		end = c.askClock()
+		end = c.AskTime()
 		start = end.AddDate(0, 0, -planWindowDays)
 	}
 	if !end.After(start) {
 		return search.ExactPage{}, nil
 	}
+	windows, err := splitSearchWindows(start, end)
+	if err != nil {
+		return search.ExactPage{}, err
+	}
 	filters, err := memoryFilters(plan.AppIDs, plan.Domains)
 	if err != nil {
 		return search.ExactPage{}, err
 	}
-
 	best := map[string]search.IndexHit{}
 	var result search.ExactPage
+	used := 0
 	for _, filter := range filters {
-		page, err := readSourceWindow(ctx, reader, storage.ObservationWindowRequest{Start: start, End: end, AppID: filter.app, Domain: filter.domain, Limit: min(storage.MaxObservationPageRows, limit+1), MaxBytes: MaxSearchBytes, ExcludeAppIDs: []string{appidentity.BundleID}})
-		if err != nil {
-			return search.ExactPage{}, err
-		}
-		if len(page.CapturedAt) != len(page.Sources) {
-			return search.ExactPage{}, ErrInvalidRequest
-		}
-		result.HasMore = result.HasMore || page.HasMore
-		result.IndexingPending = result.IndexingPending || page.Pending
-		for i, o := range page.Sources {
-			at := page.CapturedAt[i]
-			if at.Before(start) || !at.Before(end) || strings.EqualFold(o.AppID(), appidentity.BundleID) || filter.app != "" && o.AppID() != filter.app || filter.domain != "" && o.Domain() != filter.domain {
-				return search.ExactPage{}, ErrInvalidRequest
+		stopped := false
+		selected := map[string]bool{}
+		for window, walkErr := range windows {
+			if walkErr != nil {
+				return search.ExactPage{}, walkErr
 			}
-			hit := search.IndexHit{SourceID: o.SourceID(), Bytes: len(o.Text()) + len(o.AppID()) + len(o.Domain()), CapturedAt: at}
-			if previous, found := best[hit.SourceID]; !found || at.After(previous.CapturedAt) {
-				best[hit.SourceID] = hit
+			if stopped {
+				break
+			}
+			request := storage.ObservationWindowRequest{Start: window.start, End: window.end, AppID: filter.app, Domain: filter.domain, Limit: min(storage.MaxObservationPageRows, limit+1), ExcludeAppIDs: []string{appidentity.BundleID}}
+			for round := 0; round <= limit; round++ {
+				if err := ctx.Err(); err != nil {
+					return search.ExactPage{}, err
+				}
+				request.MaxBytes = MaxSearchBytes - used
+				// The storage window requires room for one maximum-size source.
+				// Stop before issuing an invalid smaller follow-up request. This
+				// allowance is shared by every filter and child window.
+				if request.MaxBytes < storage.MaxObservationTextBytes+128+253 {
+					result.CoverageLimited = true
+					result.HasMore = true
+					stopped = true
+					break
+				}
+				page, err := readSourceWindow(ctx, reader, request)
+				if err != nil {
+					return search.ExactPage{}, err
+				}
+				result.IndexingPending = result.IndexingPending || page.Pending
+				for i, source := range page.Sources {
+					at := page.CapturedAt[i]
+					if at.Before(window.start) || !at.Before(window.end) || strings.EqualFold(source.AppID(), appidentity.BundleID) || filter.app != "" && source.AppID() != filter.app || filter.domain != "" && source.Domain() != filter.domain {
+						return search.ExactPage{}, ErrInvalidRequest
+					}
+					size := len(source.Text()) + len(source.AppID()) + len(source.Domain())
+					used += size
+					hit := search.IndexHit{SourceID: source.SourceID(), Bytes: size, CapturedAt: at}
+					if previous, found := best[hit.SourceID]; !found || at.After(previous.CapturedAt) {
+						best[hit.SourceID] = hit
+					}
+					selected[hit.SourceID] = true
+				}
+				// Bound retained metadata too; each later window is strictly older.
+				ordered := make([]search.IndexHit, 0, len(best))
+				for _, hit := range best {
+					ordered = append(ordered, hit)
+				}
+				sort.Slice(ordered, func(i, j int) bool {
+					if !ordered[i].CapturedAt.Equal(ordered[j].CapturedAt) {
+						return ordered[i].CapturedAt.After(ordered[j].CapturedAt)
+					}
+					return ordered[i].SourceID > ordered[j].SourceID
+				})
+				if len(ordered) > limit+1 {
+					for _, hit := range ordered[limit+1:] {
+						delete(best, hit.SourceID)
+					}
+					result.HasMore = true
+				}
+				if len(selected) > limit {
+					result.HasMore = true
+					stopped = true
+					break
+				}
+				if !page.HasMore {
+					break
+				}
+				result.HasMore = true
+				if page.NextCapturedAt.IsZero() || page.NextSourceID == "" || page.NextCapturedAt.Equal(request.BeforeCapturedAt) && page.NextSourceID == request.BeforeSourceID || round == limit {
+					result.CoverageLimited = true
+					stopped = true
+					break
+				}
+				request.BeforeCapturedAt, request.BeforeSourceID = page.NextCapturedAt, page.NextSourceID
 			}
 		}
 	}
@@ -123,6 +178,9 @@ func (c *Client) browseSearchScope(ctx context.Context, plan assistant.Plan, lim
 	}
 	for _, hit := range result.Hits {
 		result.Bytes += hit.Bytes
+	}
+	if err := ctx.Err(); err != nil {
+		return search.ExactPage{}, err
 	}
 	return result, nil
 }

@@ -3,6 +3,7 @@ package durable
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ func TestCapturePartDeletionPreparesWholeSourceAndCanRejectBeforeIntent(t *testi
 	if err != nil || more || len(ids) < 2 {
 		t.Fatal("fixture", len(ids), more, err)
 	}
+	taskFor := map[string]string{}
 	for i, id := range ids {
 		item := taskFixture(i + 1)
 		item.UserAuthored = false
@@ -31,40 +33,75 @@ func TestCapturePartDeletionPreparesWholeSourceAndCanRejectBeforeIntent(t *testi
 		if err := s.PutTask(ctx, item, 0); err != nil {
 			t.Fatal(err)
 		}
+		taskFor[id] = item.ID
+	}
+	expected := []string{summary.ContentID()}
+	if err := s.view(ctx, func(reader bolt.Reader) error {
+		edition, _, _, err := s.captureEditionReader(reader, summary.ContentID())
+		if err != nil {
+			return err
+		}
+		for index, id := range ids {
+			head, err := s.captureRangeHead(reader, summary.ContentID(), edition.Publication, int64(index))
+			if err != nil {
+				return err
+			}
+			for head != "" {
+				expected = append(expected, head)
+				mapping, _, err := s.captureIndexPartReader(reader, head)
+				if err != nil {
+					return err
+				}
+				head = mapping.Next
+			}
+			expected = append(expected, id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkTasks := func(id string, items []tasks.Item) {
+		t.Helper()
+		if !slices.Contains(expected, id) {
+			t.Fatal("preparation invented a source", id)
+		}
+		if taskID, canonical := taskFor[id]; canonical {
+			if len(items) != 1 || items[0].ID != taskID || !items[0].References(id) {
+				t.Fatal("canonical task snapshot lost exact membership", id, items)
+			}
+		} else if len(items) != 0 {
+			t.Fatal("parent/range invented a task reference", id, items)
+		}
 	}
 	refusal := errors.New("native cleanup unavailable")
-	prepared := 0
+	var prepared []string
 	err = s.DeleteSourceRecordWithPrepare(ctx, ids[1], func(id string, items []tasks.Item) error {
-		prepared++
+		prepared = append(prepared, id)
+		checkTasks(id, items)
 		if id == ids[0] {
-			if len(items) != 1 {
-				t.Error("part task snapshot missing")
-			}
 			return refusal
 		}
 		return nil
 	})
-	if !errors.Is(err, refusal) || prepared != 2 {
+	if !errors.Is(err, refusal) || !slices.Equal(prepared, expected[:slices.Index(expected, ids[0])+1]) {
 		t.Fatal("preparation did not fail closed", prepared, err)
 	}
 	if _, found, err := s.GetCapture(ctx, summary.ContentID()); err != nil || !found {
 		t.Fatal("native refusal deleted source", err)
 	}
-	seen := map[string]int{}
+	prepared = nil
 	err = s.DeleteSourceRecordWithPrepare(ctx, ids[1], func(id string, items []tasks.Item) error {
-		seen[id]++
-		if id != summary.ContentID() && len(items) != 1 {
-			t.Error("missing sibling task")
-		}
+		prepared = append(prepared, id)
+		checkTasks(id, items)
 		return nil
 	})
-	if err != nil || len(seen) != 1+len(ids) {
-		t.Fatal("whole-source preparation missing", seen, err)
+	if err != nil || !slices.Equal(prepared, expected) {
+		t.Fatal("whole-source preparation missing or duplicated authority", prepared, expected, err)
 	}
 	if _, found, err := s.GetCapture(ctx, summary.ContentID()); err != nil || found {
 		t.Fatal("part delete retained document", err)
 	}
-	for _, id := range ids {
+	for _, id := range expected[1:] {
 		if _, found, err := s.GetSourceEvidence(ctx, id); err != nil || found {
 			t.Fatal("part source survived", err)
 		}

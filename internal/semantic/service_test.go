@@ -377,3 +377,40 @@ func TestServiceConcurrentCloseCancelsAndDrainsQuery(t *testing.T) {
 		t.Fatalf("query not canceled: %v", err)
 	}
 }
+
+func TestServiceYearScopeResolvesActualVisitInBoundedWindows(t *testing.T) {
+	ctx := context.Background()
+	store := serviceStore(t)
+	o, _ := capture.SanitizeObservation("reader.app", "work.example", "Mira owns the rollback.", 512)
+	first := time.Date(2023, 7, 1, 9, 0, 0, 0, time.UTC)
+	visit := time.Date(2024, 6, 15, 10, 0, 0, 0, time.UTC)
+	if err := store.PutObservationAt(ctx, o, first); err != nil {
+		t.Fatal(err)
+	}
+	e := &serviceEmbedder{}
+	s, err := semantic.NewService(store, store, e, semantic.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.Start()
+	waitServiceReady(t, s, 1)
+	for _, at := range []time.Time{visit, time.Date(2025, 1, 2, 9, 0, 0, 0, time.UTC)} {
+		if err := store.RecordObservationSighting(ctx, o, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	query := semantic.Query{Limit: 5, AppIDs: []string{"reader.app"}, Domains: []string{"work.example"}, Start: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), End: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
+	hits, err := s.Search(ctx, "who handles reverting the deployment", query)
+	if err != nil || len(hits) != 1 || hits[0].SourceID != o.ContentID() || !hits[0].CapturedAt.Equal(visit) {
+		t.Fatalf("year visit lost: %+v %v", hits, err)
+	}
+	query.AppIDs = []string{"other.app"}
+	hits, err = s.Search(ctx, "reverting the deployment", query)
+	if err != nil || len(hits) != 0 {
+		t.Fatalf("wrong app: %+v %v", hits, err)
+	}
+	if e.documents.Load() != 1 {
+		t.Fatalf("reembedded unchanged source %d times", e.documents.Load())
+	}
+}

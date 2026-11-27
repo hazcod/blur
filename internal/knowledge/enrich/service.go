@@ -25,6 +25,11 @@ type Generator interface {
 	Identity(context.Context) (string, error)
 }
 
+type compactingGenerator interface {
+	CountCompactedInputTokens(context.Context, []derive.Evidence, int) (int, error)
+	GenerateCompacted(context.Context, []derive.Evidence, int) ([]derive.Proposal, string, error)
+}
+
 type Policy interface {
 	Effective(context.Context) (power.Effective, error)
 }
@@ -74,6 +79,7 @@ type Service struct {
 	started, closed bool
 	runCancel       context.CancelFunc
 	pending         map[string]bool
+	pendingAfter    string // Round-robin admission only; source cursors remain durable.
 	repair          bool
 	retryInvalid    bool
 	repairAfterPass bool
@@ -175,6 +181,7 @@ func (s *Service) Invalidate() {
 		s.runCancel()
 	}
 	clear(s.pending)
+	s.pendingAfter = ""
 	s.repair = true
 	s.status.Complete = false
 	s.mu.Unlock()
@@ -393,8 +400,23 @@ func (s *Service) backfill(parent context.Context, repairAdmitted *bool) (result
 	if err != nil {
 		return err
 	}
-	if !found || checkpoint.ModelKey != key {
+	sameModelCheckpoint := found && checkpoint.ModelKey == key
+	if !sameModelCheckpoint {
 		checkpoint = Checkpoint{ModelKey: key}
+	}
+	if checkpoint.OutputRevision < OutputDecoderRevision {
+		if sameModelCheckpoint && checkpoint.CoverageLimited {
+			// Revisit durable invalid-output receipts once with this decoder.
+			// process skips complete sources and native refusals, preserving
+			// their work and the ordinary four-chunk inference quantum.
+			checkpoint.After, checkpoint.CaptureAfter = "", ""
+			checkpoint.Complete, checkpoint.CaptureComplete = false, false
+			checkpoint.CoverageLimited = false
+		}
+		checkpoint.OutputRevision = OutputDecoderRevision
+		if err := s.commit(epoch, func() error { return s.repository.PutEnrichmentCheckpoint(ctx, checkpoint) }); err != nil {
+			return err
+		}
 	}
 	if capturesDirty {
 		checkpoint.CaptureComplete = false
@@ -440,32 +462,61 @@ func (s *Service) backfill(parent context.Context, repairAdmitted *bool) (result
 	for id := range s.pending {
 		pending = append(pending, id)
 	}
+	pendingAfter := s.pendingAfter
 	s.mu.Unlock()
 	sort.Strings(pending)
-	for _, id := range pending {
-		complete, err := s.process(ctx, epoch, key, digest, id, &budget, checkpoint.RetryInvalid)
+	// Give independently captured work a turn before revisiting a large
+	// source. A bounded incremental share also reserves service for durable
+	// legacy and multipart directories under a continuous capture stream.
+	pivot := sort.Search(len(pending), func(i int) bool { return pending[i] > pendingAfter })
+	pending = append(pending[pivot:], pending[:pivot]...)
+	pendingLimit := 2
+	_, hasCaptureDirectory := s.sources.(storage.CaptureEvidencePageReader)
+	if checkpoint.Complete && (checkpoint.CaptureComplete || !hasCaptureDirectory) {
+		// No competing directory work is known, so spend otherwise idle
+		// capacity on the incremental queue without changing its rotation.
+		pendingLimit = budget
+	}
+	pendingUsed := 0
+	for visited, id := range pending {
+		if visited >= 32 || pendingUsed >= pendingLimit {
+			break
+		}
+		slice := 1
+		complete, err := s.process(ctx, epoch, key, digest, id, &slice, checkpoint.RetryInvalid)
+		s.mu.Lock()
+		if ctx.Err() == nil {
+			s.pendingAfter = id
+		}
+		s.mu.Unlock()
+		used := 1 - slice
+		pendingUsed += used
+		budget -= used
 		if err != nil {
 			return err
 		}
-		if complete {
-			if limited := s.Status().CoverageLimited; limited != checkpoint.CoverageLimited {
-				checkpoint.CoverageLimited = limited
-				if err := s.commit(epoch, func() error { return s.repository.PutEnrichmentCheckpoint(ctx, checkpoint) }); err != nil {
-					return err
-				}
+		if limited := s.Status().CoverageLimited; limited != checkpoint.CoverageLimited {
+			checkpoint.CoverageLimited = limited
+			if err := s.commit(epoch, func() error { return s.repository.PutEnrichmentCheckpoint(ctx, checkpoint) }); err != nil {
+				return err
 			}
+		}
+		if complete {
 			s.mu.Lock()
 			delete(s.pending, id)
 			s.mu.Unlock()
-		} else {
-			return ErrMoreWork
-		}
-		if budget == 0 {
-			return ErrMoreWork
 		}
 	}
 	if checkpoint.Complete {
 		return s.backfillCaptures(ctx, epoch, key, digest, &checkpoint, &budget)
+	}
+	// Appended capture parts must advance even while an old legacy source
+	// needs many quanta. One chunk here leaves at least one for legacy work.
+	captureSlice := 1
+	captureErr := s.backfillCaptures(ctx, epoch, key, digest, &checkpoint, &captureSlice)
+	budget -= 1 - captureSlice
+	if captureErr != nil && !errors.Is(captureErr, ErrMoreWork) {
+		return captureErr
 	}
 	// Bound scanning too: already-covered captures require no model invocation.
 	for scanned := 0; scanned < 32; {
@@ -536,7 +587,7 @@ func (s *Service) backfill(parent context.Context, repairAdmitted *bool) (result
 func (s *Service) backfillCaptures(ctx context.Context, epoch uint64, key, digest string, checkpoint *Checkpoint, budget *int) error {
 	reader, ok := s.sources.(storage.CaptureEvidencePageReader)
 	if !ok || checkpoint.CaptureComplete {
-		if checkpoint.RetryInvalid {
+		if checkpoint.Complete && checkpoint.RetryInvalid {
 			checkpoint.RetryInvalid = false
 			return s.commit(epoch, func() error { return s.repository.PutEnrichmentCheckpoint(ctx, *checkpoint) })
 		}
@@ -593,7 +644,15 @@ func (s *Service) backfillCaptures(ctx context.Context, epoch uint64, key, diges
 		}
 		if !page.HasMore {
 			checkpoint.CaptureComplete = true
-			checkpoint.RetryInvalid = false
+			if checkpoint.Complete {
+				checkpoint.RetryInvalid = false
+			}
+			if !checkpoint.Complete && checkpoint.CaptureAfter == "" {
+				// An empty directory changed no source cursor. Carry this
+				// no-work result into the next legacy checkpoint rather than
+				// publishing another indistinguishable repair-reset receipt.
+				return nil
+			}
 			return s.commit(epoch, func() error { return s.repository.PutEnrichmentCheckpoint(ctx, *checkpoint) })
 		}
 		if len(page.Sources) == 0 {
@@ -611,8 +670,14 @@ func (s *Service) process(ctx context.Context, epoch uint64, key, digest, id str
 	if err != nil {
 		return false, err
 	}
-	retrying := progress.ModelKey == key && progress.Declined && progress.FailureCode == FailureInvalidOutput && retryInvalid
-	if found && (progress.Suppressed || progress.ModelKey == key && (progress.Complete || progress.Declined && !retrying)) {
+	retrying := progress.ModelKey == key && progress.Declined && progress.FailureCode == FailureInvalidOutput && (retryInvalid || progress.OutputRevision < OutputDecoderRevision)
+	_, compacts := s.generator.(compactingGenerator)
+	if found && (progress.Suppressed && !compacts || progress.ModelKey == key && (progress.Complete || progress.Declined && !retrying)) {
+		if progress.ModelKey == key && progress.ClaimsLimited {
+			s.mu.Lock()
+			s.status.CoverageLimited = true
+			s.mu.Unlock()
+		}
 		if !progress.Suppressed && progress.ModelKey == key && progress.Declined {
 			s.recordDeclined(false, progress.FailureCode)
 		}
@@ -646,30 +711,55 @@ func (s *Service) process(ctx context.Context, epoch uint64, key, digest, id str
 		if err != nil {
 			return false, err
 		}
-		chunk := Chunk{SourceID: id, ModelKey: key, Start: start, End: end, Next: next, Complete: complete, RetryInvalid: retrying}
-		text := strings.TrimSpace(source.Text()[start:end])
-		if text != "" && source.AppID() != appidentity.BundleID {
-			input := []derive.Evidence{{SourceID: id, Text: text}}
-			tokens, err := s.generator.CountInputTokens(ctx, input)
+		chunk := Chunk{SourceID: id, ModelKey: key, Start: start, End: end, Next: next, Complete: complete, RetryInvalid: retrying, OutputRevision: OutputDecoderRevision}
+		compactor, compacting := s.generator.(compactingGenerator)
+		tokens := 0
+		outputTokens := derive.MaxOutputTokens
+		if compacting && source.AppID() != appidentity.BundleID {
+			chunk, tokens, outputTokens, err = s.admitCompaction(ctx, compactor, policy, source.Text(), chunk)
 			if err != nil {
 				return false, err
 			}
-			if tokens < 1 || tokens > derive.MaxInputTokens {
+			end, next, complete = chunk.End, chunk.Next, chunk.Complete
+			if mode, ok := compactor.(interface{ ExtractsClaims() bool }); ok {
+				chunk.PreserveClaims = !mode.ExtractsClaims()
+			}
+		}
+		text := strings.TrimSpace(source.Text()[start:end])
+		if text != "" && source.AppID() != appidentity.BundleID {
+			input := []derive.Evidence{{SourceID: id, Text: text}}
+			if !compacting {
+				tokens, err = s.generator.CountInputTokens(ctx, input)
+			}
+			if err != nil {
+				return false, err
+			}
+			if tokens < 1 || tokens > model.ContextTokenLimit-model.PromptTemplateReserve-outputTokens {
 				return false, ErrCapacity
 			}
 			capacity, err := model.RuntimeContextLimit(ctx, s.generator, model.ContextTokenLimit)
 			if err != nil {
 				return false, err
 			}
-			if tokens+derive.MaxOutputTokens+model.PromptTemplateReserve > capacity {
+			if tokens+outputTokens+model.PromptTemplateReserve > capacity {
 				return false, ErrCapacity
 			}
 			duration := min(policy.MaxBackgroundDuration, time.Minute)
-			if !policy.AllowBackgroundAI(power.LocalProvider, tokens+derive.MaxOutputTokens, duration) {
+			if !policy.AllowBackgroundAI(power.LocalProvider, tokens+outputTokens, duration) {
 				return false, ErrPolicy
 			}
 			jobCtx, cancel := context.WithTimeout(ctx, duration)
-			chunk.Proposals, err = s.generator.Generate(jobCtx, input)
+			if compacting {
+				chunk.Proposals, chunk.Compaction, err = compactor.GenerateCompacted(jobCtx, input, outputTokens)
+				if err == nil {
+					chunk.CompactionVersion = 1
+					if !ValidCompaction(1, chunk.Compaction) {
+						err = derive.ErrInvalid
+					}
+				}
+			} else {
+				chunk.Proposals, err = s.generator.Generate(jobCtx, input)
+			}
 			declined := errors.Is(err, model.ErrAppleRefused)
 			invalid := invalidOutput(err)
 			if err == nil && derive.ValidateSuggestions(input, chunk.Proposals) != nil {
@@ -697,6 +787,7 @@ func (s *Service) process(ctx context.Context, epoch uint64, key, digest, id str
 			}
 			if chunk.Declined {
 				chunk.Proposals = nil
+				chunk.Compaction, chunk.CompactionVersion = "", 0
 			} else if derive.ValidateSuggestions(input, chunk.Proposals) != nil {
 				return false, ErrInvalid
 			}
@@ -713,6 +804,17 @@ func (s *Service) process(ctx context.Context, epoch uint64, key, digest, id str
 		}
 		if err != nil {
 			return false, err
+		}
+		if chunk.CompactionVersion != 0 {
+			stored, _, readErr := s.repository.GetEnrichmentProgress(ctx, id)
+			if readErr != nil {
+				return false, readErr
+			}
+			if stored.ClaimsLimited {
+				s.mu.Lock()
+				s.status.CoverageLimited = true
+				s.mu.Unlock()
+			}
 		}
 		*budget--
 		if chunk.Declined {

@@ -14,11 +14,11 @@ func (s *Store) ensureCapturePartIndex(ctx context.Context) error {
 	// completed initialization with reads so ready stores reopen unchanged.
 	ready := false
 	err := s.view(ctx, func(reader bolt.Reader) error {
-		stateFound, err := s.capturePartIndexStateReader(reader)
+		format, err := s.capturePartIndexStateReader(reader)
 		if err != nil {
 			return err
 		}
-		_, backfillFound, err := s.captureIndexBackfillReader(reader)
+		backfill, backfillFound, err := s.captureIndexBackfillReader(reader)
 		if err != nil {
 			return err
 		}
@@ -27,7 +27,7 @@ func (s *Store) ensureCapturePartIndex(ctx context.Context) error {
 			err = ErrCorrupt
 		}
 		clear(marker)
-		ready = stateFound && backfillFound && timelineFound
+		ready = format == captureIndexContentFormat && backfillFound && backfill.Format == captureIndexContentFormat && timelineFound
 		return err
 	})
 	if err != nil || ready {
@@ -35,16 +35,16 @@ func (s *Store) ensureCapturePartIndex(ctx context.Context) error {
 	}
 	return s.captureUpdate(ctx, func(tx *Tx) error {
 		scoped := tx.capturePartSearch()
-		found, err := s.capturePartIndexStateReader(tx.writer)
+		format, err := s.capturePartIndexStateReader(tx.writer)
 		if err != nil {
 			return err
 		}
-		if !found {
-			if err := scoped.writeSearchIndexStateLocked(); err != nil {
+		if format != captureIndexContentFormat {
+			if err := scoped.putSearchIndexValueLocked(scoped.store.exactStateKey(), "search-index-state-v1", []byte{captureIndexContentFormat, 1}, format != 0); err != nil {
 				return err
 			}
 		}
-		_, exists, err := s.captureIndexBackfillReader(tx.writer)
+		backfill, exists, err := s.captureIndexBackfillReader(tx.writer)
 		if err != nil {
 			return err
 		}
@@ -57,42 +57,39 @@ func (s *Store) ensureCapturePartIndex(ctx context.Context) error {
 			return ErrCorrupt
 		}
 		clear(marker)
-		if exists && timelineFound {
+		if exists && backfill.Format == captureIndexContentFormat && format == captureIndexContentFormat && timelineFound {
 			return nil
 		}
 		catalog, err := s.captureCatalogReader(tx.writer, "published")
 		if err != nil {
 			return err
 		}
-		if err := tx.capturePutJSONLocked(captureIndexBackfillKey, captureIndexBackfill{captureIndexVersion, catalog.Head}, 256); err != nil {
+		if err := tx.capturePutJSONLocked(captureIndexBackfillKey, captureIndexBackfill{Version: captureIndexVersion, Next: catalog.Head, Format: captureIndexContentFormat}, 256); err != nil {
 			return err
 		}
 		return tx.putIndexValueLocked(captureNS, captureTimelineMarkerID, []byte{1})
 	})
 }
 
-// The capture-part index is not rebuilt on a content-version bump: its parts
-// are indexed incrementally from retained sources, so a marker written at the
-// structure version stays valid. Parts indexed before version 5 keep their
-// earlier tokenization (no diacritic folding, no possessive handling) until
-// they are indexed again.
-func (s *Store) capturePartIndexStateReader(reader bolt.Reader) (bool, error) {
+// Older content formats remain structurally readable while the durable
+// backfill and part queue migrate their derived tokens in the background.
+func (s *Store) capturePartIndexStateReader(reader bolt.Reader) (int, error) {
 	index := s.capturePartIndex()
 	key := index.exactStateKey()
 	envelope, found, err := reader.Get(key)
 	if err != nil {
-		return false, mapStorePhysicalError(err)
+		return 0, mapStorePhysicalError(err)
 	}
 	if !found {
-		return false, nil
+		return 0, nil
 	}
 	plain, err := index.open(key, index.exactNamespace("search-index-state-v1"), envelope)
 	clear(envelope)
 	defer clear(plain)
-	if err != nil || len(plain) != 2 || plain[0] < searchIndexStructureVersion || plain[0] > searchIndexFormatVersion || plain[1] != 1 {
-		return false, ErrCorrupt
+	if err != nil || len(plain) != 2 || plain[0] < searchIndexStructureVersion || plain[0] > captureIndexContentFormat || plain[1] != 1 {
+		return 0, ErrCorrupt
 	}
-	return true, nil
+	return int(plain[0]), nil
 }
 
 func (s *Store) captureIndexPendingReader(reader bolt.Reader) (bool, error) {
@@ -188,6 +185,7 @@ func (s *Store) captureMemberPartReader(reader bolt.Reader, edition captureEditi
 type captureIndexSnapshot struct {
 	id, publication string
 	index           int64
+	format          int
 	part            capture.CapturePart
 	summary         capture.CaptureSummary
 	live            bool
@@ -207,10 +205,8 @@ func (s *Store) loadCaptureIndexSnapshot(ctx context.Context) (captureIndexSnaps
 		if r.Version == 0 || !r.IndexQueued || r.IndexPrev != "" {
 			return ErrCorrupt
 		}
-		snapshot = captureIndexSnapshot{id: root.Head, publication: r.Publication, index: r.IndexPart, summary: summary, live: live}
-		if live && r.IndexPart < summary.PartCount() {
-			snapshot.part, err = s.captureMemberPartReader(reader, r, summary, r.IndexPart)
-		}
+		snapshot = captureIndexSnapshot{id: root.Head, publication: r.Publication, index: r.IndexPart, format: r.IndexFormat, summary: summary, live: live}
+
 		return err
 	})
 	return snapshot, err
@@ -241,95 +237,25 @@ func (s *Store) IndexPendingCaptures(ctx context.Context, maxBatches int) (bool,
 			}
 			continue // a backfill step skipped a suppressed edition
 		}
-		var terms map[string]byte
-		var ordered []string
-		sourceBytes := 0
-		if snapshot.part.Text() != "" {
-			terms, err = searchFieldTermsLimit(snapshot.part.Text(), snapshot.summary.Header().AppID(), snapshot.summary.Header().Domain(), "", capture.MaxCapturePartTextBytes+128+253)
-			if err != nil {
-				return true, err
-			}
-			ordered = sortedTermKeys(terms)
-			sourceBytes = len(snapshot.part.Text()) + len(snapshot.summary.Header().AppID()) + len(snapshot.summary.Header().Domain())
-		}
-		err = s.captureUpdate(ctx, func(tx *Tx) error {
-			r, summary, live, err := s.captureLiveReader(tx.writer, snapshot.id)
-			if err != nil {
-				return err
-			}
-			if r.Version == 0 || !r.IndexQueued || r.Publication != snapshot.publication || r.IndexPart != snapshot.index {
-				return nil
-			}
-			if !live {
-				if err := tx.unlinkCaptureIndexLocked(snapshot.id, &r); err != nil {
-					return err
-				}
-				return tx.capturePutJSONLocked("edition:"+snapshot.id, r, captureMetaBytes)
-			}
-			if r.IndexPart < summary.PartCount() {
-				if snapshot.part.Text() == "" {
-					return nil
-				} // a newly admitted visit revived this edition
-				if err := tx.indexCapturePartBatchLocked(snapshot.id, &r, snapshot.part, summary, sourceBytes, terms, ordered); err != nil {
-					return err
-				}
-			}
-			if err := tx.indexNextCaptureVisitLocked(snapshot.id, &r, summary.Header().FamilyID()); err != nil {
-				return err
-			}
-			if r.IndexPart == summary.PartCount() && r.IndexVisits == r.Visits {
-				if err := tx.unlinkCaptureIndexLocked(snapshot.id, &r); err != nil {
-					return err
-				}
-			}
-			return tx.capturePutJSONLocked("edition:"+snapshot.id, r, captureMetaBytes)
-		})
-		if err != nil {
+		if err := s.indexCaptureStreamRound(ctx, snapshot); err != nil {
 			return true, err
 		}
 	}
 	return s.CaptureIndexPending(ctx)
 }
-func (tx *Tx) indexCapturePartBatchLocked(id string, r *captureEditionRecord, part capture.CapturePart, summary capture.CaptureSummary, sourceBytes int, terms map[string]byte, ordered []string) error {
-	sourceID := capturePartSourceID(id, r.Publication, r.IndexPart)
+func (tx *Tx) initializeCapturePartIndexLocked(sourceID string, sourceBytes int, mapping captureIndexPart) error {
 	scoped := tx.capturePartSearch()
 	key := scoped.store.searchReverseKey(sourceID)
 	defer clear(key)
-	root, found, err := scoped.searchIndexPlainLocked(key, "search-index-reverse-v4")
-	clear(root)
+	encoded, err := encodePagedSearchReverse(pagedSearchProgress{}, sourceBytes, nil)
 	if err != nil {
 		return err
 	}
-	mapping, mapped, err := tx.store.captureIndexPartReader(tx.writer, sourceID)
-	if err != nil {
+	defer clear(encoded)
+	if err := scoped.putSearchIndexValueLocked(key, "search-index-reverse-v4", encoded, false); err != nil {
 		return err
 	}
-	expected := captureIndexPart{captureIndexVersion, id, r.Publication, r.IndexPart, len(part.Text())}
-	if found != mapped || mapped && mapping != expected {
-		return ErrCorrupt
-	}
-	if !found {
-		encoded, err := encodePagedSearchReverse(pagedSearchProgress{}, sourceBytes, nil)
-		if err != nil {
-			return err
-		}
-		if err := scoped.putSearchIndexValueLocked(key, "search-index-reverse-v4", encoded, false); err != nil {
-			clear(encoded)
-			return err
-		}
-		clear(encoded)
-		if err := tx.capturePutJSONLocked("index-part:"+sourceID, expected, 512); err != nil {
-			return err
-		}
-	}
-	done, err := scoped.indexSearchTermsBatchLocked(sourceID, summary.Header().AppID(), summary.Header().Domain(), sourceBytes, terms, ordered)
-	if err != nil {
-		return err
-	}
-	if done {
-		r.IndexPart++
-	}
-	return nil
+	return tx.capturePutJSONLocked("index-part:"+sourceID, mapping, 768)
 }
 
 // A part's reverse pages carry their own bounded erasure cursor. The caller

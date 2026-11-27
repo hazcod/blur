@@ -35,7 +35,18 @@ func (c *Client) RetrieveSources(ctx context.Context, plan assistant.Plan, ids [
 		return assistant.Retrieval{}, ErrMemoryChanging
 	}
 	var result assistant.Retrieval
-	if plan.SubjectFollowup {
+	var publication assistant.PublicationGuard
+	recordingContext := false
+	if plan.ContextFollowup {
+		var err error
+		result, recordingContext, err = c.citedRecordingContext(ctx, plan, ids)
+		if err != nil {
+			return assistant.Retrieval{}, err
+		}
+	}
+	if recordingContext {
+		// The recording context has already selected exact current originals.
+	} else if plan.SubjectFollowup {
 		// Factual questions may need a source never cited in the preceding
 		// answer. The planner pins the named subject and current filters;
 		// MatchOnly forbids an unrelated recent-source fallback.
@@ -53,7 +64,7 @@ func (c *Client) RetrieveSources(ctx context.Context, plan assistant.Plan, ids [
 			// Current library corrections remain authoritative for unbounded
 			// subject questions; they cannot establish what happened inside a
 			// newly requested historical window.
-			derived, err := c.inferredEntityEvidence(ctx, plan)
+			derived, err := c.inferredEntityEvidence(ctx, plan, &result.Diagnosis)
 			if err != nil {
 				return assistant.Retrieval{}, err
 			}
@@ -75,7 +86,8 @@ func (c *Client) RetrieveSources(ctx context.Context, plan assistant.Plan, ids [
 		if err != nil {
 			return assistant.Retrieval{}, err
 		}
-		if handled && direct.Text != "" {
+		publication = direct.Publication
+		if handled && !direct.InsufficientEvidence && direct.Text != "" {
 			text := "Recorded foreground activity: " + direct.Text + " This measures saved app activity, not attention or productivity. It cannot account for periods when capture was paused or unavailable."
 			result.Evidence = []assistant.Evidence{{SourceID: syntheticID("activity-followup", plan.Question, plan.Scope.Start.UTC().Format(time.RFC3339Nano), plan.Scope.End.UTC().Format(time.RFC3339Nano), direct.Text), AppID: "blur.activity", AppName: "Recorded activity", Text: text}}
 		}
@@ -141,10 +153,16 @@ func (c *Client) RetrieveSources(ctx context.Context, plan assistant.Plan, ids [
 	if !c.MemoryReadCurrent(epoch) {
 		return assistant.Retrieval{}, ErrMemoryChanging
 	}
+	if publication != nil && !publication.Publish(func() {}) {
+		return assistant.Retrieval{}, ErrMemoryChanging
+	}
 	return result, nil
 }
 
 func followupSourceInScope(item assistant.Evidence, plan assistant.Plan) bool {
+	if !technicalSubjectSupport(plan.TechnicalSubjects, item.Text, item.AppName) {
+		return false
+	}
 	if len(plan.AppIDs) > 0 && !slices.ContainsFunc(plan.AppIDs, func(id string) bool { return strings.EqualFold(id, item.AppID) }) {
 		return false
 	}

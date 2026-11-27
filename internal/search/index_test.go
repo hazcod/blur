@@ -27,10 +27,10 @@ func TestNormalizeTokensFoldsDiacritics(t *testing.T) {
 		{"Ångström", "angstrom"},
 		{"São Paulo", "paulo,sao"},
 		{"Dvořák", "dvorak"},
-		{"Łódź", "łodz"}, // ł has no decomposition: only combining marks are folded
+		{"Łódź", "lodz"},
 		{"İstanbul", "istanbul"},
 		{"re\u0301sume\u0301", "resume"}, // already decomposed input
-		{"straße", "straße"},             // no decomposition: left alone
+		{"straße", "strasse"},
 		{"naïve café", "cafe,naive"},
 		{"CV_Youssef_résumé.pdf", "cv,pdf,resume,youssef"},
 		{"中文 日本語", "中文,日本語"},
@@ -92,6 +92,30 @@ func TestNormalizeTokensIsIdempotent(t *testing.T) {
 			if err != nil || len(single) != 1 || single[0] != term {
 				t.Errorf("token %q of %q does not re-normalize to itself: %q %v", term, in, single, err)
 			}
+		}
+	}
+}
+
+func TestNormalizeTokensFoldsLettersWithoutDecomposition(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"Søren", "soren"}, {"SØREN", "soren"}, {"Łukasz", "lukasz"}, {"Strauß", "strauss"},
+		{"STRASSE", "strasse"}, {"Straße", "strasse"}, {"Æsir", "aesir"}, {"Œuvre", "oeuvre"},
+		{"Đorđe", "dorde"}, {"Þór Ðegn", "degn,thor"}, {"Mħarr", "mharr"}, {"Ismaıl", "ismail"},
+		{"Ŧ", "t"}, {"Ŋ", "n"}, {"Ĳssel", "ijssel"}, {"Kolŀlegi", "kolllegi"}, {"ſea", "sea"},
+		{"ẞ", "ss"},
+		{"Müller", "muller"},                                           // no umlaut transliteration
+		{"й", "й"}, {"か\u3099", "が"}, {"한국어", "한국어"}, {"क\u093f", "क"}, // vowel sign is not a letter: unchanged by the fold
+		{"Dima's Søren's", "dima,soren"}, {"cafe", "cafe"},
+	} {
+		got, err := NormalizeTokens(tc.in, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(got, ",") != tc.want {
+			t.Errorf("NormalizeTokens(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		if len(got) == 1 && !strings.Contains(tc.in, "'") && !strings.Contains(tc.in, "\u093f") && FoldWord(tc.in) != got[0] {
+			t.Errorf("FoldWord(%q) = %q, want %q", tc.in, FoldWord(tc.in), got[0])
 		}
 	}
 }

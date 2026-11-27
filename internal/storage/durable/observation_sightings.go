@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -471,7 +472,11 @@ func (tx *Tx) changeSightingMonthLocked(id string, at time.Time, remove bool) er
 func (tx *Tx) deleteIndexValueLocked(namespace, id string) error {
 	key := tx.store.logicalKey(groupRecord, kindIndex, "index:"+namespace, id)
 	defer clear(key)
-	return tx.deleteEntryLocked(key)
+	err := tx.deleteEntryLocked(key)
+	if err == nil && strings.HasPrefix(namespace, "meeting-") {
+		tx.voiceDirty = true
+	}
+	return err
 }
 
 // changeTimelineVisitLocked changes one authenticated source/hour row. The

@@ -6,9 +6,11 @@ import (
 	"errors"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -83,7 +85,7 @@ func TestMeetingAudioBatchPreservesIntegerBoundsAndRejectsUnsafeEvents(t *testin
 	for _, data := range []string{
 		strings.Replace(meetingAudioFinalFixture, `"session_id":"synthetic"`, `"session_id":"late"`, 1),
 		strings.Replace(meetingAudioFinalFixture, `"final":true,`, "", 1),
-		strings.Replace(meetingAudioFinalFixture, `"end_ms":100`, `"end_ms":86400001`, 1),
+		strings.Replace(meetingAudioFinalFixture, `"end_ms":100`, `"end_ms":`+strconv.FormatInt(math.MaxInt64/int64(time.Millisecond)+1, 10), 1),
 		strings.Replace(meetingAudioFinalFixture, `"track":"microphone"`, `"track":"speaker name"`, 1),
 		strings.Replace(meetingAudioFinalFixture, `"text":"synthetic final"`, `"text":"`+strings.Repeat("x", 16385)+`"`, 1),
 		strings.Replace(meetingAudioFinalFixture, `"epoch":18446744073709551615`, `"epoch":18446744073709551616`, 1),
@@ -92,6 +94,19 @@ func TestMeetingAudioBatchPreservesIntegerBoundsAndRejectsUnsafeEvents(t *testin
 	} {
 		if _, err := decodeMeetingAudioBatch([]byte(data), "synthetic"); !errors.Is(err, ErrMeetingAudioInvalid) {
 			t.Fatalf("unsafe event accepted: %v", err)
+		}
+	}
+}
+
+func TestMeetingAudioLongSessionTimestampsUseDurationRepresentation(t *testing.T) {
+	for _, end := range []int64{86400001, int64(40 * time.Hour / time.Millisecond), math.MaxInt64 / int64(time.Millisecond)} {
+		fixture := strings.Replace(meetingAudioFinalFixture, `"end_ms":100`, `"end_ms":`+strconv.FormatInt(end, 10), 1)
+		events, err := decodeMeetingAudioBatch([]byte(fixture), "synthetic")
+		if err != nil || len(events) != 1 || *events[0].EndMS != end {
+			t.Fatalf("representable long-session offset %d rejected: %v", end, err)
+		}
+		if offset := time.Duration(*events[0].EndMS) * time.Millisecond; offset < 0 {
+			t.Fatalf("accepted offset overflowed: %v", offset)
 		}
 	}
 }

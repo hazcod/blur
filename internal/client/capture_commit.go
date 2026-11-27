@@ -20,6 +20,48 @@ type nativeCaptureStore interface {
 	RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error
 }
 
+type nativeActivityJournal interface {
+	StageActivitySegment(context.Context, activity.Segment) error
+	PeekPendingActivity(context.Context) (activity.Segment, bool, error)
+	DiscardPendingActivity(context.Context, string) error
+}
+
+func (s *nativeCaptureCommitSink) StageActivitySegment(ctx context.Context, segment activity.Segment) error {
+	err := s.admit(ctx, segment.AppID, segment.Domain, func(ctx context.Context) error {
+		if journal, ok := s.store.(nativeActivityJournal); ok {
+			return journal.StageActivitySegment(ctx, segment)
+		}
+		// Older adapters can acknowledge only an actual durable write. There is
+		// no pending receipt to replay in this fallback.
+		return s.store.PutActivitySegment(ctx, segment)
+	})
+	var rejected *capture.CaptureError
+	if errors.As(err, &rejected) && rejected.Code == capture.Excluded {
+		return &storage.StoreError{Code: storage.Invalid}
+	}
+	return err
+}
+
+func (s *nativeCaptureCommitSink) PeekPendingActivity(ctx context.Context) (activity.Segment, bool, error) {
+	if s == nil || s.store == nil || ctx == nil {
+		return activity.Segment{}, false, ErrNotConfigured
+	}
+	if journal, ok := s.store.(nativeActivityJournal); ok {
+		return journal.PeekPendingActivity(ctx)
+	}
+	return activity.Segment{}, false, nil
+}
+
+func (s *nativeCaptureCommitSink) DiscardPendingActivity(ctx context.Context, id string) error {
+	if s == nil || s.store == nil || ctx == nil {
+		return ErrNotConfigured
+	}
+	if journal, ok := s.store.(nativeActivityJournal); ok {
+		return journal.DiscardPendingActivity(ctx, id)
+	}
+	return nil
+}
+
 // Linearizes native capture admission and each encrypted write with preferences
 // Save, including duplicate visits and pending activity. No raw text is handled.
 type nativeCaptureCommitSink struct {

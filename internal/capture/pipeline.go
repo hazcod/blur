@@ -1122,34 +1122,16 @@ func visualFrameSafe(frame rawFrame, nodes []*rawNode) bool {
 	return true
 }
 
-// MinObservationChars is the fewest non-whitespace Unicode characters a
-// passively captured observation must carry to be stored as a capture.
-const MinObservationChars = 32
+// MinObservationChars admits any nonblank sanitized text, including a single
+// Unicode code point, regardless of the capturing application.
+const MinObservationChars = 1
 
-// Voice transcripts and typed notes are user-authored and always stored.
-const (
-	meetingsAppID = "sh.blur.meetings"
-	notesAppID    = "sh.blur.notes"
-)
-
-// ExemptFromMinimum reports whether an app identity belongs to a voice
-// transcript or typed note, which are stored regardless of length.
-func ExemptFromMinimum(appID string) bool {
-	return appID == meetingsAppID || appID == notesAppID
-}
-
-// MeetsMinimumContent reports whether text has at least MinObservationChars
-// non-whitespace characters, or the app identity is exempt.
-func MeetsMinimumContent(appID, text string) bool {
-	if ExemptFromMinimum(appID) {
-		return true
-	}
-	n := 0
+// MeetsMinimumContent reports whether sanitized text contains a non-whitespace
+// Unicode code point. App identity does not change content eligibility.
+func MeetsMinimumContent(_ string, text string) bool {
 	for _, r := range text {
 		if !unicode.IsSpace(r) {
-			if n++; n >= MinObservationChars {
-				return true
-			}
+			return true
 		}
 	}
 	return false

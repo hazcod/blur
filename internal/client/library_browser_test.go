@@ -297,6 +297,7 @@ func TestLibraryBrowserUpdatesOnlyWhenTheProcessingStatusCopyChanges(t *testing.
 	// Only the fixture's in-memory status changes; no settings file, model, or
 	// provider operation is involved.
 	d.client.localAI.mu.Lock()
+	d.client.localAI.settings.Enabled = true
 	d.client.localAI.settings.AutomaticLibrary = true
 	d.client.localAI.mu.Unlock()
 	d.client.notifyMemoryIndexChanged()

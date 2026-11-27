@@ -90,7 +90,7 @@ func receiverFixture(t *testing.T, now time.Time, enabled bool, sink *receiverSi
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test/a?secret=hide","title":"Plan","text":"Owner: Sam owns the rollback and schedule","active":true,"privacy_known":true,"private":false,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
+	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test/a?secret=hide","title":"Plan","text":"Owner: Sam owns the rollback and schedule","active":true,"privacy_known":true,"private":false,"complete":true,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
 	digest := sha256.Sum256(payload)
 	proof, err := localapi.NewProof(grant, localapi.ScopeCaptureIngest, digest, now, nil)
 	if err != nil {
@@ -159,7 +159,7 @@ func TestReceiverRejectsInvalidOrDisabledRequestsWithoutWriting(t *testing.T) {
 		})
 	}
 	for _, mutate := range []func(*Snapshot){func(p *Snapshot) { p.Private = true }, func(p *Snapshot) { p.Active = false }, func(p *Snapshot) { p.PrivacyKnown = false }} {
-		p := Snapshot{Browser: SafariBundleID, URL: "https://example.test", Text: "body text that is comfortably long enough to keep", Active: true, PrivacyKnown: true, CapturedAt: now}
+		p := Snapshot{Browser: SafariBundleID, URL: "https://example.test", Text: "body text that is comfortably long enough to keep", Active: true, PrivacyKnown: true, Complete: true, CapturedAt: now}
 		mutate(&p)
 		if _, err := Sanitize(p, true, now); err == nil {
 			t.Fatal("accepted disallowed privacy state")
@@ -307,14 +307,14 @@ func TestReceiverPolicyCoversDuplicateSightingAndCanceledCommit(t *testing.T) {
 	}
 }
 
-func TestReceiverDropsShortSnapshotsButKeepsExemptAndLongOnes(t *testing.T) {
+func TestReceiverPreservesShortSnapshotsAndRejectsBlankContent(t *testing.T) {
 	ctx := context.Background()
 	long := strings.Repeat("x", 32)
 	short := strings.Repeat("x", 31)
 	for _, c := range []struct {
 		text, app string
 		stored    bool
-	}{{short, "", false}, {long, "", true}, {"hi", "sh.blur.notes", true}, {"hi", "sh.blur.meetings", true}} {
+	}{{"", "", false}, {" \n\t  ", "", false}, {"", "sh.blur.notes", false}, {" \n", "sh.blur.meetings", false}, {"x", "", true}, {"日", "", true}, {short, "", true}, {long, "", true}, {"hi", "sh.blur.notes", true}, {"hi", "sh.blur.meetings", true}} {
 		sink := &receiverSink{encrypted: true}
 		r, _, _ := receiverFixture(t, time.Now(), true, sink)
 		o, err := capture.SanitizeObservation(firstNonEmpty(c.app, SafariBundleID), "example.test", c.text, 256)

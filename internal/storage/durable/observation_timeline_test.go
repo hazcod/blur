@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,6 +64,80 @@ func TestObservationWindowFindsEveryCaptureBeyondChronicleBudget(t *testing.T) {
 	page, err := store.ListObservationWindow(ctx, request)
 	if err != nil || len(page.Observations) != request.Limit || page.Observations[0].ContentID() != want[count-2] {
 		t.Fatalf("delete did not update time index: page=%+v err=%v", page, err)
+	}
+}
+
+type publicationFenceTestContext struct {
+	context.Context
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (ctx *publicationFenceTestContext) Err() error {
+	ctx.once.Do(func() {
+		close(ctx.entered)
+		<-ctx.release
+	})
+	return ctx.Context.Err()
+}
+
+func TestObservationWindowHoldsPublicationEpochAcrossScanQuanta(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0xd8), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	start := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	for index := 0; index < observationTimelinePageSize+1; index++ {
+		observation, err := capture.SanitizeObservation("terminal.app", "", fmt.Sprintf("Publication epoch source %d", index), 256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PutObservationAt(ctx, observation, start.Add(time.Duration(index)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queryCtx := &publicationFenceTestContext{Context: ctx, entered: make(chan struct{}), release: make(chan struct{})}
+	request := storage.ObservationWindowRequest{Start: start, End: start.Add(time.Hour), Limit: 1, MaxBytes: storage.MaxObservationPageBytes}
+	queryDone := make(chan struct {
+		page storage.ObservationWindow
+		err  error
+	}, 1)
+	go func() {
+		page, err := store.ListObservationWindow(queryCtx, request)
+		queryDone <- struct {
+			page storage.ObservationWindow
+			err  error
+		}{page, err}
+	}()
+	<-queryCtx.entered // the query has acquired its publication read fence
+	newest, err := capture.SanitizeObservation("terminal.app", "", "Written after the timeline scan", 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- store.PutObservationAt(ctx, newest, start.Add(10*time.Minute)) }()
+	select {
+	case err := <-writeDone:
+		t.Fatalf("writer crossed an active timeline read epoch: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(queryCtx.release)
+	result := <-queryDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if len(result.page.Observations) != 1 {
+		t.Fatalf("bounded scan returned %d rows", len(result.page.Observations))
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal("writer failed after query epoch ended:", err)
+	}
+	page, err := store.ListObservationWindow(ctx, request)
+	if err != nil || len(page.Observations) != 1 || page.Observations[0].ContentID() != newest.ContentID() {
+		t.Fatalf("post-epoch query did not see committed write: %+v err=%v", page, err)
 	}
 }
 
@@ -193,6 +268,77 @@ func TestObservationWindowFiltersBeforeSelectingRecentPrefix(t *testing.T) {
 			}
 		} else if len(page.Observations) != 1 || page.Observations[0].ContentID() != selected.ContentID() || page.HasMore {
 			t.Fatalf("filtered time query selected an unrelated recent prefix: %+v", page)
+		}
+	}
+}
+
+func TestTimelineScanContinuesPastFormerTxnAndRowCeilingsOnEncryptedStore(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0xd7), CreateNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	start := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+	const rows = (64 << 10) + 1
+	baseID := func(index int) string { return fmt.Sprintf("%064x", index+1) }
+	for _, namespace := range []string{observationTimelineNS, captureTimelineNS} {
+		hourID := observationTimelineHourID(start)
+		pages := (rows + observationTimelinePageSize - 1) / observationTimelinePageSize
+		for first := 0; first < pages; first += 16 {
+			last := first + 16
+			if last > pages {
+				last = pages
+			}
+			if err := store.Update(ctx, func(tx *Tx) error {
+				for page := first; page < last; page++ {
+					begin := page * observationTimelinePageSize
+					end := begin + observationTimelinePageSize
+					if end > rows {
+						end = rows
+					}
+					entries := make([]captureWindowCandidate, 0, end-begin)
+					for index := begin; index < end; index++ {
+						entries = append(entries, captureWindowCandidate{id: baseID(index), at: start.Add(time.Duration(index) * time.Nanosecond)})
+					}
+					if err := tx.PutIndexRecord(namespace, observationTimelinePageID(hourID, page), encodeObservationTimelinePage(entries)); err != nil {
+						return err
+					}
+				}
+				if last == pages {
+					return tx.PutIndexRecord(namespace, hourID, encodeObservationTimelineMeta(observationTimelineMeta{pages: pages, count: rows}))
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("write encrypted timeline pages %d..%d: %v", first, last, err)
+			}
+		}
+		olderHour := observationTimelineHourID(start.Add(-time.Hour))
+		duplicate := []captureWindowCandidate{{id: baseID(0), at: start.Add(-time.Minute)}}
+		if err := store.Update(ctx, func(tx *Tx) error {
+			if err := tx.PutIndexRecord(namespace, observationTimelinePageID(olderHour, 0), encodeObservationTimelinePage(duplicate)); err != nil {
+				return err
+			}
+			return tx.PutIndexRecord(namespace, olderHour, encodeObservationTimelineMeta(observationTimelineMeta{pages: 1, count: 1}))
+		}); err != nil {
+			t.Fatal("write duplicate cross-hour sighting:", err)
+		}
+		cursor := newObservationTimelineScanCursor(start.Add(-time.Hour), start.Add(time.Hour))
+		seen := make(map[string]struct{}, rows)
+		inspected := 0
+		for !cursor.done {
+			entries, next, err := store.observationTimelineQuantum(ctx, namespace, cursor)
+			if err != nil {
+				t.Fatalf("continue encrypted scan for %s after %d entries: %v", namespace, inspected, err)
+			}
+			cursor = next
+			for _, entry := range entries {
+				inspected++
+				seen[entry.id] = struct{}{}
+			}
+		}
+		if inspected != rows+1 || len(seen) != rows {
+			t.Fatalf("%s scanned %d rows and %d unique sources; want %d rows and %d sources", namespace, inspected, len(seen), rows+1, rows)
 		}
 	}
 }

@@ -36,7 +36,6 @@ const (
 	capturePreviewRows = 8
 	captureLineBytes   = 80
 	timeTopApps        = 5
-	entityTextBytes    = 1500
 )
 
 // appsCache holds the KnownApps result between memory changes.
@@ -54,7 +53,13 @@ func (c *Client) askClock() time.Time {
 	return time.Now()
 }
 
-func (c *Client) AskTime() time.Time { return c.askClock() }
+func (c *Client) AskTime() time.Time {
+	now := c.askClock()
+	if zone, err := loadZone(localZoneName()); err == nil {
+		return now.In(zone)
+	}
+	return now
+}
 
 // SetCaptureStateReader lets the desktop report whether capture is running so
 // an empty answer can say capture is paused. pausedSince may be zero.
@@ -86,7 +91,12 @@ func (c *Client) planActivity() (ActivityData, bool) {
 // planMaxDates.
 func utcDates(start, end time.Time) []string {
 	var dates []string
-	for day := start.UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour); day.Before(end); day = day.Add(24 * time.Hour) {
+	first := start.UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour)
+	last := end.UTC().Add(-time.Nanosecond).Truncate(24 * time.Hour)
+	if bounded := last.AddDate(0, 0, -planMaxDates+1); first.Before(bounded) {
+		first = bounded
+	}
+	for day := first; day.Before(end) && len(dates) < planMaxDates; day = day.Add(24 * time.Hour) {
 		dates = append(dates, day.Format("2006-01-02"))
 	}
 	if len(dates) > planMaxDates {
@@ -248,7 +258,10 @@ func knownAppsFromSegments(segments []activity.Segment) []assistant.KnownApp {
 				byID[key] = assistant.KnownApp{ID: id, Name: name, Aliases: uniqueSorted(aliases)}
 			}
 		}
-		if domain := segment.Domain; domain != "" {
+		// Internal note/recording addresses are source handles, not websites.
+		// Their suffixes must not turn ordinary "note" or "meeting" wording
+		// into a filter for one arbitrary saved record.
+		if domain := segment.Domain; domain != "" && segment.AppID != "sh.blur.meetings" && segment.AppID != "sh.blur.notes" {
 			if _, seen := byID["d:"+domain]; !seen {
 				host := strings.TrimPrefix(strings.ToLower(domain), "www.")
 				aliases := []string{strings.ToLower(domain), host}
@@ -495,7 +508,10 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 		retrieval.Diagnosis.AppKnown = c.planAppsKnown(ctx, plan)
 	}
 	var windowSegs, scoped []activity.Segment
-	if _, ok := c.planActivity(); ok {
+	// Topic retrieval streams activity membership together with its bounded
+	// source queries. A bulk preload can overflow even a short, busy scope.
+	needsActivity := plan.Kind != assistant.KindLookup && plan.Kind != assistant.KindEntity && !(plan.Kind == assistant.KindRecap && end.Sub(start) > searchWindowSpan)
+	if _, ok := c.planActivity(); ok && needsActivity {
 		var err error
 		if windowSegs, err = c.windowSegments(ctx, start, end, MaxActivityReportSegments); err != nil {
 			return assistant.Retrieval{}, err
@@ -511,7 +527,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 	var topicLibrary []assistant.Evidence
 	var supersededTopicSources []string
 	var topicLibraryLimited bool
-	if plan.Kind == assistant.KindLookup && !voiceRequested && !plan.WholeDocument && !plan.Conversation {
+	if plan.Kind == assistant.KindLookup && !voiceRequested && !plan.WholeDocument && !plan.Conversation && len(plan.TechnicalSubjects) == 0 {
 		topicLibrary, topicLibraryLimited, supersededTopicSources, err = c.inferredTopicEvidence(ctx, plan)
 		if err != nil {
 			return assistant.Retrieval{}, err
@@ -527,7 +543,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 		retrieval.Evidence = voice
 		retrieval.Diagnosis.VoiceRequested = true
 		retrieval.Diagnosis.VoiceRecallLimited = limited
-		retrieval.Diagnosis.VoiceAssociationUnverified = len(voice) > 0 && !asksAboutNamedSession(plan)
+		retrieval.Diagnosis.VoiceAssociationUnverified = len(voice) > 0 && !asksAboutSavedRecording(plan)
 	} else if plan.Conversation {
 		retrieval.Evidence, retrieval.Diagnosis.RecapSampled, err = c.conversationEvidence(ctx, plan, bounded, windowSegs)
 	} else {
@@ -545,7 +561,7 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 			}
 		case assistant.KindEntity:
 			if assistant.IsOutstandingQuestion(plan.Question) {
-				retrieval.Evidence, outstandingSources, err = c.outstandingEntityEvidence(ctx, plan)
+				retrieval.Evidence, outstandingSources, err = c.outstandingEntityEvidence(ctx, plan, &retrieval.Diagnosis)
 				if err == nil && len(retrieval.Evidence) == 0 {
 					// The Library may not have distilled a project conversation into
 					// an open loop yet. Recover bounded source material for review,
@@ -584,11 +600,15 @@ func (c *Client) retrievePlan(ctx context.Context, plan assistant.Plan, expansio
 			}
 			retrieval.Evidence = filtered
 		}
-		retrieval.Evidence = uniqueEvidence(append(topicLibrary, retrieval.Evidence...), planEvidenceItems)
-		retrieval.Diagnosis.LibraryRecallLimited = topicLibraryLimited
+		retrieval.Evidence = uniqueEvidence(append(topicLibrary, retrieval.Evidence...), technicalEvidenceLimit(plan))
+		retrieval.Diagnosis.LibraryRecallLimited = retrieval.Diagnosis.LibraryRecallLimited || topicLibraryLimited
 	}
-	if (plan.Kind == assistant.KindLookup || plan.Kind == assistant.KindEntity) && !voiceRequested && !plan.WholeDocument && !plan.Conversation {
-		taskPage, taskErr := c.searchTasks(ctx, plan.Question, taskTopicTerms(plan.Terms), semantic.Query{AppIDs: plan.AppIDs, Domains: plan.Domains, Start: plan.Scope.Start, End: plan.Scope.End}, planEvidenceItems, plan.MatchOnly, outstandingSources...)
+	if (plan.Kind == assistant.KindLookup || plan.Kind == assistant.KindEntity) && !voiceRequested && !plan.WholeDocument && !plan.Conversation && len(plan.TechnicalSubjects) == 0 {
+		// Once a saved source already answers the topic, do not make Ask run a
+		// second semantic model search across unrelated task titles. Keep exact
+		// task matches and source-linked tasks available through the local index.
+		exactTasksOnly := slices.ContainsFunc(retrieval.Evidence, func(item assistant.Evidence) bool { return item.Layer == assistant.LayerSource })
+		taskPage, taskErr := c.searchTasksMode(ctx, plan.Question, taskTopicTerms(plan.Terms), semantic.Query{AppIDs: plan.AppIDs, Domains: plan.Domains, Start: plan.Scope.Start, End: plan.Scope.End}, planEvidenceItems, plan.MatchOnly, exactTasksOnly, outstandingSources...)
 		if taskErr != nil {
 			return assistant.Retrieval{}, taskErr
 		}
@@ -690,6 +710,9 @@ func firstDiagnosis(diagnosis []*assistant.Diagnosis) *assistant.Diagnosis {
 }
 
 func (c *Client) lookupEvidenceWithExpansion(ctx context.Context, plan assistant.Plan, bounded bool, windowSegs, scoped []activity.Segment, diagnosis *assistant.Diagnosis, alternateOutput *[]string, alternateQueries []string) ([]assistant.Evidence, bool, error) {
+	if technicalComparison(plan) {
+		return c.technicalComparisonEvidence(ctx, plan, bounded, windowSegs, diagnosis)
+	}
 	hasFilter := len(plan.AppIDs)+len(plan.Domains) > 0
 	var evidence []assistant.Evidence
 	var pending bool
@@ -705,7 +728,8 @@ func (c *Client) lookupEvidenceWithExpansion(ctx context.Context, plan assistant
 			return nil, pending, err
 		}
 		pending = page.IndexingPending
-		if page.CoverageLimited && diagnosis != nil {
+		// A bounded exact page can omit matches without semantic-search limits.
+		if (page.CoverageLimited || page.HasMore) && diagnosis != nil {
 			diagnosis.SemanticIssue = "limited"
 		}
 		if alternateOutput != nil {
@@ -715,8 +739,16 @@ func (c *Client) lookupEvidenceWithExpansion(ctx context.Context, plan assistant
 		if err != nil {
 			return nil, pending, err
 		}
+		if bounded && len(evidence) == 0 {
+			start, end, _, _ := c.planWindow(plan)
+			if end.Sub(start) > storage.MaxObservationWindow {
+				// Every search window was checked. The recent-source fallback
+				// cannot read this whole scope or establish an unrelated topic.
+				return nil, pending, nil
+			}
+		}
 	}
-	if plan.WholeDocument && len(evidence) == 0 {
+	if plan.WholeDocument && len(evidence) == 0 && !plan.MatchOnly {
 		start, end, _, _ := c.planWindow(plan)
 		evidence, err := c.recentPlanEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
 		evidence = withoutAuthenticationPages(evidence)
@@ -741,7 +773,7 @@ func (c *Client) pageEvidence(ctx context.Context, plan assistant.Plan, page sea
 	if err != nil {
 		return nil, err
 	}
-	locateExactPassages(hits, plan.Terms)
+	locateExactPassages(hits, locateTerms(plan.Terms, page.MatchSpellings))
 	matched := make(map[string]uint32, len(page.Hits))
 	for _, hit := range page.Hits {
 		matched[hit.SourceID] = hit.MatchedTerms
@@ -761,9 +793,12 @@ func (c *Client) pageEvidence(ctx context.Context, plan assistant.Plan, page sea
 	}
 	var evidence []assistant.Evidence
 	for _, hit := range hits {
+		if !technicalSubjectSupport(plan.TechnicalSubjects, hit.Text, hit.WindowTitle) {
+			continue
+		}
 		ev := newEvidence(hit.SourceID, hit.AppID, hit.Domain, hit.Text)
 		ev.Partial = hit.Partial
-		ev.TermsRelaxed = termsRelaxed(matched[hit.SourceID], len(plan.Terms))
+		ev.TermsRelaxed = termsRelaxed(matched[hit.SourceID], len(plan.Terms)) || numberedSubjectSupport(plan.NumberedSubjects, hit.Text, hit.WindowTitle) < len(plan.NumberedSubjects)
 		ev.Document = hit.Document
 		ev.CapturedAt, ev.TimeUnknown = hit.CapturedAt, hit.TimeUnknown
 		ev.MatchStart, ev.MatchEnd = hit.MatchStart, hit.MatchEnd
@@ -782,6 +817,9 @@ func (c *Client) pageEvidence(ctx context.Context, plan assistant.Plan, page sea
 // planSearch runs exact search for the plan's terms, one query per app id or
 // domain filter, merged by score and restricted to sources inside the window.
 func (c *Client) planSearch(ctx context.Context, plan assistant.Plan, bounded bool, windowSegs []activity.Segment) (search.ExactPage, error) {
+	if technicalSubjectTermsOnly(plan) {
+		return c.technicalSubjectPage(ctx, plan, bounded, windowSegs, planEvidenceItems)
+	}
 	pool := planEvidenceItems
 	if bounded || plan.Kind == assistant.KindLookup {
 		pool = planLookupPool
@@ -790,19 +828,15 @@ func (c *Client) planSearch(ctx context.Context, plan assistant.Plan, bounded bo
 }
 
 func (c *Client) planSearchWithQueries(ctx context.Context, plan assistant.Plan, bounded bool, windowSegs []activity.Segment, queries []string) (search.ExactPage, error) {
+	if plan.Literal {
+		return c.planSearch(ctx, plan, bounded, windowSegs)
+	}
 	if len(queries) == 0 || len(queries) > 3 {
 		return search.ExactPage{}, ErrInvalidRequest
 	}
 	start, end, _, _ := c.planWindow(plan)
-	var scopeSources []string
-	if bounded {
-		for _, segment := range windowSegs {
-			scopeSources = append(scopeSources, segment.SourceIDs...)
-		}
-		scopeSources = uniqueSorted(scopeSources)
-		if len(scopeSources) > search.MaxScopeSourceIDs {
-			return search.ExactPage{}, ErrActivityLimit
-		}
+	if !bounded {
+		start, end = time.Time{}, time.Time{}
 	}
 	question := plan.Question
 	if question == "" {
@@ -810,7 +844,7 @@ func (c *Client) planSearchWithQueries(ctx context.Context, plan assistant.Plan,
 	}
 	return c.selectedModelPageUsingQueries(ctx, question, search.ExactPage{}, semantic.Query{
 		Limit: planEvidenceItems, AppIDs: plan.AppIDs, Domains: plan.Domains,
-		Start: start, End: end, ScopeSourceIDs: scopeSources,
+		Start: start, End: end,
 	}, planEvidenceItems, queries, .3)
 }
 
@@ -833,17 +867,17 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 	}
 
 	var start, end time.Time
-	var scopeSources []string
 	if bounded {
 		start, end, _, _ = c.planWindow(plan)
-		var ids []string
-		for _, segment := range windowSegs {
-			ids = append(ids, segment.SourceIDs...)
+		if end.Sub(start) > searchWindowSpan {
+			// The recent-horizon activity read cannot prove membership across
+			// the entire calendar scope. Read each search window's partitions.
+			windowSegs = nil
 		}
-		scopeSources = uniqueSorted(ids)
-		if len(scopeSources) > search.MaxScopeSourceIDs {
-			return search.ExactPage{}, ErrActivityLimit
-		}
+	}
+	windows, err := c.searchScopeWindows(ctx, plan, bounded, windowSegs)
+	if err != nil {
+		return search.ExactPage{}, err
 	}
 	best := map[string]search.IndexHit{}
 	partialBest := map[string]search.IndexHit{}
@@ -858,7 +892,7 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 			if err := ctx.Err(); err != nil {
 				return search.ExactPage{}, err
 			}
-			page, err := c.data.SearchExact(ctx, search.ExactQuery{Terms: terms, AppID: f.app, Domain: f.domain, ExcludeAppIDs: []string{appidentity.BundleID}, CapturedStart: start, CapturedEnd: end, ScopeSourceIDs: scopeSources, MinTermMatches: minMatches, PartialOnly: pass == 1, TopK: pool, MaxRows: maxRows, MaxBytes: search.MaxIndexBytes})
+			page, err := c.searchExactWindows(ctx, search.ExactQuery{Terms: terms, AppID: f.app, Domain: f.domain, ExcludeAppIDs: []string{appidentity.BundleID}, MinTermMatches: minMatches, PartialOnly: pass == 1, TopK: pool, MaxRows: maxRows, MaxBytes: search.MaxIndexBytes}, windows)
 			if pass == 1 && errors.Is(err, search.ErrIndexBudget) {
 				// The majority-term pass is an optional widening. When it cannot
 				// prove its top results inside the row budget, keep the all-terms
@@ -874,6 +908,7 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 			merged.Nodes += page.Nodes
 			merged.HasMore = merged.HasMore || page.HasMore
 			merged.IndexingPending = merged.IndexingPending || page.IndexingPending
+			merged.CoverageLimited = merged.CoverageLimited || page.CoverageLimited
 			for _, hit := range page.Hits {
 				if pass == 0 {
 					if prev, ok := best[hit.SourceID]; !ok || hit.Score > prev.Score {
@@ -897,6 +932,33 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 			minMatches = lookupMajorityTerms(len(terms))
 		}
 	}
+	// Sources that spell a compound of the question the other way hold its
+	// words too ("ThreatBot" for "threat bot"). They join the hits above with
+	// match reports on the question's own terms, before ranking and the cut.
+	question := plan.Question
+	if question == "" {
+		question = plan.SearchQuery()
+	}
+	relevanceQuestion := question
+	variant, compoundLimited, err := c.compoundVariantFor(ctx, plan, question, compoundScope{filters: filters, windows: windows, start: start, end: end}, best, partialBest)
+	if err != nil {
+		return search.ExactPage{}, err
+	}
+	merged.CoverageLimited = merged.CoverageLimited || compoundLimited
+	if variant != nil {
+		extra, limited, more, err := variant.hits(ctx, terms, pool, maxRows)
+		if err != nil {
+			return search.ExactPage{}, err
+		}
+		merged.CoverageLimited = merged.CoverageLimited || limited
+		merged.HasMore = merged.HasMore || more
+		if len(best) == 0 {
+			// Only the respelling matched: passage selection and relevance
+			// read the question's words, which must be the ones sources use.
+			relevanceQuestion = variant.respelled
+		}
+		mergeCompoundHits(best, partialBest, extra, len(terms))
+	}
 	partial := make([]search.IndexHit, 0, len(partialBest))
 	for _, hit := range partialBest {
 		partial = append(partial, hit)
@@ -916,32 +978,32 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 		}
 		return merged.Hits[i].SourceID < merged.Hits[j].SourceID
 	})
-	if relaxed {
-		merged.Hits, err = c.rankLookupPool(ctx, plan, terms, merged.Hits, partial, pool)
+	if relaxed || len(plan.NumberedSubjects) > 0 {
+		var limited bool
+		merged.Hits, limited, err = c.rankLookupPool(ctx, plan, terms, merged.Hits, partial, pool)
+		merged.CoverageLimited = merged.CoverageLimited || limited
 		if err != nil {
 			return search.ExactPage{}, err
 		}
 	} else {
 		merged.Hits = reservePartialTermCandidates(merged.Hits, partial, pool, limit)
 	}
-	question := plan.Question
-	if question == "" {
-		question = plan.SearchQuery()
-	}
 	minimumScore := float32(.3)
 	if plan.MatchOnly {
 		minimumScore = .55
 	}
 	if !plan.Literal {
-		hybrid := c.hybridPage
-		if !rankExactQuestions {
-			hybrid = c.hybridAskPage
-		}
-		merged, err = hybrid(ctx, question, merged, semantic.Query{Limit: pool, AppIDs: plan.AppIDs, Domains: plan.Domains, Start: start, End: end, ScopeSourceIDs: scopeSources}, limit, minimumScore)
+		merged, err = c.hybridScopedSearch(ctx, relevanceQuestion, merged, semantic.Query{Limit: pool, AppIDs: plan.AppIDs, Domains: plan.Domains, Start: start, End: end}, windows, limit, !rankExactQuestions, minimumScore)
 		if err != nil {
 			return search.ExactPage{}, err
 		}
 	}
+	var subjectLimited bool
+	merged.Hits, subjectLimited, err = c.filterTechnicalSubjects(ctx, plan.TechnicalSubjects, merged.Hits)
+	if err != nil {
+		return search.ExactPage{}, err
+	}
+	merged.CoverageLimited = merged.CoverageLimited || subjectLimited
 	if len(merged.Hits) > limit {
 		merged.HasMore = true
 		merged.Hits = merged.Hits[:limit]
@@ -950,6 +1012,7 @@ func (c *Client) planSearchCandidatesWithExactRanking(ctx context.Context, plan 
 	for _, hit := range merged.Hits {
 		merged.Bytes += hit.Bytes
 	}
+	merged.MatchSpellings = variant.words()
 	return merged, nil
 }
 
@@ -994,7 +1057,7 @@ type knowledgeSearcher interface {
 // Outstanding-work questions need explicit open loops and current open tasks.
 // A project login page or other recent capture cannot establish what remains
 // to do, so this path never falls back to arbitrary captured page text.
-func (c *Client) outstandingEntityEvidence(ctx context.Context, plan assistant.Plan) ([]assistant.Evidence, []string, error) {
+func (c *Client) outstandingEntityEvidence(ctx context.Context, plan assistant.Plan, diagnosis ...*assistant.Diagnosis) ([]assistant.Evidence, []string, error) {
 	if strings.TrimSpace(plan.Entity) == "" {
 		return nil, nil, nil
 	}
@@ -1033,7 +1096,7 @@ func (c *Client) outstandingEntityEvidence(ctx context.Context, plan assistant.P
 		}
 	}
 	if repository, ok := c.inferredRepository(); ok {
-		entities, err := findInferredKnowledgeFolded(ctx, repository, plan.Entity)
+		entities, err := findInferredKnowledgeFolded(ctx, repository, plan, diagnosis...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1177,8 +1240,9 @@ func (c *Client) entityEvidence(ctx context.Context, plan assistant.Plan, bounde
 			var sourceIDs []string
 			var b strings.Builder
 			b.WriteString(entity.Name)
+			// Keep complete Library evidence; context packing reports any excerpts.
 			add := func(text string, sources []knowledge.Source) {
-				if text == "" || b.Len()+len(text) > entityTextBytes {
+				if text == "" {
 					return
 				}
 				b.WriteString("\n- " + text)
@@ -1221,7 +1285,7 @@ func (c *Client) entityEvidence(ctx context.Context, plan assistant.Plan, bounde
 		}
 	}
 	if !bounded {
-		inferred, err := c.inferredEntityEvidence(ctx, plan)
+		inferred, err := c.inferredEntityEvidence(ctx, plan, diagnosis...)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1293,6 +1357,9 @@ func (c *Client) AnswerDirect(ctx context.Context, plan assistant.Plan) (assista
 	}
 	switch plan.Kind {
 	case assistant.KindTime:
+		if len(plan.Terms) > 0 {
+			return assistant.DirectAnswer{Answer: assistant.Answer{InsufficientEvidence: true, Text: "Tracked time can currently be totalled by app or website. Topic and project totals need verified activity labels."}}, true, nil
+		}
 	case assistant.KindCapture:
 		if len(plan.Terms) > 0 {
 			return assistant.DirectAnswer{}, false, nil
@@ -1301,8 +1368,21 @@ func (c *Client) AnswerDirect(ctx context.Context, plan assistant.Plan) (assista
 		return assistant.DirectAnswer{}, false, nil
 	}
 	start, end, _, zone := c.planWindow(plan)
+	if plan.Kind != assistant.KindTime && end.Sub(start) > storage.MaxObservationWindow {
+		// Direct totals must never label the bounded last-month activity scan
+		// as a complete year. Long recaps have a separate disclosed sampling path.
+		return assistant.DirectAnswer{}, false, ErrActivityLimit
+	}
 	var segments []activity.Segment
-	if _, ok := c.planActivity(); ok {
+	var timeReport activity.ReportResult
+	var timeRead activityScopeRead
+	if plan.Kind == assistant.KindTime {
+		var err error
+		timeReport, timeRead, err = c.activityScopeReport(ctx, start, end, zone, plan)
+		if err != nil {
+			return assistant.DirectAnswer{}, false, err
+		}
+	} else if _, ok := c.planActivity(); ok {
 		var err error
 		segments, err = c.windowSegments(ctx, start, end, MaxActivityReportSegments)
 		if err != nil {
@@ -1323,8 +1403,8 @@ func (c *Client) AnswerDirect(ctx context.Context, plan assistant.Plan) (assista
 		subject = strings.Join(names, ", ")
 	}
 	if plan.Kind == assistant.KindTime {
-		answer, handled, err := directTime(scoped, start, end, zone, label, subject)
-		return assistant.DirectAnswer{Answer: answer}, handled, err
+		answer, handled, err := directTimeReport(timeReport, timeRead.sessions, label, subject)
+		return assistant.DirectAnswer{Answer: answer, Publication: &memoryAnswerPublication{client: c, read: timeRead.memoryReadPublication}}, handled, err
 	}
 	evidence, widened, scoped, err := c.captureEvidence(ctx, plan, start, end, scoped, planEvidenceItems)
 	if err != nil || len(evidence) == 0 {
@@ -1349,6 +1429,25 @@ func (c *Client) directEntitySummary(ctx context.Context, plan assistant.Plan) (
 	if err != nil || len(terms) == 0 {
 		return assistant.DirectAnswer{}, false, nil
 	}
+	corrections, superseded, coverageLimited, err := c.directEntityCorrections(ctx, plan)
+	if err != nil {
+		return assistant.DirectAnswer{}, false, err
+	}
+	indexingPending, err := c.ExactIndexPending(ctx)
+	if err != nil {
+		return assistant.DirectAnswer{}, false, err
+	}
+	coverageLimited = coverageLimited || len(corrections) > 3
+	var evidence []assistant.Evidence
+	for _, item := range corrections[:min(3, len(corrections))] {
+		item.MatchStart, item.MatchEnd = search.MatchPassage(item.Text, terms, 768)
+		if item.MatchEnd > item.MatchStart {
+			coverageLimited = coverageLimited || item.MatchStart > 0 || item.MatchEnd < len(item.Text)
+			evidence = append(evidence, item)
+		}
+	}
+	repository, hasRepository := c.inferredRepository()
+	authorityFiltered := len(superseded) > 0
 	var start, end time.Time
 	if !plan.Scope.IsZero() {
 		start, end, _, _ = c.planWindow(plan)
@@ -1361,20 +1460,37 @@ func (c *Client) directEntitySummary(ctx context.Context, plan assistant.Plan) (
 	seen := make(map[string]bool)
 	for _, filter := range filters {
 		remaining := MaxSearchBytes - page.Bytes
-		if len(page.Hits) >= 3 || remaining <= 0 {
+		if len(page.Hits)+len(evidence) >= 3 || remaining <= 0 {
+			coverageLimited = true
 			break
 		}
 		matched, err := c.data.SearchExact(ctx, search.ExactQuery{
 			Terms: terms, AppID: filter.app, Domain: filter.domain, ExcludeAppIDs: []string{appidentity.BundleID},
-			CapturedStart: start, CapturedEnd: end, TopK: 3 - len(page.Hits), MaxRows: 48, MaxBytes: remaining, MinTermMatches: len(terms),
+			CapturedStart: start, CapturedEnd: end, TopK: 3 - len(page.Hits) - len(evidence), MaxRows: 48, MaxBytes: remaining, MinTermMatches: len(terms),
 		})
 		if err != nil {
 			return assistant.DirectAnswer{}, false, err
 		}
 		page.IndexingPending = page.IndexingPending || matched.IndexingPending
 		page.HasMore = page.HasMore || matched.HasMore
+		page.CoverageLimited = page.CoverageLimited || matched.CoverageLimited
 		for _, hit := range matched.Hits {
 			if seen[hit.SourceID] || hit.Bytes > remaining {
+				coverageLimited = coverageLimited || hit.Bytes > remaining
+				continue
+			}
+			// A dismissed claim has no replacement fact, but its source receipt
+			// still records user authority. Neither path may quote it as current.
+			blocked := superseded[hit.SourceID]
+			if hasRepository && !blocked {
+				progress, found, err := repository.GetEnrichmentProgress(ctx, hit.SourceID)
+				if err != nil {
+					return assistant.DirectAnswer{}, false, err
+				}
+				blocked = found && progress.Suppressed
+			}
+			if blocked {
+				authorityFiltered = true
 				continue
 			}
 			seen[hit.SourceID] = true
@@ -1382,14 +1498,13 @@ func (c *Client) directEntitySummary(ctx context.Context, plan assistant.Plan) (
 			page.Bytes += hit.Bytes
 		}
 	}
-	if len(page.Hits) == 0 {
+	if len(page.Hits) == 0 && len(evidence) == 0 && !authorityFiltered {
 		return assistant.DirectAnswer{}, false, nil
 	}
 	hydrated, err := c.hydrateSearchPage(ctx, boundSearchHydration(page))
 	if err != nil {
 		return assistant.DirectAnswer{}, false, err
 	}
-	var evidence []assistant.Evidence
 	for _, hit := range hydrated {
 		begin, finish := search.MatchPassage(hit.Text, terms, 768)
 		if finish <= begin {
@@ -1399,14 +1514,27 @@ func (c *Client) directEntitySummary(ctx context.Context, plan assistant.Plan) (
 		item.CapturedAt, item.TimeUnknown = hit.CapturedAt, hit.TimeUnknown
 		item.Partial = hit.Partial
 		item.MatchStart, item.MatchEnd = begin, finish
+		coverageLimited = coverageLimited || begin > 0 || finish < len(hit.Text)
 		evidence = append(evidence, item)
 	}
+	if err := ctx.Err(); err != nil {
+		return assistant.DirectAnswer{}, false, err
+	}
+	coverageLimited = coverageLimited || page.HasMore || page.CoverageLimited
+	indexingPending = indexingPending || page.IndexingPending
 	if len(evidence) == 0 {
+		if authorityFiltered {
+			return assistant.DirectAnswer{Answer: assistant.Answer{Text: "I couldn’t verify a current saved mention of " + plan.Entity + ".", InsufficientEvidence: true}, CoverageLimited: coverageLimited, IndexingPending: indexingPending}, true, nil
+		}
 		return assistant.DirectAnswer{}, false, nil
 	}
 	var answer strings.Builder
 	if len(evidence) == 1 {
-		answer.WriteString("Your saved source says: ")
+		if evidence[0].Origin == assistant.OriginUserCorrection {
+			answer.WriteString("Your saved correction says: ")
+		} else {
+			answer.WriteString("Your saved source says: ")
+		}
 	} else {
 		answer.WriteString("I found these saved mentions of " + plan.Entity + ":")
 	}
@@ -1416,6 +1544,9 @@ func (c *Client) directEntitySummary(ctx context.Context, plan assistant.Plan) (
 		}
 		if len(evidence) > 1 {
 			answer.WriteString("[" + strconv.Itoa(index+1) + "] ")
+			if item.Origin == assistant.OriginUserCorrection {
+				answer.WriteString("Your correction: ")
+			}
 		}
 		answer.WriteString("“" + item.Text[item.MatchStart:item.MatchEnd] + "”")
 	}
@@ -1423,7 +1554,62 @@ func (c *Client) directEntitySummary(ctx context.Context, plan assistant.Plan) (
 	for i, item := range evidence {
 		ids[i] = item.SourceID
 	}
-	return assistant.DirectAnswer{Answer: assistant.Answer{Text: answer.String(), SourceIDs: ids}, Sources: evidence}, true, nil
+	return assistant.DirectAnswer{Answer: assistant.Answer{Text: answer.String(), SourceIDs: ids}, Sources: evidence, CoverageLimited: coverageLimited, IndexingPending: indexingPending}, true, nil
+}
+
+// Keep correction authority distinct from the original capture. Supersession
+// is collected before date projection so an excluded correction cannot revive
+// the older text it replaced. App/domain context is applied before either step.
+func (c *Client) directEntityCorrections(ctx context.Context, plan assistant.Plan) ([]assistant.Evidence, map[string]bool, bool, error) {
+	repository, ok := c.inferredRepository()
+	if !ok {
+		return nil, nil, false, nil
+	}
+	var diagnosis assistant.Diagnosis
+	entities, err := findInferredKnowledgeFolded(ctx, repository, plan, &diagnosis)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	var scoped []knowledge.Entity
+	for _, entity := range entities {
+		app, domain := "", ""
+		if entity.Inference != nil {
+			app, domain = entity.Inference.AppID, entity.Inference.Domain
+		}
+		if len(plan.AppIDs) > 0 && !slices.Contains(plan.AppIDs, app) || len(plan.Domains) > 0 && !slices.Contains(plan.Domains, domain) {
+			continue
+		}
+		scoped = append(scoped, entity)
+	}
+	superseded := make(map[string]bool)
+	for _, id := range supersededLibrarySources(scoped) {
+		superseded[id] = true
+	}
+	scoped, err = c.datedLibraryEntities(ctx, plan, scoped)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	var corrected []knowledge.Entity
+	for _, entity := range scoped {
+		projection := entity
+		projection.Facts, projection.OpenLoops, projection.ActivitySourceIDs = nil, nil, nil
+		for _, fact := range entity.Facts {
+			if fact.State == knowledge.Dismissed {
+				continue
+			}
+			for _, source := range fact.Sources {
+				if source.UserAuthored {
+					projection.Facts = append(projection.Facts, fact)
+					break
+				}
+			}
+		}
+		if len(projection.Facts) > 0 {
+			corrected = append(corrected, projection)
+		}
+	}
+	evidence, err := c.inferredEntitiesEvidence(ctx, plan, corrected, false)
+	return evidence, superseded, diagnosis.LibraryRecallLimited || len(corrected) > len(evidence), err
 }
 
 func isEntitySummaryQuestion(question, entity string) bool {
@@ -1440,32 +1626,21 @@ func isEntitySummaryQuestion(question, entity string) bool {
 	return false
 }
 
-func directTime(segments []activity.Segment, start, end time.Time, zone *time.Location, label, subject string) (assistant.Answer, bool, error) {
-	clipped := make([]activity.Segment, 0, len(segments))
-	for _, segment := range segments {
-		if segment.WallStart.Before(start) {
-			segment.WallStart = start
+func directTimeReport(report activity.ReportResult, sessionsCount int, label, subject string) (assistant.Answer, bool, error) {
+	if sessionsCount == 0 {
+		text := "No tracked foreground time is saved"
+		if subject != "" {
+			text += " for " + subject
 		}
-		if segment.WallEnd.After(end) {
-			segment.WallEnd = end
-		}
-		if segment.Duration = int64(segment.WallEnd.Sub(segment.WallStart)); segment.Duration > 0 {
-			clipped = append(clipped, segment)
-		}
+		return assistant.Answer{Text: text + " " + label + ".", InsufficientEvidence: true}, true, nil
 	}
-	if len(clipped) == 0 {
-		return assistant.Answer{}, false, nil
-	}
-	report, err := activity.Report(clipped, zone)
-	if err != nil {
-		return assistant.Answer{}, false, err
-	}
+
 	if subject != "" {
 		sessions := "sessions"
-		if len(clipped) == 1 {
+		if sessionsCount == 1 {
 			sessions = "session"
 		}
-		return assistant.Answer{Text: subject + ": " + formatReportDuration(report.Eligible) + " " + label + ", " + strconv.Itoa(len(clipped)) + " " + sessions + "."}, true, nil
+		return assistant.Answer{Text: subject + ": " + formatReportDuration(report.Eligible) + " " + label + ", " + strconv.Itoa(sessionsCount) + " " + sessions + "."}, true, nil
 	}
 	var apps []string
 	for _, bucket := range report.Apps {

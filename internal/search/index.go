@@ -78,10 +78,14 @@ type ExactPage struct {
 	// AlternateQueries contains short phrases generated while relevance-ranking
 	// Ask candidates; callers may use them for one bounded recovery search.
 	AlternateQueries []string
-	Rows             int
-	Nodes            int
-	Bytes            int
-	HasMore          bool
+	// MatchSpellings are words the sources use for a compound the question
+	// spelled another way ("threat", "bot" for "threatbot"). Callers add them
+	// when cutting a passage or preview; match reports never refer to them.
+	MatchSpellings []string
+	Rows           int
+	Nodes          int
+	Bytes          int
+	HasMore        bool
 	// IndexingPending means saved sources still have exact-index work queued.
 	// Matches remain useful, but absence and global ranking are provisional.
 	IndexingPending bool
@@ -194,7 +198,9 @@ func IsCombiningAccent(r rune) bool { return r >= 0x0300 && r <= 0x036f }
 // letter so accented and plain spellings index alike. Other scripts keep their
 // marks (Cyrillic "й", Japanese dakuten, Hangul and Indic vowel signs change
 // meaning), and canonical composition is restored afterwards so those texts
-// tokenize exactly as before. The input is already lowercase.
+// tokenize exactly as before. Then the few Latin letters without a canonical
+// decomposition are spelled plainly (see undecomposedLetter). The input is
+// already lowercase.
 func foldDiacritics(value string) string {
 	ascii := true
 	for i := 0; i < len(value); i++ {
@@ -216,5 +222,63 @@ func foldDiacritics(value string) string {
 		base = r
 		out.WriteRune(r)
 	}
-	return norm.NFC.String(out.String())
+	composed := norm.NFC.String(out.String())
+	special := false
+	for _, r := range composed {
+		if _, ok := undecomposedLetter(r); ok {
+			special = true
+			break
+		}
+	}
+	if !special {
+		return composed
+	}
+	out.Reset()
+	for _, r := range composed {
+		if folded, ok := undecomposedLetter(r); ok {
+			out.WriteString(folded)
+		} else {
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
+}
+
+// undecomposedLetter returns the plain Latin spelling of a lowercase letter
+// that has no canonical decomposition, so NFD cannot strip it to a base letter
+// ("søren" is "soren", "strauß" is "strauss"). The table is deliberately
+// short and conventional: no umlaut transliteration ("ü" stays "u"), no
+// stemming, and no other script. It may expand one rune into two, so callers
+// must not assume folded text maps 1:1 onto original offsets; the capture
+// token stream attributes every folded rune to the span of its source rune.
+func undecomposedLetter(r rune) (string, bool) {
+	switch r {
+	case 'ß':
+		return "ss", true
+	case 'æ':
+		return "ae", true
+	case 'œ':
+		return "oe", true
+	case 'ø':
+		return "o", true
+	case 'đ', 'ð':
+		return "d", true
+	case 'þ':
+		return "th", true
+	case 'ł', 'ŀ':
+		return "l", true
+	case 'ħ':
+		return "h", true
+	case 'ı':
+		return "i", true
+	case 'ŧ':
+		return "t", true
+	case 'ŋ':
+		return "n", true
+	case 'ĳ':
+		return "ij", true
+	case 'ſ':
+		return "s", true
+	}
+	return "", false
 }

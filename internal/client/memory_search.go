@@ -53,6 +53,7 @@ type MemorySummaryHit struct {
 	Excerpt         string    `json:"excerpt"`
 	SourceIDsSample []string  `json:"source_ids"`
 	Dirty           bool      `json:"dirty,omitempty"`
+	CoverageLimited bool      `json:"coverage_limited,omitempty"`
 
 	// text and terms let a byte budget re-cut the excerpt without a re-read.
 	text  string
@@ -95,22 +96,17 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 	if err != nil {
 		return naturalPage{}, err
 	}
+	windows, err := c.searchScopeWindows(ctx, plan, bounded, segments)
+	if err != nil {
+		return naturalPage{}, err
+	}
 	var start, end time.Time
-	var scopeSources []string
 	if bounded {
 		start, end, _, _ = c.planWindow(plan)
-		var ids []string
-		for _, segment := range segments {
-			ids = append(ids, segment.SourceIDs...)
-		}
-		scopeSources = uniqueSorted(ids)
-		if len(scopeSources) > search.MaxScopeSourceIDs {
-			return naturalPage{}, ErrActivityLimit
-		}
 	}
 	rows, pool := searchRowBudget(limit), searchPoolSize(limit)
 	query := func(f memoryFilter, minMatches int, partialOnly bool, topK int) search.ExactQuery {
-		return search.ExactQuery{Terms: terms, AppID: f.app, Domain: f.domain, ExcludeAppIDs: []string{appidentity.BundleID}, CapturedStart: start, CapturedEnd: end, ScopeSourceIDs: scopeSources, MinTermMatches: minMatches, PartialOnly: partialOnly, TopK: topK, MaxRows: rows, MaxBytes: search.MaxIndexBytes}
+		return search.ExactQuery{Terms: terms, AppID: f.app, Domain: f.domain, ExcludeAppIDs: []string{appidentity.BundleID}, CapturedStart: start, CapturedEnd: end, MinTermMatches: minMatches, PartialOnly: partialOnly, TopK: topK, MaxRows: rows, MaxBytes: search.MaxIndexBytes}
 	}
 	var merged search.ExactPage
 	exactBest := map[string]search.IndexHit{}
@@ -118,12 +114,12 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 		if err := ctx.Err(); err != nil {
 			return naturalPage{}, err
 		}
-		page, err := c.data.SearchExact(ctx, query(f, 0, false, pool))
+		page, err := c.searchExactWindows(ctx, query(f, 0, false, pool), windows)
 		if errors.Is(err, search.ErrIndexBudget) && pool > limit {
 			// The ranking pool could not be proven inside the row budget; fall
 			// back to the page-sized prefix and report the gap.
 			merged.CoverageLimited = true
-			page, err = c.data.SearchExact(ctx, query(f, 0, false, limit))
+			page, err = c.searchExactWindows(ctx, query(f, 0, false, limit), windows)
 		}
 		if err != nil {
 			return naturalPage{}, err
@@ -132,34 +128,23 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 		merged.Nodes += page.Nodes
 		merged.HasMore = merged.HasMore || page.HasMore
 		merged.IndexingPending = merged.IndexingPending || page.IndexingPending
+		merged.CoverageLimited = merged.CoverageLimited || page.CoverageLimited
 		for _, hit := range page.Hits {
 			if prev, ok := exactBest[hit.SourceID]; !ok || hit.Score > prev.Score {
 				exactBest[hit.SourceID] = hit
 			}
 		}
 	}
-	exact := make([]search.IndexHit, 0, len(exactBest))
-	for _, hit := range exactBest {
-		exact = append(exact, hit)
-	}
-	sort.Slice(exact, func(i, j int) bool { return exact[i].SourceID < exact[j].SourceID }) // deterministic input
-	rankers := map[bool]lookupRankInput{}
-	exact, rankers[false], err = c.rankSearchGroup(ctx, plan, terms, exact, false)
-	if err != nil {
-		return naturalPage{}, err
-	}
-
-	var partial []search.IndexHit
+	partialBest := map[string]search.IndexHit{}
 	relaxed := map[string]bool{}
-	if len(exact) < limit && len(terms) >= 2 && !plan.Literal {
-		partialBest := map[string]search.IndexHit{}
+	if (len(exactBest) < limit || len(plan.NumberedSubjects) > 0) && len(terms) >= 2 && !plan.Literal {
 		minMatches := lookupMajorityTerms(len(terms))
 	passes:
 		for _, f := range filters {
 			if err := ctx.Err(); err != nil {
 				return naturalPage{}, err
 			}
-			page, err := c.data.SearchExact(ctx, query(f, minMatches, true, pool))
+			page, err := c.searchExactWindows(ctx, query(f, minMatches, true, pool), windows)
 			if errors.Is(err, search.ErrIndexBudget) {
 				// The majority-term pass is an optional widening: keep the
 				// all-terms hits and report the gap instead of failing.
@@ -173,6 +158,7 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 			merged.Nodes += page.Nodes
 			merged.HasMore = merged.HasMore || page.HasMore
 			merged.IndexingPending = merged.IndexingPending || page.IndexingPending
+			merged.CoverageLimited = merged.CoverageLimited || page.CoverageLimited
 			for _, hit := range page.Hits {
 				if _, isExact := exactBest[hit.SourceID]; isExact {
 					continue
@@ -182,17 +168,57 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 				}
 			}
 		}
-		for _, hit := range partialBest {
-			partial = append(partial, hit)
-		}
-		sort.Slice(partial, func(i, j int) bool { return partial[i].SourceID < partial[j].SourceID })
-		partial, rankers[true], err = c.rankSearchGroup(ctx, plan, terms, partial, true)
+	}
+	// Sources that spell a compound of the query the other way hold its words
+	// too ("threat-bot" for "threatbot"). They join the rows above with match
+	// reports on the query's own terms, so a full match is not a closest match.
+	variant, compoundLimited, err := c.compoundVariantFor(ctx, plan, question, compoundScope{filters: filters, windows: windows, start: start, end: end}, exactBest, partialBest)
+	if err != nil {
+		return naturalPage{}, err
+	}
+	merged.CoverageLimited = merged.CoverageLimited || compoundLimited
+	if variant != nil {
+		extra, limited, more, err := variant.hits(ctx, terms, pool, rows)
 		if err != nil {
 			return naturalPage{}, err
 		}
-		for _, hit := range partial {
-			relaxed[hit.SourceID] = true
+		merged.CoverageLimited = merged.CoverageLimited || limited
+		merged.HasMore = merged.HasMore || more
+		mergeCompoundHits(exactBest, partialBest, extra, len(terms))
+	}
+	exact, partial := mapHits(exactBest), mapHits(partialBest) // deterministic input
+	// A date can supply every independent token without supplying a numbered
+	// subject. Read a single bounded pool for numeric phrase support before
+	// cutting the page, and place unverified all-term rows with closest matches.
+	var facts map[string]lookupSourceFacts
+	if len(plan.NumberedSubjects) > 0 {
+		candidates := append(slices.Clone(exact), partial...)
+		facts, err = c.readLookupFacts(ctx, candidates, plan.NumberedSubjects...)
+		if err != nil {
+			return naturalPage{}, err
 		}
+		merged.CoverageLimited = merged.CoverageLimited || len(facts) < len(candidates)
+		var supported []search.IndexHit
+		for _, hit := range exact {
+			if facts[hit.SourceID].numbered == len(plan.NumberedSubjects) {
+				supported = append(supported, hit)
+			} else {
+				partial = append(partial, hit)
+			}
+		}
+		exact = supported
+	}
+	rankers := map[bool]lookupRankInput{}
+	exact, rankers[false], err = c.rankSearchGroup(ctx, plan, terms, exact, false, facts)
+	if err != nil {
+		return naturalPage{}, err
+	}
+	partial, rankers[true], err = c.rankSearchGroup(ctx, plan, terms, partial, true, facts)
+	if err != nil {
+		return naturalPage{}, err
+	}
+	for _, hit := range partial {
+		relaxed[hit.SourceID] = true
 	}
 	core := append(append(make([]search.IndexHit, 0, len(exact)+len(partial)), exact...), partial...)
 	merged.Hits = core
@@ -210,7 +236,7 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 		if plan.MatchOnly {
 			minimumScore = .55
 		}
-		extra, err := c.hybridPage(ctx, question, search.ExactPage{Rows: merged.Rows, Nodes: merged.Nodes, Hits: slices.Clone(core), IndexingPending: merged.IndexingPending, CoverageLimited: merged.CoverageLimited, HasMore: merged.HasMore}, semantic.Query{Limit: min(limit, semantic.MaxResults), AppIDs: plan.AppIDs, Domains: plan.Domains, Start: start, End: end, ScopeSourceIDs: scopeSources}, limit, minimumScore)
+		extra, err := c.hybridScopedSearch(ctx, question, search.ExactPage{Rows: merged.Rows, Nodes: merged.Nodes, Hits: slices.Clone(core), IndexingPending: merged.IndexingPending, CoverageLimited: merged.CoverageLimited, HasMore: merged.HasMore}, semantic.Query{Limit: min(limit, semantic.MaxResults), AppIDs: plan.AppIDs, Domains: plan.Domains, Start: start, End: end}, windows, limit, false, minimumScore)
 		if err != nil {
 			return naturalPage{}, err
 		}
@@ -239,6 +265,7 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 	for _, hit := range merged.Hits {
 		merged.Bytes += hit.Bytes
 	}
+	merged.MatchSpellings = variant.words()
 	return naturalPage{ExactPage: merged, relaxed: relaxed, semantic: semanticAdded, rankers: rankers}, nil
 }
 
@@ -248,8 +275,11 @@ func (c *Client) rankedSearchPage(ctx context.Context, question string, plan ass
 // and capture time newest first. Term closeness joins as a tie-break after
 // hydration (see reorderByCloseness), never by reading more sources. Nothing
 // is demoted or dropped here.
-func (c *Client) rankSearchGroup(ctx context.Context, plan assistant.Plan, terms []string, hits []search.IndexHit, rarity bool) ([]search.IndexHit, lookupRankInput, error) {
+func (c *Client) rankSearchGroup(ctx context.Context, plan assistant.Plan, terms []string, hits []search.IndexHit, rarity bool, facts map[string]lookupSourceFacts) ([]search.IndexHit, lookupRankInput, error) {
 	in := lookupRankInput{entityMask: lookupEntityMask(plan.Entity, terms), speech: questionHasSpeechVerb(plan.Question)}
+	if len(plan.NumberedSubjects) > 0 {
+		in.numbered = func(hit search.IndexHit) int { return facts[hit.SourceID].numbered }
+	}
 	if len(hits) < 2 {
 		return hits, in, nil
 	}
@@ -264,14 +294,17 @@ func (c *Client) rankSearchGroup(ctx context.Context, plan assistant.Plan, terms
 		}
 	}
 	if in.speech {
-		facts, err := c.readLookupFacts(ctx, hits)
-		if err != nil {
-			return nil, in, err
+		if facts == nil {
+			var err error
+			facts, err = c.readLookupFacts(ctx, hits)
+			if err != nil {
+				return nil, in, err
+			}
 		}
 		in.isMessaging = func(id string) bool { return facts[id].conversational }
 	}
 	in.capturedAt = func(hit search.IndexHit) time.Time {
-		at, unknown, err := c.sourceCaptureTime(ctx, hit.SourceID, time.Time{})
+		at, unknown, err := c.sourceCaptureTime(ctx, hit.SourceID, hit.CapturedAt)
 		if err != nil || unknown {
 			return time.Time{}
 		}
@@ -359,7 +392,7 @@ func (c *Client) searchSummaries(ctx context.Context, plan assistant.Plan, terms
 	var found []MemorySummaryHit
 
 	examined := 0
-	for _, level := range []string{chronicle.RollupLevelDay, chronicle.RollupLevelWeek} {
+	for _, level := range []string{chronicle.RollupLevelYear, chronicle.RollupLevelMonth, chronicle.RollupLevelWeek, chronicle.RollupLevelDay} {
 		room := maxSearchSummaryRollups - examined
 		if room < 1 {
 			break
@@ -368,6 +401,10 @@ func (c *Client) searchSummaries(ctx context.Context, plan assistant.Plan, terms
 		widen := 2 * 24 * time.Hour
 		if level == chronicle.RollupLevelWeek {
 			widen = 8 * 24 * time.Hour
+		} else if level == chronicle.RollupLevelMonth {
+			widen = 32 * 24 * time.Hour
+		} else if level == chronicle.RollupLevelYear {
+			widen = 367 * 24 * time.Hour
 		}
 		rows, _, err := c.chronicles.ListChronicleRollups(ctx, level, start.Add(-widen), end, "", room)
 		if err != nil {
@@ -383,7 +420,7 @@ func (c *Client) searchSummaries(ctx context.Context, plan assistant.Plan, terms
 			}
 			found = append(found, MemorySummaryHit{
 				ID: "chronicle:" + row.ID, Level: level, Period: row.PeriodKey, Start: row.Start, End: row.End,
-				Excerpt: QueryExcerpt(row.Text, terms, 0, 0, searchExcerptBytes), SourceIDsSample: sampleSourceIDs(row.SourceIDs), Dirty: row.Dirty, text: row.Text, terms: terms,
+				Excerpt: QueryExcerpt(row.Text, terms, 0, 0, searchExcerptBytes), SourceIDsSample: sampleSourceIDs(row.SourceIDs), Dirty: row.Dirty, CoverageLimited: row.Sampled || row.CoverageVersion == 0, text: row.Text, terms: terms,
 			})
 		}
 	}

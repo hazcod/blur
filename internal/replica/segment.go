@@ -37,6 +37,10 @@ const (
 	KindPadding     = 0
 	KindObservation = 1
 	KindTombstone   = 2
+	// Capture records are accepted only in the isolated .cap sidecar lane.
+	KindCaptureManifest   = 3
+	KindCapturePart       = 4
+	CaptureSegmentVersion = 2
 )
 
 var (
@@ -63,6 +67,10 @@ type Record struct {
 	At          time.Time
 	Observation []byte
 	SourceID    string
+	EditionID   string
+	Publication string
+	Summary     []byte
+	Part        []byte
 }
 
 // DeriveKey derives the 32-byte sync key from a passphrase and the folder salt.
@@ -85,8 +93,12 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 }
 
 func encodeRecords(records []Record) ([]byte, error) {
+	return encodeRecordsVersion(records, SegmentVersion)
+}
+
+func encodeRecordsVersion(records []Record, version byte) ([]byte, error) {
 	out := make([]byte, 1, 1024)
-	out[0] = SegmentVersion
+	out[0] = version
 	put := func(kind byte, payload []byte) {
 		var head [5]byte
 		head[0] = kind
@@ -123,6 +135,45 @@ func encodeRecords(records []Record) ([]byte, error) {
 				payload = append(payload, id...)
 			}
 			put(KindTombstone, payload)
+		case KindCaptureManifest:
+			if version != CaptureSegmentVersion || r.At.IsZero() || len(r.EditionID) != 64 || len(r.Publication) != 64 || len(r.Summary) == 0 || len(r.Summary) > 1<<16 {
+				return nil, ErrFormat
+			}
+			edition, err := decodeHex(r.EditionID)
+			if err != nil {
+				return nil, ErrFormat
+			}
+			publication, err := decodeHex(r.Publication)
+			if err != nil {
+				return nil, ErrFormat
+			}
+			payload := make([]byte, 8, 8+32+32+4+len(r.Summary))
+			binary.BigEndian.PutUint64(payload, uint64(r.At.UTC().UnixNano()))
+			payload = append(payload, edition...)
+			payload = append(payload, publication...)
+			var size [4]byte
+			binary.BigEndian.PutUint32(size[:], uint32(len(r.Summary)))
+			payload = append(payload, size[:]...)
+			payload = append(payload, r.Summary...)
+			put(KindCaptureManifest, payload)
+		case KindCapturePart:
+			if version != CaptureSegmentVersion || r.At.IsZero() || len(r.EditionID) != 64 || len(r.Publication) != 64 || len(r.Part) == 0 || len(r.Part) > 512<<10 {
+				return nil, ErrFormat
+			}
+			edition, err := decodeHex(r.EditionID)
+			if err != nil {
+				return nil, ErrFormat
+			}
+			publication, err := decodeHex(r.Publication)
+			if err != nil {
+				return nil, ErrFormat
+			}
+			payload := make([]byte, 8, 8+32+32+len(r.Part))
+			binary.BigEndian.PutUint64(payload, uint64(r.At.UTC().UnixNano()))
+			payload = append(payload, edition...)
+			payload = append(payload, publication...)
+			payload = append(payload, r.Part...)
+			put(KindCapturePart, payload)
 		default:
 			return nil, ErrFormat
 		}
@@ -146,7 +197,7 @@ func encodeRecords(records []Record) ([]byte, error) {
 }
 
 func decodeRecords(plain []byte) ([]Record, error) {
-	if len(plain) < 1 || plain[0] != SegmentVersion || len(plain) > MaxSegmentPlaintext {
+	if len(plain) < 1 || plain[0] != SegmentVersion && plain[0] != CaptureSegmentVersion || len(plain) > MaxSegmentPlaintext {
 		return nil, ErrFormat
 	}
 	rest := plain[1:]
@@ -191,6 +242,28 @@ func decodeRecords(plain []byte) ([]Record, error) {
 				return nil, ErrFormat
 			}
 			records = append(records, r)
+		case KindCaptureManifest:
+			if plain[0] != CaptureSegmentVersion || len(payload) < 8+32+32+4 {
+				return nil, ErrFormat
+			}
+			size := int(binary.BigEndian.Uint32(payload[72:76]))
+			if size == 0 || size > 1<<16 || len(payload) != 76+size {
+				return nil, ErrFormat
+			}
+			r := Record{Kind: kind, At: time.Unix(0, int64(binary.BigEndian.Uint64(payload[:8]))).UTC(), EditionID: encodeHex(payload[8:40]), Publication: encodeHex(payload[40:72]), Summary: append([]byte(nil), payload[76:]...)}
+			if r.At.IsZero() {
+				return nil, ErrFormat
+			}
+			records = append(records, r)
+		case KindCapturePart:
+			if plain[0] != CaptureSegmentVersion || len(payload) <= 72 || len(payload)-72 > 512<<10 {
+				return nil, ErrFormat
+			}
+			r := Record{Kind: kind, At: time.Unix(0, int64(binary.BigEndian.Uint64(payload[:8]))).UTC(), EditionID: encodeHex(payload[8:40]), Publication: encodeHex(payload[40:72]), Part: append([]byte(nil), payload[72:]...)}
+			if r.At.IsZero() {
+				return nil, ErrFormat
+			}
+			records = append(records, r)
 		default:
 			return nil, ErrFormat
 		}
@@ -201,6 +274,16 @@ func decodeRecords(plain []byte) ([]Record, error) {
 // SealSegment encodes, pads and seals records. The header (version, device ID,
 // sequence, nonce) is authenticated as additional data.
 func SealSegment(key []byte, deviceID [16]byte, seq uint64, records []Record, random io.Reader) ([]byte, error) {
+	return sealSegment(key, deviceID, seq, records, random, SegmentVersion)
+}
+
+// SealCaptureSegment seals records for the additive .cap sidecar lane. Its
+// version is intentionally distinct from the stable v1 observation stream.
+func SealCaptureSegment(key []byte, deviceID [16]byte, seq uint64, records []Record, random io.Reader) ([]byte, error) {
+	return sealSegment(key, deviceID, seq, records, random, CaptureSegmentVersion)
+}
+
+func sealSegment(key []byte, deviceID [16]byte, seq uint64, records []Record, random io.Reader, version byte) ([]byte, error) {
 	aead, err := newGCM(key)
 	if err != nil {
 		return nil, err
@@ -208,13 +291,13 @@ func SealSegment(key []byte, deviceID [16]byte, seq uint64, records []Record, ra
 	if random == nil {
 		random = rand.Reader
 	}
-	plain, err := encodeRecords(records)
+	plain, err := encodeRecordsVersion(records, version)
 	if err != nil {
 		return nil, err
 	}
 	defer clear(plain)
 	header := make([]byte, headerSize, headerSize+len(plain)+aead.Overhead())
-	header[0] = SegmentVersion
+	header[0] = version
 	copy(header[1:17], deviceID[:])
 	binary.BigEndian.PutUint64(header[17:25], seq)
 	if _, err := io.ReadFull(random, header[25:]); err != nil {
@@ -226,11 +309,19 @@ func SealSegment(key []byte, deviceID [16]byte, seq uint64, records []Record, ra
 // OpenSegment authenticates and decrypts a segment. Wrong key, any tampering
 // of header or body, and truncation all return ErrAuth.
 func OpenSegment(key, data []byte) (Header, []Record, error) {
+	return openSegment(key, data, SegmentVersion)
+}
+
+func OpenCaptureSegment(key, data []byte) (Header, []Record, error) {
+	return openSegment(key, data, CaptureSegmentVersion)
+}
+
+func openSegment(key, data []byte, expectedVersion byte) (Header, []Record, error) {
 	aead, err := newGCM(key)
 	if err != nil {
 		return Header{}, nil, err
 	}
-	if len(data) < headerSize+aead.Overhead() || len(data) > headerSize+MaxSegmentPlaintext+aead.Overhead() || data[0] != SegmentVersion {
+	if len(data) < headerSize+aead.Overhead() || len(data) > headerSize+MaxSegmentPlaintext+aead.Overhead() || data[0] != expectedVersion {
 		return Header{}, nil, ErrFormat
 	}
 	plain, err := aead.Open(nil, data[25:headerSize], data[headerSize:], data[:headerSize])
@@ -238,6 +329,9 @@ func OpenSegment(key, data []byte) (Header, []Record, error) {
 		return Header{}, nil, ErrAuth
 	}
 	defer clear(plain)
+	if len(plain) == 0 || plain[0] != expectedVersion {
+		return Header{}, nil, ErrFormat
+	}
 	h := Header{Version: data[0], Seq: binary.BigEndian.Uint64(data[17:25])}
 	copy(h.DeviceID[:], data[1:17])
 	records, err := decodeRecords(plain)

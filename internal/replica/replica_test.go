@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,6 +156,199 @@ func TestRoundTripObservationsAndDeletionPropagate(t *testing.T) {
 	}
 	if _, err := b.im.Run(ctx); err != nil || has(t, b, id2) {
 		t.Fatalf("delete all did not propagate: %v", err)
+	}
+}
+
+func TestCaptureSidecarSegmentIsVersionedAndCarriesOriginIdentity(t *testing.T) {
+	key := testKey(t, "capture sidecar key")
+	device := [16]byte{1, 2, 3}
+	publication := fmt.Sprintf("%064x", 9)
+	edition := fmt.Sprintf("%064x", 8)
+	records := []Record{
+		{Kind: KindCaptureManifest, At: time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC), EditionID: edition, Publication: publication, Summary: []byte("authenticated summary")},
+		{Kind: KindCapturePart, At: time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC), EditionID: edition, Publication: publication, Part: []byte("authenticated part")},
+	}
+	sealed, err := SealCaptureSegment(key, device, 1, records, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := OpenSegment(key, sealed); !errors.Is(err, ErrFormat) {
+		t.Fatalf("legacy observation reader accepted capture sidecar: %v", err)
+	}
+	header, got, err := OpenCaptureSegment(key, sealed)
+	if err != nil || header.Version != CaptureSegmentVersion || header.Seq != 1 || len(got) != 2 {
+		t.Fatalf("capture sidecar decode: header=%+v records=%d err=%v", header, len(got), err)
+	}
+	defer clearRecords(got)
+	if got[0].EditionID != edition || got[0].Publication != publication || !bytes.Equal(got[1].Part, records[1].Part) {
+		t.Fatal("capture sidecar lost origin publication or authenticated part")
+	}
+}
+
+func TestPublishedMultipartCaptureSyncsWithPublicationAndDeletion(t *testing.T) {
+	ctx := context.Background()
+	folder, key := t.TempDir(), testKey(t, "capture sidecar roundtrip")
+	a, b := newDevice(t, folder, key), newDevice(t, folder, key)
+	at := time.Date(2026, 11, 22, 13, 0, 0, 0, time.UTC)
+	builder, err := capture.NewCaptureBuilder("com.example.terminal", "local", fmt.Sprintf("%064x", 37), at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Repeat("agent_build_01 deployment finished successfully. ", 1800)
+	var parts []capture.CapturePart
+	sink := func(_ context.Context, batch []capture.CapturePart) error {
+		parts = append(parts, batch...)
+		return nil
+	}
+	for len(input) > 0 {
+		n := min(len(input), 4096)
+		if err := builder.Write(ctx, input[:n], sink); err != nil {
+			t.Fatal(err)
+		}
+		input = input[n:]
+	}
+	summary, err := builder.Finish(ctx, capture.CaptureComplete, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := builder.Header()
+	if err := a.store.BeginCapture(ctx, header); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.store.AppendCaptureParts(ctx, header, parts); err != nil {
+		t.Fatal(err)
+	}
+	origin, err := a.store.PublishCapture(ctx, summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if origin.Publication == "" || len(parts) < 2 {
+		t.Fatal("fixture did not create a multipart origin publication")
+	}
+	if _, err := a.w.Flush(ctx); err != nil {
+		t.Fatalf("capture export: %v", err)
+	}
+	capDir := filepath.Join(folder, a.state.Get().DeviceID, "captures")
+	if _, err := os.Stat(filepath.Join(capDir, captureSegmentName(1))); err != nil {
+		t.Fatalf("sidecar file missing: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(capDir, captureSegmentName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, captureRecords, err := OpenCaptureSegment(key, data)
+	clear(data)
+	if err != nil {
+		t.Fatalf("open capture segment: %v", err)
+	}
+	clearRecords(captureRecords)
+	res, err := b.im.Run(ctx)
+	if err != nil || res.CaptureParts != len(parts) || res.Rejected != 0 {
+		t.Fatalf("capture import = %+v, %v", res, err)
+	}
+	got, found, err := b.store.GetCapture(ctx, summary.ContentID())
+	if err != nil || !found || got.Publication != origin.Publication {
+		t.Fatalf("origin publication not preserved: %+v found=%v err=%v", got, found, err)
+	}
+	if _, err := b.w.Flush(ctx); err != nil {
+		t.Fatalf("imported capture echo check: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(folder, b.state.Get().DeviceID, "captures", captureSegmentName(1))); !os.IsNotExist(err) {
+		t.Fatalf("imported capture was echoed: %v", err)
+	}
+	if _, err := a.del.DeleteSource(ctx, summary.ContentID()); err != nil {
+		t.Fatalf("source deletion: %v", err)
+	}
+	if _, err := a.w.Flush(ctx); err != nil {
+		t.Fatalf("deletion export: %v", err)
+	}
+	res, err = b.im.Run(ctx)
+	if err != nil || res.Tombstones == 0 {
+		t.Fatalf("capture deletion import = %+v, %v", res, err)
+	}
+	if _, found, err := b.store.GetCapture(ctx, summary.ContentID()); err != nil || found {
+		t.Fatalf("deleted capture survived replica tombstone: found=%v err=%v", found, err)
+	}
+}
+
+type failCaptureExportAck struct {
+	*durable.Store
+	fail bool
+}
+
+func (s *failCaptureExportAck) AcknowledgeReplicaCaptureExport(ctx context.Context, generation string, items []durable.ExportedCapturePart, importedOnly bool) error {
+	if s.fail {
+		s.fail = false
+		return errors.New("injected capture receipt failure")
+	}
+	return s.Store.AcknowledgeReplicaCaptureExport(ctx, generation, items, importedOnly)
+}
+
+func TestCaptureSidecarReplayRetainsExactPublishedBytesUntilReceiptCommits(t *testing.T) {
+	ctx, folder, key := context.Background(), t.TempDir(), testKey(t, "capture sidecar replay")
+	a := newDevice(t, folder, key)
+	at := time.Date(2026, 11, 22, 14, 0, 0, 0, time.UTC)
+	builder, err := capture.NewCaptureBuilder("com.example.terminal", "local", fmt.Sprintf("%064x", 39), at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Repeat("release status: build complete. ", 1500)
+	var parts []capture.CapturePart
+	sink := func(_ context.Context, batch []capture.CapturePart) error {
+		parts = append(parts, batch...)
+		return nil
+	}
+	for len(input) > 0 {
+		n := min(4096, len(input))
+		if err := builder.Write(ctx, input[:n], sink); err != nil {
+			t.Fatal(err)
+		}
+		input = input[n:]
+	}
+	summary, err := builder.Finish(ctx, capture.CaptureComplete, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := builder.Header()
+	if err := a.store.BeginCapture(ctx, header); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.store.AppendCaptureParts(ctx, header, parts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.store.PublishCapture(ctx, summary); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &failCaptureExportAck{Store: a.store, fail: true}
+	a.w.Store = wrapped
+	if _, err := a.w.Flush(ctx); err == nil {
+		t.Fatal("injected receipt failure was ignored")
+	}
+	state := a.state.Get()
+	if state.CapturePending == nil || state.CaptureLastSeq != 0 {
+		t.Fatalf("capture outbox not retained: %+v", state)
+	}
+	path := filepath.Join(folder, state.DeviceID, "captures", captureSegmentName(1))
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.w.Store = a.store
+	if _, err := a.w.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(first)
+	defer clear(second)
+	if !bytes.Equal(first, second) {
+		t.Fatal("published capture segment bytes changed during replay")
+	}
+	state = a.state.Get()
+	if state.CapturePending != nil || state.CaptureLastSeq != 1 {
+		t.Fatalf("capture receipt did not commit: %+v", state)
 	}
 }
 

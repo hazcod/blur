@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hazcod/blur/internal/search"
 )
 
 // Kind is what a question asks for. The planner decides it without a model so
@@ -49,22 +51,28 @@ type KnownApp struct {
 
 // Plan is the model-free reading of a question.
 type Plan struct {
-	Kind              Kind
-	WholeDocument     bool // explicit request to analyze all parts of a captured source
-	Scope             Scope
-	AppIDs            []string // canonical app ids the question names
-	AppNames          []string // display names for AppIDs, same order
-	Domains           []string // web domains the question names
-	Terms             []string // normalised topic terms, stop words removed, sorted
-	Entity            string   // subject of a KindEntity question
-	Question          string   // normalised question text
-	Literal           bool     // Search-only quoted/code terms require lexical matches.
-	LiteralTerms      []string // Mandatory topics restored after scope/task grammar.
-	FilterQuestion    string   // Search-only grammar with literal topics masked.
-	MatchOnly         bool     // ambiguity probe: require a topic match, never recent-source fallback
-	ReferenceQuestion string   // original retrieval question retained through grounded continuations
-	SubjectFollowup   bool     // factual continuation may retrieve new matches for the inherited named subject
-	Conversation      bool     // recap of the saved conversation with the person named in Entity
+	Kind                Kind
+	WholeDocument       bool        // explicit request to analyze all parts of a captured source
+	EventTime           bool        // question dates describe an event in evidence, not when evidence was observed
+	EventSubjectTerms   []string    // inherited event topic, kept separately from replaceable date cues
+	NumberedSubjects    [][2]string // topic word and adjacent number; lexical support, not a semantic identity
+	TechnicalSubjects   []string    // exact code/agent labels; their component words cannot replace the label
+	TechnicalComparison bool        // independently compare named subjects; inherited only by genuine continuations
+	Scope               Scope
+	AppIDs              []string // canonical app ids the question names
+	AppNames            []string // display names for AppIDs, same order
+	Domains             []string // web domains the question names
+	Terms               []string // normalised topic terms, stop words removed, sorted
+	Entity              string   // subject of a KindEntity question
+	Question            string   // normalised question text
+	Literal             bool     // Search-only quoted/code terms require lexical matches.
+	LiteralTerms        []string // Mandatory topics restored after scope/task grammar.
+	FilterQuestion      string   // Search-only grammar with literal topics masked.
+	MatchOnly           bool     // ambiguity probe: require a topic match, never recent-source fallback
+	ReferenceQuestion   string   // original retrieval question retained through grounded continuations
+	SubjectFollowup     bool     // factual continuation may retrieve new matches for the inherited named subject
+	ContextFollowup     bool     // attribute continuation reads within an authenticated cited source context
+	Conversation        bool     // recap of the saved conversation with the person named in Entity
 }
 
 // Turn is one earlier exchange, kept so follow-ups can inherit scope.
@@ -86,10 +94,14 @@ const (
 	LayerDay                 // a stored recap of one whole local day
 	LayerWeek                // a stored recap of one whole ISO week
 	LayerDigest              // a Library digest
+	LayerMonth               // appended to preserve existing stored enum values
+	LayerYear
+	LayerCompaction // independent generated summaries covering one saved source
 )
 
 // Diagnosis explains an empty or thin retrieval so the answer can say why.
 type Diagnosis struct {
+	MissingTechnicalSubjects   []string      // requested subjects not covered by selected source passages
 	VoiceRequested             bool          // the question asks for spoken content, not browser playback controls
 	VoiceAssociationUnverified bool          // a recent transcript does not establish the requested website/video identity
 	VoiceRecallLimited         bool          // bounded transcript selection omitted other saved rows or sessions
@@ -159,8 +171,17 @@ type DirectAnswerer interface {
 // answer, while keeping deterministic capture listings independent of a model.
 type DirectAnswer struct {
 	Answer
-	Sources []Evidence
-	Targets []TargetRef
+	Sources         []Evidence
+	Targets         []TargetRef
+	Publication     PublicationGuard `json:"-"`
+	CoverageLimited bool
+	IndexingPending bool
+}
+
+// PublicationGuard installs already-loaded state only while the read remains
+// current. Callbacks must not perform IO or call back into the retriever.
+type PublicationGuard interface {
+	Publish(func()) bool
 }
 
 // TargetRef is an app-owned action handle returned by a local read. Models
@@ -191,6 +212,8 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 		return Plan{}, err
 	}
 	plan := Plan{Kind: KindGeneral, Question: question}
+	plan.TechnicalSubjects = technicalSubjects(question)
+	plan.TechnicalComparison = !searchMode && len(plan.TechnicalSubjects) > 1 && technicalComparisonQuestion(question, plan.TechnicalSubjects)
 	var literal []string
 	if searchMode {
 		question, literal, err = searchGrammar(question)
@@ -201,12 +224,38 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 		plan.LiteralTerms = literal
 		plan.FilterQuestion = question
 	}
-	ws := splitWords(question)
-	scopeWords := ws
-	if searchMode {
-		scopeWords = searchScopeWords(question, ws)
+	if len(plan.TechnicalSubjects) > 0 {
+		literal, err = search.NormalizeTokens(strings.Join(append(slices.Clone(literal), plan.TechnicalSubjects...), " "), search.MaxTerms)
+		if err != nil {
+			return Plan{}, err
+		}
+		plan.Literal, plan.LiteralTerms = true, literal
 	}
-	scope, scopeWordsUsed := detectScope(scopeWords, now)
+	question = maskTechnicalSubjects(question, plan.TechnicalSubjects)
+	ws := splitWords(question)
+	scopeQuestion := question
+	if !searchMode {
+		if grammar, _, maskErr := searchGrammar(question); maskErr == nil {
+			scopeQuestion = grammar
+		}
+	}
+	dutch := dutchRecallGrammar(question, ws)
+	// Domains and quoted subjects are content, not observation-time phrases,
+	// in both native Ask and Search.
+	scopeWords := searchScopeWords(scopeQuestion, ws)
+	scopeWords, plan.EventTime = timeQuestionScope(scopeWords)
+	if dutch.active {
+		scopeWords, plan.EventTime = dutch.scope, dutch.event
+		scopeWords = searchScopeWords(scopeQuestion, scopeWords)
+	}
+	allScopeWords := ws
+	if dutch.active {
+		allScopeWords = dutchCalendarView(ws)
+	}
+	scope, scopeWordsUsed := detectScope(scopeWords, now, allScopeWords)
+	if dutch.active {
+		scopeWordsUsed = append(scopeWordsUsed, dutchScopeTerms(ws, scopeWordsUsed, scope)...)
+	}
 	ids, names, domains, consumed := matchApps(question, ws, apps)
 	more, consumed := findDomains(question, consumed)
 	for _, d := range more {
@@ -238,10 +287,11 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 		}
 	}
 	named := len(ids) > 0 || len(domains) > 0
+	retrievalEnd := max(retrievalCommandEnd(ws), recordLocationEnd(ws, searchMode && len(literal) > 0))
 	// A conversation recap names a person, not a document, even though it
 	// uses the words "recap" and "conversation".
 	plan.WholeDocument = !searchMode && !conversation.ok && detectWholeDocumentRequest(ws)
-	memory := plan.WholeDocument || searchMode || QuestionSeeksPersonalMemory(question) || !scope.IsZero() ||
+	memory := len(plan.TechnicalSubjects) > 0 || dutch.memory || plan.WholeDocument || searchMode || retrievalEnd > 0 || QuestionSeeksPersonalMemory(question) || !scope.IsZero() ||
 		entity != "" && IsOutstandingQuestion(question) ||
 		startsWith(ws, "what", "or", "who", "is") ||
 		startsWith(ws, "what", "do", "you", "know") || startsWith(ws, "what", "do", "you", "remember") ||
@@ -260,6 +310,14 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 			}
 		}
 	}
+	// Short general continuations still carry a newly named topic. Without
+	// these terms, "And Mina?" looks identical to a scope-only continuation.
+	if !searchMode && IsFollowUp(question) {
+		plan.Terms, err = planTerms(question, consumed, !scope.IsZero() && !plan.EventTime)
+		if err != nil {
+			return Plan{}, err
+		}
+	}
 	if !searchMode && !plan.WholeDocument && IsCreationRequest(question) && !creationNeedsMemory(question) {
 		return plan, nil
 	}
@@ -272,13 +330,27 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 	if !searchMode && storageQuestion(ws) {
 		consumed = withWords(consumed, storageGrammarWords...)
 	}
+	if retrievalEnd > 0 {
+		plan.MatchOnly = true
+		for _, word := range ws[:retrievalEnd] {
+			consumed = withWords(consumed, word.s)
+		}
+	}
+	if plan.EventTime || dutch.memory {
+		plan.MatchOnly = true
+	}
+	if len(plan.TechnicalSubjects) > 0 {
+		plan.MatchOnly = true
+	}
 	if strings.TrimSpace(question) != "" {
-		plan.Terms, err = planTerms(question, consumed, !scope.IsZero())
+		plan.Terms, err = planTerms(question, consumed, !scope.IsZero() && !plan.EventTime)
 	}
 	if err != nil {
 		return Plan{}, err
 	}
-	if searchMode {
+	if !searchMode && len(plan.TechnicalSubjects) > 0 {
+		plan.Terms = slices.Clone(literal)
+	} else if searchMode {
 		plan.Terms, err = searchPlanTerms(plan.Terms, literal, ws)
 		if err != nil {
 			return Plan{}, err
@@ -289,6 +361,22 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 		plan.Kind = KindLookup
 	case detectTimeKind(ws):
 		plan.Kind = KindTime
+		// Time-query grammar is not an activity subject. Keep project/topic
+		// names so unsupported classification cannot become an all-app total.
+		grammar := withWords(nil, "during", "using")
+		if hasSeq(ws, "total", "screen", "time") || hasSeq(ws, "total", "time") {
+			grammar = withWords(grammar, "total")
+		}
+		if hasSeq(ws, "screen", "time") {
+			grammar = withWords(grammar, "screen")
+		}
+		terms := plan.Terms[:0]
+		for _, term := range plan.Terms {
+			if _, consumed := grammar[term]; !consumed {
+				terms = append(terms, term)
+			}
+		}
+		plan.Terms = terms
 	case detectCaptureKind(ws):
 		plan.Kind = KindCapture
 	case scope.Label == ScopeJustNow && len(plan.Terms) == 0:
@@ -303,6 +391,9 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 	case len(plan.Terms) == 0 && !scope.IsZero():
 		plan.Kind = KindRecap
 	default:
+		plan.Kind = KindLookup
+	}
+	if len(plan.TechnicalSubjects) > 0 && plan.Kind != KindTime {
 		plan.Kind = KindLookup
 	}
 	if conversation.ok {
@@ -333,6 +424,12 @@ func planQuestion(question string, now time.Time, apps []KnownApp, searchMode bo
 			return Plan{}, err
 		}
 	}
+	if plan.EventTime {
+		plan.EventSubjectTerms = eventSubjectTerms(plan)
+	}
+	// Search's local question has literal text masked. An unrelated quoted
+	// qualifier must not disable cues from the remaining numbered topic.
+	plan.NumberedSubjects = numberedSubjects(question, plan.Terms)
 	return plan, nil
 }
 
@@ -367,10 +464,11 @@ func creationNeedsMemory(question string) bool {
 // Inherit fills a follow-up's missing scope and app from the previous turn's
 // plan. A question that names its own window or app keeps it.
 func (p Plan) Inherit(prev Plan) Plan {
+	p, _ = eventDateContinuation(p, prev)
 	if p.Kind == KindGeneral {
 		return p
 	}
-	if p.Scope.IsZero() && !prev.Scope.IsZero() {
+	if p.Scope.IsZero() && !p.EventTime && !prev.Scope.IsZero() {
 		p.Scope = prev.Scope
 		p.Scope.Explicit = false
 	}
@@ -380,6 +478,15 @@ func (p Plan) Inherit(prev Plan) Plan {
 	}
 	if len(p.Domains) == 0 && len(prev.Domains) > 0 {
 		p.Domains = append([]string(nil), prev.Domains...)
+	}
+	if len(p.TechnicalSubjects) == 0 && p.Entity == "" && (technicalContinuation(p) || technicalComparisonContinuation(p, prev)) && len(prev.TechnicalSubjects) > 0 {
+		p.TechnicalSubjects = slices.Clone(prev.TechnicalSubjects)
+		p.TechnicalComparison = prev.TechnicalComparison && !technicalRelationshipQuestion(p.Question, p.TechnicalSubjects)
+		p.Terms, p.LiteralTerms = slices.Clone(prev.Terms), slices.Clone(prev.LiteralTerms)
+		p.Literal, p.MatchOnly = true, true
+		if p.Kind != KindTime {
+			p.Kind = KindLookup
+		}
 	}
 	return p
 }

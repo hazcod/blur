@@ -433,13 +433,17 @@ func TestSearchSummariesReadBoundedRollupsAndRecapPages(t *testing.T) {
 		t.Fatalf("read %d recap pages, want exactly the %d page bound", recorder.recapPages, maxSearchSummaryRecapPages)
 	}
 	total := 0
-	for _, call := range recorder.rollupCalls {
+	levels := []string{"year", "month", "week", "day"}
+	for i, call := range recorder.rollupCalls {
 		if call.limit < 1 || call.limit > maxSearchSummaryRollups {
 			t.Fatalf("rollup read limit %d outside 1..%d", call.limit, maxSearchSummaryRollups)
 		}
+		if i >= len(levels) || call.level != levels[i] || call.limit != maxSearchSummaryRollups-total {
+			t.Fatalf("calendar levels must share the remaining read budget: %+v", recorder.rollupCalls)
+		}
 		total += call.rows
 	}
-	if total > maxSearchSummaryRollups || len(recorder.rollupCalls) > 2 {
+	if total > maxSearchSummaryRollups || len(recorder.rollupCalls) != len(levels) {
 		t.Fatalf("rollup reads = %+v", recorder.rollupCalls)
 	}
 }

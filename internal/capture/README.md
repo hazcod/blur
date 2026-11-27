@@ -5,6 +5,26 @@ It does not need a model or an app-specific integration for ordinary exposed tex
 The optional Safari page bridge supplies separately authorized structured browser
 content. All accepted text passes the shared redactor and encrypted store.
 
+## Streaming text consistency
+
+Large document capture continues across bounded rounds without a total document
+size ceiling. AXValue-backed text uses an immutable native string. Range-only
+providers use a second streamed pass over the observed range and compare content
+digests before issuing a complete document receipt. Character count alone cannot
+detect an edit that replaces text with the same number of characters.
+
+Both passes retain character-count, retained-path, foreground and sensitivity
+checks. Verification consumes the round's byte/time budget and counts as forward
+progress, without repeating text in the capture or storing a second raw copy.
+Changed or unavailable verification aborts the unpublished document. An unknown
+extent remains partial even when its visible slice verifies successfully.
+
+A matching second pass establishes repeatable observed content. It does not
+provide an atomic snapshot of an arbitrarily changing application or prove that
+every app exposes complete content. Native CF/range tests and
+`FuzzNativeRangeDocumentStability` exercise these contracts with simulated
+cross-process providers; signed-app live acceptance remains required.
+
 ## Local visible-text fallback
 
 `NewDarwinPipelineWithVisualText` adds the bundled Apple Vision/ScreenCaptureKit

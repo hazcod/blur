@@ -6,22 +6,24 @@ import (
 )
 
 func TestMeetsMinimumContentCountsNonWhitespaceCharacters(t *testing.T) {
-	if MinObservationChars != 32 {
-		t.Fatalf("MinObservationChars = %d", MinObservationChars)
-	}
 	cases := []struct {
 		name, app, text string
 		want            bool
 	}{
-		{"31 characters", "org.example.editor", strings.Repeat("a", 31), false},
-		{"32 characters", "org.example.editor", strings.Repeat("a", 32), true},
-		{"31 plus spaces", "org.example.editor", strings.Repeat("a b\n", 10) + "abcdefghijk  \t", false},
-		{"32 multibyte runes", "org.example.editor", strings.Repeat("é", 32), true},
-		{"31 multibyte runes", "org.example.editor", strings.Repeat("日", 31), false},
+		{"single ASCII code point", "org.example.editor", "0", true},
+		{"short terminal command", "com.apple.terminal", "ls", true},
+		{"short status", "org.example.editor", "ok", true},
+		{"padded single code point", "org.example.editor", " \n\t日  ", true},
+		{"single accented code point", "org.example.editor", "é", true},
+		{"single emoji code point", "org.example.editor", "😀", true},
+		{"combining code point", "org.example.editor", "\u0301", true},
+		{"31 characters", "org.example.editor", strings.Repeat("a", 31), true},
 		{"whitespace only", "org.example.editor", strings.Repeat(" \n\t  ", 40), false},
 		{"empty", "org.example.editor", "", false},
-		{"voice transcript exempt", "sh.blur.meetings", "ok", true},
-		{"typed note exempt", "sh.blur.notes", "ok", true},
+		{"short voice transcript", "sh.blur.meetings", "ok", true},
+		{"short typed note", "sh.blur.notes", "ok", true},
+		{"empty voice transcript", "sh.blur.meetings", "", false},
+		{"blank typed note", "sh.blur.notes", " \n\t  ", false},
 	}
 	for _, c := range cases {
 		if got := MeetsMinimumContent(c.app, c.text); got != c.want {
@@ -30,19 +32,14 @@ func TestMeetsMinimumContentCountsNonWhitespaceCharacters(t *testing.T) {
 	}
 }
 
-// Counting is per rune: combining marks and ZWJ sequences count as several
-// characters. This is accepted behavior, documented here.
-func TestMinimumContentCountsRunesNotGraphemes(t *testing.T) {
+func TestMinimumContentPreservesSingleVisibleGraphemes(t *testing.T) {
 	const app = "org.example.editor"
-	combining := strings.Repeat("e\u0301", 16) // 16 graphemes, 32 runes
+	combining := "e\u0301"
 	if !MeetsMinimumContent(app, combining) {
-		t.Fatal("16 combining-mark graphemes (32 runes) should meet the minimum")
+		t.Fatal("a decomposed accented character should be retained")
 	}
-	family := strings.Repeat("\U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466", 4) // 4 emoji, 28 runes
-	if MeetsMinimumContent(app, family) {
-		t.Fatal("4 ZWJ families are 28 runes and must not meet the minimum")
-	}
-	if !MeetsMinimumContent(app, family+"abcd") {
-		t.Fatal("28 runes plus 4 more should meet the minimum")
+	family := "\U0001F468\u200D\U0001F469\u200D\U0001F467\u200D\U0001F466"
+	if !MeetsMinimumContent(app, family) {
+		t.Fatal("a single ZWJ family should be retained")
 	}
 }

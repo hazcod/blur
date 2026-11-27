@@ -88,6 +88,23 @@ func TestAppleDerivationBindsProgressToProviderScopedIdentity(t *testing.T) {
 	}
 }
 
+func TestDerivationBindsAnOmittedCitationOnlyForOneInputSource(t *testing.T) {
+	input := []Evidence{{SourceID: sourceID('a'), Text: "Project Atlas is owned by Mina."}}
+	client := &appleCompletionStub{text: `{"suggestions":[{"kind":"project","name":"Atlas","fact":"Mina owns Atlas.","open_work":false}]}`}
+	g := newAppleGenerator(client)
+	got, err := g.Generate(context.Background(), input)
+	if err != nil || len(got) != 1 || got[0].SourceID != input[0].SourceID {
+		t.Fatal("a sole input has an unambiguous app-owned citation", got, err)
+	}
+	if _, err := g.Generate(context.Background(), append(input, Evidence{SourceID: sourceID('b'), Text: "A different project."})); err == nil {
+		t.Fatal("an omitted citation was guessed across multiple sources")
+	}
+	client.text = `{"suggestions":[{"kind":"project","name":"Atlas","fact":"Mina owns Atlas.","open_work":false,"source_id":"e2"}]}`
+	if _, err := g.Generate(context.Background(), input); err == nil {
+		t.Fatal("an explicit citation outside the supplied evidence was rebound")
+	}
+}
+
 func TestAppleDerivationGuidanceUsesArrayValuesAndExactSourceChoices(t *testing.T) {
 	input := []Evidence{
 		{SourceID: sourceID('a'), Text: "Project Atlas has a local parser."},

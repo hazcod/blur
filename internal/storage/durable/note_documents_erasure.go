@@ -83,6 +83,7 @@ func (s *Store) deleteNoteDocument(ctx context.Context, id string, expected uint
 		if prepare != nil {
 			for revision := uint64(1); revision <= d.Revision; revision++ {
 				readErr = nil
+				var sourceID string
 				err = state.db.View(ctx, func(r bolt.Reader) error {
 					b, live, e := s.readIndexValueReader(r, noteDocumentRevisionNS, noteRevisionKey(id, revision), 64)
 					defer clear(b)
@@ -93,19 +94,23 @@ func (s *Store) deleteNoteDocument(ctx context.Context, id string, expected uint
 					if !live {
 						return nil
 					}
-					sourceID := string(b)
+					sourceID = string(b)
 					if !validHash(sourceID) {
 						readErr = ErrCorrupt
 						return readErr
 					}
-					readErr = s.prepareSourceErasureReader(ctx, r, sourceID, prepare)
-					return readErr
+					return nil
 				})
 				if readErr != nil {
 					return readErr
 				}
 				if err != nil {
 					return mapStorePhysicalError(err)
+				}
+				if sourceID != "" {
+					if err := s.prepareSourceErasureLocked(ctx, sourceID, prepare); err != nil {
+						return err
+					}
 				}
 			}
 		}

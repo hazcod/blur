@@ -55,7 +55,7 @@ func TestMCPGetChronicleReadsDayAndWeekRecapsAndRejectsBadPeriods(t *testing.T) 
 
 	calls := reader.calls
 	for name, arguments := range map[string]map[string]any{
-		"unknown level":        {"level": "month", "period": "2026-11"},
+		"unknown level":        {"level": "quarter", "period": "2026-Q4"},
 		"day without period":   {"level": "day"},
 		"bad calendar day":     {"level": "day", "period": "2026-02-30"},
 		"week period for day":  {"level": "day", "period": "2026-W46"},

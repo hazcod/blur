@@ -17,6 +17,15 @@ type captureExactIndexStore interface {
 	CaptureIndexPending(context.Context) (bool, error)
 }
 
+type libraryNameIndexStore interface {
+	IndexPendingLibraryNames(context.Context, int) (bool, error)
+	LibraryNameIndexPending(context.Context) (bool, error)
+}
+
+type chronicleErasureMaintenanceStore interface {
+	ResumeChronicleErasure(context.Context) (worked, more bool, err error)
+}
+
 // Exact indexing is a local storage service. It runs even when all AI models
 // and automatic Library enrichment are disabled.
 type exactIndexController struct {
@@ -37,25 +46,43 @@ func newExactIndexController(store exactIndexStore, canRead func() bool, onChang
 		defer ticker.Stop()
 		for {
 			if canRead == nil || canRead() {
-				pending, err := store.ExactIndexPending(ctx)
-				more := false
-				if err == nil && pending {
-					more, err = store.IndexPendingExact(ctx, 32)
+				pending, more := false, false
+				var err error
+				if recaps, ok := store.(chronicleErasureMaintenanceStore); ok {
+					pending, more, err = recaps.ResumeChronicleErasure(ctx)
 				}
-				if captures, ok := store.(captureExactIndexStore); ok && ctx.Err() == nil {
-					capturePending, captureErr := captures.CaptureIndexPending(ctx)
-					captureMore := false
-					if captureErr == nil && capturePending {
-						captureMore, captureErr = captures.IndexPendingCaptures(ctx, 32)
+				// Finish a pending privacy operation before ordinary index work.
+				// This service exists even when every AI feature is disabled.
+				if err == nil && !more {
+					exactPending, exactErr := store.ExactIndexPending(ctx)
+					pending, err = pending || exactPending, exactErr
+					if err == nil && exactPending {
+						more, err = store.IndexPendingExact(ctx, 32)
 					}
-					pending, more = pending || capturePending, more || captureMore
-					err = errors.Join(err, captureErr)
-					if capturePending && captureErr == nil && !captureMore && ctx.Err() == nil {
-						for _, ready := range onCapturesReady {
-							if ready != nil {
-								ready()
+					if captures, ok := store.(captureExactIndexStore); ok && ctx.Err() == nil {
+						capturePending, captureErr := captures.CaptureIndexPending(ctx)
+						captureMore := false
+						if captureErr == nil && capturePending {
+							captureMore, captureErr = captures.IndexPendingCaptures(ctx, 32)
+						}
+						pending, more = pending || capturePending, more || captureMore
+						err = errors.Join(err, captureErr)
+						if capturePending && captureErr == nil && !captureMore && ctx.Err() == nil {
+							for _, ready := range onCapturesReady {
+								if ready != nil {
+									ready()
+								}
 							}
 						}
+					}
+					if library, ok := store.(libraryNameIndexStore); ok && ctx.Err() == nil {
+						libraryPending, libraryErr := library.LibraryNameIndexPending(ctx)
+						libraryMore := false
+						if libraryErr == nil && libraryPending {
+							libraryMore, libraryErr = library.IndexPendingLibraryNames(ctx, 32)
+						}
+						pending, more = pending || libraryPending, more || libraryMore
+						err = errors.Join(err, libraryErr)
 					}
 				}
 				if ctx.Err() != nil {
@@ -114,7 +141,14 @@ func (c *Client) ExactIndexPending(ctx context.Context) (bool, error) {
 		}
 		if captures, ok := c.data.(captureExactIndexStore); ok {
 			capturePending, err := captures.CaptureIndexPending(ctx)
-			return pending || capturePending, err
+			if err != nil {
+				return false, err
+			}
+			pending = pending || capturePending
+		}
+		if library, ok := c.data.(libraryNameIndexStore); ok {
+			libraryPending, err := library.LibraryNameIndexPending(ctx)
+			return pending || libraryPending, err
 		}
 		return pending, nil
 	}

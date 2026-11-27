@@ -344,6 +344,9 @@ func quickPanelQuestionIntent(input string) bool {
 	if assistant.IsCreationRequest(query) {
 		return true
 	}
+	if assistant.IsDutchReadRequest(query) {
+		return true
+	}
 	query = strings.ToLower(query)
 	query = strings.TrimSpace(strings.TrimPrefix(query, "please "))
 	if strings.HasSuffix(query, "?") {
@@ -612,6 +615,7 @@ func (d *desktop) copyLatestQuickAnswer() {
 
 // carryQuickToAsk moves the latest quick exchange into the Ask page state.
 func (d *desktop) carryQuickToAsk() {
+	d.clearRecapSources()
 	n := len(d.quickConversation)
 	if n == 0 {
 		return

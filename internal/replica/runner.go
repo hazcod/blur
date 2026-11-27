@@ -38,12 +38,13 @@ func (r *Runner) Start(parent context.Context) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	r.cancel, r.done, r.poke = cancel, make(chan struct{}), make(chan struct{}, 1)
+	done, poke := r.done, r.poke
 	interval := r.Interval
 	if interval <= 0 {
 		interval = Interval
 	}
 	go func() {
-		defer close(r.done)
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		_, _ = r.Sync(ctx)
@@ -53,7 +54,7 @@ func (r *Runner) Start(parent context.Context) {
 				return
 			case <-ticker.C:
 				_, _ = r.Sync(ctx)
-			case <-r.poke:
+			case <-poke:
 				_, _ = r.Sync(ctx)
 			}
 		}

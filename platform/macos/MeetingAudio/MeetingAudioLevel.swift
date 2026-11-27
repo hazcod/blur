@@ -55,7 +55,7 @@ final class MeetingAudioLevelMeter: @unchecked Sendable {
         if let event = event(track: track, buffer: buffer, milliseconds: milliseconds) { emit(event) }
     }
     func event(track: String, buffer: AVAudioPCMBuffer, milliseconds: Double) -> MeetingAudioEvent? {
-        guard ["microphone", "system"].contains(track), milliseconds.isFinite, milliseconds >= 0, milliseconds <= 86400000 else { return nil }
+        guard ["microphone", "system"].contains(track), meetingAudioTimestamp(milliseconds) != nil else { return nil }
         guard lock.withLock({ last[track].map { milliseconds >= $0 + 100 } ?? true }) else { return nil }
         guard let level = meetingAudioRMS(buffer) else { return nil }
         return lock.withLock {

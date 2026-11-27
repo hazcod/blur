@@ -3,9 +3,9 @@ package client
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
-	"fmt"
-	"os"
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strconv"
@@ -13,8 +13,64 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/activity"
+	"github.com/hazcod/blur/internal/localzone"
 	"github.com/hazcod/blur/internal/today"
 )
+
+type todayActivityPager interface {
+	ListActivitySegmentsForDate(context.Context, string, string, int) ([]activity.Segment, string, error)
+}
+
+func walkTodayActivity(ctx context.Context, reader ActivityData, dates []string, consume func(activity.Segment) error) error {
+	if pager, ok := reader.(todayActivityPager); ok {
+		for _, date := range dates {
+			after := ""
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				rows, next, err := pager.ListActivitySegmentsForDate(ctx, date, after, 64)
+				if err != nil {
+					return err
+				}
+				if len(rows) > 64 || next != "" && (next == after || len(rows) == 0) {
+					return ErrInvalidRequest
+				}
+				for _, row := range rows {
+					if err := consume(row); err != nil {
+						return err
+					}
+				}
+				if next == "" {
+					break
+				}
+				after = next
+			}
+		}
+		return ctx.Err()
+	}
+	segments, err := reader.ListActivitySegmentsForDates(ctx, dates, MaxActivityReportSegments)
+	if err != nil {
+		return err
+	}
+	if len(segments) > MaxActivityReportSegments {
+		return ErrActivityLimit
+	}
+	// The compatibility path has no page API. Keep its historical ordering so
+	// existing adapters produce the same generation on each materialization.
+	sort.Slice(segments, func(i, j int) bool {
+		if segments[i].WallStart.Equal(segments[j].WallStart) {
+			return segments[i].ID < segments[j].ID
+		}
+		return segments[i].WallStart.After(segments[j].WallStart)
+	})
+	for _, segment := range segments {
+		if err := consume(segment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // materializeTodayActivity derives a small, deterministic day recap from
 // encrypted activity metadata. It never re-reads an app or sends captured text
@@ -37,20 +93,6 @@ func materializeTodayActivity(ctx context.Context, date, zoneName string, existi
 	if len(dates) == 0 || len(dates) > 3 {
 		return today.Snapshot{}, false, ErrInvalidRequest
 	}
-	segments, err := reader.ListActivitySegmentsForDates(ctx, dates, MaxActivityReportSegments)
-	if err != nil {
-		return today.Snapshot{}, false, err
-	}
-	if len(segments) > MaxActivityReportSegments {
-		return today.Snapshot{}, false, ErrActivityLimit
-	}
-	sort.Slice(segments, func(i, j int) bool {
-		if segments[i].WallStart.Equal(segments[j].WallStart) {
-			return segments[i].ID < segments[j].ID
-		}
-		return segments[i].WallStart.After(segments[j].WallStart)
-	})
-
 	type group struct {
 		id, label      string
 		duration       time.Duration
@@ -66,19 +108,17 @@ func materializeTodayActivity(ctx context.Context, date, zoneName string, existi
 	}
 	changes := make(map[string]change)
 	var latest time.Time
-	fingerprint := sha256.New()
-	var sourceBuffer = make([]byte, 0, 128)
-	separator := []byte{0}
-	for i := range segments {
-		segment := segments[i]
+	var fingerprint [sha256.Size]byte
+	var fingerprintCount uint64
+	consume := func(segment activity.Segment) error {
 		if segment.Validate() != nil {
-			return today.Snapshot{}, false, ErrInvalidRequest
+			return ErrInvalidRequest
 		}
 		if len(segment.SourceIDs) == 0 {
-			continue
+			return nil
 		}
 		if !segment.WallEnd.After(start) || !segment.WallStart.Before(end) {
-			continue
+			return nil
 		}
 		if segment.WallStart.Before(start) {
 			segment.WallStart = start
@@ -88,16 +128,20 @@ func materializeTodayActivity(ctx context.Context, date, zoneName string, existi
 		}
 		segment.Duration = int64(segment.WallEnd.Sub(segment.WallStart))
 		if segment.Duration <= 0 {
-			continue
+			return nil
 		}
 		label, groupValue := activityLabel(segment)
 		id := projectionID("subject", groupValue)
-		_, _ = fmt.Fprintf(fingerprint, "%s\x00%s\x00%s\x00%d\x00", segment.ID, id, segment.WallStart.UTC().Format(time.RFC3339Nano), segment.Duration)
-		for _, sourceID := range segment.SourceIDs {
-			sourceBuffer = append(sourceBuffer[:0], sourceID...)
-			_, _ = fingerprint.Write(sourceBuffer)
-			_, _ = fingerprint.Write(separator)
+		encoded, err := json.Marshal(segment)
+		if err != nil {
+			return ErrInvalidRequest
 		}
+		segmentHash := sha256.Sum256(encoded)
+		clear(encoded)
+		for i := range fingerprint {
+			fingerprint[i] ^= segmentHash[i]
+		}
+		fingerprintCount++
 		entry := groups[id]
 		if entry == nil {
 			entry = &group{id: id, label: label, sources: make(map[string]struct{})}
@@ -122,11 +166,17 @@ func materializeTodayActivity(ctx context.Context, date, zoneName string, existi
 				changes[sourceID] = change{at: segment.WallEnd.Add(-time.Nanosecond), sourceTime: segment.WallEnd, text: "Active in " + label, source: sourceID, subjectID: id, subjectLabel: label}
 			}
 		}
+		return nil
+	}
+	if err := walkTodayActivity(ctx, reader, dates, consume); err != nil {
+		return today.Snapshot{}, false, err
 	}
 	if len(groups) == 0 {
 		return existing, found, nil
 	}
-	fingerprintHash := fingerprint.Sum(nil)
+	var countBytes [8]byte
+	binary.LittleEndian.PutUint64(countBytes[:], fingerprintCount)
+	fingerprintHash := sha256.Sum256(append(fingerprint[:], countBytes[:]...))
 	generationID := "activity-" + date + "-" + hex.EncodeToString(fingerprintHash[:16])
 	if found && existing.GenerationID == generationID {
 		return existing, true, nil
@@ -344,6 +394,9 @@ func hasSource(set map[string]struct{}, id string) bool {
 }
 
 func displayAppName(appID string) string {
+	if strings.TrimSpace(appID) == "" || strings.HasSuffix(appID, ".") {
+		return "Unknown app"
+	}
 	switch strings.ToLower(appID) {
 	case "com.tinyspeck.slackmacgap", "com.slack":
 		return "Slack"
@@ -459,39 +512,16 @@ func (w fencedTodayWriter) PutTodaySnapshot(ctx context.Context, snapshot today.
 	return err
 }
 
-const defaultLocaltimePath = "/etc/localtime"
-
 var zoneFallbackPattern = regexp.MustCompile(`^([A-Za-z]{1,6})([+-])(\d{2})(\d{2})$`)
 
 // localZoneName resolves the machine zone to a stable name. time.Local.String()
 // is the literal "Local", which is meaningless once stored.
 func localZoneName() string {
-	return resolveZoneName(os.Getenv("TZ"), defaultLocaltimePath, time.Now())
+	return localzone.Name()
 }
 
 func resolveZoneName(tzEnv, localtimePath string, now time.Time) string {
-	if name := strings.TrimPrefix(tzEnv, ":"); name != "" && name != "Local" {
-		if _, err := time.LoadLocation(name); err == nil {
-			return name
-		}
-	}
-	if target, err := os.Readlink(localtimePath); err == nil {
-		target = strings.ReplaceAll(target, `\`, "/")
-		const marker = "zoneinfo/"
-		if i := strings.LastIndex(target, marker); i >= 0 {
-			if name := target[i+len(marker):]; name != "" && name != "Local" {
-				if _, err := time.LoadLocation(name); err == nil {
-					return name
-				}
-			}
-		}
-	}
-	abbreviation, offset := now.In(time.Local).Zone()
-	sign := '+'
-	if offset < 0 {
-		sign, offset = '-', -offset
-	}
-	return fmt.Sprintf("%s%c%02d%02d", abbreviation, sign, offset/3600, offset%3600/60)
+	return localzone.Resolve(tzEnv, localtimePath, now)
 }
 
 // loadZone accepts IANA names and the "ABBR+HHMM" fallback from localZoneName.

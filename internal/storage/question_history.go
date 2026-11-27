@@ -44,3 +44,14 @@ type QuestionHistory interface {
 	// DeleteAllQuestions clears the whole history.
 	DeleteAllQuestions(context.Context) error
 }
+
+// QuestionHistoryReadWriter atomically appends convenience history only if the
+// answer's committed read is unchanged. The returned epoch includes that write
+// alone; it must never adopt an intervening evidence mutation as a fresh read.
+type QuestionHistoryReadWriter interface {
+	AppendQuestionAtRead(context.Context, QuestionRecord, uint64) (next uint64, accepted bool, err error)
+}
+
+type VoiceQuestionHistoryReadWriter interface {
+	AppendQuestionAtVoiceRead(context.Context, QuestionRecord, uint64) (next uint64, accepted bool, err error)
+}

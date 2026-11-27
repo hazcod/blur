@@ -59,10 +59,12 @@ func TestActivityReportRangeValidationMatchesClientLimits(t *testing.T) {
 		want             bool
 	}{
 		{"single day", "2026-11-06", "2026-11-06", true},
-		{"maximum span", "2026-10-07", "2026-11-06", true},
+		{"31 day span", "2026-10-07", "2026-11-06", true},
+		{"year", "2024-01-01", "2024-12-31", true},
+		{"maximum span", "2024-01-01", "2025-02-03", true},
 		{"reverse order", "2026-11-07", "2026-11-06", false},
 		{"invalid calendar date", "2026-02-30", "2026-03-01", false},
-		{"too many days", "2026-10-06", "2026-11-06", false},
+		{"too many days", "2024-01-01", "2025-02-04", false},
 		{"empty", "", "", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {

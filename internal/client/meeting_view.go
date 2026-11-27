@@ -591,16 +591,20 @@ func (d *desktop) loadMeetingTranscript(after uint64) {
 	d.meetingUI.request++
 	request, generation := d.meetingUI.request, d.memoryGeneration
 	go func() {
-		page, err := d.client.MeetingTranscript(context.Background(), id, after)
+		page, read, err := d.client.readMeetingTranscript(context.Background(), id, after)
 		d.app.Post(func() {
 			if generation != d.memoryGeneration || request != d.meetingUI.request || id != d.meetingUI.selected {
 				return
 			}
 			d.meetingUI.reading = false
 			if err != nil {
-				d.meetingUI.status = meetingErrorCopy(err)
-			} else {
-				d.meetingUI.transcript, d.meetingUI.transcriptAt = page, after
+				if errors.Is(err, ErrMemoryChanging) {
+					d.meetingUI.status = voiceReadChangedCopy
+				} else {
+					d.meetingUI.status = meetingErrorCopy(err)
+				}
+			} else if !read.publish(d.client, func() { d.meetingUI.transcript, d.meetingUI.transcriptAt = page, after }) {
+				d.meetingUI.status = voiceReadChangedCopy
 			}
 			d.app.RequestUpdate()
 		})
@@ -613,8 +617,10 @@ func (d *desktop) summarizeMeetingPage() {
 		return
 	}
 	id, after, request := u.selected, u.transcriptAt, u.request
-	epoch, stable := d.client.BeginMemoryRead()
+	read, stable := d.client.beginVoicePublication()
 	if !stable {
+		u.status = voiceReadChangedCopy
+		d.app.RequestUpdate()
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -625,19 +631,34 @@ func (d *desktop) summarizeMeetingPage() {
 		result, err := d.client.SummarizeMeetingPage(ctx, id, after)
 		cancel()
 		d.app.Post(func() {
-			if u.selected != id || u.request != request || !d.client.MemoryReadCurrent(epoch) {
+			if u.selected != id || u.request != request {
 				return
 			}
 			u.summaryLoading, u.summaryCancel = false, nil
+			if !read.publish(d.client, func() {}) {
+				u.summary, u.transcript, u.status = nil, meetings.RecordPage{}, voiceReadChangedCopy
+				d.app.RequestUpdate()
+				return
+			}
+			if err == nil && result.Publication != nil && !result.Publication.Publish(func() { u.summary = &result }) {
+				u.transcript = meetings.RecordPage{}
+				err = ErrMemoryChanging
+			}
 			if err != nil {
-				u.status = meetingSummaryErrorCopy(err, effectiveProvider(d.client.LocalAISettings()))
-			} else {
+				if errors.Is(err, ErrMemoryChanging) {
+					u.status = voiceReadChangedCopy
+				} else {
+					u.status = meetingSummaryErrorCopy(err, effectiveProvider(d.client.LocalAISettings()))
+				}
+			} else if result.Publication == nil {
 				u.summary = &result
 			}
 			d.app.RequestUpdate()
 		})
 	}()
 }
+
+const voiceReadChangedCopy = "Memory is changing. Open this voice note again to load its current saved words."
 
 func meetingErrorCopy(err error) string {
 	var operation darwin.MeetingAudioOperationError
@@ -741,7 +762,10 @@ func (d *desktop) meetingTranscriptView() ui.View {
 		if live {
 			records = u.live.Tail
 		}
-		if len(records) == 0 && !u.reading {
+		if live && u.live.TailOlder {
+			rows = append(rows, wrapLabel("Earlier saved words are available in the full transcript.").Style(styleMeta))
+		}
+		if len(records) == 0 && !u.reading && (!live || !u.live.TailOlder) {
 			rows = append(rows, wrapLabel("No saved words on this page.").Style(modern.MutedText))
 		}
 		if u.reading && !live {

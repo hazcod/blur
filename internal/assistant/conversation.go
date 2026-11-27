@@ -227,7 +227,9 @@ func EvidenceDigests(evidence []Evidence) map[string]string {
 			Text, App, Domain string
 			Origin            EvidenceOrigin
 			Partial           bool
-		}{item.Text, item.AppID, item.Domain, item.Origin, item.Partial})
+			CoverageLimited   bool
+			SourceIDs         []string
+		}{item.Text, item.AppID, item.Domain, item.Origin, item.Partial, item.CoverageLimited, item.SourceIDs})
 		sum := sha256.Sum256(data)
 		result[item.SourceID] = hex.EncodeToString(sum[:])
 	}

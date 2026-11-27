@@ -544,14 +544,14 @@ func TestActivityReportUsesBoundedUTCIndexAndLocalCalendar(t *testing.T) {
 	if got.Eligible != int64(30*time.Minute) || len(got.Days) != 1 || got.Days[0].Date != "2026-11-05" || got.Days[0].Duration != int64(30*time.Minute) {
 		t.Fatalf("local-day report = %+v", got)
 	}
-	if len(d.activityDates) == 0 || d.activityDates[0] != "2026-11-04" {
+	if len(d.activityDates) == 0 || d.activityDates[0] != "2026-11-03" {
 		t.Fatalf("report did not query the overlapping UTC partition: %v", d.activityDates)
 	}
 }
 
 func TestActivityReportRejectsInvalidOrOverlongRanges(t *testing.T) {
 	client := NewClient(&testData{})
-	for _, input := range [][3]string{{"bad", "2026-11-05", "UTC"}, {"2026-11-06", "2026-11-05", "UTC"}, {"2026-01-01", "2026-02-01", "UTC"}, {"2026-11-05", "2026-11-05", "No/Such_Zone"}} {
+	for _, input := range [][3]string{{"bad", "2026-11-05", "UTC"}, {"2026-11-06", "2026-11-05", "UTC"}, {"2024-01-01", "2025-02-04", "UTC"}, {"2026-11-05", "2026-11-05", "No/Such_Zone"}} {
 		if _, err := client.ActivityReport(input[0], input[1], input[2]); err == nil {
 			t.Fatalf("accepted range %q..%q zone %q", input[0], input[1], input[2])
 		}

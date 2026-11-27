@@ -99,6 +99,7 @@ type mcpRollupResponse struct {
 	SourceIDsTruncated bool      `json:"source_ids_truncated,omitempty"`
 	GeneratedAt        time.Time `json:"generated_at,omitempty"`
 	Dirty              bool      `json:"dirty,omitempty"`
+	CoverageLimited    bool      `json:"coverage_limited,omitempty"`
 }
 
 type mcpChronicleResponse struct {
@@ -211,6 +212,8 @@ type mcpWikiEntity struct {
 	Aliases          []string        `json:"aliases,omitempty"`
 	State            knowledge.State `json:"state"`
 	Facts            []mcpWikiFact   `json:"facts,omitempty"`
+	FactsNext        string          `json:"facts_next,omitempty"`
+	FactsHasMore     bool            `json:"facts_has_more,omitempty"`
 	OpenLoops        []mcpWikiLoop   `json:"open_loops,omitempty"`
 	DetailsTruncated bool            `json:"details_truncated,omitempty"`
 }
@@ -435,6 +438,14 @@ func decodeMCPChronicleParams(raw []byte) (mcpChronicleParams, error) {
 		if params.HourID != "" || !chronicle.ValidWeekKey(params.Period) {
 			return mcpChronicleParams{}, ErrInvalidRequest
 		}
+	case chronicle.RollupLevelMonth:
+		if params.HourID != "" || !chronicle.ValidMonthKey(params.Period) {
+			return mcpChronicleParams{}, ErrInvalidRequest
+		}
+	case chronicle.RollupLevelYear:
+		if params.HourID != "" || !chronicle.ValidYearKey(params.Period) {
+			return mcpChronicleParams{}, ErrInvalidRequest
+		}
 	default:
 		return mcpChronicleParams{}, ErrInvalidRequest
 	}
@@ -458,7 +469,7 @@ func (c *Client) readMCPRollup(ctx context.Context, epoch uint64, params mcpChro
 		if rollup.ID != id || rollup.Level != params.Level || rollup.PeriodKey != params.Period || chronicle.ValidateRollup(rollup) != nil || len(rollup.SourceIDs) == 0 {
 			return nil, ErrInvalidRequest
 		}
-		response = mcpRollupResponse{Found: true, Level: rollup.Level, Period: rollup.PeriodKey, Start: rollup.Start.UTC(), End: rollup.End.UTC(), Text: rollup.Text, ChildIDs: append([]string(nil), rollup.ChildIDs...), GeneratedAt: rollup.GeneratedAt.UTC(), Dirty: rollup.Dirty}
+		response = mcpRollupResponse{Found: true, Level: rollup.Level, Period: rollup.PeriodKey, Start: rollup.Start.UTC(), End: rollup.End.UTC(), Text: rollup.Text, ChildIDs: append([]string(nil), rollup.ChildIDs...), GeneratedAt: rollup.GeneratedAt.UTC(), Dirty: rollup.Dirty, CoverageLimited: rollup.Sampled || rollup.CoverageVersion == 0}
 		response.SourceIDs = append([]string(nil), rollup.SourceIDs...)
 		if len(response.SourceIDs) > maxMCPRollupSourceIDs {
 			response.SourceIDs, response.SourceIDsTruncated = response.SourceIDs[:maxMCPRollupSourceIDs], true
@@ -893,7 +904,7 @@ func (c *Client) searchMCPWiki(ctx context.Context, epoch uint64, params mcpWiki
 }
 
 func boundMCPWikiEntity(entity knowledge.Entity) mcpWikiEntity {
-	item := mcpWikiEntity{ID: entity.ID, Kind: entity.Kind, Name: entity.Name, State: entity.State}
+	item := mcpWikiEntity{ID: entity.ID, Kind: entity.Kind, Name: entity.Name, State: entity.State, FactsNext: entity.FactsNext, FactsHasMore: entity.FactsHasMore}
 	if len(entity.Aliases) > 8 {
 		item.DetailsTruncated = true
 		entity.Aliases = entity.Aliases[:8]

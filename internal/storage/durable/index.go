@@ -29,11 +29,12 @@ const (
 	// searchIndexFormatVersion is the version of what the observation index
 	// contains, stamped in its ready marker. Version 5 adds the window-title
 	// field (bit 0x08) and folds diacritics and possessives in
-	// search.NormalizeTokens. A store whose marker is older is rebuilt by
+	// search.NormalizeTokens. Version 6 also folds letters without a canonical
+	// decomposition ("ø", "ß", "ł"). A store whose marker is older is rebuilt by
 	// ensureSearchIndex: the index is cleared and every retained observation
 	// is queued through the pending-index backfill, which indexes it in the
 	// background. Bump it whenever field bits or tokenization change.
-	searchIndexFormatVersion byte = 5
+	searchIndexFormatVersion byte = 6
 	// searchIndexStructureVersion is the version byte of the page, tree and
 	// reverse-link encodings. It is independent of the content version above
 	// so a content-only bump never makes an existing record undecodable (the
@@ -81,6 +82,9 @@ type searchIndexConstraint struct {
 var _ search.ExactIndex = (*Store)(nil)
 
 func (s *Store) searchLookupDigest(kind byte, value string) [sha256.Size]byte {
+	if s.captureSearch && kind == searchIndexTerm {
+		return s.captureTermLookupDigest(search.CaptureTermDigest(value))
+	}
 	mac := hmac.New(sha256.New, s.state.idKey)
 	_, _ = io.WriteString(mac, s.exactNamespace("blur.durable.search.lookup.v1\x00"))
 	_, _ = mac.Write([]byte{kind})
@@ -89,6 +93,15 @@ func (s *Store) searchLookupDigest(kind byte, value string) [sha256.Size]byte {
 	sum := mac.Sum(nil)
 	copy(digest[:], sum)
 	clear(sum)
+	return digest
+}
+
+func (s *Store) captureTermLookupDigest(term [32]byte) [32]byte {
+	mac := hmac.New(sha256.New, s.state.idKey)
+	_, _ = io.WriteString(mac, s.exactNamespace("blur.durable.capture.token.v1\x00"))
+	_, _ = mac.Write(term[:])
+	var digest [32]byte
+	copy(digest[:], mac.Sum(nil))
 	return digest
 }
 
@@ -532,6 +545,9 @@ func (tx *Tx) deleteObservation(sourceID string) error {
 	if err := tx.removeSearchIndexSourceLocked(sourceID); err != nil {
 		return tx.failLocked(err)
 	}
+	if err := tx.removeReplicaReceiptLocked(sourceID); err != nil {
+		return tx.failLocked(err)
+	}
 	recordKey := tx.store.logicalKey(groupRecord, kindObservation, "", sourceID)
 	orderKey := tx.store.logicalKey(groupOrder, kindObservation, "", sourceID)
 	if err := tx.deleteEntryLocked(recordKey); err != nil {
@@ -798,14 +814,10 @@ func decodeSearchIndexState(reader bolt.Reader, store *Store, maxBytes int) (int
 	decoded, err := store.open(store.exactStateKey(), store.exactNamespace("search-index-state-v1"), envelope)
 	clear(envelope)
 	// The observation index is rebuilt on a content-version bump, so its marker
-	// must be current. The capture-part index is not rebuilt: its marker may
-	// still carry the structure version it was written at, and its pages stay
-	// decodable (see capturePartIndexStateReader). The capture-part marker is
-	// never upgraded to the new format version, so this relaxed branch is
-	// permanent, and parts published before a version bump keep the old
-	// tokenization until they are re-published.
+	// must be current. Capture-part pages remain structurally decodable during
+	// the bounded content migration (see capturePartIndexStateReader).
 	current := len(decoded) == 2 && (decoded[0] == searchIndexFormatVersion ||
-		store.captureSearch && decoded[0] >= searchIndexStructureVersion && decoded[0] < searchIndexFormatVersion)
+		store.captureSearch && decoded[0] >= searchIndexStructureVersion && decoded[0] <= captureIndexContentFormat)
 	if err != nil || !current || decoded[1] != 1 {
 		clear(decoded)
 		return used, false, false, ErrCorrupt
@@ -1113,6 +1125,19 @@ func (s *Store) searchExactTreeReaderScoped(ctx context.Context, reader bolt.Rea
 			}
 			if candidate.matches {
 				capturedAt = captureSummary.Header().CapturedAt()
+				mapping, found, err := s.captureIndexPartReader(captureQueryReader{reader, result, query.MaxBytes}, posting.sourceID)
+				if err != nil {
+					return err
+				}
+				if !found {
+					return ErrCorrupt
+				}
+				if mapping.Range {
+					sourceBytes = mapping.Bytes + len(captureSummary.Header().AppID()) + len(captureSummary.Header().Domain())
+					if sourceBytes > query.MaxBytes-result.Bytes {
+						return search.ErrIndexBudget
+					}
+				}
 			}
 		}
 		if candidate.matches && !query.CapturedStart.IsZero() && captureEvidence {

@@ -127,37 +127,45 @@ func (tx *Tx) removeChronicleFollowUp(summary chronicle.Summary) error {
 	return nil
 }
 
-// Observation admission validates the same small encrypted order entry twice:
-// once with the primary text and once when reading its captured-at provenance.
-// Reuse only the last such entry during the read-only admission phase. The
-// caller still authenticates/decodes it on every use. No source text is cached,
-// no write occurs through this reader, and the cache never grows with inputs.
+// Admission reuses small authenticated receipts during its read-only phase:
+// source liveness and the hour-visit check share edition/mapping/cutoff records.
+// Cache absence too, so empty global cutoffs do not consume repeated physical
+// reads. Bodies are excluded; both entry count and total bytes are bounded.
+// Call close before the first write through the underlying transaction.
 type chronicleAdmissionReader struct {
 	bolt.Reader
-	key, value []byte
+	entries map[string]admissionEntry
+	bytes   int
+}
+
+type admissionEntry struct {
+	value []byte
+	found bool
 }
 
 func (r *chronicleAdmissionReader) Get(key []byte) ([]byte, bool, error) {
-	if len(key) < 2 || key[0] != groupOrder || key[1] != kindObservation {
+	if len(key) < 2 || !(key[0] == groupOrder && key[1] == kindObservation || key[0] == groupRecord && key[1] == kindIndex) {
 		return r.Reader.Get(key)
 	}
-	if bytes.Equal(r.key, key) {
-		return append([]byte(nil), r.value...), true, nil
+	if entry, ok := r.entries[string(key)]; ok {
+		return append([]byte(nil), entry.value...), entry.found, nil
 	}
-	clear(r.key)
-	clear(r.value)
-	r.key, r.value = nil, nil
 	value, found, err := r.Reader.Get(key)
-	if err == nil && found && len(value) <= 1024 {
-		r.key = append([]byte(nil), key...)
-		r.value = append([]byte(nil), value...)
+	if err == nil && len(value) <= 4096 && len(r.entries) < 1024 && len(value)+len(key) <= (256<<10)-r.bytes {
+		if r.entries == nil {
+			r.entries = make(map[string]admissionEntry)
+		}
+		r.entries[string(key)] = admissionEntry{value: append([]byte(nil), value...), found: found}
+		r.bytes += len(value) + len(key)
 	}
 	return value, found, err
 }
 func (r *chronicleAdmissionReader) close() {
-	clear(r.key)
-	clear(r.value)
-	r.key, r.value = nil, nil
+	for _, entry := range r.entries {
+		clear(entry.value)
+	}
+	clear(r.entries)
+	r.entries, r.bytes = nil, 0
 }
 
 // migrateChronicleFollowUpPageLocked repairs copies whose historical recap

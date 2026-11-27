@@ -372,10 +372,33 @@ func seeksStoredLocation(ws []word) bool {
 	if !startsWithWhere(ws) {
 		return false
 	}
-	if hasWord(ws, storageParticiples...) {
+	if hasWord(ws, storageParticiples...) || recordLocationEnd(ws, false) > 0 {
 		return true
 	}
 	return ws[len(ws)-1].s == "again" && (hasWord(ws, "my", "our", "that", "this") || hasSeq(ws, "the", "one"))
+}
+
+// recordLocationEnd recognises the stored-record noun phrase, not every use of
+// "record" (a record player or a world record). Return the topic's first word
+// so retrieval can omit the request grammar and require matching evidence.
+func recordLocationEnd(ws []word, literalSubject bool) int {
+	if !startsWithWhere(ws) {
+		return 0
+	}
+	at := 1
+	if ws[0].s == "where" {
+		if ws[at].s != "is" && ws[at].s != "are" {
+			return 0
+		}
+		at++
+	}
+	if at < len(ws) && hasWord(ws[at:at+1], "the", "a", "that", "this", "those", "these", "my", "our") {
+		at++
+	}
+	if at+2 > len(ws) || at+2 == len(ws) && !literalSubject || !hasWord(ws[at:at+1], "record", "records") || !hasWord(ws[at+1:at+2], "for", "of", "about", "on") {
+		return 0
+	}
+	return at + 2
 }
 
 // storageQuestion also covers the first-person act ("where did I put the SOW

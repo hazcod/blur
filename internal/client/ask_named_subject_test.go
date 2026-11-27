@@ -29,6 +29,15 @@ func (g *namedSubjectAnswerGenerator) GenerateGeneral(context.Context, string, i
 	return "A general response.", nil
 }
 
+func TestRetrievalCommandRespectsExplicitGeneralMode(t *testing.T) {
+	c := libraryNameFixture(t)
+	g := &namedSubjectAnswerGenerator{}
+	result, err := assistant.NewService(c, g, integrationTokenCounter{}, assistant.ContextTokenLimit).AskWithHistoryMode(context.Background(), "Find voyagerpacket", nil, "general")
+	if err != nil || !result.General || g.generalCalls != 1 || g.memoryCalls != 0 || len(result.Answer.SourceIDs) != 0 {
+		t.Fatalf("explicit general mode became memory search: %+v general=%d memory=%d err=%v", result, g.generalCalls, g.memoryCalls, err)
+	}
+}
+
 func TestUnknownNamedSubjectAttributeAbstainsWithOnlyMatchingEncryptedNote(t *testing.T) {
 	store, err := durable.OpenDurable(filepath.Join(t.TempDir(), "memory.db"), securestore.OfflineFixtureKey(), durable.CreateNew)
 	if err != nil {

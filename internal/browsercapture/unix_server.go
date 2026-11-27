@@ -4,6 +4,7 @@ package browsercapture
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -83,7 +84,13 @@ func (s *UnixServer) serve(ctx context.Context) {
 					return
 				}
 				defer clear(frame)
-				_ = s.receiver.Accept(requestCtx, frame)
+				err = s.receiver.Accept(requestCtx, frame)
+				reply, _ := json.Marshal(struct {
+					OK      bool `json:"ok"`
+					Restart bool `json:"restart"`
+					Paused  bool `json:"paused"`
+				}{OK: err == nil, Restart: errors.Is(err, ErrDocumentRestart), Paused: errors.Is(err, ErrReceiverPaused) || errors.Is(err, ErrRejected)})
+				_ = conn.Send(requestCtx, reply)
 			}()
 		default:
 			_ = conn.Close()

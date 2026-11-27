@@ -81,6 +81,22 @@ type Entity struct {
 	ActivitySourceIDs []string   `json:"activity_source_ids,omitempty"`
 	MergedInto        string     `json:"merged_into,omitempty"`
 	Inference         *Inference `json:"inference,omitempty"`
+	// FactsNext and FactsHasMore describe a bounded fact window returned by
+	// inferred-memory readers. Authored entities leave them empty.
+	FactsNext       string `json:"facts_next,omitempty"`
+	FactsHasMore    bool   `json:"facts_has_more,omitempty"`
+	ActivityHasMore bool   `json:"activity_has_more,omitempty"`
+}
+
+type FactPageRequest struct {
+	After string
+	Limit int
+}
+
+type FactPage struct {
+	Facts   []Fact `json:"facts"`
+	Next    string `json:"next,omitempty"`
+	HasMore bool   `json:"has_more"`
 }
 
 // Inference identifies a group of source-backed mentions in one context.

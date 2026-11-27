@@ -170,13 +170,13 @@ func formatBackgroundWorkGroup(group BackgroundWorkGroup) backgroundWorkRow {
 	if group.ID == "recaps" {
 		switch {
 		case group.RollupsPending == 1:
-			row.Detail += " 1 day or week recap pending."
+			row.Detail += " 1 calendar recap pending."
 		case group.RollupsPending > 1:
-			row.Detail += fmt.Sprintf(" %d day or week recaps pending.", group.RollupsPending)
+			row.Detail += fmt.Sprintf(" %d calendar recaps pending.", group.RollupsPending)
 		case group.RollupsDirty == 1:
-			row.Detail += " 1 day or week recap waiting for its period to end."
+			row.Detail += " 1 calendar recap waiting for its period to end."
 		case group.RollupsDirty > 1:
-			row.Detail += fmt.Sprintf(" %d day or week recaps waiting for their period to end.", group.RollupsDirty)
+			row.Detail += fmt.Sprintf(" %d calendar recaps waiting for their period to end.", group.RollupsDirty)
 		}
 	}
 	if group.Completed > 0 {

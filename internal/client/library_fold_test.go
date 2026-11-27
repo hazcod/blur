@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,10 +18,24 @@ import (
 	"github.com/hazcod/blur/internal/storage/durable"
 )
 
-// libraryNameFixture stores one inferred Library entity per name. The durable
-// name index is keyed by knowledge.NormalizeExact (lowercase only) and is never
-// migrated, so lookups must offer the stored spelling at the boundary.
+// libraryNameFixture stores one inferred Library entity per name through the
+// same source-validated path as background enrichment.
 func libraryNameFixture(t *testing.T, names ...string) *Client {
+	t.Helper()
+	entries := make([]libraryEntry, len(names))
+	for i, name := range names {
+		entries[i] = libraryEntry{knowledge.Person, name}
+	}
+	return libraryEntryFixture(t, entries...)
+}
+
+type libraryEntry struct {
+	kind knowledge.Kind
+	name string
+}
+
+// libraryEntryFixture is libraryNameFixture with a chosen kind per entry.
+func libraryEntryFixture(t *testing.T, entries ...libraryEntry) *Client {
 	t.Helper()
 	s, err := durable.OpenDurable(filepath.Join(t.TempDir(), "memory.db"), securestore.OfflineFixtureKey(), durable.CreateNew)
 	if err != nil {
@@ -29,7 +44,8 @@ func libraryNameFixture(t *testing.T, names ...string) *Client {
 	t.Cleanup(func() { _ = s.Close() })
 	c := NewClient(s)
 	t.Cleanup(c.Close)
-	for _, name := range names {
+	for _, entry := range entries {
+		name := entry.name
 		text := name + " owns the vendor contract renewal."
 		source, err := capture.SanitizeObservation("editor.app", "work.example", text, 4096)
 		if err != nil {
@@ -39,7 +55,7 @@ func libraryNameFixture(t *testing.T, names ...string) *Client {
 			t.Fatal(err)
 		}
 		chunk := enrich.Chunk{SourceID: source.ContentID(), ModelKey: enrich.ModelKey("fixture"), End: len(text), Next: len(text), Complete: true,
-			Proposals: []derive.Proposal{{Kind: knowledge.Person, Name: name, Fact: text, SourceID: source.ContentID()}}}
+			Proposals: []derive.Proposal{{Kind: entry.kind, Name: name, Fact: text, SourceID: source.ContentID()}}}
 		if err := s.ApplyEnrichment(context.Background(), chunk); err != nil {
 			t.Fatal(err)
 		}
@@ -72,9 +88,54 @@ func hasFact(facts []string, want string) bool {
 
 func TestTopicQuestionFindsLibraryEntityStoredWithAccents(t *testing.T) {
 	c := libraryNameFixture(t, "José Müller")
-	for _, question := range []string{"What did we decide about José Müller?", "what did we decide about JOSÉ MÜLLER"} {
+	for _, question := range []string{"What did we decide about José Müller?", "what did we decide about JOSÉ MÜLLER", "What did we decide about jose muller?", "What did we decide about José Müller?"} {
 		if facts := libraryFacts(t, c, question); !hasFact(facts, "José Müller owns") {
 			t.Fatalf("%q lost the accented Library entity: %v", question, facts)
+		}
+	}
+}
+
+func TestEntityQuestionFindsAccentedLibraryEntityFromAsciiName(t *testing.T) {
+	c := libraryNameFixture(t, "José")
+	plan, err := assistant.PlanQuestion("What do you know about Jose?", time.Now(), nil)
+	if err != nil || plan.Entity == "" {
+		t.Fatalf("plan: %+v err=%v", plan, err)
+	}
+	evidence, err := c.inferredEntityEvidence(context.Background(), plan)
+	if err != nil || !hasFact(evidenceTexts(evidence), "José owns") {
+		t.Fatalf("entity lookup missed the accented Library entity: %+v err=%v", evidence, err)
+	}
+}
+
+func TestFoldedLibrarySubjectReportsOmittedContexts(t *testing.T) {
+	c := libraryNameFixture(t)
+	s := c.data.(*durable.Store)
+	ctx := context.Background()
+	for index := 0; index < 129; index++ {
+		name := "José"
+		if index%2 == 0 {
+			name = "Jose"
+		}
+		text := fmt.Sprintf("%s owns supplier renewal %d.", name, index)
+		o, err := capture.SanitizeObservation("editor.app", fmt.Sprintf("work%d.example", index), text, 4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutObservationAt(ctx, o, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ApplyEnrichment(ctx, enrich.Chunk{SourceID: o.ContentID(), ModelKey: enrich.ModelKey("fixture"), End: len(text), Next: len(text), Complete: true, Proposals: []derive.Proposal{{Kind: knowledge.Person, Name: name, Fact: text, SourceID: o.ContentID()}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, question := range []string{"What do you know about Jose?", "What's outstanding for Jose?"} {
+		plan, err := assistant.PlanQuestion(question, time.Now(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := c.RetrievePlan(ctx, plan)
+		if err != nil || !got.Diagnosis.LibraryRecallLimited {
+			t.Fatalf("%q hid omitted contexts or failed: diagnosis=%+v err=%v", question, got.Diagnosis, err)
 		}
 	}
 }
@@ -161,5 +222,41 @@ func TestTopicKnowledgeQueriesOfferFoldedAndOriginalSpellings(t *testing.T) {
 	}
 	if got := topicKnowledgeQueries([]string{"atlas"}, "what about Atlas"); !slices.Equal(got, []string{"atlas"}) {
 		t.Fatalf("plain questions must not change: %q", got)
+	}
+}
+
+func TestFoldedLibraryScopeAppliedBeforeCandidateLimit(t *testing.T) {
+	c := libraryNameFixture(t)
+	s := c.data.(*durable.Store)
+	ctx := context.Background()
+	for i := 0; i < 32; i++ {
+		text := fmt.Sprintf("José owns renewal %d.", i)
+		o, err := capture.SanitizeObservation("editor.app", fmt.Sprintf("work%d.example", i), text, 4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutObservationAt(ctx, o, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ApplyEnrichment(ctx, enrich.Chunk{SourceID: o.ContentID(), ModelKey: enrich.ModelKey("fixture"), End: len(text), Next: len(text), Complete: true, Proposals: []derive.Proposal{{Kind: knowledge.Person, Name: "José", Fact: text, SourceID: o.ContentID()}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := s.FindInferredKnowledge(ctx, "José")
+	if err != nil || len(all) != 32 {
+		t.Fatal("fixture", len(all), err)
+	}
+	target := all[len(all)-1]
+	const correction = "José coordinates the exclusive scoped exception."
+	if err := s.CorrectInferredFact(ctx, target.ID, target.Facts[0].ID, correction); err != nil {
+		t.Fatal(err)
+	}
+	plan := assistant.Plan{Kind: assistant.KindEntity, Entity: "Jose", Question: "What do you know about Jose?", Domains: []string{target.Inference.Domain}}
+	got, err := c.RetrievePlan(ctx, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFact(evidenceTexts(got.Evidence), correction) {
+		t.Fatalf("sole requested domain %s lost its authored correction among 32 contexts; diagnosis=%+v evidence=%v", target.Inference.Domain, got.Diagnosis, evidenceTexts(got.Evidence))
 	}
 }

@@ -58,6 +58,51 @@ func (s *Store) ConfirmInferredFact(ctx context.Context, id string, expected kno
 			record.Entity.Facts[i].State = knowledge.Confirmed
 			return tx.putInferredRecord(record, true)
 		}
+		for pageIndex := 0; pageIndex < record.FactPageCount; pageIndex++ {
+			page, err := s.readInferredFactPage(tx.writer, id, pageIndex)
+			if err != nil {
+				return err
+			}
+			for i, fact := range page.Facts {
+				if fact.ID != expected.ID {
+					continue
+				}
+				if fact.Text != expected.Text || !slices.Equal(fact.Sources, expected.Sources) || fact.State != knowledge.Proposed && fact.State != knowledge.Confirmed {
+					return enrich.ErrStale
+				}
+				if err := validateConfirmableFactSources(tx, fact); err != nil {
+					return err
+				}
+				if fact.State == knowledge.Confirmed {
+					return nil
+				}
+				page.Facts[i].State = knowledge.Confirmed
+				encoded := mustJSON(page)
+				defer clear(encoded)
+				return tx.putIndexValueLocked(inferredFactPageNS, inferredPageID(id, pageIndex), encoded)
+			}
+		}
 		return enrich.ErrStale
 	})
+}
+
+func validateConfirmableFactSources(tx *Tx, fact knowledge.Fact) error {
+	for _, source := range fact.Sources {
+		if source.UserAuthored || source.ID == "" {
+			return enrich.ErrInvalid
+		}
+		if _, _, found, err := tx.store.sourceEvidenceReader(tx.writer, source.ID); err != nil {
+			return err
+		} else if !found {
+			return enrich.ErrSourceGone
+		}
+		current, err := tx.store.isCurrentNoteSourceReader(tx.writer, source.ID)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return enrich.ErrSourceGone
+		}
+	}
+	return nil
 }

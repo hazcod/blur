@@ -359,7 +359,7 @@ func TestMeetingRepositoryRejectsInvalidOrTruncatedEvidenceAtomically(t *testing
 		func(r *meetings.Record) { r.Event.TrackID = "unregistered" },
 		func(r *meetings.Record) { r.Event.Revision = 0 },
 		func(r *meetings.Record) { r.Event.Start = -time.Second },
-		func(r *meetings.Record) { r.Event.End = 9 * time.Hour },
+		func(r *meetings.Record) { r.Event.End = time.Duration(1<<63 - 1) },
 		func(r *meetings.Record) { r.Key = "different-key" },
 		func(r *meetings.Record) { r.Event.Text = strings.Repeat("x", meetings.DefaultLimits().MaxEventBytes+1) },
 		// Redaction expands each SSN, so the sanitized text exceeds the event cap.

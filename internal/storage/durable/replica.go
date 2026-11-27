@@ -153,6 +153,7 @@ func decodeTombstones(encoded []byte) ([]Tombstone, error) {
 type ExportedObservation struct {
 	CapturedAt time.Time
 	Record     []byte
+	Revision   [32]byte // exact authenticated order-entry revision for durable export receipts
 }
 
 type exportCandidate struct {
@@ -162,9 +163,9 @@ type exportCandidate struct {
 
 // ExportObservations returns observations captured strictly after `after`, in
 // (capture time, keyed record order). It returns at most maxCount records and
-// about maxBytes of record bytes, never splitting a group that shares one
-// capture time unless the group alone exceeds the budget (so a time watermark
-// is always a safe resume point). more reports remaining observations.
+// about maxBytes of record bytes. This compatibility snapshot cannot represent
+// continuation inside an oversized equal-time group. Replication uses
+// ExportReplicaObservations with exact receipts and a physical cursor instead.
 func (s *Store) ExportObservations(ctx context.Context, after time.Time, maxCount, maxBytes int) (items []ExportedObservation, more bool, err error) {
 	if ctx == nil || maxCount < 1 || maxCount > 1<<16 || maxBytes < 1 || maxBytes > 64<<20 {
 		return nil, false, &storage.StoreError{Code: storage.Invalid}

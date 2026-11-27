@@ -4,14 +4,11 @@ import SafariServices
 import Security
 import Darwin
 
-private let captureMessage = "blur-page-snapshot-v1"
+private let captureMessage = "blur-page-snapshot-v2"
 private let stateQueryMessage = "blur-capture-state-query"
 private let stateReplyMessage = "blur-capture-state"
 private let grantService = "sh.blur.safari"
 private let grantAccount = "capture"
-private let maxTextBytes = 256 * 1024
-private let maxWireBytes = 288 * 1024
-private let maxPayloadBytes = maxTextBytes + 8 * 1024 + 4 * 1024 + 4 * 1024
 private let captureScope = "capture:ingest"
 
 private struct GrantRecord: Decodable {
@@ -19,17 +16,6 @@ private struct GrantRecord: Decodable {
     let client_id: String
     let credential: Data
     let expires_at: String
-}
-
-private struct PagePayload: Encodable {
-    let browser: String
-    let url: String
-    let title: String
-    let text: String
-    let active: Bool
-    let privacy_known: Bool
-    let `private`: Bool
-    let captured_at: String
 }
 
 private struct ProofPayload: Encodable {
@@ -42,51 +28,56 @@ private struct ProofPayload: Encodable {
 }
 
 final class SafariExtensionHandler: SFSafariExtensionHandler {
+    private let captureGate = DispatchSemaphore(value: 4)
+
     override func messageReceived(withName messageName: String, from page: SFSafariPage, userInfo: [String: Any]? = nil) {
         guard messageName == captureMessage || messageName == stateQueryMessage else { return }
+        let batch = messageName == captureMessage ? SafariCaptureProtocol.batch(userInfo) : nil
+        guard messageName == stateQueryMessage || batch != nil else {
+            page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false]); return
+        }
+        guard captureGate.wait(timeout: .now()) == .success else {
+            if let batch { Self.reply(page, batch: batch, acknowledgement: nil) }
+            return
+        }
         page.getPropertiesWithCompletionHandler { properties in
-            guard let properties = properties else {
-                if messageName == stateQueryMessage { page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false]) }
-                return
-            }
-            let active = properties.isActive
-            let nonPrivate = !properties.usesPrivateBrowsing
-            guard active, nonPrivate, let grant = Self.validGrant() else {
-                page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false])
-                return
+            guard let properties, properties.isActive, !properties.usesPrivateBrowsing,
+                  let grant = Self.validGrant() else {
+                self.captureGate.signal()
+                page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false]); return
             }
             if messageName == stateQueryMessage {
-                page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": true])
+                self.captureGate.signal()
+                page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": true]); return
+            }
+            guard let batch, let url = properties.url, SafariCaptureProtocol.current(batch, url: url),
+                  let title = properties.title else {
+                self.captureGate.signal()
+                if let batch { Self.reply(page, batch: batch, acknowledgement: SafariCaptureProtocol.Ack(ok: false, restart: true, paused: false)) }
                 return
             }
-            guard let text = userInfo?["text"] as? String,
-                  !text.isEmpty,
-                  let url = Self.safeOrigin(properties.url),
-                  let title = properties.title, title.utf8.count <= 8 * 1024 else {
+            // Bound native work and recheck browser authority for every batch,
+            // including retries and the final publication message.
+            DispatchQueue.global(qos: .utility).async {
+                defer { self.captureGate.signal() }
+                let at = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+                guard let payload = SafariCaptureProtocol.payload(batch, url: url, title: title, capturedAt: Self.formatDate(at)),
+                      let frame = Self.makeFrame(grant: grant, payload: payload, timestamp: at) else {
+                    Self.reply(page, batch: batch, acknowledgement: SafariCaptureProtocol.Ack(ok: false, restart: false, paused: true)); return
+                }
+                Self.reply(page, batch: batch, acknowledgement: Self.send(frame: frame))
+            }
+        }
+    }
+
+    private static func reply(_ page: SFSafariPage, batch: SafariCaptureProtocol.Batch, acknowledgement: SafariCaptureProtocol.Ack?) {
+        DispatchQueue.main.async {
+            if acknowledgement?.paused == true {
                 page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false])
-                return
+            } else {
+                page.dispatchMessageToScript(withName: "blur-page-capture-ack", userInfo: ["revision": batch.revision, "sequence": batch.sequence,
+                                                                                       "ok": acknowledgement?.ok ?? false, "restart": acknowledgement?.restart ?? false])
             }
-            guard text.utf8.count <= maxTextBytes,
-                  url.utf8.count <= 4 * 1024 else {
-                page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false])
-                return
-            }
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            let emptyPage = PagePayload(browser: "com.apple.safari", url: url, title: title, text: "",
-                                        active: active, privacy_known: true, private: !nonPrivate,
-                                        captured_at: Self.formatDate(Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))))
-            guard let basePayload = try? encoder.encode(emptyPage) else { return }
-            let encodedTextBudget = maxPayloadBytes - basePayload.count + 2
-            let boundedText = Self.boundedText(text, byteLimit: maxTextBytes - title.utf8.count - 1,
-                                               jsonByteLimit: encodedTextBudget)
-            guard !boundedText.isEmpty,
-                  let frame = Self.makeFrame(grant: grant, url: url, title: title, text: boundedText, active: active, private: !nonPrivate),
-                  frame.count <= maxWireBytes else {
-                page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false])
-                return
-            }
-            if !Self.send(frame: frame) { page.dispatchMessageToScript(withName: stateReplyMessage, userInfo: ["enabled": false]) }
         }
     }
 
@@ -110,51 +101,10 @@ final class SafariExtensionHandler: SFSafariExtensionHandler {
         return grant
     }
 
-    private static func safeOrigin(_ url: URL?) -> String? {
-        guard let url = url, var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme == "http" || components.scheme == "https",
-              let host = components.host, !host.isEmpty,
-              components.user == nil, components.password == nil else { return nil }
-        components.path = ""
-        components.query = nil
-        components.fragment = nil
-        components.port = nil
-        return components.string
-    }
-
-    private static func boundedText(_ value: String, byteLimit: Int, jsonByteLimit: Int) -> String {
-        var result = String()
-        var used = 2 // JSON string quotes
-        var textBytes = 0
-        for scalar in value.unicodeScalars {
-            let utf8Width = scalar.value <= 0x7f ? 1 : scalar.value <= 0x7ff ? 2 : scalar.value <= 0xffff ? 3 : 4
-            let width = Self.jsonEncodedWidth(scalar.value)
-            if textBytes + utf8Width > byteLimit || used + width > jsonByteLimit { break }
-            result.unicodeScalars.append(scalar)
-            used += width
-            textBytes += utf8Width
-        }
-        return result
-    }
-
-    private static func jsonEncodedWidth(_ scalar: UInt32) -> Int {
-        if scalar == 0x22 || scalar == 0x5c || scalar == 0x2f { return 2 }
-        if scalar == 0x2028 || scalar == 0x2029 || (scalar >= 0x7f && scalar <= 0x9f) { return 6 }
-        if scalar < 0x20 { return scalar == 0x08 || scalar == 0x09 || scalar == 0x0a || scalar == 0x0c || scalar == 0x0d ? 2 : 6 }
-        if scalar <= 0x7f { return 1 }
-        if scalar <= 0x7ff { return 2 }
-        if scalar <= 0xffff { return 3 }
-        return 4
-    }
-
-    private static func makeFrame(grant: GrantRecord, url: String, title: String, text: String, active: Bool, private isPrivate: Bool) -> Data? {
-        let timestamp = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+    private static func makeFrame(grant: GrantRecord, payload: Data, timestamp: Date) -> Data? {
         let timestampString = formatDate(timestamp)
-        let page = PagePayload(browser: "com.apple.safari", url: url, title: title, text: text,
-                               active: active, privacy_known: true, private: isPrivate, captured_at: timestampString)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        guard let payload = try? encoder.encode(page), payload.count <= maxPayloadBytes else { return nil }
         let nonce = randomBytes(count: 24)
         guard nonce.count == 24 else { return nil }
         let keyData = Data(SHA256.hash(data: grant.credential))
@@ -168,12 +118,12 @@ final class SafariExtensionHandler: SFSafariExtensionHandler {
                                                                                          digest: Data(SHA256.hash(data: payload))),
                                                                  using: SymmetricKey(data: keyData))))
 		guard let encodedProof = try? encoder.encode(proof) else { return nil }
-		var encoded = Data("{\"version\":1,\"payload\":".utf8)
+		var encoded = Data("{\"version\":2,\"payload\":".utf8)
 		encoded.append(payload)
 		encoded.append(Data(",\"proof\":".utf8))
 		encoded.append(encodedProof)
 		encoded.append(0x7d)
-		guard encoded.count <= maxWireBytes else { return nil }
+		guard encoded.count <= SafariCaptureProtocol.maxWireBytes else { return nil }
 		return encoded
     }
 
@@ -216,21 +166,24 @@ final class SafariExtensionHandler: SFSafariExtensionHandler {
         return bytes
     }
 
-    private static func send(frame: Data) -> Bool {
+    private static func send(frame: Data) -> SafariCaptureProtocol.Ack? {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "BlurAppGroupIdentifier") as? String,
-              let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else { return false }
+              let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else { return nil }
         let path = container.appendingPathComponent("b", isDirectory: true).appendingPathComponent("s").path
-        guard path.utf8.count < MemoryLayout<sockaddr_un>.size else { return false }
+        guard path.utf8.count < MemoryLayout<sockaddr_un>.size else { return nil }
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
+        guard fd >= 0 else { return nil }
         defer { close(fd) }
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         var noSignal: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(path.utf8) + [0]
         let socketPathCapacity = MemoryLayout.size(ofValue: address.sun_path)
-        guard pathBytes.count <= socketPathCapacity else { return false }
+        guard pathBytes.count <= socketPathCapacity else { return nil }
         withUnsafeMutablePointer(to: &address.sun_path) { pointer in
             pointer.withMemoryRebound(to: CChar.self, capacity: socketPathCapacity) { destination in
                 for index in pathBytes.indices { destination[index] = CChar(bitPattern: pathBytes[index]) }
@@ -239,12 +192,15 @@ final class SafariExtensionHandler: SFSafariExtensionHandler {
         let connected = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
-        guard connected == 0 else { return false }
+        guard connected == 0 else { return nil }
 		var header = UInt32(frame.count).bigEndian
         var packet = Data()
         withUnsafeBytes(of: &header) { packet.append(contentsOf: $0) }
         packet.append(frame)
-        return writeAll(fd: fd, packet: packet)
+        guard writeAll(fd: fd, packet: packet), let header = readAll(fd: fd, count: 4) else { return nil }
+        let length = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard length > 0, length <= SafariCaptureProtocol.maxAckBytes, let data = readAll(fd: fd, count: Int(length)) else { return nil }
+        return SafariCaptureProtocol.ack(data)
     }
 
     private static func writeAll(fd: Int32, packet: Data) -> Bool {
@@ -258,6 +214,22 @@ final class SafariExtensionHandler: SFSafariExtensionHandler {
             }
             return true
         }
+    }
+
+    private static func readAll(fd: Int32, count: Int) -> Data? {
+        var data = Data(count: count)
+        let complete = data.withUnsafeMutableBytes { buffer -> Bool in
+            guard let base = buffer.baseAddress else { return false }
+            var received = 0
+            while received < buffer.count {
+                let amount = Darwin.recv(fd, base.advanced(by: received), buffer.count - received, 0)
+                if amount < 0 && errno == EINTR { continue }
+                if amount <= 0 { return false }
+                received += amount
+            }
+            return true
+        }
+        return complete ? data : nil
     }
 
     private static func parseDate(_ value: String) -> Date? {

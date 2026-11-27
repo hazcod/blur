@@ -85,7 +85,11 @@ func filterLookupEntity(hits []search.IndexHit, entityMask uint32) []search.Inde
 
 type lookupRankInput struct {
 	entityMask uint32
-	speech     bool
+	// numbered scores lexical support for the plan's numbered topic pairs.
+	// It precedes broad term counts and app/recency boosts, so a date token
+	// cannot outrank a source that actually says the numbered subject.
+	numbered func(search.IndexHit) int
+	speech   bool
 	// isMessaging reports whether a source was captured from a chat, mail or
 	// spoken-word app. It is only consulted when speech is set.
 	isMessaging func(sourceID string) bool
@@ -107,19 +111,21 @@ type lookupRankInput struct {
 // rankLookupHits orders a candidate pool. The full order is, first to last:
 //
 //  1. entity matched (only when the plan names an entity),
-//  2. messaging-app boost (only when the question has a speech verb),
-//  3. matched-term count, more first,
-//  4. term rarity sum, rarer first,
-//  5. term closeness, tighter first (only when the closeness hook is set; Ask
+//  2. numbered topic phrase support (only when the hook is set),
+//  3. messaging-app boost (only when the question has a speech verb),
+//  4. matched-term count, more first,
+//  5. term rarity sum, rarer first,
+//  6. term closeness, tighter first (only when the closeness hook is set; Ask
 //     leaves it nil, Search sets it from rows it has already read),
-//  6. capture time, newest first,
-//  7. source ID, ascending, as the deterministic final tie-break.
+//  7. capture time, newest first,
+//  8. source ID, ascending, as the deterministic final tie-break.
 //
 // Hits the demote hook marks are dropped before the pool is cut, unless
 // nothing else is left.
 func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHit {
 	type key struct {
 		entity, messaging bool
+		numbered          int
 		matched           int
 		rarity            float64
 		closeness         int
@@ -128,6 +134,9 @@ func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHi
 	keys := make(map[string]key, len(hits))
 	for _, hit := range hits {
 		k := key{entity: in.entityMask != 0 && hit.MatchedTerms&in.entityMask == in.entityMask, matched: bits.OnesCount32(hit.MatchedTerms), at: hit.CapturedAt}
+		if in.numbered != nil {
+			k.numbered = in.numbered(hit)
+		}
 		if in.speech && in.isMessaging != nil {
 			k.messaging = in.isMessaging(hit.SourceID)
 		}
@@ -152,6 +161,9 @@ func rankLookupHits(hits []search.IndexHit, in lookupRankInput) []search.IndexHi
 		a, b := keys[ranked[i].SourceID], keys[ranked[j].SourceID]
 		if a.entity != b.entity {
 			return a.entity
+		}
+		if a.numbered != b.numbered {
+			return a.numbered > b.numbered
 		}
 		if a.messaging != b.messaging {
 			return a.messaging
@@ -270,6 +282,7 @@ func (c *Client) termDocumentFrequency(ctx context.Context, term string) (int, e
 type lookupSourceFacts struct {
 	conversational bool
 	authentication bool
+	numbered       int
 }
 
 type meetingRecordKindReader interface {
@@ -280,7 +293,7 @@ type meetingRecordKindReader interface {
 // ceiling that hydration uses. Candidates past the budget carry no facts and are
 // treated as ordinary captures. No metadata-only reader exists, so the read
 // that supplies the app identity also supplies the page text for demotion.
-func (c *Client) readLookupFacts(ctx context.Context, hits []search.IndexHit) (map[string]lookupSourceFacts, error) {
+func (c *Client) readLookupFacts(ctx context.Context, hits []search.IndexHit, subjects ...[2]string) (map[string]lookupSourceFacts, error) {
 	facts := make(map[string]lookupSourceFacts, len(hits))
 	used := 0
 	kinds, _ := c.data.(meetingRecordKindReader)
@@ -295,7 +308,11 @@ func (c *Client) readLookupFacts(ctx context.Context, hits []search.IndexHit) (m
 		if !found {
 			continue
 		}
-		used += hit.Bytes
+		cost := len(source.Text()) + len(source.AppID()) + len(source.Domain())
+		if cost > MaxSearchBytes-used {
+			continue
+		}
+		used += cost
 		spoken := false
 		if source.AppID() == meetingsAppID && kinds != nil {
 			kind, live, err := kinds.MeetingRecordKindForSource(ctx, hit.SourceID)
@@ -307,6 +324,7 @@ func (c *Client) readLookupFacts(ctx context.Context, hits []search.IndexHit) (m
 		facts[hit.SourceID] = lookupSourceFacts{
 			conversational: isConversationalSource(source.AppID(), source.Domain(), spoken),
 			authentication: looksLikeAuthenticationPage(source.Text()),
+			numbered:       numberedSubjectSupport(subjects, source.Text(), source.Title()),
 		}
 	}
 	return facts, nil
@@ -316,7 +334,7 @@ func (c *Client) readLookupFacts(ctx context.Context, hits []search.IndexHit) (m
 // requires the plan's entity, ranks it with rankLookupHits, drops sign-in pages
 // that only partly match (unless the question is about signing in) and only
 // then cuts the pool, so demoted chrome cannot crowd out substantive candidates.
-func (c *Client) rankLookupPool(ctx context.Context, plan assistant.Plan, terms []string, exact, partial []search.IndexHit, pool int) ([]search.IndexHit, error) {
+func (c *Client) rankLookupPool(ctx context.Context, plan assistant.Plan, terms []string, exact, partial []search.IndexHit, pool int) ([]search.IndexHit, bool, error) {
 	entityMask := lookupEntityMask(plan.Entity, terms)
 	hits := filterLookupEntity(append(append([]search.IndexHit(nil), exact...), partial...), entityMask)
 	in := lookupRankInput{entityMask: entityMask, speech: questionHasSpeechVerb(plan.Question), limit: pool}
@@ -325,23 +343,28 @@ func (c *Client) rankLookupPool(ctx context.Context, plan assistant.Plan, terms 
 		for i, term := range terms {
 			df, err := c.termDocumentFrequency(ctx, term)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			in.rarity[i] = lookupTermRarity(df, lookupRarityTotal)
 		}
 	}
 	demoting := !questionHasLoginCue(plan.Question)
 	relaxed := func(hit search.IndexHit) bool { return termsRelaxed(hit.MatchedTerms, len(terms)) }
-	if len(hits) > 1 && (in.speech || demoting) {
+	limited := false
+	if len(hits) > 1 && (in.speech || demoting || len(plan.NumberedSubjects) > 0) {
 		var read []search.IndexHit
 		for _, hit := range hits {
-			if in.speech || relaxed(hit) {
+			if in.speech || relaxed(hit) || len(plan.NumberedSubjects) > 0 {
 				read = append(read, hit)
 			}
 		}
-		facts, err := c.readLookupFacts(ctx, read)
+		facts, err := c.readLookupFacts(ctx, read, plan.NumberedSubjects...)
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if len(plan.NumberedSubjects) > 0 {
+			in.numbered = func(hit search.IndexHit) int { return facts[hit.SourceID].numbered }
+			limited = len(facts) < len(read)
 		}
 		if in.speech {
 			in.isMessaging = func(id string) bool { return facts[id].conversational }
@@ -359,5 +382,5 @@ func (c *Client) rankLookupPool(ctx context.Context, plan assistant.Plan, terms 
 			return at
 		}
 	}
-	return rankLookupHits(hits, in), nil
+	return rankLookupHits(hits, in), limited, nil
 }

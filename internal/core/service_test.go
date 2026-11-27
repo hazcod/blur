@@ -859,12 +859,12 @@ func TestCapabilityEvidenceMatchesPort(t *testing.T) {
 	check("autostart", platform.PortalMissing, "portal_missing", "xdg_portal", false)
 }
 
-func TestIngestDropsShortObservationsExceptNotesAndTranscripts(t *testing.T) {
+func TestIngestPreservesShortObservationsAndRejectsBlankContent(t *testing.T) {
 	ctx := context.Background()
 	for _, c := range []struct {
 		app, text string
 		stored    bool
-	}{{"demo.app", strings.Repeat("x", 31), false}, {"demo.app", strings.Repeat("x", 32), true}, {"sh.blur.notes", "hi", true}, {"sh.blur.meetings", "hi", true}} {
+	}{{"demo.app", "", false}, {"demo.app", " \n\t  ", false}, {"sh.blur.notes", " \n", false}, {"sh.blur.meetings", "", false}, {"demo.app", "x", true}, {"com.apple.terminal", "ls", true}, {"demo.app", "日", true}, {"demo.app", strings.Repeat("x", 31), true}, {"demo.app", strings.Repeat("x", 32), true}, {"sh.blur.notes", "hi", true}, {"sh.blur.meetings", "hi", true}} {
 		svc, store, _, grant := fixture(t, localapi.ScopeCaptureIngest)
 		o, err := capture.SanitizeObservation(c.app, "example.test", c.text, 256)
 		if err != nil {

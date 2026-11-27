@@ -34,10 +34,11 @@ func (c *Client) summarizeMeetingPage(ctx context.Context, id string, after uint
 		return assistant.Result{}, meetings.RecordPage{}, err
 	}
 	defer done()
-	epoch, stable := c.BeginMemoryRead()
+	read, stable := c.beginVoicePublication()
 	if !stable {
 		return assistant.Result{}, meetings.RecordPage{}, ErrMemoryChanging
 	}
+	epoch := read.memoryEpoch
 	retriever := &meetingSummaryRetriever{}
 	service, askCtx, finish, err := c.beginMeetingSummaryAsk(op, epoch, retriever, localOnly)
 	if err != nil {
@@ -120,11 +121,10 @@ func (c *Client) summarizeMeetingPage(ctx context.Context, id string, after uint
 	if err := askCtx.Err(); err != nil {
 		return assistant.Result{}, meetings.RecordPage{}, err
 	}
-	c.memoryChangeMu.Lock()
-	defer c.memoryChangeMu.Unlock()
-	if c.memoryMutationDepth != 0 || c.memoryMutationEpoch != epoch {
+	if !read.publish(c, func() {}) {
 		return assistant.Result{}, meetings.RecordPage{}, ErrMemoryChanging
 	}
+	result.Publication = &memoryAnswerPublication{client: c, read: read}
 	return result, page, summaryErr
 }
 

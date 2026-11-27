@@ -38,7 +38,7 @@ func (s *Store) resolveCaptureSourceReader(r bolt.Reader, id string) (string, bo
 	if err != nil {
 		return "", false, err
 	}
-	if !present || edition.Publication != mapping.Publication || mapping.Index < 0 || mapping.Index >= summary.PartCount() || capturePartSourceID(mapping.EditionID, mapping.Publication, mapping.Index) != id {
+	if !present || edition.Publication != mapping.Publication || mapping.Index < 0 || mapping.Index >= summary.PartCount() || mapping.sourceID() != id || mapping.Range && (mapping.LastPart >= summary.PartCount() || mapping.End > summary.Bytes()) {
 		return "", false, ErrCorrupt
 	}
 	return mapping.EditionID, true, nil

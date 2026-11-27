@@ -56,7 +56,7 @@ func (c *Client) BackgroundWorkStatus() BackgroundWorkSnapshot {
 		settings, repair = c.localAI.settings, c.localAI.needsRepair
 		library, recaps, service := c.localAI.libraryWorker, c.localAI.chronicleWorker, c.localAI.service
 		c.localAI.mu.RUnlock()
-		out.Groups[0].Enabled = settings.Enabled && settings.AutomaticLibrary
+		out.Groups[0].Enabled = settings.Enabled && (settings.AutomaticLibrary || settings.BackgroundSummaries)
 		out.Groups[1].Enabled = settings.Enabled && settings.BackgroundSummaries
 		out.Groups[2].Enabled = settings.Enabled && (!isRemoteCompletionProvider(effectiveProvider(settings)) || settings.RemoteNotesEnabled)
 		for i := range out.Groups {

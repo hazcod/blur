@@ -38,12 +38,17 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 	defer clear(encoded)
 	dependencies := summary.DependencyIDs()
 	return s.Update(ctx, func(tx *Tx) error {
+		if j, pending, err := s.chronicleErasureReader(tx.writer); err != nil {
+			return err
+		} else if pending && j.Hours {
+			return errChronicleErasurePending
+		}
 		var followUpAt time.Time
 		var priorSources []string
 		admission := &chronicleAdmissionReader{Reader: tx.writer}
 		defer admission.close()
 		for _, sourceID := range dependencies {
-			observation, capturedAt, found, err := s.sourceEvidenceReader(admission, sourceID)
+			capturedAt, found, err := s.sourceAdmissionReader(admission, sourceID)
 			if err != nil {
 				return err
 			} else if !found {
@@ -57,6 +62,13 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 				return &storage.StoreError{Code: storage.Invalid}
 			}
 			if summary.FollowUp != nil && sourceID == summary.FollowUp.SourceID {
+				observation, _, found, err := s.sourceEvidenceReader(admission, sourceID)
+				if err != nil {
+					return err
+				}
+				if !found {
+					return &storage.StoreError{Code: storage.Invalid}
+				}
 				if !chronicle.SupportsFollowUpSource(observation) {
 					return &storage.StoreError{Code: storage.Invalid}
 				}
@@ -64,6 +76,12 @@ func (s *Store) PutChronicle(ctx context.Context, summary chronicle.Summary) err
 			}
 		}
 		admission.close() // release the read-only cache before any projection write
+		projection := newChronicleProjectionWriter(tx.writer)
+		tx.writer = projection
+		defer func() {
+			tx.writer = projection.Writer
+			projection.cache.close()
+		}()
 		oldBytes, found, err := tx.readIndexValue(chronicleNS, summary.HourID, chronicle.MaxSummaryBytes+(16<<10))
 		if err != nil {
 			return err
@@ -211,6 +229,11 @@ func (s *Store) GetChronicle(ctx context.Context, id string) (chronicle.Summary,
 	}
 	var summary chronicle.Summary
 	err := s.view(ctx, func(reader bolt.Reader) error {
+		if j, pending, err := s.chronicleErasureReader(reader); err != nil {
+			return err
+		} else if pending && j.Hours {
+			return nil
+		}
 		b, found, err := s.readIndexValueReader(reader, chronicleNS, id, chronicle.MaxSummaryBytes+(16<<10))
 		if err != nil || !found {
 			return err
@@ -242,6 +265,11 @@ func (s *Store) ListChronicles(ctx context.Context, start, end time.Time, after 
 	var rows []chronicle.Summary
 	var next string
 	err := s.view(ctx, func(reader bolt.Reader) error {
+		if j, pending, err := s.chronicleErasureReader(reader); err != nil {
+			return err
+		} else if pending && j.Hours {
+			return nil
+		}
 		days, err := s.readChronicleDays(reader)
 		if err != nil {
 			return err
@@ -325,34 +353,7 @@ func (s *Store) chronicleTimeKnownReader(ctx context.Context, reader bolt.Reader
 }
 
 func (s *Store) DeleteAllChronicles(ctx context.Context) error {
-	if ctx == nil {
-		return &storage.StoreError{Code: storage.Invalid}
-	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		days, err := s.readChronicleDaysContext(ctx)
-		if err != nil {
-			return err
-		}
-		if len(days) == 0 {
-			// Rollups are derived from the recaps and go with them.
-			return s.DeleteAllChronicleRollups(ctx)
-		}
-		ids, err := s.readChronicleDayContext(ctx, days[0])
-		if err != nil {
-			return err
-		}
-		if len(ids) == 0 {
-			return ErrCorrupt
-		}
-		for _, id := range ids {
-			if err := s.DeleteChronicle(ctx, id); err != nil {
-				return err
-			}
-		}
-	}
+	return s.eraseChronicles(ctx, true)
 }
 
 func (s *Store) DeleteChronicle(ctx context.Context, id string) error {

@@ -172,6 +172,12 @@ func parseGeneratedAnswerWithLimit(content string, sourceIDs []string, itemLimit
 		return ModelAnswer{}, err
 	}
 	answer := ModelAnswer{Text: generated.Text, SourceIDs: selected, InsufficientEvidence: generated.InsufficientEvidence}
+	if answer.InsufficientEvidence {
+		// Some providers cite inspected context while abstaining. Keep the
+		// abstention, not their explanatory prose or any citation. Labels have
+		// already been checked against this exact request's admitted sources.
+		answer.Text, answer.SourceIDs = InsufficientEvidenceText, nil
+	}
 	validated, err := validateAnswerWithLimit(answer, sourceIDs, itemLimit)
 	if err != nil {
 		return ModelAnswer{}, err

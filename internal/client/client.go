@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -85,7 +86,7 @@ func appendKnowledgePage(current, next knowledge.Page, after string) (knowledge.
 }
 
 const (
-	MaxActivityReportDays     = 31
+	MaxActivityReportDays     = 400
 	MaxActivityReportSegments = activity.MaxReportSegments
 	maxActivityReportUTCdays  = 33
 )
@@ -153,10 +154,11 @@ type Client struct {
 	safariCaptureMu        sync.Mutex
 	safariCaptureStatus    string
 	safariCaptureChanges   chan struct{}
-	memoryChangeMu         sync.Mutex
+	memoryChangeMu         sync.RWMutex
 	memoryStartMu          sync.Mutex
 	aiPolicyMu             sync.RWMutex
 	aiPolicyEpoch          uint64
+	asksMu                 sync.Mutex
 	activeAsks             map[uint64]context.CancelFunc
 	nextAskID              uint64
 	memoryChanges          chan struct{}
@@ -168,7 +170,7 @@ type Client struct {
 	apps                   appsCache
 	captureState           func() (bool, time.Time)
 	askNow                 func() time.Time
-	lifeMu                 sync.Mutex
+	lifeMu                 sync.RWMutex
 	lifeCtx                context.Context
 	lifeCancel             context.CancelFunc
 	lifeClosed             bool
@@ -191,14 +193,14 @@ func (c *Client) beginOperation(parent context.Context, timeout time.Duration) (
 	if parent == nil {
 		return nil, nil, ErrNotConfigured
 	}
-	c.lifeMu.Lock()
+	c.lifeMu.RLock()
 	if c.lifeClosed {
-		c.lifeMu.Unlock()
+		c.lifeMu.RUnlock()
 		return nil, nil, ErrClientClosed
 	}
 	c.inflight.Add(1)
 	life := c.lifeCtx
-	c.lifeMu.Unlock()
+	c.lifeMu.RUnlock()
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	stop := context.AfterFunc(life, cancel)
 	return ctx, func() {
@@ -542,8 +544,8 @@ func (c *Client) MemoryIsChanging() bool {
 	if c == nil {
 		return false
 	}
-	c.memoryChangeMu.Lock()
-	defer c.memoryChangeMu.Unlock()
+	c.memoryChangeMu.RLock()
+	defer c.memoryChangeMu.RUnlock()
 	return c.memoryMutationDepth > 0
 }
 
@@ -554,8 +556,8 @@ func (c *Client) BeginMemoryRead() (uint64, bool) {
 	if c == nil {
 		return 0, false
 	}
-	c.memoryChangeMu.Lock()
-	defer c.memoryChangeMu.Unlock()
+	c.memoryChangeMu.RLock()
+	defer c.memoryChangeMu.RUnlock()
 	return c.memoryMutationEpoch, c.memoryMutationDepth == 0
 }
 
@@ -565,8 +567,8 @@ func (c *Client) MemoryReadCurrent(epoch uint64) bool {
 	if c == nil {
 		return false
 	}
-	c.memoryChangeMu.Lock()
-	defer c.memoryChangeMu.Unlock()
+	c.memoryChangeMu.RLock()
+	defer c.memoryChangeMu.RUnlock()
 	return c.memoryMutationDepth == 0 && c.memoryMutationEpoch == epoch
 }
 
@@ -577,8 +579,8 @@ func (c *Client) PublishMemoryRead(epoch uint64, publish func()) bool {
 	if c == nil || publish == nil {
 		return false
 	}
-	c.memoryChangeMu.Lock()
-	defer c.memoryChangeMu.Unlock()
+	c.memoryChangeMu.RLock()
+	defer c.memoryChangeMu.RUnlock()
 	if c.memoryMutationDepth != 0 || c.memoryMutationEpoch != epoch {
 		return false
 	}
@@ -608,10 +610,7 @@ func (c *Client) notifyMemoryChangingEpoch(epoch *uint64) bool {
 	if c.memoryMutationEpoch == 0 {
 		c.memoryMutationEpoch++
 	}
-	cancels := make([]context.CancelFunc, 0, len(c.activeAsks))
-	for _, cancel := range c.activeAsks {
-		cancels = append(cancels, cancel)
-	}
+	cancels := c.askCancellations()
 	invalidate := c.memoryInvalidator
 	hooks := append([]func(){}, c.memoryHooks...)
 	select {
@@ -619,6 +618,7 @@ func (c *Client) notifyMemoryChangingEpoch(epoch *uint64) bool {
 	default:
 	}
 	c.memoryChangeMu.Unlock()
+	c.replica.invalidatePending()
 	for _, cancel := range cancels {
 		cancel()
 	}
@@ -654,11 +654,13 @@ func (c *Client) registerAsk(cancel context.CancelFunc) (uint64, bool) {
 	return c.registerAskEpoch(cancel, nil)
 }
 func (c *Client) registerAskEpoch(cancel context.CancelFunc, epoch *uint64) (uint64, bool) {
-	c.memoryChangeMu.Lock()
-	defer c.memoryChangeMu.Unlock()
+	c.memoryChangeMu.RLock()
+	defer c.memoryChangeMu.RUnlock()
 	if c.memoryMutationDepth > 0 || epoch != nil && *epoch != c.memoryMutationEpoch {
 		return 0, false
 	}
+	c.asksMu.Lock()
+	defer c.asksMu.Unlock()
 	c.nextAskID++
 	if c.nextAskID == 0 {
 		c.nextAskID++
@@ -668,9 +670,21 @@ func (c *Client) registerAskEpoch(cancel context.CancelFunc, epoch *uint64) (uin
 }
 
 func (c *Client) unregisterAsk(id uint64) {
-	c.memoryChangeMu.Lock()
+	c.asksMu.Lock()
 	delete(c.activeAsks, id)
-	c.memoryChangeMu.Unlock()
+	c.asksMu.Unlock()
+}
+
+// Ask bookkeeping is independent of evidence publication. Registration keeps
+// the shared memory gate until insertion so a deletion cannot miss a new ask.
+func (c *Client) askCancellations() []context.CancelFunc {
+	c.asksMu.Lock()
+	defer c.asksMu.Unlock()
+	cancels := make([]context.CancelFunc, 0, len(c.activeAsks))
+	for _, cancel := range c.activeAsks {
+		cancels = append(cancels, cancel)
+	}
+	return cancels
 }
 
 func (c *Client) CanAddNote() bool { return c != nil && c.data != nil && c.notes != nil }
@@ -865,6 +879,17 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 	// rejected by registration; one after bumps the epoch), so the question
 	// history write below is fenced against deletions.
 	historyEpoch, historyStable := c.BeginMemoryRead()
+	// Grounded time follow-ups are transformed by the assistant service, so
+	// they do not retain the direct-answer guard. Fence their entire Ask read
+	// before planning/retrieval and carry it through the same history/install
+	// path. A direct time answer keeps its more precise scanner token.
+	wholeAskRead := memoryReadPublication{memoryEpoch: historyEpoch}
+	wholeAskStable := historyStable
+	if fence, ok := c.data.(storage.ReadPublicationFence); ok {
+		wholeAskRead.fence = fence
+		wholeAskRead.epoch, wholeAskStable = fence.BeginPublicationRead()
+	}
+	wholeVoiceRead, wholeVoiceStable := c.beginVoicePublication()
 	var result assistant.Result
 	if text, calculated := assistant.Calculate(question); calculated {
 		result = assistant.Result{Answer: assistant.Answer{Text: text}, Direct: true, General: true, Plan: assistant.Plan{Question: question}}
@@ -873,6 +898,22 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 	}
 	if err != nil {
 		return assistant.Result{}, err
+	}
+	if (result.Plan.Kind == assistant.KindTime || recordedAnswerNeedsPublication(result)) && result.Publication == nil {
+		read, stable := wholeAskRead, wholeAskStable
+		if result.Plan.Kind != assistant.KindTime {
+			voiceOnly, err := c.recordedAnswerVoiceOnly(askCtx, result)
+			if err != nil {
+				return assistant.Result{}, err
+			}
+			if voiceOnly {
+				read, stable = wholeVoiceRead, wholeVoiceStable
+			}
+		}
+		if !historyStable || !stable {
+			return assistant.Result{}, ErrMemoryChanging
+		}
+		result.Publication = &memoryAnswerPublication{client: c, read: read}
 	}
 	if err := c.validateTaskTargets(askCtx, result); err != nil {
 		return assistant.Result{}, err
@@ -886,6 +927,9 @@ func (c *Client) askMemoryWithModeProgress(ctx context.Context, question string,
 	}
 	if historyStable {
 		c.recordAskedQuestion(askCtx, historyEpoch, question, result)
+	}
+	if result.Publication != nil && !result.Publication.Publish(func() {}) {
+		return assistant.Result{}, ErrMemoryChanging
 	}
 	return result, nil
 }
@@ -1134,7 +1178,7 @@ type SearchHit struct {
 	Excerpt      string   `json:"-"` // bounded preview; Text keeps the full capture
 	ExcerptStart int      `json:"-"` // emphasised span inside Excerpt
 	ExcerptEnd   int      `json:"-"`
-	Relaxed      bool     `json:"-"` // matched some but not all query terms
+	Relaxed      bool     `json:"-"` // partial lexical support, including unverified numbered-topic cues
 	Semantic     bool     `json:"-"` // added by the optional meaning step, not the exact core
 	MatchedTerms []string `json:"-"`
 	matchedMask  uint32
@@ -1273,7 +1317,7 @@ type MemorySearchPage struct {
 	IndexingPending bool
 	CoverageLimited bool
 	HasMore         bool
-	// Relaxed reports that some hits matched only some of the query terms.
+	// Relaxed reports that some hits have only partial lexical support.
 	Relaxed bool
 	terms   []string
 }
@@ -1319,6 +1363,15 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int) 
 	if !stable {
 		return MemorySearchPage{}, ErrMemoryChanging
 	}
+	// A split scope spans separate storage transactions. Capture the durable
+	// commit epoch before any planning/read, then validate the entire hydrated
+	// response against it. Client deletion epochs alone miss background writes.
+	var publicationEpoch uint64
+	publicationStable := false
+	publication, hasPublication := c.data.(storage.ReadPublicationFence)
+	if hasPublication {
+		publicationEpoch, publicationStable = publication.BeginPublicationRead()
+	}
 	page, plan, err := c.naturalSearchPage(ctx, query, limit)
 	if err != nil {
 		return MemorySearchPage{}, err
@@ -1333,7 +1386,11 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int) 
 		return MemorySearchPage{}, err
 	}
 	terms := plan.Terms
-	locateExactPassages(hits, terms)
+	// A capture may spell a compound of the query another way; its preview is
+	// cut around the words it really contains. Match reports, tasks and
+	// summaries keep the query's own terms, which stay first.
+	located := locateTerms(terms, page.MatchSpellings)
+	locateExactPassages(hits, located)
 	taskPlan := plan
 	if len(hits) > 0 && c.localAI != nil {
 		taskPlan.Literal = true
@@ -1350,7 +1407,7 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int) 
 	relaxed := false
 	for i := range hits {
 		relaxed = relaxed || hits[i].Relaxed
-		fillSearchPresentation(&hits[i], terms)
+		fillSearchPresentation(&hits[i], located, page.MatchSpellings...)
 	}
 	// Summaries are an optional index over derived recaps; a failure reading
 	// them must not hide capture matches, only mark the page incomplete.
@@ -1360,6 +1417,10 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int) 
 			return MemorySearchPage{}, ctx.Err()
 		}
 		summaries = nil
+	}
+	summaryLimited := false
+	for _, summary := range summaries {
+		summaryLimited = summaryLimited || summary.CoverageLimited
 	}
 	c.aiPolicyMu.RLock()
 	defer c.aiPolicyMu.RUnlock()
@@ -1372,12 +1433,18 @@ func (c *Client) memorySearchPage(ctx context.Context, query string, limit int) 
 	if !c.MemoryReadCurrent(epoch) {
 		return MemorySearchPage{}, ErrMemoryChanging
 	}
-	return MemorySearchPage{Hits: hits, Summaries: summaries, IndexingPending: page.IndexingPending, CoverageLimited: page.CoverageLimited || taskPage.historyIncomplete || taskPage.semanticIssue != "" || summaryErr != nil, HasMore: page.HasMore || taskMore, Relaxed: relaxed, terms: plan.Terms}, nil
+	result := MemorySearchPage{Hits: hits, Summaries: summaries, IndexingPending: page.IndexingPending, CoverageLimited: page.CoverageLimited || taskPage.historyIncomplete || taskPage.semanticIssue != "" || summaryErr != nil || summaryLimited, HasMore: page.HasMore || taskMore, Relaxed: relaxed, terms: located}
+	if plan.Scope.End.Sub(plan.Scope.Start) > searchWindowSpan || plan.Scope.IsZero() && len(plan.Terms) == 0 {
+		if !hasPublication || !publicationStable || !publication.PublishRead(publicationEpoch, func() {}) {
+			return MemorySearchPage{}, ErrMemoryChanging
+		}
+	}
+	return result, nil
 }
 
 // fillSearchPresentation sets the preview, matched terms and emphasised span
 // of one hit from its full text. The text itself is left untouched.
-func fillSearchPresentation(hit *SearchHit, terms []string) {
+func fillSearchPresentation(hit *SearchHit, terms []string, spellings ...string) {
 	if hit.Excerpt != "" {
 		return
 	}
@@ -1388,6 +1455,16 @@ func fillSearchPresentation(hit *SearchHit, terms []string) {
 	hit.Excerpt, hit.ExcerptStart, hit.ExcerptEnd = QueryExcerptSpan(hit.Text, terms, semanticStart, semanticEnd, searchExcerptBytes)
 	if hit.Task == nil {
 		hit.MatchedTerms = matchedQueryTerms(hit.Text, hit.WindowTitle, terms, hit.matchedMask)
+		// The index reports the query's terms. A capture matched through a
+		// respelled compound also lists the words it contains, so the preview
+		// can emphasise them.
+		if held := matchedQueryTerms(hit.Text, hit.WindowTitle, spellings, 0); len(spellings) > 0 && len(held) == len(spellings) {
+			for _, word := range held {
+				if !slices.Contains(hit.MatchedTerms, word) {
+					hit.MatchedTerms = append(hit.MatchedTerms, word)
+				}
+			}
+		}
 	}
 }
 
@@ -1693,65 +1770,12 @@ func newKnowledgeID(prefix string) (string, error) {
 // only UTC date partitions overlapping the requested range, bounds both date
 // span and segment count, and clips boundary segments before aggregation.
 func (c *Client) ActivityReport(startDate, endDate, zoneName string) (activity.ReportResult, error) {
-	if c == nil || c.data == nil {
-		return activity.ReportResult{}, ErrNotConfigured
-	}
-	reader, ok := c.data.(ActivityData)
-	if !ok {
-		return activity.ReportResult{}, ErrNotConfigured
-	}
-	start, err := time.Parse("2006-01-02", startDate)
-	if err != nil || start.Format("2006-01-02") != startDate {
-		return activity.ReportResult{}, ErrInvalidRequest
-	}
-	last, err := time.Parse("2006-01-02", endDate)
-	if err != nil || last.Format("2006-01-02") != endDate || last.Before(start) || int(last.Sub(start)/(24*time.Hour))+1 > MaxActivityReportDays {
-		return activity.ReportResult{}, ErrInvalidRequest
-	}
-	zone, err := loadZone(zoneName)
-	if err != nil {
-		return activity.ReportResult{}, ErrInvalidRequest
-	}
-	startLocal := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, zone)
-	endLocal := time.Date(last.Year(), last.Month(), last.Day()+1, 0, 0, 0, 0, zone)
-	var dates []string
-	for day := startLocal.UTC().Truncate(24 * time.Hour); day.Before(endLocal); day = day.Add(24 * time.Hour) {
-		dates = append(dates, day.Format("2006-01-02"))
-	}
-	if len(dates) == 0 || len(dates) > maxActivityReportUTCdays {
-		return activity.ReportResult{}, ErrInvalidRequest
-	}
-	segments, err := reader.ListActivitySegmentsForDates(context.Background(), dates, MaxActivityReportSegments)
-	if err != nil {
-		return activity.ReportResult{}, err
-	}
-	if len(segments) > MaxActivityReportSegments {
-		return activity.ReportResult{}, ErrActivityLimit
-	}
-	for i := range segments {
-		segment := &segments[i]
-		if segment.Validate() != nil {
-			return activity.ReportResult{}, ErrInvalidRequest
-		}
-		if segment.WallEnd.After(startLocal) && segment.WallStart.Before(endLocal) {
-			if segment.WallStart.Before(startLocal) {
-				segment.WallStart = startLocal
-			}
-			if segment.WallEnd.After(endLocal) {
-				segment.WallEnd = endLocal
-			}
-			segment.Duration = int64(segment.WallEnd.Sub(segment.WallStart))
-		} else {
-			segment.Duration = 0
-		}
-	}
-	filtered := segments[:0]
-	for _, segment := range segments {
-		if segment.Duration > 0 {
-			filtered = append(filtered, segment)
-		}
-	}
-	return activity.Report(filtered, zone)
+	return c.ActivityReportContext(context.Background(), startDate, endDate, zoneName)
+}
+
+func (c *Client) ActivityReportContext(ctx context.Context, startDate, endDate, zoneName string) (activity.ReportResult, error) {
+	report, _, err := c.readActivityReport(ctx, startDate, endDate, zoneName)
+	return report, err
 }
 
 // HourSoFar returns a deterministic, model-free preview of the current UTC

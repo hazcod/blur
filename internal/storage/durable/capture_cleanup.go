@@ -141,6 +141,9 @@ func (tx *Tx) captureErasePartsStep(j *sourceErasure) (bool, error) {
 		}
 		return true, nil
 	}
+	if done, err := tx.eraseCaptureRangeStep(j, j.SourceID, r); err != nil || !done {
+		return false, err
+	}
 	// The same bounded projection phases apply to the genuine part identity.
 	// Keep their cursor in the parent journal, so a crash cannot advance past
 	// retained claims or lose the authenticated mapping needed to find them.
@@ -271,6 +274,16 @@ func (tx *Tx) captureUnlinkEdition(id string) error {
 	}
 	if err := tx.unlinkCaptureIndexReferencesLocked(id, &r); err != nil {
 		return err
+	}
+	if r.IndexRangeWork != nil && r.IndexRangeWork.CoreTerms > 0 {
+		if err := tx.deleteIndexValueLocked(captureNS, captureRangeCoreKey(id, r.Publication)); err != nil {
+			return err
+		}
+	}
+	if r.IndexRangeQueued > 0 {
+		if err := tx.deleteIndexValueLocked(captureNS, captureRangeQueueKey(id, r.Publication)); err != nil {
+			return err
+		}
 	}
 	for _, family := range []bool{false, true} {
 		key, prev, next := "published", r.Prev, r.Next

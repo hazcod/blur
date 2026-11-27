@@ -38,9 +38,13 @@ func TestRecordTimesSeparatesCreationRecordingAndManualClocks(t *testing.T) {
 	if _, _, err = RecordTimes(m, note); !errors.Is(err, ErrInvalid) {
 		t.Fatal("ambiguous manual clocks silently selected")
 	}
-	final.Event.End = 9 * time.Hour
+	final.Event.End = 40 * time.Hour
+	if _, end, err = RecordTimes(m, final); err != nil || !end.Equal(recording.Add(40*time.Hour)) {
+		t.Fatal("long audio offset rejected despite representable provenance", err)
+	}
+	final.Event.End = MaxCaptureDuration
 	if _, _, err = RecordTimes(m, final); !errors.Is(err, ErrInvalid) {
-		t.Fatal("audio duration ceiling was relaxed")
+		t.Fatal("unrepresentable transcript wall time was accepted")
 	}
 }
 func TestManualNotesDoNotUseAudioDurationBudget(t *testing.T) {

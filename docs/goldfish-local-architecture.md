@@ -40,6 +40,28 @@ Goldfish's own release history and UI are feature claims, not proof that all tho
 
 ## Consequences for Blur
 
+The 2026-11-22 basic live run proved one native TextEdit capture through saved
+original retrieval, and one system-audio recording through actual on-device
+transcription, pause exclusion/resume, indexing, recap and grounded voice recall.
+It also demonstrated why acquisition and retrieval need separate checks: an
+ordinary note failed before persistence due to differing local-zone names,
+while a Find command spent 14 seconds in answer/ranking stages despite the
+indexed voice hit being available. These are Blur observations, with fixes
+under verification, not comparative Goldfish measurements. Microphone input,
+notification delivery, browser capture and Terminal dedup/ranking remain open.
+
+Voice delivery retains the durable read token through question history and
+queued original/recap installation, including terminal model errors. A scoped
+voice token is selected only after live meeting membership and record-kind
+authentication. Client publication gates permit overlapping readers while
+mutations and Close retain exclusive access; native delivery rejects a busy
+writer without waiting. The full-suite run exposed false mutation errors when
+two unchanged readers shared an exclusive mutex, and a controlled concurrent
+read regression plus twenty recap repetitions exercise that correction.
+Ask cancellation bookkeeping has its own mutex. Registration retains the
+shared memory guard until insertion, so deletion cannot miss a newly admitted
+ask; registration and cleanup no longer act as evidence writers.
+
 1. Keep encrypted source observations authoritative. Encryption is compatible with in-process decryption, bounded retrieval and RAM-only search indexes; changing to plaintext SQLite is not required.
 2. Persist repeated sightings and last-seen times while capture continues, independently of activity-segment closure or summary generation.
 3. Retrieve current raw evidence and the requested full time span; recent context and hierarchical summaries can improve recall without becoming the only searchable memory.
@@ -352,6 +374,11 @@ bare-hour reminders and task-creation phrasings; a 32-character minimum-content
 filter on every write path with per-source sighting counts; a focused-element
 breadcrumb per capture; and persistent, deletion-fenced question history.
 
+The 32-character admission gate described in that historical plan was removed
+on 2026-11-22. Current Blur capture admits any non-empty sanitized text, including
+short terminal commands and one non-whitespace Unicode code point. Blank text,
+privacy exclusions, authorization and current-revision checks still gate writes.
+
 ### Remaining gaps (2026-11-16)
 
 Inside the recall goal:
@@ -366,7 +393,17 @@ Inside the recall goal:
 - Entity detection only recognises capitalised names or Library matches at
   retrieval time; the planner cannot consult the Library, so lowercase names
   ("what did dima say") do not become a subject.
-- Month and year rollups, and rule-based project time in `get_time_report`.
+- Native original-source expansion from derived recaps, long direct totals and
+  exact Search across long periods, and rule-based project time remain open.
+  Persisted day/week/month/year work now shares an encrypted fair queue, bounded
+  compatible historical backfill, zone rebasing and calendar ancestor fences.
+  Months use days and years use months within six total model calls per pass.
+  Admission uses authenticated metadata receipts; legacy supporting edges drain
+  in bounded claims. Source/year reverse records remove the old lifetime
+  512-reference ceiling, with deferred cleanup and restartable model-free erasure.
+  Arbitrary manual 256-source publication remains open. Native long recaps prefer
+  stored calendar parents and retain a disclosed distributed fallback (up to
+  400 days, at most eight raw originals).
 - Semantic recall covers only the optional local index; raw captures are
   lexical, as in Goldfish, but Blur has no vector index over Library pages.
 - The live Accessibility breadcrumb path, long-session voice capture and
@@ -395,15 +432,382 @@ running an older build cannot import sync segments that contain them and stops
 at the first such segment until it is upgraded (nothing is lost). Upgrade all
 synced Macs together.
 
-Still open for search: a folded-name index for the Library so an unaccented
-question finds an accented entry (today only the accented spelling matches),
-a vector index over Library pages (Goldfish embeds Wiki pages; Blur's optional
-meaning index covers captures only), lowercase entity detection in the planner, and re-tokenization of capture parts
-published before the format bump. Open-path cost: queuing the re-index is
+The inferred Library folded-name gap was resolved on 2026-11-21 (below).
+Still open for search: a vector index over Library pages (Goldfish embeds Wiki pages; Blur's optional
+meaning index covers captures only) and lowercase entity detection in the planner. Old published capture-part tokens now migrate in bounded background work (below). Observation open-path cost: queuing the re-index is
 still O(N) in receipts (about 0.7 s per 1,000 captures measured).
 
-Outside the goal (not started): morning/evening briefs and contextual nudges,
+Additional parity gaps (not started): morning/evening briefs and contextual nudges,
 inline writing assistance and learned writing rules, time-rule editing UI,
 attention items from observed calendars and mail, chat threads/inbox, and
 ChatGPT/Claude history import. Details per area are in
 `docs/goldfish-feature-parity.md`.
+
+
+### Update 2026-11-21: folded Library names and dynamic journeys
+
+Inferred Library identity keys stay unchanged; an additive, authenticated
+folded-name posting index resolves accent/composition variants without merging
+same-named mentions across contexts. Values remain encrypted and names in keys
+remain keyed. New writes and erasure maintain postings atomically. A durable
+cursor backfills one entity per transaction through the existing local indexing
+worker, even with AI disabled. Opening does not scan all entity bodies. Empty
+Libraries do not report false pending coverage. Reader allowances include the
+bounded posting scans; the 128-context/six-sources-per-context regression passes.
+Scoped reads apply app/domain filters before the eligible-result limit and
+preserve a correction in a requested domain behind other same-name contexts.
+
+The new stateful, coverage-guided journey runner changes action order and saved
+state instead of generating a static list of phrasing variants. Native Client
+Ask, Entry, encrypted persistence, tasks/reminders, source deletion, follow-ups
+and reopen behavior are exercised. Mutation first exposed a sighting-event
+oracle error (duplicate event instants are idempotent), then a real routing gap:
+bare Find stopped being a local lookup after its only source was deleted.
+Recognized retrieval commands now retain their memory intent and return a
+missing-evidence answer without requiring a model. Procedural requests,
+ordinary factual probes and explicit general mode retain separate routes. A later minimized
+case found the same missing-evidence gap for stored-record location questions;
+that route now also preserves memory intent, including quoted Search topics.
+
+The one-million-execution campaign is a target, not achieved coverage. Report
+actual execution counts and minimized failures, and keep the full objective
+active. See [dynamic memory scenarios](dynamic-memory-scenarios.md) for the
+runner, independent oracles, replay commands and remaining acceptance gaps.
+Explicit Library exact-identity APIs are unchanged. Live app acquisition,
+unrestricted language/intent understanding remain outside this change's evidence.
+
+
+### Update 2026-11-21: retained capture token migration
+
+Published parts with old accented tokens now enter a durable content-format
+backfill. Open updates bounded metadata; the existing local worker resets one
+edition's derived progress and removes/rebuilds each part's authenticated
+proofs in bounded batches. Fully indexed and partially indexed old parts are
+covered. Original encrypted part payloads, publication IDs, source IDs and
+visit provenance stay unchanged. Reopening resumes; completed current stores
+remain read-only on open. Search reports pending coverage until work finishes.
+
+Review found a transient citation-resolution gap in an intermediate version.
+Permanent regressions now check raw evidence, sighting times and whole-capture
+deletion through cited part IDs between every work quantum. The final proof
+removal atomically creates an empty current root and preserves part membership;
+term indexing happens in a later round. Deletion before the cursor and during
+rebuilding, an old queue head ahead of backfill, and newly arriving captures
+have separate lifecycle coverage. This does not establish universal app capture
+or unrestricted natural-language understanding.
+
+
+### Update 2026-11-21: event dates versus observation dates
+
+Synthetic mail confirms a calendar-recall defect: a Monday appointment question
+previously filtered captures to the past Monday and hid its Thursday-observed
+confirmation. Clear event-time grammar now retains dates as content cues while
+keeping observation provenance intact. Explicit activity questions and read
+clauses retain their own capture windows. Event questions avoid inheriting an
+unrelated activity window; date-only continuations retain the topic and replace
+old date cues. Future visits, nominal book readings, mixed date clauses and
+bounded continuation terms have planner/native regressions.
+
+An inherited event topic is kept separately from replaceable date cues. Span
+classification preserves a token that also occurs outside a date (Route 23 on
+23 November, or a May project in May). Native chains include app refinement and
+answer shortening between date updates. A separate probe found a lexical
+limitation: a source date can supply the same token as a route number, even in a
+first-turn query. The following update adds numbered-phrase support for it.
+
+### Update 2026-11-21: numbered topic phrase support
+
+The date/route token collision now has bounded local phrase support. Planning
+retains adjacent topic/number pairs independently of date spans and carries
+them through date/app/grounded refinements. Numbered-topic evidence precedes
+broad term counts and app/recency boosts; unverified pairs are closest matches.
+The shared Search/MCP core classifies its bounded candidate pool before page
+truncation, including when every independent word occurred in an unsupported
+source. Ask uses the same source/title matcher and flags, including late bare
+and entity lookup plans. Quoted qualifiers preserve unquoted numbered cues;
+wholly literal subjects keep their term contract.
+
+Candidate reads share the existing aggregate hydration byte ceiling and report
+incomplete support coverage instead of claiming an exhaustive ranking. Runtime
+journeys vary numbered subjects against newer date-token collisions and check
+Ask plus Search/MCP. These are lexical relevance checks, not general semantic
+ID resolution or native acquisition acceptance.
+
+The runtime journey now also mutates future event dates, older capture dates,
+clock times and mail/browser origin independently, checking the actual source
+and extractive missing-end wording. Existing minimized failure selectors remain
+stable. Generated-answer semantics, general event extraction, Dutch acceptance
+and calendar integration remain unverified; a large mutation count cannot
+establish them.
+
+### Update 2026-11-21: range-only capture consistency
+
+A native CF/range regression reproduced a same-length edit producing mixed
+chunks while retaining the window, path, role and character count. Range-only
+document values now require a matching second streamed content digest before
+completion. Both passes retain path/privacy/count checks and bounded round work;
+verification advances the job without duplicating text or allocating a whole
+document. Immutable AXValue snapshots remain the preferred path. Unknown-range
+visible slices remain partial. Mutation tests vary multilingual text, edit
+timing, read sizes, secure transitions and unavailable providers; job regressions
+also check deadline continuation, cancellation and publication receipts.
+
+This establishes repeatable observed ranges, not atomic app snapshots or
+universal native capture. A non-interactive standalone capability probe returned
+`permission_required` on this machine; this does not establish the signed app's
+grant. No permissions were changed. The signed app has not been launched for
+this check because AGENTS.md requires separate launch authorization.
+
+### Update 2026-11-21: Dutch recall and Interact read authority
+
+Explicit Dutch personal recall/search now shares local planning with English.
+A grammar-only calendar view reuses observation-window calculation while
+retaining original topic terms and question text. Event-time questions keep
+content dates separate from relative past-read clauses; app/date and bounded
+bare-weekday follow-ups carry the event topic and numbered-subject cues.
+Search retains its domain/literal exclusions. Generic Dutch task collections
+reuse local status/calendar/count filters without new mutation authority.
+
+Native encrypted-store regressions exposed an integration gap beyond planning:
+unpunctuated Dutch reads could fall through Interact to saving a note. The
+composer now shares the Dutch read recognizer with the planner, preserving
+explicit note/task prefixes. Independent review also reproduced and verified
+fixes for weekday domains, explicit web requests, nominal activity adjectives
+and bare-date follow-ups. Deletion tests include previous answer prose and
+require grounded continuations to abstain after the sources disappear.
+
+Runtime journeys vary Dutch source/query content, dates, clocks, app origins,
+numbered conflicts and collection reads against independent expected records.
+The older million-target campaign continues against its recorded immutable
+baseline; newer language code has separate current-source checks. This does
+not establish arbitrary Dutch semantics, task/reminder creation, source
+translation, model-answer correctness or universal native app acquisition.
+
+
+### Bounded historical source references and erasure recovery
+
+New rollup/source links use encrypted per-source/year leaves (at most 432 possible
+calendar/ISO period IDs) and a fixed logical four-digit-year bitmap directory.
+The directory encodes sparse nonzero bytes for ordinary histories and uses a
+dense form only when smaller; encoded size stays between 4 and 1,251 bytes. Legacy
+512-element reverse arrays are read/drained alongside new links, without eagerly
+rewriting them. Ordinary unlinks retain empty leaves, and source erasure removes
+at most 16 empty years separately from 8 forward-row invalidations per transaction.
+
+Input-only erasure clears public recap text, child/source IDs and generation
+metadata immediately. A separate encrypted receipt retains pending reverse edges,
+with at most 32 unlinks per cleanup claim. Publication is blocked while that receipt
+exists, including candidates with a fresh revision. A hard-delete receipt keeps
+the forward row catalogued until final receipt/row removal can commit together.
+
+Recap clearing has its own encrypted intent, separate from original-source
+deletion. It fences reads and writes while deleting at most one hour or one
+rollup-cleanup quantum per transaction. An ending epoch fences claims acquired
+during clearing. The always-running local storage service resumes intents without
+a model, including after reopening with AI disabled; it never starts historical
+discovery when no intent exists. These are storage/worker guarantees. They do
+not establish arbitrary-app capture or full persisted month/year acceptance.
+
+
+### Persisted calendar hierarchy integration
+
+Calendar month/year persistence, historical discovery and generation now use the
+full source-linked lifecycle. Backfill version 2 revisits completed version-1
+history; the fixed four-date/sixteen-row discovery quantum remains. Day/week/month/year
+claims have separate persisted cursors. The six-call per-pass inference budget
+reserves opportunities for higher levels, and month/year generation waits for
+compatible discovery and clean children. Local calendar bounds, active zones,
+revisions and erasure epochs fence publication.
+
+Hour changes atomically invalidate every overlapping calendar ancestor; input-only
+erasure clears public fields at all four levels. A Kathmandu New Year regression
+with 64 revisited capture sources crosses eight ancestors and fits the existing
+physical transaction limit. A bounded mutation-aware encrypted-record cache removes
+redundant metadata reads while retaining normal integrity-manifest writes. Reopen
+and rollback probes verify repeated writes, deletion and recreation.
+
+Native Ask selects stored calendar parents, Search indexes them, MCP exposes their
+period/child hierarchy, and grounded follow-ups stop reopening erased summaries.
+Limited coverage survives both MCP search transport and native summary rows.
+Independent review and targeted checks pass; current runtime lifecycle checks
+passed 78 reported executions with four new coverage-interesting inputs from
+68 baseline entries on the final test revision. The canonical app was rebuilt
+and strictly verified; the complete suite passed (56 tested packages), as did vet and targeted race checks. This does not establish live app capture or arbitrary-model
+semantic quality.
+
+
+### Native recap originals and changing-memory publication
+
+Hour/day/week/month/year source cards can expand the recap's saved supporting
+originals inline. The reader authenticates the current stored period from the
+answer's existing derived handle and time bounds; cached answer text and claimed
+source IDs provide no read authority. A receipt binds complete persisted recap
+metadata, so unchanged wording with new provenance still invalidates old page
+cursors and full-source requests. Each request hydrates at most eight originals;
+previews retain at most 4,096 UTF-8 bytes each, and one full original is held
+separately. Closing sources, leaving Ask, browsing, replacing the answer or opening
+the note editor cancels loading and releases these payloads.
+
+Reads check current provenance again after hydration. Queued UI publication also
+holds both the Client deletion fence and a durable committed-write fence through
+the tiny state assignment. This conservatively retries after any intervening
+store write, including background recap regeneration. UI installation performs
+no database I/O and never waits for an active writer. Failed transactions retain
+the earlier valid token. Preview truncation clones the visible bytes to release
+unshown capture-part backing storage. Ask planning now converts the real clock to
+the same resolved local zone as the recap worker, including when Go previously
+cached a different process zone.
+
+`FuzzRecapSourceNavigation` generates changing histories against actual encrypted
+storage, the calendar worker, native Ask and mounted source actions. Its separate
+insertion ledger checks exact live source IDs and original text after edits,
+erasure, reopening, recap clearing, pagination, full reads and queued publication.
+Inputs vary calendar years/months, UTC/Kathmandu, app origins, personal/work topics,
+large multilingual bodies and action order. Mutation feedback retains inputs
+that exercise new code coverage; no static catalogue is presented as a million
+unique needs. The local summary generator and GUI dispatch boundary are controlled.
+These checks do not establish live cross-app acquisition, arbitrary model semantics
+or visual acceptance in a launched app.
+
+This increment passed independent review, the complete suite (56 tested packages),
+vet and targeted race checks. The final-source navigation mutation run passed
+25 executions with three new coverage-interesting inputs from nineteen baseline
+entries, including the retained minimized scenario. The canonical universal app
+was rebuilt and strictly verified against the exact original signing certificate
+and designated requirement, with only the audio-input entitlement. No app
+lifecycle action was performed; the live acceptance gaps above remain open.
+
+
+Long-scope Search now covers explicit month/year capture windows up to400 days
+through at most15 small index queries. Native Search and MCP share global ranking,
+source deduplication, actual matching visit instants and preserved coverage flags.
+Activity-only legacy membership, app/domain intersections and quoted years have
+actual encrypted-store regressions. Selected-model recent/rewrite candidates and
+embedding sighting resolution retain bounded storage calls; model quality is not
+claimed. A durable commit token rejects a split read if memory changes during it.
+Browse/meaning candidate reads share 2 MiB of returned source bytes across windows
+and filters and stop before issuing an invalid smaller storage request.
+
+The final long-Search source passed the complete suite (56 tested packages), vet,
+focused race checks and all retained runtime source-navigation cases. The
+current-source mutation run passed 28 reported executions with 1 new interesting
+input from 22 baseline entries. A fresh review exposed mixed snapshots, meaning
+integration, timestamp and coverage/admission defects; retained RED regressions
+now pass. The canonical signed universal app was rebuilt and independently
+verified against its exact original certificate and designated requirement.
+No app lifecycle action was performed. Live cross-app, voice, arbitrary-model
+and native visual acceptance remain open. These counts
+are never added to older campaigns as unique user needs.
+
+
+Exact month/year tracked foreground time now shares a metadata-only scanner
+across native Ask, Time and MCP. Up to 400 local dates require at most fifteen
+28-day windows; existing storage row/date limits stay unchanged. Each piece is
+clipped to its child, original IDs count sessions once, and durations stay in
+nanoseconds until presentation. The independent retained-session and aggregate
+metadata ceilings are each 65,536 entries. Mandatory failures, cancellation or
+committed memory changes discard the total. Empty-app unknown recovery gaps and
+Blur itself cannot become tracked foreground time.
+
+Native Time pages 20 app rows. Its queued installation checks dates, zone, page
+and the exact durable read token. Direct time Ask carries an opaque publication
+guard through the assistant service; its own convenience history write compares
+and advances that token atomically, and native installation rechecks it without
+IO. A source erased before queue dispatch cannot reappear as a stale total.
+The shared day splitter stops at actual zone transitions and strictly advances,
+including skipped/repeated midnights. Report/MCP date endpoints use the first
+real instant of the civil date. App and website qualifiers are supported;
+unverified topic/project totals receive explicit insufficient evidence.
+
+The changing-history target exercises actual encrypted source/activity
+replacement, erasure, reopen, duplicate rejection and sightings, plus real
+Engine-produced unknown gaps and varied natural time wording. It compares native
+reports, MCP and Ask against an independent inserted-duration ledger. Its counts
+are stress executions, not semantic uniqueness or live macOS acquisition proof.
+
+
+The final tracked-time source passed the complete suite (56 tested packages),
+vet and focused race checks. The current-source mutation run passed 63 reported
+executions with 12 new interesting inputs from 40 baseline entries; it includes
+grounded time follow-ups after mutations. A first full run exposed follow-up
+integration failures and incorrect test assumptions, now covered by passing
+regressions. The durable suite completed in 724.443 seconds with a 30-minute
+package budget; production operation deadlines were unchanged. The canonical
+universal app was rebuilt and strictly verified against the exact original
+certificate and designated requirement, retaining only the audio-input
+entitlement. It was not launched. The larger personal-memory goal remains open;
+these counts are not semantic-unique use cases or live macOS acquisition proof.
+
+## Work-driven text processing and multi-subject recall
+
+All accepted source text can enter the existing local enrichment queue in
+summary-only mode, independently of optional Library extraction. Compaction
+retains independent encrypted original-span blocks instead of a rolling
+whole-source summary. The next source cursor and its block commit atomically;
+successful batches resume after interruption, and erasure drains each block.
+Input spans adapt to actual model/power admission. Pending sources rotate with
+reserved opportunities for multipart and legacy history. Semantic indexing also
+checkpoints successful partial batches and publishes only complete revisions.
+Schema 8 introduced these private namespaces through an atomic metadata-only migration
+from schema 7, retaining existing payload ciphertext and identity.
+
+Technical comparisons retrieve each named subject independently while preserving
+the strict identifier conjunction within that lookup. Complete labels are
+validated within every physical app/date page before accepted results compete
+for ranking and returned-source bytes. Distinct original passages can share one
+real source ID; bounded UTF-8 ranges retain the full original separately and
+render explicit gaps. Context allocation accounts for the subjects supported by
+each selected passage. Actual text/JSON clipping recomputes which subjects have
+support, and citations must cover those subjects. Missing or omitted subjects
+are disclosed. Ordinary Search and explicit relationships retain conjunctions;
+comparison follow-ups retain their original subject scope.
+
+Dated Library projections validate each fact/open loop against its own observed
+source support, including exact historical visits. An unrelated recent entity
+mention cannot date an older claim. Corrections suppress their originals before
+date projection, and the stored Library is not rewritten. See the
+[functional review](blur-functional-gap-review.md) for verified cases and open
+issues; these mechanisms do not establish unlimited model context, million-record
+throughput, complete Accessibility acquisition or Goldfish parity.
+
+## Text integrity receipts and original-range search
+
+The current reader floor is schema 9. Existing schema-7/8 stores upgrade through
+an atomic authenticated metadata change; original payload ciphertext and saved
+identity remain intact. Older readers reject admission before their erasure code
+can leave new source-linked metadata behind.
+
+Capture exact indexing now carries a bounded Unicode normalization segment,
+original part boundaries and an unfinished token digest across physical parts.
+Completed seam tokens use authenticated original-range evidence, while ordinary
+tokens retain their canonical part IDs. Citation reads authenticate the same
+publication and intersecting original parts; they retain neighboring original
+context without copying or rewriting the capture. Old derived indexes rebuild
+through persisted work and retire their obsolete fragment postings.
+
+One normalization segment can emit several terms with overlapping original
+spans. Encrypted pending and active work rows preserve those projections
+independently and drain before advancing the input part. Only identical spans
+merge core digests. Word projections index their original global token digests;
+neighbor context does not invent substring or sibling postings. A short match
+therefore remains readable beside a word exceeding one source-read envelope.
+Identifier-run projections separately preserve joined technical labels.
+Oversized requested evidence returns an explicit budget error. Reset and erasure
+remove pending work, core digests, range proofs and derived postings.
+
+Replica export authority is an authenticated receipt for the writer generation
+and exact source revision, rather than the largest capture timestamp. Bounded
+physical scans and acknowledgement batches retain continuation through equal-time
+and backdated inputs. One private sealed outbox becomes durable before immutable
+public publication and replays the exact segment bytes after interruption.
+Configuration commits share a publication gate; folder changes rotate writer
+identity, disable cancels old work, and erasure retires unpublished private data.
+The public wire format remains version 1. Published multipart captures still need
+a compatible transport and are not yet synchronized by that observation format.
+
+Native deletion preparation reads source/range task metadata in separate bounded
+transactions while holding exclusive deletion authority and the scheduling
+guard. Native failure or cancellation before journal admission preserves the
+source. Targeted reminder cleanup authenticates current source/revision authority
+without exposing captured text and preserves unrelated pending and delivered
+notices. The actual erasure journal then drains every accepted part and derivative.

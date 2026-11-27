@@ -39,11 +39,14 @@ func TestMinimumContentBoundary(t *testing.T) {
 		name, app, text string
 		stored          bool
 	}{
-		{"31 chars dropped", "org.example.editor", strings.Repeat("x", 31), false},
+		{"single terminal code point stored", "com.apple.terminal", "0", true},
+		{"short command stored", "com.apple.terminal", "ls", true},
+		{"single Unicode code point stored", "org.example.editor", "日", true},
+		{"31 chars stored", "org.example.editor", strings.Repeat("x", 31), true},
 		{"32 chars stored", "org.example.editor", strings.Repeat("x", 32), true},
-		{"padded whitespace does not count", "org.example.editor", "  " + strings.Repeat("x", 31) + "  \n\t ", false},
-		{"voice transcript exempt", "sh.blur.meetings", "hi", true},
-		{"typed note exempt", "sh.blur.notes", "hi", true},
+		{"padded single code point stored", "org.example.editor", "  x  \n\t ", true},
+		{"short voice transcript", "sh.blur.meetings", "hi", true},
+		{"short typed note", "sh.blur.notes", "hi", true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			service, _, o, stored := captureOnce(t, c.app, c.text)
@@ -61,15 +64,15 @@ func TestMinimumContentBoundary(t *testing.T) {
 	}
 }
 
-func TestShortCaptureStillCountsForegroundVisitInActivity(t *testing.T) {
-	service, engine, _, _ := captureOnce(t, "org.example.editor", "tiny")
+func TestShortCaptureLinksForegroundVisitToSavedEvidence(t *testing.T) {
+	service, engine, observation, stored := captureOnce(t, "org.example.editor", "tiny")
 	time.Sleep(2 * time.Millisecond)
 	if err := service.captureCurrent(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	segments := engine.Segments()
-	if len(segments) != 1 || segments[0].AppID != "org.example.editor" || len(segments[0].SourceIDs) != 0 {
-		t.Fatalf("short visit lost from activity or linked to dropped source: %#v", segments)
+	if !stored(observation.ContentID()) || len(segments) != 1 || segments[0].AppID != "org.example.editor" || len(segments[0].SourceIDs) != 1 || segments[0].SourceIDs[0] != observation.ContentID() {
+		t.Fatalf("short visit lost saved evidence or its activity link: %#v", segments)
 	}
 }
 

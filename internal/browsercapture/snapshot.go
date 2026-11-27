@@ -27,21 +27,28 @@ var ErrRejected = errors.New("browser capture: page rejected")
 // Active must be established by the native browser adapter, not page script.
 // The raw URL is used only to derive the hostname and is never persisted.
 type Snapshot struct {
-	Browser      string    `json:"browser"`
-	URL          string    `json:"url"`
-	Title        string    `json:"title"`
-	Text         string    `json:"text"`
-	Active       bool      `json:"active"`
-	PrivacyKnown bool      `json:"privacy_known"`
-	Private      bool      `json:"private"`
-	CapturedAt   time.Time `json:"captured_at"`
+	Browser          string    `json:"browser"`
+	URL              string    `json:"url"`
+	Title            string    `json:"title"`
+	Text             string    `json:"text"`
+	Active           bool      `json:"active"`
+	PrivacyKnown     bool      `json:"privacy_known"`
+	Private          bool      `json:"private"`
+	CapturedAt       time.Time `json:"captured_at"`
+	Complete         bool      `json:"complete"`
+	Truncated        bool      `json:"truncated,omitempty"`
+	DocumentID       string    `json:"document_id,omitempty"`
+	SourceKey        string    `json:"source_key,omitempty"`
+	Revision         int64     `json:"revision,omitempty"`
+	Sequence         int64     `json:"sequence,omitempty"`
+	StructureLimited bool      `json:"structure_limited,omitempty"`
 }
 
 // Sanitize accepts only a fresh active Safari page with a known non-private
 // browsing state and an enabled capture policy. It returns the same validated,
 // redacted observation type used by native accessibility capture.
 func Sanitize(page Snapshot, enabled bool, now time.Time) (capture.SanitizedObservation, error) {
-	if !enabled || !page.Active || !page.PrivacyKnown || page.Private || page.Browser != SafariBundleID ||
+	if !enabled || !page.Complete || page.Truncated || page.StructureLimited || !page.Active || !page.PrivacyKnown || page.Private || page.Browser != SafariBundleID ||
 		now.IsZero() || page.CapturedAt.IsZero() || len(page.URL) == 0 || len(page.URL) > MaxURLBytes ||
 		len(page.Title) > MaxTitleBytes || len(page.Text) == 0 || len(page.Text) > MaxPageBytes || strings.TrimSpace(page.Text) == "" {
 		return capture.SanitizedObservation{}, ErrRejected

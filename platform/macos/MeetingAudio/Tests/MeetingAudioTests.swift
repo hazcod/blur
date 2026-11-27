@@ -9,6 +9,7 @@ func requireMeeting(_ condition: @autoclosure () -> Bool, _ message: String) thr
     static func main() async throws {
         let valid = Data(#"{"version":1,"kind":"start","session_id":"synthetic","locale":"en-US","tracks":["microphone","system"],"explicit_start":true,"startup_ms":1000}"#.utf8)
         let configuration = try decodeMeetingAudioConfiguration(valid)
+        try await testMeetingAudioLongTimeline(configuration)
         try await testMeetingAudioBuffering()
         try await testMeetingAudioLongQueueSchedules()
         try await testMeetingAudioLevels(configuration)
@@ -207,6 +208,46 @@ func requireMeeting(_ condition: @autoclosure () -> Bool, _ message: String) thr
         try requireMeeting(meetingUnsigned(largeJSON["epoch"]) == UInt64.max && meetingUnsigned(NSNumber(value: true)) == nil, "epoch parser rounded UInt64 or accepted bool")
         print("PASS generated PCM bounds, shared microphone/system origin and sample-accurate clock")
     }
+}
+
+// Virtual timestamps exercise long sessions without recording audio or waiting.
+func testMeetingAudioLongTimeline(_ configuration: MeetingAudioConfiguration) async throws {
+    let longMS: Int64 = 40 * 60 * 60 * 1000
+    let maximumMS = Int64.max / 1_000_000
+    for milliseconds in [longMS, maximumMS] {
+        var clock = MeetingAudioClock(sampleRate: 192000)
+        let placed = try clock.place(milliseconds: Double(milliseconds), frames: 1024)
+        try requireMeeting(placed.value > 0, "long-session sample clock rejected a representable offset")
+        let origin = CMTime(value: 0, timescale: 1000)
+        let host = CMTime(value: milliseconds, timescale: 1000)
+        let measured = try meetingAudioMilliseconds(hostTime: host, origin: origin)
+        try requireMeeting(abs(measured - Double(milliseconds)) < 0.01, "long-session host clock lost its offset")
+        var identity = MeetingAudioResultIdentity(sessionID: configuration.sessionID, track: "microphone", epoch: 1)
+        let range = CMTimeRange(start: CMTime(value: milliseconds - 100, timescale: 1000), duration: CMTime(value: 100, timescale: 1000))
+        let final = try identity.event(text: "synthetic long-session final", range: range, finalStream: true, isFinal: true)
+        try requireMeeting(final.endMS == milliseconds, "long-session final timestamp changed")
+    }
+    for invalid in [Double.nan, Double.infinity, -1, Double(maximumMS + 1)] {
+        var clock = MeetingAudioClock(sampleRate: 48000)
+        do { _ = try clock.place(milliseconds: invalid, frames: 1024); throw NSError(domain: "MeetingAudioTests", code: 6) }
+        catch is MeetingAudioFailure { }
+    }
+    let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
+    let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024)!
+    pcm.frameLength = 1024
+    pcm.floatChannelData![0].initialize(repeating: 0, count: 1024)
+    let meter = MeetingAudioLevelMeter(sessionID: configuration.sessionID, epoch: 1, emit: { _ in })
+    try requireMeeting(meter.event(track: "microphone", buffer: pcm, milliseconds: Double(longMS)) != nil, "long-session meter stopped at a lifetime cap")
+    let session = MeetingAudioSession(configuration, factory: SyntheticMeetingFactory(), releaseSlot: {})
+    defer { session.cancel() }
+    session.begin()
+    _ = try await collectMeeting(session.queue, until: "running")
+    session.receive(MeetingAudioEvent(version: 1, sessionID: configuration.sessionID, epoch: 1, kind: "transcript", track: "microphone", segmentID: "long-final", revision: 1, startMS: longMS - 100, endMS: longMS, final: true, text: "retained after forty hours"))
+    let size = session.queue.poll(capacity: 0).0
+    try requireMeeting(size > 0, "native session silently rejected a long-session final")
+    let batch = try JSONDecoder().decode(MeetingAudioBatch.self, from: session.queue.poll(capacity: Int(size)).1 ?? Data())
+    try requireMeeting(batch.events.contains { $0.segmentID == "long-final" && $0.endMS == longMS }, "native session lost a long-session final")
+    print("PASS long-session clocks, finals, native admission and duration representation guards")
 }
 
 final class SyntheticMeetingFactory: MeetingAudioFactory, @unchecked Sendable {

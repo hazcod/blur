@@ -142,15 +142,34 @@ func (c *Client) MeetingPage(ctx context.Context, after uint64) (meetings.Meetin
 }
 
 func (c *Client) MeetingTranscript(ctx context.Context, id string, after uint64) (meetings.RecordPage, error) {
+	page, _, err := c.readMeetingTranscript(ctx, id, after)
+	return page, err
+}
+
+func (c *Client) readMeetingTranscript(ctx context.Context, id string, after uint64) (meetings.RecordPage, memoryReadPublication, error) {
 	if !c.CanUseMeetings() || c.MemoryIsChanging() {
-		return meetings.RecordPage{}, ErrNotConfigured
+		return meetings.RecordPage{}, memoryReadPublication{}, ErrNotConfigured
 	}
 	op, done, err := c.beginOperation(ctx, shortOperationTimeout)
 	if err != nil {
-		return meetings.RecordPage{}, err
+		return meetings.RecordPage{}, memoryReadPublication{}, err
 	}
 	defer done()
-	return c.meetings.repo.MeetingRecords(op, id, meetings.PageRequest{After: after, Limit: 20, MaxBytes: 128 << 10})
+	read, stable := c.beginVoicePublication()
+	if !stable {
+		return meetings.RecordPage{}, memoryReadPublication{}, ErrMemoryChanging
+	}
+	page, err := c.meetings.repo.MeetingRecords(op, id, meetings.PageRequest{After: after, Limit: 20, MaxBytes: 128 << 10})
+	if err != nil {
+		return meetings.RecordPage{}, memoryReadPublication{}, err
+	}
+	if err := op.Err(); err != nil {
+		return meetings.RecordPage{}, memoryReadPublication{}, err
+	}
+	if !read.publish(c, func() {}) {
+		return meetings.RecordPage{}, memoryReadPublication{}, ErrMemoryChanging
+	}
+	return page, read, nil
 }
 
 func (c *Client) DeleteMeeting(ctx context.Context, id string) error {

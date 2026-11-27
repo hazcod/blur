@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,7 @@ const replicaKeySecret = "replica-sync-key"
 // <data dir>/replica/state.json, the derived key in the OS secret store and
 // the sync folder behind a security-scoped bookmark.
 type replicaService struct {
+	control sync.Mutex
 	state   *replica.StateFile
 	runner  *replica.Runner
 	secrets platform.SecretStore
@@ -43,6 +45,16 @@ func (s *replicaService) passDone() {
 	if f := s.notify.Load(); f != nil {
 		(*f)()
 	}
+}
+
+func (s *replicaService) invalidatePending() {
+	if s == nil || s.state == nil {
+		return
+	}
+	if err := s.state.InvalidateOutbox(); err != nil {
+		slog.Warn("sync pending erasure failed", "result", "failed")
+	}
+	s.passDone()
 }
 
 // snapshotMode reports whether the UI snapshot run (throwaway store) is
@@ -70,6 +82,9 @@ func newReplicaService(directory string, store *durable.Store, deleter *deletion
 // resolve opens the chosen folder and loads the derived key.
 func (s *replicaService) resolve(ctx context.Context) (replica.Target, error) {
 	st := s.state.Get()
+	if !st.Enabled {
+		return replica.Target{}, replica.ErrDisabled
+	}
 	if st.FolderPath == "" {
 		return replica.Target{}, replica.ErrFolderNotReady
 	}
@@ -156,12 +171,16 @@ func (s *replicaService) flushAsync() {
 }
 
 func (s *replicaService) setEnabled(enabled bool) error {
+	s.control.Lock()
+	defer s.control.Unlock()
 	if err := s.state.Update(func(st *replica.State) { st.Enabled = enabled }); err != nil {
 		return err
 	}
 	if enabled && !snapshotMode() {
 		s.runner.Start(context.Background())
 		s.runner.Poke()
+	} else if !enabled && s.runner != nil {
+		s.runner.Close()
 	}
 	return nil
 }
@@ -169,11 +188,24 @@ func (s *replicaService) setEnabled(enabled bool) error {
 // setFolder stores the chosen folder. A different folder has a different salt
 // and a fresh history, so the key and export progress reset.
 func (s *replicaService) setFolder(path string, bookmark []byte) error {
+	s.control.Lock()
+	defer s.control.Unlock()
 	previous := s.state.Get()
 	changed := previous.FolderPath != path
+	deviceID := previous.DeviceID
+	if changed {
+		var err error
+		deviceID, err = replica.NewDeviceID()
+		if err != nil {
+			return err
+		}
+	}
 	if err := s.state.Update(func(st *replica.State) {
 		st.FolderPath, st.Bookmark = path, bookmark
 		if changed {
+			st.DeviceID = deviceID
+			st.Pending = nil
+			st.ObservationCursor = nil
 			st.KeySet = false
 			st.ObsWatermark, st.TombWatermark, st.LastSeq = 0, 0, 0
 			st.TombSequence = 0
@@ -181,6 +213,11 @@ func (s *replicaService) setFolder(path string, bookmark []byte) error {
 		}
 	}); err != nil {
 		return err
+	}
+	if changed {
+		if err := s.state.InvalidateOutbox(); err != nil {
+			return err
+		}
 	}
 	if changed && previous.KeySet && s.secrets != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -193,12 +230,23 @@ func (s *replicaService) setFolder(path string, bookmark []byte) error {
 // setPassphrase derives the key from the folder salt and stores it. The
 // passphrase itself is never persisted.
 func (s *replicaService) setPassphrase(ctx context.Context, passphrase string) error {
+	s.control.Lock()
+	defer s.control.Unlock()
 	st := s.state.Get()
 	if st.FolderPath == "" {
 		return replica.ErrFolderNotReady
 	}
 	if s.secrets == nil {
 		return replica.ErrNoKey
+	}
+	// Retire old-key operations before replacing the secret. If a subsequent
+	// write fails, sync remains visibly unconfigured rather than publishing
+	// with a secret that disagrees with its configuration snapshot.
+	if err := s.state.Update(func(st *replica.State) { st.KeySet = false }); err != nil {
+		return err
+	}
+	if err := s.state.InvalidateOutbox(); err != nil {
+		return err
 	}
 	dir, release, err := s.openFolder(st)
 	if err != nil {
@@ -237,6 +285,9 @@ type syncSettingsState struct {
 // syncStatusLine summarizes sync for the Settings page. No content, only times
 // and counts.
 func syncStatusLine(st replica.State) string {
+	if st.OutboxInvalid {
+		return "Sync is paused while pending data is cleared. Retry sync to finish."
+	}
 	if !st.Enabled {
 		return "Off."
 	}

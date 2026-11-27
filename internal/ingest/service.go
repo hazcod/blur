@@ -33,8 +33,6 @@ type Capturer interface {
 
 type Stats struct{ Persisted, Duplicates, Skipped, DroppedShort uint64 }
 
-const maxPendingActivitySegments = 256
-
 type ObservationSink interface {
 	EncryptedAtRest() bool
 	// PutObservation must honor ctx and abort an uncommitted write when canceled.
@@ -60,6 +58,7 @@ type Service struct {
 	activitySink    ActivitySink
 	activityEpoch   time.Time
 	pendingActivity []activity.Segment
+	activityReplay  bool
 	onChange        func()
 	onObservation   func(capture.SanitizedObservation, time.Time)
 	onCaptureCycle  func()
@@ -198,6 +197,10 @@ func (s *Service) Run(ctx context.Context) (runErr error) {
 		if s.document != nil {
 			interval = 25 * time.Millisecond
 		}
+		replayOnly := s.activityReplay && (interval == 0 || interval > 250*time.Millisecond)
+		if replayOnly {
+			interval = 250 * time.Millisecond
+		}
 		if interval > 0 {
 			waitCtx, cancelWait = context.WithTimeout(ctx, interval)
 		}
@@ -209,6 +212,13 @@ func (s *Service) Run(ctx context.Context) (runErr error) {
 				return ctx.Err()
 			}
 			if refreshDue && errors.Is(err, context.DeadlineExceeded) {
+				if replayOnly {
+					if err := s.flushPendingActivity(ctx); err != nil {
+						s.reportHealth(HealthStorageError, time.Now().UTC(), capture.ReadIssue{})
+						return activityWriteError(ctx, err)
+					}
+					continue
+				}
 				if err := s.captureCurrent(ctx); err != nil {
 					return err
 				}
@@ -224,7 +234,9 @@ func (s *Service) Run(ctx context.Context) (runErr error) {
 			// their existing contiguous activity accounting.
 			if _, streams := s.capture.(DocumentCapturer); streams {
 				if _, stages := s.sink.(DocumentSink); stages {
-					s.pauseActivity(ctx)
+					if err := s.pauseActivity(ctx); err != nil {
+						return err
+					}
 				}
 			}
 			s.closeDocument()
@@ -242,13 +254,16 @@ func (s *Service) closeActivitySession() error {
 		return nil
 	}
 	now := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.flushPendingActivity(ctx); err != nil {
+		return ErrActivityFailed
+	}
 	segments, err := s.activity.Apply(activity.Event{Kind: activity.Idle, Monotonic: now.Sub(s.activityEpoch).Nanoseconds(), Wall: now})
 	if err != nil {
 		s.logger.Error("activity session close rejected", "operation", "activity", "result", "invalid")
 		return ErrActivityFailed
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
 	s.enqueueActivity(segments)
 	if err := s.flushPendingActivity(ctx); err != nil {
 		s.logger.Error("final encrypted activity write failed", "operation", "activity", "result", safeActivityWriteResult(err))
@@ -262,45 +277,6 @@ func (s *Service) enqueueActivity(segments []activity.Segment) {
 		segment.SourceIDs = append([]string(nil), segment.SourceIDs...)
 		s.pendingActivity = append(s.pendingActivity, segment)
 	}
-	if overflow := len(s.pendingActivity) - maxPendingActivitySegments; overflow > 0 {
-		for i := 0; i < overflow; i++ {
-			clear(s.pendingActivity[i].SourceIDs)
-			s.pendingActivity[i] = activity.Segment{}
-		}
-		copy(s.pendingActivity, s.pendingActivity[overflow:])
-		clear(s.pendingActivity[len(s.pendingActivity)-overflow:])
-		s.pendingActivity = s.pendingActivity[:len(s.pendingActivity)-overflow]
-		s.logger.Error("activity retry queue reached limit", "operation", "activity", "result", "oldest_segments_dropped", "dropped", overflow)
-	}
-}
-
-func (s *Service) flushPendingActivity(ctx context.Context) error {
-	if s == nil || s.activitySink == nil || ctx == nil {
-		return ErrInvalidService
-	}
-	for len(s.pendingActivity) > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := s.activitySink.PutActivitySegment(ctx, s.pendingActivity[0]); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if isPermanentActivityWriteError(err) {
-				// A segment the store will never accept must not pin the queue.
-				s.logger.Error("encrypted activity write rejected", "operation", "activity", "result", safeActivityWriteResult(err), "dropped", 1)
-			} else {
-				s.logger.Error("encrypted activity write failed", "operation", "activity", "result", safeActivityWriteResult(err), "retry_pending", len(s.pendingActivity))
-				return err
-			}
-		}
-		clear(s.pendingActivity[0].SourceIDs)
-		s.pendingActivity[0] = activity.Segment{}
-		copy(s.pendingActivity, s.pendingActivity[1:])
-		s.pendingActivity[len(s.pendingActivity)-1] = activity.Segment{}
-		s.pendingActivity = s.pendingActivity[:len(s.pendingActivity)-1]
-	}
-	return nil
 }
 
 func (s *Service) captureCurrent(ctx context.Context) error {
@@ -316,13 +292,26 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 		}
 		s.reportHealth(state, attemptedAt, readIssue)
 	}()
+	if s.activity != nil {
+		if err := s.flushPendingActivity(ctx); err != nil {
+			state = HealthStorageError
+			return activityWriteError(ctx, err)
+		}
+	}
 	handled, documentState, documentPartial, err := s.captureDocumentCurrent(ctx)
 	if handled && err == nil {
 		state, partial = documentState, documentPartial
 		return nil
 	}
+	if handled && errors.Is(err, ErrActivityFailed) {
+		state = HealthStorageError
+		return err
+	}
 	if handled && errors.Is(err, ErrStoreWrite) {
 		if s.rejectPolicyCommit(ctx, err, &state) {
+			if state == HealthStorageError {
+				return ErrActivityFailed
+			}
 			return nil
 		}
 		state = HealthStorageError
@@ -352,7 +341,10 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 				s.logger.Error("capture configuration rejected", "operation", "capture", "result", code)
 				return ErrCaptureFailed
 			}
-			s.pauseActivity(ctx)
+			if err := s.pauseActivity(ctx); err != nil {
+				state = HealthStorageError
+				return err
+			}
 			s.skipped.Add(1)
 			attrs := []any{"operation", "capture", "result", code}
 			if readIssue.Valid() {
@@ -377,7 +369,10 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 	if strings.TrimSpace(observation.Text()) == "" {
 		state = HealthEmpty
 		s.skipped.Add(1)
-		s.pauseActivity(ctx)
+		if err := s.pauseActivity(ctx); err != nil {
+			state = HealthStorageError
+			return err
+		}
 		return nil
 	}
 	if !capture.MeetsMinimumContent(observation.AppID(), observation.Text()) {
@@ -385,7 +380,10 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 		// toward activity timing (without evidence links).
 		state = HealthEmpty
 		s.droppedShort.Add(1)
-		s.recordShortVisit(ctx, observation)
+		if err := s.recordShortVisit(ctx, observation); err != nil {
+			state = HealthStorageError
+			return err
+		}
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -413,6 +411,9 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 				return ctx.Err()
 			}
 			if s.rejectPolicyCommit(ctx, putErr, &state) {
+				if state == HealthStorageError {
+					return ErrActivityFailed
+				}
 				return nil
 			}
 			var storeErr *storage.StoreError
@@ -441,6 +442,9 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 					return ctx.Err()
 				}
 				if s.rejectPolicyCommit(ctx, err, &state) {
+					if state == HealthStorageError {
+						return ErrActivityFailed
+					}
 					return nil
 				}
 				state = HealthStorageError
@@ -457,8 +461,9 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 			s.logger.Error("activity event rejected", "operation", "activity", "result", "invalid")
 		} else {
 			s.enqueueActivity(segments)
-			if err := s.flushPendingActivity(ctx); err != nil && ctx.Err() != nil {
-				return ctx.Err()
+			if err := s.flushPendingActivity(ctx); err != nil {
+				state = HealthStorageError
+				return activityWriteError(ctx, err)
 			}
 		}
 	}
@@ -471,17 +476,20 @@ func (s *Service) captureCurrent(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) pauseActivity(ctx context.Context) {
+func (s *Service) pauseActivity(ctx context.Context) error {
 	if s.activity == nil || ctx.Err() != nil {
-		return
+		return nil
+	}
+	if err := s.flushPendingActivity(ctx); err != nil {
+		return activityWriteError(ctx, err)
 	}
 	now := time.Now()
 	segments, err := s.activity.Apply(activity.Event{Kind: activity.Idle, Monotonic: now.Sub(s.activityEpoch).Nanoseconds(), Wall: now.UTC()})
 	if err != nil {
-		return
+		return ErrActivityFailed
 	}
 	s.enqueueActivity(segments)
-	_ = s.flushPendingActivity(ctx)
+	return activityWriteError(ctx, s.flushPendingActivity(ctx))
 }
 
 // isPermanentActivityWriteError reports store rejections that retrying cannot fix.
@@ -541,20 +549,25 @@ func (s *Service) rejectPolicyCommit(ctx context.Context, err error, state *Heal
 	}
 	*state = HealthExcluded
 	s.skipped.Add(1)
-	s.pauseActivity(ctx)
+	if err := s.pauseActivity(ctx); err != nil {
+		*state = HealthStorageError
+	}
 	return true
 }
 
-func (s *Service) recordShortVisit(ctx context.Context, observation capture.SanitizedObservation) {
+func (s *Service) recordShortVisit(ctx context.Context, observation capture.SanitizedObservation) error {
 	if s.activity == nil || ctx.Err() != nil {
-		return
+		return nil
+	}
+	if err := s.flushPendingActivity(ctx); err != nil {
+		return activityWriteError(ctx, err)
 	}
 	now := time.Now().UTC()
 	segments, err := s.activity.Apply(activity.Event{Kind: activity.Seen, Monotonic: now.Sub(s.activityEpoch).Nanoseconds(), Wall: now, AppID: observation.AppID(), Domain: observation.Domain()})
 	if err != nil {
 		s.logger.Error("activity event rejected", "operation", "activity", "result", "invalid")
-		return
+		return ErrActivityFailed
 	}
 	s.enqueueActivity(segments)
-	_ = s.flushPendingActivity(ctx)
+	return activityWriteError(ctx, s.flushPendingActivity(ctx))
 }

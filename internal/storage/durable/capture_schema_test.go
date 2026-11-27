@@ -44,7 +44,7 @@ func TestCaptureIndexReadyReopenPreservesDurableBytes(t *testing.T) {
 }
 
 func TestCaptureIndexReadyReopenRejectsInvalidMetadata(t *testing.T) {
-	for _, component := range []string{"index state", "backfill cursor"} {
+	for _, component := range []string{"index state", "backfill cursor", "backfill content format"} {
 		t.Run(component, func(t *testing.T) {
 			ctx := context.Background()
 			path, key := durableTestPath(t), durableTestKey(t, 0x9b)
@@ -57,7 +57,10 @@ func TestCaptureIndexReadyReopenRejectsInvalidMetadata(t *testing.T) {
 					index := tx.capturePartSearch()
 					return index.putSearchIndexValueLocked(index.store.exactStateKey(), "search-index-state-v1", []byte{searchIndexFormatVersion, 0}, true)
 				}
-				return tx.capturePutJSONLocked(captureIndexBackfillKey, captureIndexBackfill{captureIndexVersion + 1, ""}, 256)
+				if component == "backfill content format" {
+					return tx.capturePutJSONLocked(captureIndexBackfillKey, captureIndexBackfill{Version: captureIndexVersion, Format: captureIndexContentFormat + 1}, 256)
+				}
+				return tx.capturePutJSONLocked(captureIndexBackfillKey, captureIndexBackfill{Version: captureIndexVersion + 1}, 256)
 			}); err != nil {
 				t.Fatal(err)
 			}

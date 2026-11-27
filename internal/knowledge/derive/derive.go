@@ -75,7 +75,7 @@ func ValidateSuggestions(input []Evidence, suggestions []Proposal) error {
 	}
 	seen := make(map[string]struct{}, len(suggestions))
 	for _, suggestion := range suggestions {
-		if !validKind(suggestion.Kind) || !validCleanText(suggestion.Name, MaxSuggestionNameSize) || !validCleanText(suggestion.Fact, MaxSuggestionBytes) || len(suggestion.Name)+len(suggestion.Fact) > MaxSuggestionBytes || !validSourceID(suggestion.SourceID) {
+		if !validKind(suggestion.Kind) || !validCleanText(suggestion.Name, MaxSuggestionNameSize) || !validCleanText(suggestion.Fact, MaxSuggestionBytes) || !validSourceID(suggestion.SourceID) {
 			return ErrInvalid
 		}
 		if _, ok := sources[suggestion.SourceID]; !ok {

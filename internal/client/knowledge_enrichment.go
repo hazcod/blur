@@ -6,10 +6,10 @@ import (
 	"sort"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/assistant"
 	"github.com/hazcod/blur/internal/knowledge"
+	"github.com/hazcod/blur/internal/knowledge/derive"
 	"github.com/hazcod/blur/internal/knowledge/enrich"
 	"github.com/hazcod/blur/internal/search"
 )
@@ -34,10 +34,10 @@ func (c *localAIController) replaceLibraryWorkerLocked() *enrich.Service {
 	previous := c.libraryWorker
 	c.libraryWorker = nil
 	settings := c.settings
-	if settings.Enabled && settings.AutomaticLibrary && !c.needsRepair && isLocalCompletionProvider(effectiveProvider(settings)) && c.libraryRepo != nil && c.librarySources != nil {
+	if settings.Enabled && (settings.AutomaticLibrary || settings.BackgroundSummaries) && !c.needsRepair && isLocalCompletionProvider(effectiveProvider(settings)) && c.libraryRepo != nil && c.librarySources != nil {
 		generator, err := newConfiguredKnowledgeGenerator(settings)
 		if err == nil {
-			c.libraryWorker, err = enrich.NewService(c.librarySources, c.libraryRepo, generator, c.libraryOptions)
+			c.libraryWorker, err = enrich.NewService(c.librarySources, c.libraryRepo, derive.WithCompaction(generator, settings.AutomaticLibrary), c.libraryOptions)
 			if err == nil {
 				c.libraryWorker.Start()
 			} else {
@@ -121,7 +121,7 @@ func (c *Client) LibraryStatus() enrich.Status {
 	if s := c.localAI.libraryService(); s != nil {
 		return s.Status()
 	}
-	if c.localAI.Settings().AutomaticLibrary {
+	if settings := c.localAI.Settings(); settings.Enabled && (settings.AutomaticLibrary || settings.BackgroundSummaries) {
 		return enrich.Status{State: "unavailable", ErrorCode: "settings_invalid"}
 	}
 	return enrich.Status{State: "disabled"}
@@ -242,6 +242,26 @@ func (c *Client) InferredKnowledge(ctx context.Context, id string) (knowledge.En
 	return entity, nil
 }
 
+// InferredFactPage continues an entity's facts beyond the bounded summary
+// returned by InferredKnowledge. The opaque cursor is scoped to that entity.
+func (c *Client) InferredFactPage(ctx context.Context, id, after string, limit int) (knowledge.FactPage, error) {
+	repository, ok := c.inferredRepository()
+	if !ok || ctx == nil {
+		return knowledge.FactPage{}, ErrNotConfigured
+	}
+	if limit <= 0 || limit > knowledge.MaxPageSize {
+		return knowledge.FactPage{}, ErrInvalidRequest
+	}
+	page, err := repository.ListInferredFactsPage(ctx, id, knowledge.FactPageRequest{After: after, Limit: limit})
+	if err != nil {
+		return knowledge.FactPage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return knowledge.FactPage{}, err
+	}
+	return page, nil
+}
+
 func (c *Client) ChangeInferredFact(ctx context.Context, entityID, factID, text string, dismiss bool) error {
 	repository, ok := c.inferredRepository()
 	if !ok || ctx == nil {
@@ -255,22 +275,55 @@ func (c *Client) ChangeInferredFact(ctx context.Context, entityID, factID, text 
 	return repository.CorrectInferredFact(ctx, entityID, factID, strings.TrimSpace(text))
 }
 
-func (c *Client) inferredEntityEvidence(ctx context.Context, plan assistant.Plan) ([]assistant.Evidence, error) {
+func (c *Client) inferredEntityEvidence(ctx context.Context, plan assistant.Plan, diagnosis ...*assistant.Diagnosis) ([]assistant.Evidence, error) {
 	repository, ok := c.inferredRepository()
 	if !ok || strings.TrimSpace(plan.Entity) == "" {
 		return nil, nil
 	}
-	entities, err := findInferredKnowledgeFolded(ctx, repository, plan.Entity)
+	entities, err := findInferredKnowledgeFolded(ctx, repository, plan, diagnosis...)
+	if err != nil {
+		return nil, err
+	}
+	entities, err = c.datedLibraryEntities(ctx, plan, entities)
 	if err != nil {
 		return nil, err
 	}
 	return c.inferredEntitiesEvidence(ctx, plan, entities, true)
 }
 
-// findInferredKnowledgeFolded looks a Library name up as typed and in the
-// folded spelling. The stored name index is lowercase-only and never migrated,
-// so "José" and "Jose" are different keys and both spellings must be offered.
-func findInferredKnowledgeFolded(ctx context.Context, repository enrich.Repository, name string) ([]knowledge.Entity, error) {
+// Current durable stores resolve folded names under one bounded read snapshot
+// and report omitted contexts. Older adapters still receive both spellings.
+func findInferredKnowledgeFolded(ctx context.Context, repository enrich.Repository, plan assistant.Plan, diagnosis ...*assistant.Diagnosis) ([]knowledge.Entity, error) {
+	name := plan.Entity
+	if batch, ok := repository.(inferredKnowledgeScopedBatchSearcher); ok {
+		queries := []string{name, search.FoldLower(name)}
+		entities, more, err := batch.FindInferredKnowledgeByNamesInScope(ctx, queries, maxTopicKnowledgeCandidates, plan.AppIDs, plan.Domains)
+		if err != nil {
+			return entities, err
+		}
+		// The question names its subject, so name parts may complete the answer.
+		// Whole-name matches keep priority and are never repeated.
+		if parts, ok := repository.(inferredKnowledgePartSearcher); ok && len(entities) < maxTopicKnowledgeCandidates {
+			exclude := make([]string, len(entities))
+			for i, entity := range entities {
+				exclude[i] = entity.ID
+			}
+			matches, partsMore, err := parts.FindInferredKnowledgeByNamePartsInScope(ctx, queries, maxTopicKnowledgeCandidates-len(entities), plan.AppIDs, plan.Domains, nil, exclude)
+			if err != nil {
+				return nil, err
+			}
+			entities = append(entities, matches...)
+			more = more || partsMore
+		}
+		if more {
+			for _, d := range diagnosis {
+				if d != nil {
+					d.LibraryRecallLimited = true
+				}
+			}
+		}
+		return entities, nil
+	}
 	entities, err := repository.FindInferredKnowledge(ctx, name)
 	if err != nil {
 		return nil, err
@@ -343,12 +396,6 @@ func (c *Client) inferredEntitiesEvidence(ctx context.Context, plan assistant.Pl
 			item := assistant.Evidence{SourceID: syntheticID("library", entity.ID, string(origin)), AppID: app, AppName: "Library", Domain: domain, Text: text, Layer: assistant.LayerDigest, Origin: origin}
 			// Preserve complete inspectable text. Context packing records any
 			// excerpt as truncated rather than silently replacing the evidence.
-			if len(text) > entityTextBytes {
-				item.MatchEnd = entityTextBytes
-				for !utf8.RuneStart(text[item.MatchEnd]) {
-					item.MatchEnd--
-				}
-			}
 			evidence = append(evidence, item)
 			if len(evidence) >= planEvidenceItems/2 {
 				break
@@ -380,6 +427,20 @@ type inferredKnowledgeBatchSearcher interface {
 	FindInferredKnowledgeByNames(context.Context, []string, int) ([]knowledge.Entity, bool, error)
 }
 
+type inferredKnowledgeScopedBatchSearcher interface {
+	FindInferredKnowledgeByNamesInScope(context.Context, []string, int, []string, []string) ([]knowledge.Entity, bool, error)
+}
+
+// Name-part lookup is recall-only: it finds entries a question names only in
+// part ("Dima" for "Dima Petrov") and carries no correction authority.
+type inferredKnowledgePartSearcher interface {
+	FindInferredKnowledgeByNamePartsInScope(context.Context, []string, int, []string, []string, []knowledge.Kind, []string) ([]knowledge.Entity, bool, error)
+}
+
+// Ordinary questions contain many incidental words, so topic questions accept
+// only a few person-name matches by part.
+const maxTopicPartCandidates = 3
+
 // inferredTopicEvidence retrieves corrected and inferred Library facts when a
 // normal topic question contains an exact saved subject name. It keeps the
 // model-assisted source search path intact and adds only name-index matches.
@@ -391,7 +452,27 @@ func (c *Client) inferredTopicEvidence(ctx context.Context, plan assistant.Plan)
 	queries := topicKnowledgeQueries(plan.Terms, plan.Question)
 	entities := make([]knowledge.Entity, 0, maxTopicKnowledgeCandidates)
 	limited := false
-	if batch, ok := repository.(inferredKnowledgeBatchSearcher); ok {
+	var partMatches []knowledge.Entity
+	if batch, ok := repository.(inferredKnowledgeScopedBatchSearcher); ok {
+		matches, more, err := batch.FindInferredKnowledgeByNamesInScope(ctx, queries, maxTopicKnowledgeCandidates, plan.AppIDs, plan.Domains)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		limited = more
+		entities = append(entities, matches...)
+		if finder, ok := repository.(inferredKnowledgePartSearcher); ok {
+			exclude := make([]string, len(entities))
+			for i, entity := range entities {
+				exclude[i] = entity.ID
+			}
+			found, partsMore, err := finder.FindInferredKnowledgeByNamePartsInScope(ctx, queries, maxTopicPartCandidates, plan.AppIDs, plan.Domains, []knowledge.Kind{knowledge.Person}, exclude)
+			if err != nil {
+				return nil, false, nil, err
+			}
+			partMatches = found
+			limited = limited || partsMore
+		}
+	} else if batch, ok := repository.(inferredKnowledgeBatchSearcher); ok && len(plan.AppIDs) == 0 && len(plan.Domains) == 0 {
 		matches, more, err := batch.FindInferredKnowledgeByNames(ctx, queries, maxTopicKnowledgeCandidates)
 		if err != nil {
 			return nil, false, nil, err
@@ -442,14 +523,33 @@ func (c *Client) inferredTopicEvidence(ctx context.Context, plan assistant.Plan)
 		filtered = append(filtered, entity)
 	}
 	entities = filtered
+	// Correction authority survives date projection. An undated correction
+	// cannot answer "today", but its replaced capture must not reappear as
+	// current truth when that correction is excluded from the dated evidence.
+	supersededSources := supersededLibrarySources(entities)
+	// Only a whole-name match carries correction authority over captures, so
+	// name-part matches join after the supersession list is final.
+	for _, entity := range partMatches {
+		if !slices.ContainsFunc(entities, func(have knowledge.Entity) bool { return have.ID == entity.ID }) {
+			entities = append(entities, entity)
+		}
+	}
+	entities, err := c.datedLibraryEntities(ctx, plan, entities)
+	if err != nil {
+		return nil, limited, nil, err
+	}
 	if len(entities) == 0 {
-		return nil, limited, nil, nil
+		return nil, limited, supersededSources, nil
 	}
 	limited = limited || len(entities) > planEvidenceItems/2
 	evidence, err := c.inferredEntitiesEvidence(ctx, plan, entities, false)
 	if err != nil {
 		return nil, limited, nil, err
 	}
+	return evidence, limited, supersededSources, nil
+}
+
+func supersededLibrarySources(entities []knowledge.Entity) []string {
 	// A correction records exactly which captured sources it supersedes. Keep
 	// those original captures available to Search, but do not show their stale
 	// fact alongside the correction in an ordinary topic Ask.
@@ -485,19 +585,18 @@ func (c *Client) inferredTopicEvidence(ctx context.Context, plan assistant.Plan)
 		ids = append(ids, sourceID)
 	}
 	sort.Strings(ids)
-	return evidence, limited, ids, nil
+	return ids
 }
 
 const maxTopicKnowledgeQueries = 12
 
 // topicKnowledgeQueries builds the exact-name queries for a topic question.
-// Plan terms are folded (diacritics removed, possessives stripped) but the
-// durable Library name index is keyed by knowledge.NormalizeExact, which only
-// lowercases, and is never migrated. A Library entity stored as "José Müller"
-// therefore needs the original spelling and one stored as "Jose Muller" needs
-// the folded one, so the result is the deduplicated union of both spellings,
+// Plan terms are folded (diacritics removed, possessives stripped). Original
+// spellings also support older adapters and legacy entries during backfill.
+// The result is the deduplicated union of both spellings,
 // interleaved so the best phrase of each comes first, within the same bound.
 func topicKnowledgeQueries(terms []string, question string) []string {
+	terms = termsInQuestionOrder(terms, question)
 	folded := topicNamePhrases(terms)
 	original := folded
 	if raw, changed := originalSpellingTerms(terms, question); changed {
@@ -522,6 +621,27 @@ func topicKnowledgeQueries(terms []string, question string) []string {
 		}
 	}
 	return queries
+}
+
+// termsInQuestionOrder restores the order the words had in the question. Plan
+// terms are sorted, but the store's squashed spelling ("threat bot" reaching
+// "ThreatBot") only matches words in their written order; the token-set and
+// partial lookups do not care. Terms the question does not contain keep their
+// relative order after the others.
+func termsInQuestionOrder(terms []string, question string) []string {
+	words, err := search.OrderedTokens(question, len(question)+1)
+	if err != nil {
+		return terms
+	}
+	position := func(term string) int {
+		if at := slices.Index(words, term); at >= 0 {
+			return at
+		}
+		return len(words)
+	}
+	ordered := slices.Clone(terms)
+	slices.SortStableFunc(ordered, func(a, b string) int { return position(a) - position(b) })
+	return ordered
 }
 
 // topicNamePhrases lists candidate name phrases for terms in priority order.

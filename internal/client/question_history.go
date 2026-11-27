@@ -57,7 +57,17 @@ func (c *Client) recordAskedQuestion(ctx context.Context, epoch uint64, question
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, shortOperationTimeout)
 	defer cancel()
-	c.PublishMemoryRead(epoch, func() { _ = history.AppendQuestion(writeCtx, record) })
+	c.PublishMemoryRead(epoch, func() {
+		if publication, ok := result.Publication.(*memoryAnswerPublication); ok && publication.read.fence != nil {
+			if writer, ok := publication.read.fence.(storage.QuestionHistoryReadWriter); ok {
+				if next, accepted, err := writer.AppendQuestionAtRead(writeCtx, record, publication.read.epoch); err == nil && accepted {
+					publication.read.epoch = next
+				}
+			}
+			return
+		}
+		_ = history.AppendQuestion(writeCtx, record)
+	})
 }
 
 // RecentQuestions returns up to limit of the newest persisted questions,

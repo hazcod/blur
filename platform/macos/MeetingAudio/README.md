@@ -128,7 +128,9 @@ can deliberately leave the slot occupied rather than multiply orphan devices.
 
 ## Bounds and transport
 
-- Transcript/preview text: 16 KiB per event; timestamps: 0 through 24 hours.
+- Transcript/preview text: 16 KiB per event. Timestamps use nonnegative
+  milliseconds convertible to a signed nanosecond duration; there is no
+  hour-based session cutoff. Sample-clock conversions and additions are checked.
 - Queued events: 128 and 512 KiB of encoded data, including a staged batch.
 - Preview updates replace unstaged revisions. Queue exhaustion preserves accepted
   finals and emits a separate emergency `event_overflow` error; it cannot prevent

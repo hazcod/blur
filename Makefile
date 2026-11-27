@@ -120,7 +120,10 @@ safari-extension-test:
 	test -z "$(MACOS_SANDBOX_DEV_PATH)" || { echo "MACOS_SANDBOX_DEV_PATH must be empty by default" >&2; exit 1; }
 	! grep -q 'absolute-path' "$(MACOS_SANDBOX_ENTITLEMENTS)" || { echo "$(MACOS_SANDBOX_ENTITLEMENTS) must not carry the dev absolute-path exception" >&2; exit 1; }
 	node --test platform/macos/SafariExtensionTests/injected.test.cjs
-	DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" swiftc -typecheck -target arm64-apple-macosx13.0 platform/macos/SafariExtension/ExtensionHandler.swift
+	@safari_protocol_test=$$(mktemp -t blur-safari-protocol); \
+		trap 'rm -f "$$safari_protocol_test"' EXIT; \
+		DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" swiftc -parse-as-library platform/macos/SafariExtension/CaptureProtocol.swift platform/macos/SafariExtensionTests/ProtocolTests.swift -o "$$safari_protocol_test" && "$$safari_protocol_test"
+	DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" swiftc -typecheck -target arm64-apple-macosx13.0 platform/macos/SafariExtension/CaptureProtocol.swift platform/macos/SafariExtension/ExtensionHandler.swift
 	plutil -lint platform/macos/SafariExtension/Info.plist platform/macos/Blur.entitlements platform/macos/SafariExtension/Extension.entitlements
 
 # Build the native macOS bundle used for Finder/Dock identity and permissions.

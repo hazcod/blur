@@ -153,6 +153,7 @@ func (d *desktop) dispatchEntryResolution(input string, resolved EntryResolution
 	case intent.TaskInspect:
 		if resolved.Answer != nil {
 			publish := func() {
+				d.clearRecapSources()
 				d.askQuestion, d.askResult = input, resolved.Answer
 				d.quickConversation = appendQuickConversation(d.quickConversation, input, *resolved.Answer)
 				d.quickEntry = EntryState{Epoch: resolved.Epoch, Targets: resolved.Answer.Targets}

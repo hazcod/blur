@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/appidentity"
+	"github.com/hazcod/blur/internal/chronicle"
 	"github.com/hazcod/blur/internal/localapi"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -74,27 +75,28 @@ type searchMemoryHit struct {
 }
 
 type searchMemorySumm struct {
-	ID        string   `json:"id"`
-	Level     string   `json:"level"`
-	Period    string   `json:"period"`
-	Start     string   `json:"start"`
-	End       string   `json:"end"`
-	Excerpt   string   `json:"excerpt"`
-	SourceIDs []string `json:"source_ids"`
-	Dirty     bool     `json:"dirty,omitempty"`
+	ID              string   `json:"id"`
+	Level           string   `json:"level"`
+	Period          string   `json:"period"`
+	Start           string   `json:"start"`
+	End             string   `json:"end"`
+	Excerpt         string   `json:"excerpt"`
+	SourceIDs       []string `json:"source_ids"`
+	Dirty           bool     `json:"dirty,omitempty"`
+	CoverageLimited bool     `json:"coverage_limited,omitempty"`
 }
 
 const searchInputSchema = `{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","minLength":1,"maxLength":512,"description":"A natural-language memory query; app, website, and time phrases narrow results. Quote text or code for literal matches."},"limit":{"type":"integer","minimum":1,"maximum":30,"description":"Maximum capture rows to return; defaults to 20. Summary rows are extra."}},"required":["query"]}`
 
-const searchOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"results":{"type":"array","maxItems":30,"items":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","maxLength":64},"app_id":{"type":"string","maxLength":128},"window_title":{"type":"string","maxLength":256},"domain":{"type":"string","maxLength":253},"captured_at":{"type":"string","maxLength":40,"format":"date-time"},"last_seen_at":{"type":"string","maxLength":40,"format":"date-time"},"sighting_count":{"type":"integer","minimum":0},"excerpt":{"type":"string","maxLength":240},"matched_terms":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":64}},"partial_match":{"type":"boolean"},"partial_capture":{"type":"boolean"},"capture_time_unknown":{"type":"boolean"}},"required":["source_id","app_id","excerpt"]}},"summaries":{"type":"array","maxItems":5,"items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","maxLength":64},"level":{"type":"string","enum":["hour","day","week"]},"period":{"type":"string","maxLength":18},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"excerpt":{"type":"string","maxLength":240},"source_ids":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":64}},"dirty":{"type":"boolean"}},"required":["id","level","period","start","end","excerpt","source_ids"]}},"relaxed":{"type":"boolean"},"truncated":{"type":"boolean"},"indexing_pending":{"type":"boolean"},"coverage_limited":{"type":"boolean"}},"required":["results","truncated"]}`
+const searchOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"results":{"type":"array","maxItems":30,"items":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","maxLength":64},"app_id":{"type":"string","maxLength":128},"window_title":{"type":"string","maxLength":256},"domain":{"type":"string","maxLength":253},"captured_at":{"type":"string","maxLength":40,"format":"date-time"},"last_seen_at":{"type":"string","maxLength":40,"format":"date-time"},"sighting_count":{"type":"integer","minimum":0},"excerpt":{"type":"string","maxLength":240},"matched_terms":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":64}},"partial_match":{"type":"boolean"},"partial_capture":{"type":"boolean"},"capture_time_unknown":{"type":"boolean"}},"required":["source_id","app_id","excerpt"]}},"summaries":{"type":"array","maxItems":5,"items":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","maxLength":64},"level":{"type":"string","enum":["hour","day","week","month","year"]},"period":{"type":"string","maxLength":18},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"excerpt":{"type":"string","maxLength":240},"source_ids":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":64}},"dirty":{"type":"boolean"},"coverage_limited":{"type":"boolean"}},"required":["id","level","period","start","end","excerpt","source_ids"]}},"relaxed":{"type":"boolean"},"truncated":{"type":"boolean"},"indexing_pending":{"type":"boolean"},"coverage_limited":{"type":"boolean"}},"required":["results","truncated"]}`
 
 const snapshotInputSchema = `{"type":"object","additionalProperties":false,"properties":{"source_ids":{"type":"array","items":{"type":"string","pattern":"^[0-9a-f]{64}$"},"minItems":1,"maxItems":3,"uniqueItems":true,"description":"Source IDs from search_memory results."},"offsets":{"type":"object","additionalProperties":{"type":"integer","minimum":0},"description":"Optional byte offset for each source_id, using next_offset_bytes from the prior response."},"max_bytes_per_source":{"type":"integer","minimum":4,"maximum":4096,"default":4096}},"required":["source_ids"]}`
 
 const snapshotOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"snapshots":{"type":"array","maxItems":3,"items":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","maxLength":64},"app_id":{"type":"string","maxLength":128},"domain":{"type":"string","maxLength":253},"captured_at":{"type":"string","maxLength":40},"content":{"type":"string","maxLength":4096},"offset_bytes":{"type":"integer","minimum":0},"next_offset_bytes":{"type":"integer","minimum":0},"complete":{"type":"boolean"},"partial_capture":{"type":"boolean"},"document_id":{"type":"string","maxLength":64},"part_index":{"type":"integer","minimum":0},"part_count":{"type":"integer","minimum":1},"document_offset_bytes":{"type":"integer","minimum":0},"document_total_bytes":{"type":"integer","minimum":0}},"required":["source_id","app_id","content","offset_bytes","next_offset_bytes","complete"]}},"truncated":{"type":"boolean"}},"required":["snapshots","truncated"]}`
 
-const chronicleInputSchema = `{"type":"object","additionalProperties":false,"properties":{"level":{"type":"string","enum":["hour","day","week"],"description":"Recap level. hour (default) needs hour_id; day and week need period."},"hour_id":{"type":"string","pattern":"^hour:[0-9]{8}T[0-9]{2}Z$","description":"Stable hour ID from the capture timestamp, formatted hour:YYYYMMDDTHHZ. Only for level hour."},"period":{"type":"string","pattern":"^([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-W[0-9]{2})$","description":"Local calendar day YYYY-MM-DD for level day, or ISO week YYYY-Www for level week."}}}`
+const chronicleInputSchema = `{"type":"object","additionalProperties":false,"properties":{"level":{"type":"string","enum":["hour","day","week","month","year"],"description":"Recap level. hour (default) needs hour_id; day, week, month and year need period."},"hour_id":{"type":"string","pattern":"^hour:[0-9]{8}T[0-9]{2}Z$","description":"Stable hour ID from the capture timestamp, formatted hour:YYYYMMDDTHHZ. Only for level hour."},"period":{"type":"string","pattern":"^([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{4}-W[0-9]{2}|[0-9]{4}-[0-9]{2}|[0-9]{4})$","description":"Local calendar day YYYY-MM-DD, ISO week YYYY-Www, calendar month YYYY-MM, or calendar year YYYY."}}}`
 
-const chronicleOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"found":{"type":"boolean"},"hour_id":{"type":"string","maxLength":18},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"summary":{"type":"string","maxLength":4096},"source_ids":{"type":"array","maxItems":64,"items":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"follow_up":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","pattern":"^[0-9a-f]{64}$"},"text":{"type":"string","maxLength":512}},"required":["source_id","text"]},"level":{"type":"string","enum":["day","week"]},"period":{"type":"string","maxLength":10},"text":{"type":"string","maxLength":2048},"child_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":18}},"source_ids_truncated":{"type":"boolean"},"generated_at":{"type":"string","format":"date-time"},"dirty":{"type":"boolean"}},"required":["found"]}`
+const chronicleOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"found":{"type":"boolean"},"hour_id":{"type":"string","maxLength":18},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"summary":{"type":"string","maxLength":4096},"source_ids":{"type":"array","maxItems":64,"items":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"follow_up":{"type":"object","additionalProperties":false,"properties":{"source_id":{"type":"string","pattern":"^[0-9a-f]{64}$"},"text":{"type":"string","maxLength":512}},"required":["source_id","text"]},"level":{"type":"string","enum":["day","week","month","year"]},"period":{"type":"string","maxLength":10},"text":{"type":"string","maxLength":2048},"child_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":18}},"source_ids_truncated":{"type":"boolean"},"coverage_limited":{"type":"boolean"},"generated_at":{"type":"string","format":"date-time"},"dirty":{"type":"boolean"}},"required":["found"]}`
 
 const chronicleRangeInputSchema = `{"type":"object","additionalProperties":false,"properties":{"start":{"type":"string","format":"date-time","description":"Inclusive RFC3339 start time."},"end":{"type":"string","format":"date-time","description":"Exclusive RFC3339 end time, at most 32 days after start."},"after":{"type":"string","pattern":"^hour:[0-9]{8}T[0-9]{2}Z$","description":"Continue after the last hour_id returned by the previous page."},"limit":{"type":"integer","minimum":1,"maximum":8,"default":8}},"required":["start","end"]}`
 
@@ -139,7 +141,7 @@ func New(reader RPCReader) *mcp.Server {
 	server.AddTool(&mcp.Tool{
 		Name:         "get_chronicle",
 		Title:        "Read an hourly, daily or weekly recap",
-		Description:  "Read a saved recap. Level hour (the default) reads the hourly recap for a stable hour ID. Level day reads the recap of one local calendar day (period YYYY-MM-DD), and level week the recap of one ISO week (period YYYY-Www); day and week recaps list the hours or days they summarize, and may be marked dirty while newer activity awaits regeneration. Every recap includes the exact capture source IDs it was based on; call get_snapshots before making exact claims. Results are returned to the MCP host and may be sent to its configured model provider.",
+		Description:  "Read a saved recap. Level hour (the default) reads the hourly recap for a stable hour ID. Level day reads the recap of one local calendar day (period YYYY-MM-DD), level week the recap of one ISO week (period YYYY-Www), level month a calendar month (YYYY-MM), and level year a calendar year (YYYY). Recaps list the child periods they summarize, and may be marked dirty while newer activity awaits regeneration. Every recap includes the exact capture source IDs it was based on; call get_snapshots before making exact claims. Results are returned to the MCP host and may be sent to its configured model provider.",
 		InputSchema:  json.RawMessage(chronicleInputSchema),
 		OutputSchema: json.RawMessage(chronicleOutputSchema),
 		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld},
@@ -245,6 +247,7 @@ type chronicleOutput struct {
 	Text               string   `json:"text,omitempty"`
 	ChildIDs           []string `json:"child_ids,omitempty"`
 	SourceIDsTruncated bool     `json:"source_ids_truncated,omitempty"`
+	CoverageLimited    bool     `json:"coverage_limited,omitempty"`
 	GeneratedAt        string   `json:"generated_at,omitempty"`
 	Dirty              bool     `json:"dirty,omitempty"`
 }
@@ -923,7 +926,7 @@ func boundRecentActivityOutput(output recentActivityOutput, limit int) bool {
 func getChronicle(ctx context.Context, reader RPCReader, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	input, err := decodeChronicleInput(request)
 	if err != nil {
-		return toolError("A chronicle needs level hour with an hour ID like hour:YYYYMMDDTHHZ, level day with a period like YYYY-MM-DD, or level week with a period like YYYY-Www."), nil
+		return toolError("A chronicle needs level hour with an hour ID like hour:YYYYMMDDTHHZ, level day with a period like YYYY-MM-DD, level week with YYYY-Www, level month with YYYY-MM, or level year with YYYY."), nil
 	}
 	if reader == nil || ctx == nil || ctx.Err() != nil {
 		return toolError("Blur local memory is unavailable."), nil
@@ -1086,6 +1089,14 @@ func decodeChronicleInput(request *mcp.CallToolRequest) (chronicleInput, error) 
 		if input.HourID != "" || !validWeekPeriod(input.Period) {
 			return chronicleInput{}, ErrUnavailable
 		}
+	case "month":
+		if input.HourID != "" || !chronicle.ValidMonthKey(input.Period) {
+			return chronicleInput{}, ErrUnavailable
+		}
+	case "year":
+		if input.HourID != "" || !chronicle.ValidYearKey(input.Period) {
+			return chronicleInput{}, ErrUnavailable
+		}
 	default:
 		return chronicleInput{}, ErrUnavailable
 	}
@@ -1121,7 +1132,7 @@ func boundChronicleOutput(output chronicleOutput, request chronicleInput) bool {
 	if request.Level != "" {
 		return boundRollupOutput(output, request)
 	}
-	if output.Level != "" || output.Period != "" || output.Text != "" || len(output.ChildIDs) != 0 || output.SourceIDsTruncated || output.GeneratedAt != "" || output.Dirty {
+	if output.Level != "" || output.Period != "" || output.Text != "" || len(output.ChildIDs) != 0 || output.SourceIDsTruncated || output.GeneratedAt != "" || output.Dirty || output.CoverageLimited {
 		return false
 	}
 	if !output.Found {
@@ -1445,7 +1456,7 @@ func boundSearchOutput(input searchMemoryOutput, limit int) (searchMemoryOutput,
 			break
 		}
 		// A recap is derived text: without capture source IDs it is not shown.
-		if !validOutputText(summary.ID, 64) || (summary.Level != "hour" && summary.Level != "day" && summary.Level != "week") || !validOutputText(summary.Period, 18) || !utf8.ValidString(summary.Excerpt) || strings.IndexByte(summary.Excerpt, 0) >= 0 || len(summary.SourceIDs) == 0 {
+		if !validOutputText(summary.ID, 64) || (summary.Level != "hour" && !chronicle.ValidRollupLevel(summary.Level)) || !validOutputText(summary.Period, 18) || !utf8.ValidString(summary.Excerpt) || strings.IndexByte(summary.Excerpt, 0) >= 0 || len(summary.SourceIDs) == 0 {
 			continue
 		}
 		if _, err := time.Parse(time.RFC3339Nano, summary.Start); err != nil {
@@ -1465,6 +1476,7 @@ func boundSearchOutput(input searchMemoryOutput, limit int) (searchMemoryOutput,
 			valid = valid && validOutputText(id, 64)
 		}
 		if valid {
+			output.CoverageLimited = output.CoverageLimited || summary.CoverageLimited
 			output.Summaries = append(output.Summaries, summary)
 		}
 	}
@@ -1505,7 +1517,7 @@ func boundRollupOutput(output chronicleOutput, request chronicleInput) bool {
 		return false
 	}
 	if !output.Found {
-		return output.Level == "" && output.Period == "" && output.Start == "" && output.End == "" && output.Text == "" && len(output.ChildIDs) == 0 && len(output.SourceIDs) == 0 && !output.SourceIDsTruncated && output.GeneratedAt == "" && !output.Dirty
+		return output.Level == "" && output.Period == "" && output.Start == "" && output.End == "" && output.Text == "" && len(output.ChildIDs) == 0 && len(output.SourceIDs) == 0 && !output.SourceIDsTruncated && output.GeneratedAt == "" && !output.Dirty && !output.CoverageLimited
 	}
 	if output.Level != request.Level || output.Period != request.Period || !validOutputText(output.Text, 2048) || len(output.SourceIDs) == 0 || len(output.SourceIDs) > 64 || len(output.ChildIDs) == 0 || len(output.ChildIDs) > 64 {
 		return false
@@ -1515,7 +1527,8 @@ func boundRollupOutput(output chronicleOutput, request chronicleInput) bool {
 		return false
 	}
 	end, err := time.Parse(time.RFC3339Nano, output.End)
-	if err != nil || !end.After(start) || end.Sub(start) > 8*24*time.Hour {
+	_, _, nominalStart, nominalEnd, valid := chronicle.RollupPeriod(output.Level+":"+output.Period, time.UTC)
+	if err != nil || !valid || !end.After(start) || end.Sub(start) > nominalEnd.Sub(nominalStart)+24*time.Hour || start.Before(nominalStart.Add(-24*time.Hour)) || start.After(nominalStart.Add(24*time.Hour)) || end.Before(nominalEnd.Add(-24*time.Hour)) || end.After(nominalEnd.Add(24*time.Hour)) {
 		return false
 	}
 	if _, err := time.Parse(time.RFC3339Nano, output.GeneratedAt); err != nil {
@@ -1533,11 +1546,33 @@ func boundRollupOutput(output chronicleOutput, request chronicleInput) bool {
 	}
 	last = ""
 	for _, id := range output.ChildIDs {
-		if !validOutputText(id, 18) || id <= last {
+		if !validOutputText(id, 18) || id <= last || !validRollupOutputChild(output.Level, output.Period, id, start, end) {
 			return false
 		}
 		last = id
 	}
 	encoded, err := json.Marshal(output)
 	return err == nil && len(encoded) <= maxSearchOutputBytes
+}
+
+func validRollupOutputChild(level, period, id string, start, end time.Time) bool {
+	switch level {
+	case chronicle.RollupLevelDay:
+		if !validChronicleHourID(id) {
+			return false
+		}
+		at, err := time.Parse("20060102T15Z", strings.TrimPrefix(id, "hour:"))
+		return err == nil && !at.Before(start) && !at.Add(time.Hour).After(end)
+	case chronicle.RollupLevelWeek:
+		key := strings.TrimPrefix(id, "day:")
+		week, valid := chronicle.WeekKeyForDate(key)
+		return strings.HasPrefix(id, "day:") && valid && week == period
+	case chronicle.RollupLevelMonth:
+		key := strings.TrimPrefix(id, "day:")
+		return strings.HasPrefix(id, "day:") && chronicle.ValidDayKey(key) && strings.HasPrefix(key, period+"-")
+	case chronicle.RollupLevelYear:
+		key := strings.TrimPrefix(id, "month:")
+		return strings.HasPrefix(id, "month:") && chronicle.ValidMonthKey(key) && strings.HasPrefix(key, period+"-")
+	}
+	return false
 }

@@ -66,6 +66,7 @@ func rollupFixtureRecord(t *testing.T, id, text string, dirty bool, sources ...s
 		row.ChildIDs = []string{"day:2026-11-10"}
 	}
 	row.GeneratedAt, row.Model = time.Date(2026, 11, 11, 1, 0, 0, 0, time.UTC), "local-test-model"
+	row.CoverageVersion = chronicle.RollupCoverageVersion
 	return row
 }
 
@@ -163,8 +164,8 @@ func TestRecapUsesWeekAndDayRollupsAndReportsDirty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if layerCount(got.Evidence, assistant.LayerWeek) != 1 || layerCount(got.Evidence, assistant.LayerDay) != 2 || got.Evidence[0].Layer != assistant.LayerWeek {
-		t.Fatalf("week and day rollups not selected week-first: %+v", got.Evidence)
+	if layerCount(got.Evidence, assistant.LayerWeek) != 1 || layerCount(got.Evidence, assistant.LayerDay) != 1 || got.Evidence[0].Layer != assistant.LayerWeek {
+		t.Fatalf("fresh week and day rollups not selected week-first: %+v", got.Evidence)
 	}
 	if got.Diagnosis.RollupsDirty != 2 {
 		t.Fatalf("RollupsDirty = %d, want 2 (a placeholder and a stale day)", got.Diagnosis.RollupsDirty)

@@ -60,6 +60,14 @@ func makeEvidence(count int) []Evidence {
 	return items
 }
 
+func TestSuggestionNameAndFactHaveIndependentBounds(t *testing.T) {
+	input := []Evidence{{SourceID: sourceID('a'), Text: "A saved technical explanation."}}
+	proposal := Proposal{Kind: knowledge.Project, Name: strings.Repeat("n", 32), Fact: strings.Repeat("f", 489), SourceID: sourceID('a')}
+	if err := ValidateSuggestions(input, []Proposal{proposal}); err != nil {
+		t.Fatal("individually bounded name and fact discarded the whole source", err)
+	}
+}
+
 func makeSuggestions(count int, source string) []Proposal {
 	items := make([]Proposal, count)
 	for i := range items {

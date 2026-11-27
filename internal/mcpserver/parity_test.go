@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hazcod/blur/internal/localapi"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -59,7 +60,7 @@ func TestMCPParityToolsRejectInvalidInputBeforeCallingBlur(t *testing.T) {
 		{"list_wiki", map[string]any{"limit": 51}},
 		{"get_time_report", map[string]any{"period": "next_year"}},
 		{"get_time_report", map[string]any{"period": "today", "from": "2026-11-01", "to": "2026-11-02"}},
-		{"get_time_report", map[string]any{"from": "2026-10-01", "to": "2026-11-15"}},
+		{"get_time_report", map[string]any{"from": "2024-01-01", "to": "2025-02-04"}},
 		{"get_promises", map[string]any{"limit": 51}},
 		{"get_promises", map[string]any{"unknown": true}},
 	} {
@@ -116,5 +117,22 @@ func TestMCPParityToolsRejectInvalidLocalResponses(t *testing.T) {
 		if err != nil || !result.IsError {
 			t.Errorf("%s accepted invalid response %s: %+v err=%v", test.tool, test.result, result, err)
 		}
+	}
+}
+
+func TestMCPTimeReportYearAcceptsAndValidatesAllDailyBuckets(t *testing.T) {
+	days := map[string]int64{}
+	for at := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC); at.Year() == 2024; at = at.AddDate(0, 0, 1) {
+		days[at.Format("2006-01-02")] = 1
+	}
+	body, err := json.Marshal(map[string]any{"from": "2024-01-01", "to": "2024-12-31", "total_seconds": 366, "buckets": []any{map[string]any{"app_id": "reader.app", "name": "Reader", "seconds": 366, "by_day": days}}, "top_segments": []any{}, "omitted_segments_seconds": 366, "note": "Tracked foreground time."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &staticRPCReader{result: body}
+	session, ctx := parityTestSession(t, reader)
+	out, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_time_report", Arguments: map[string]any{"from": "2024-01-01", "to": "2024-12-31"}})
+	if err != nil || out.IsError || out.StructuredContent == nil || reader.calls != 1 {
+		t.Fatalf("year blocked by MCP transport: %+v %v", out, err)
 	}
 }

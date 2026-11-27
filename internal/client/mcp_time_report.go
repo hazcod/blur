@@ -8,12 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hazcod/blur/internal/activity"
 	"github.com/hazcod/blur/internal/appidentity"
+	"github.com/hazcod/blur/internal/assistant"
 	"github.com/hazcod/blur/internal/localapi"
 )
 
 const (
-	maxMCPReportDays       = 31
+	maxMCPReportDays       = 400
 	maxMCPReportBuckets    = 15
 	maxMCPReportDomains    = 5
 	maxMCPReportTop        = 20
@@ -91,7 +93,7 @@ func decodeMCPTimeReportParams(raw []byte) (mcpTimeReportParams, error) {
 // mcpReportRange returns the half-open local range [start, end) for a request.
 func mcpReportRange(params mcpTimeReportParams, now time.Time, zone *time.Location) (time.Time, time.Time, error) {
 	day := func(offset int) time.Time {
-		return time.Date(now.Year(), now.Month(), now.Day()+offset, 0, 0, 0, 0, zone)
+		return activity.StartOfDate(now.Year(), now.Month(), now.Day()+offset, zone)
 	}
 	sinceMonday := (int(now.Weekday()) + 6) % 7
 	switch params.Period {
@@ -116,7 +118,7 @@ func mcpReportRange(params mcpTimeReportParams, now time.Time, zone *time.Locati
 	if err != nil || to.Before(from) || to.Sub(from) > time.Duration(maxMCPReportDays-1)*24*time.Hour {
 		return time.Time{}, time.Time{}, ErrInvalidRequest
 	}
-	return time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, zone), time.Date(to.Year(), to.Month(), to.Day()+1, 0, 0, 0, 0, zone), nil
+	return activity.StartOfDate(from.Year(), from.Month(), from.Day(), zone), activity.StartOfDate(to.Year(), to.Month(), to.Day()+1, zone), nil
 }
 
 func reportSeconds(ns int64) int64 { return (ns + int64(time.Second)/2) / int64(time.Second) }
@@ -135,7 +137,7 @@ type reportTopAcc struct {
 }
 
 func (c *Client) readMCPTimeReport(ctx context.Context, epoch uint64, params mcpTimeReportParams) (json.RawMessage, error) {
-	reader, ok := c.data.(ActivityData)
+	_, ok := c.data.(ActivityData)
 	if !ok {
 		return nil, ErrNotConfigured
 	}
@@ -147,82 +149,101 @@ func (c *Client) readMCPTimeReport(ctx context.Context, epoch uint64, params mcp
 	if err != nil {
 		return nil, err
 	}
-	var dates []string
-	for day := start.UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour); day.Before(end.UTC()); day = day.Add(24 * time.Hour) {
-		dates = append(dates, day.Format("2006-01-02"))
+	buckets, tops := map[string]*reportBucketAcc{}, map[string]*reportTopAcc{}
+	var total int64
+	metadataEntries := 0
+	admit := func() error {
+		if metadataEntries >= maxActivityScopeMetadata {
+			return ErrActivityLimit
+		}
+		metadataEntries++
+		return nil
 	}
-	if len(dates) == 0 || len(dates) > maxMCPReportDays+2 {
-		return nil, ErrInvalidRequest
-	}
-	rows, err := reader.ListActivitySegmentsForDates(ctx, dates, MaxActivityReportSegments)
+	read, err := c.walkActivityScope(ctx, start, end, assistant.Plan{}, func(rows []activity.Segment) error {
+		for _, row := range rows {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if row.Validate() != nil {
+				return ErrInvalidRequest
+			}
+			if strings.EqualFold(row.AppID, appidentity.BundleID) || !row.WallEnd.After(start) || !row.WallStart.Before(end) {
+				continue
+			}
+			from, to := row.WallStart, row.WallEnd
+			if from.Before(start) {
+				from = start
+			}
+			if to.After(end) {
+				to = end
+			}
+			duration := int64(to.Sub(from))
+			if duration <= 0 {
+				continue
+			}
+			total += duration
+			bucket := buckets[strings.ToLower(row.AppID)]
+			if bucket == nil {
+				if err := admit(); err != nil {
+					return err
+				}
+				bucket = &reportBucketAcc{app: row.AppID, days: map[string]int64{}, domains: map[string]int64{}}
+				buckets[strings.ToLower(row.AppID)] = bucket
+			}
+			bucket.total += duration
+			if row.Domain != "" && appidentity.IsBrowserApp(strings.ToLower(row.AppID)) {
+				if _, found := bucket.domains[row.Domain]; !found {
+					if err := admit(); err != nil {
+						return err
+					}
+				}
+				bucket.domains[row.Domain] += duration
+			}
+			row.WallStart, row.WallEnd, row.Duration = from, to, duration
+			days, err := activity.SplitDays(row, zone)
+			if err != nil {
+				return err
+			}
+			for _, day := range days {
+				if _, found := bucket.days[day.Date]; !found {
+					if err := admit(); err != nil {
+						return err
+					}
+				}
+				bucket.days[day.Date] += day.Duration
+			}
+			title := row.Topic
+			if title == "" {
+				title = row.Project
+			}
+			key := strings.ToLower(row.AppID) + "\x00" + strings.ToLower(row.Domain) + "\x00" + title
+			top := tops[key]
+			if top == nil {
+				if err := admit(); err != nil {
+					return err
+				}
+				top = &reportTopAcc{app: row.AppID, domain: row.Domain, title: title}
+				tops[key] = top
+			}
+			top.total += duration
+			for _, id := range row.SourceIDs {
+				if len(top.sources) < maxMCPReportTopSources && validMCPSourceID(id) && !slices.Contains(top.sources, id) {
+					if err := admit(); err != nil {
+						return err
+					}
+					top.sources = append(top.sources, id)
+				}
+			}
+		}
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) > MaxActivityReportSegments {
-		return nil, ErrActivityLimit
-	}
-	buckets, tops := map[string]*reportBucketAcc{}, map[string]*reportTopAcc{}
-	var total int64
-	for _, row := range rows {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if row.Validate() != nil {
-			return nil, ErrInvalidRequest
-		}
-		if strings.EqualFold(row.AppID, appidentity.BundleID) || !row.WallEnd.After(start) || !row.WallStart.Before(end) {
-			continue
-		}
-		from, to := row.WallStart, row.WallEnd
-		if from.Before(start) {
-			from = start
-		}
-		if to.After(end) {
-			to = end
-		}
-		duration := int64(to.Sub(from))
-		if duration <= 0 {
-			continue
-		}
-		total += duration
-		bucket := buckets[strings.ToLower(row.AppID)]
-		if bucket == nil {
-			bucket = &reportBucketAcc{app: row.AppID, days: map[string]int64{}, domains: map[string]int64{}}
-			buckets[strings.ToLower(row.AppID)] = bucket
-		}
-		bucket.total += duration
-		if row.Domain != "" && appidentity.IsBrowserApp(strings.ToLower(row.AppID)) {
-			bucket.domains[row.Domain] += duration
-		}
-		for cursor := from.In(zone); cursor.Before(to); {
-			next := time.Date(cursor.Year(), cursor.Month(), cursor.Day()+1, 0, 0, 0, 0, zone)
-			stop := to
-			if next.Before(stop) {
-				stop = next
-			}
-			bucket.days[cursor.Format("2006-01-02")] += int64(stop.Sub(cursor))
-			cursor = stop
-		}
-		title := row.Topic
-		if title == "" {
-			title = row.Project
-		}
-		key := strings.ToLower(row.AppID) + "\x00" + strings.ToLower(row.Domain) + "\x00" + title
-		top := tops[key]
-		if top == nil {
-			top = &reportTopAcc{app: row.AppID, domain: row.Domain, title: title}
-			tops[key] = top
-		}
-		top.total += duration
-		for _, id := range row.SourceIDs {
-			if len(top.sources) < maxMCPReportTopSources && validMCPSourceID(id) && !slices.Contains(top.sources, id) {
-				top.sources = append(top.sources, id)
-			}
-		}
-	}
 
 	response := mcpTimeReportResponse{
-		From: start.Format("2006-01-02"), To: end.AddDate(0, 0, -1).Format("2006-01-02"),
+		From: start.Format("2006-01-02"), To: end.Add(-time.Nanosecond).In(zone).Format("2006-01-02"),
 		TotalSeconds: reportSeconds(total), Buckets: []mcpReportBucket{}, TopSegments: []mcpReportTop{}, Note: mcpReportNote,
 	}
 	bucketList := make([]*reportBucketAcc, 0, len(buckets))
@@ -296,7 +317,14 @@ func (c *Client) readMCPTimeReport(ctx context.Context, epoch uint64, params mcp
 			return nil, ErrInvalidRequest
 		}
 	}
-	return c.publishMCPParity(ctx, epoch, response, localapi.MaxRPCSnapshotResponseBytes)
+	raw, err := c.publishMCPParity(ctx, epoch, response, localapi.MaxRPCSnapshotResponseBytes)
+	if err != nil {
+		return nil, err
+	}
+	if !read.publish(c, func() {}) {
+		return nil, ErrMemoryChanging
+	}
+	return raw, nil
 }
 
 func reportAppName(id string) string {

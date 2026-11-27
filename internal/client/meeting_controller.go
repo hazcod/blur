@@ -62,6 +62,7 @@ type MeetingLiveView struct {
 	Issue            string // closed, content-free code; never a raw native error
 	Preview          map[string]string
 	Tail             []meetings.StoredRecord
+	TailOlder        bool
 	Availability     darwin.MeetingAudioAvailability
 	Levels           map[string]MeetingAudioLevel
 	AudioRecording   bool
@@ -75,7 +76,11 @@ type MeetingLiveView struct {
 func (v MeetingLiveView) RecordingLength(now time.Time) time.Duration {
 	elapsed := max(time.Duration(0), v.RecordingElapsed)
 	if v.AudioRecording && !v.RecordingSince.IsZero() && now.After(v.RecordingSince) {
-		elapsed += now.Sub(v.RecordingSince)
+		delta := now.Sub(v.RecordingSince)
+		if delta > meetings.MaxCaptureDuration-elapsed {
+			return meetings.MaxCaptureDuration
+		}
+		elapsed += delta
 	}
 	return elapsed
 }
@@ -119,6 +124,7 @@ type activeMeeting struct {
 	nativeEpoch uint64
 	cancel      context.CancelFunc
 	cursor      uint64
+	tailOlder   bool
 }
 
 // meetingController serializes durable writes and native acknowledgements.
@@ -278,12 +284,33 @@ func (m *meetingController) newNotes(ctx context.Context, title, locale string, 
 	return a.metadata.ID, nil
 }
 
-// restoreReadyAgenda never restores a recording engine or loads a recorded
-// transcript. Ready agendas contain bounded manual notes only. Paging retains
-// only the display tail and the repository's opaque consumed cursor, including
-// erased slots. An excessive deletion history fails explicitly at the scan
-// bound rather than silently starting with an incomplete tail/cursor.
+// restoreReadyAgenda uses the production repository's bounded newest-record
+// tail and authenticated Ready eligibility, independent of total history size.
+// Its append cursor includes deleted slots. Legacy adapters without this port
+// scan forward with bounded memory and retain their explicit fallback guards.
 func (m *meetingController) restoreReadyAgenda(ctx context.Context, id string) (*activeMeeting, []meetings.StoredRecord, error) {
+	if reader, ok := m.repo.(meetings.AgendaTailReader); ok {
+		result, err := reader.ReadyAgendaTail(ctx, id, meetings.PageRequest{Limit: 20, MaxBytes: 128 << 10})
+		if err != nil {
+			return nil, nil, err
+		}
+		metadata := result.Meeting
+		if metadata.ID != id || metadata.Validate() != nil || result.Cursor >= 1<<48 || metadata.RecordCount > result.Cursor || len(result.Records) > 20 || meetingTailBytes(result.Records) > 128<<10 || uint64(len(result.Records)) > metadata.RecordCount {
+			return nil, nil, meetings.ErrInvalid
+		}
+		if metadata.State != meetings.Ready || !metadata.RecordingStartedAt.IsZero() || !metadata.EndedAt.IsZero() {
+			return nil, nil, meetings.ErrState
+		}
+		previous := uint64(0)
+		for _, row := range result.Records {
+			if row.Record.Kind != meetings.UserNote || row.Record.SessionID != id || row.Sequence <= previous || row.Sequence > result.Cursor {
+				return nil, nil, meetings.ErrState
+			}
+			previous = row.Sequence
+		}
+		older := result.Older || uint64(len(result.Records)) < metadata.RecordCount
+		return &activeMeeting{metadata: metadata, cursor: result.Cursor, tailOlder: older}, result.Records, nil
+	}
 	metadata, found, err := m.repo.GetMeeting(ctx, id)
 	if err != nil {
 		return nil, nil, err
@@ -298,13 +325,21 @@ func (m *meetingController) restoreReadyAgenda(ctx context.Context, id string) (
 		return nil, nil, meetings.ErrState
 	}
 	limits := meetings.DefaultLimits()
-	if metadata.RecordCount > uint64(limits.MaxNotes) {
+	_, indexed := m.repo.(meetings.RecordLookup)
+	if !indexed && metadata.RecordCount > uint64(limits.MaxNotes) {
 		return nil, nil, meetings.ErrLimit
 	}
 	active := &activeMeeting{metadata: metadata}
 	var tail []meetings.StoredRecord
-	notes, bytes := 0, 0
-	for pass := 0; pass <= limits.MaxNotes; pass++ {
+	notes := uint64(0)
+	legacyBytes, legacyPages := 0, 0
+	for {
+		if !indexed {
+			if legacyPages > limits.MaxNotes {
+				return nil, nil, meetings.ErrLimit
+			}
+			legacyPages++
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
@@ -321,25 +356,33 @@ func (m *meetingController) restoreReadyAgenda(ctx context.Context, id string) (
 				return nil, nil, meetings.ErrState
 			}
 			sequence = row.Sequence
-			notes++
-			bytes += len(row.Record.Note.Text)
-			if notes > limits.MaxNotes || bytes > limits.MaxManualBytes {
+			if notes == ^uint64(0) {
 				return nil, nil, meetings.ErrLimit
+			}
+			notes++
+			if notes > metadata.RecordCount {
+				return nil, nil, meetings.ErrState
+			}
+			if !indexed {
+				legacyBytes += len(row.Record.Note.Text)
+				if notes > uint64(limits.MaxNotes) || legacyBytes > limits.MaxManualBytes {
+					return nil, nil, meetings.ErrLimit
+				}
 			}
 			tail = append(tail, row)
 			for len(tail) > 20 || meetingTailBytes(tail) > 128<<10 {
+				active.tailOlder = true
 				tail = tail[1:]
 			}
 		}
 		active.cursor = page.Next
 		if !page.More {
-			if uint64(notes) != metadata.RecordCount {
+			if notes != metadata.RecordCount {
 				return nil, nil, meetings.ErrState
 			}
 			return active, tail, nil
 		}
 	}
-	return nil, nil, meetings.ErrLimit
 }
 
 func (m *meetingController) start(parent context.Context, title, locale string, tracks []string, selectedID ...string) error {
@@ -370,6 +413,7 @@ func (m *meetingController) start(parent context.Context, title, locale string, 
 		active = &copyOfReady
 		locale, tracks = active.metadata.Locale, active.metadata.Tracks
 		agendaTail = append([]meetings.StoredRecord(nil), m.view.Tail...)
+		active.tailOlder = m.view.TailOlder
 	}
 	m.setupCancel = cancel
 	m.mu.Unlock()
@@ -390,7 +434,7 @@ func (m *meetingController) start(parent context.Context, title, locale string, 
 			return ErrMemoryChanging
 		}
 		m.active = active
-		m.view = MeetingLiveView{Meeting: active.metadata, State: "ready", Preview: map[string]string{}, Tail: agendaTail}
+		m.view = MeetingLiveView{Meeting: active.metadata, State: "ready", Preview: map[string]string{}, Tail: agendaTail, TailOlder: active.tailOlder}
 		m.mu.Unlock()
 		m.notify()
 		// Invalidation may inspect the published Ready selection while native
@@ -468,7 +512,7 @@ func (m *meetingController) start(parent context.Context, title, locale string, 
 		m.mu.Lock()
 		if !m.closed && m.generation == generation {
 			m.active = active
-			m.view = MeetingLiveView{Meeting: active.metadata, State: "ready", Preview: map[string]string{}, Tail: agendaTail, Availability: a}
+			m.view = MeetingLiveView{Meeting: active.metadata, State: "ready", Preview: map[string]string{}, Tail: agendaTail, TailOlder: active.tailOlder, Availability: a}
 		}
 		m.mu.Unlock()
 		return err
@@ -484,7 +528,7 @@ func (m *meetingController) start(parent context.Context, title, locale string, 
 		return ErrMemoryChanging
 	}
 	m.active = active
-	m.view = MeetingLiveView{Meeting: active.metadata, State: "starting", Preview: map[string]string{}, Tail: agendaTail, Availability: a}
+	m.view = MeetingLiveView{Meeting: active.metadata, State: "starting", Preview: map[string]string{}, Tail: agendaTail, TailOlder: active.tailOlder, Availability: a}
 	m.wg.Add(1)
 	m.mu.Unlock()
 	m.notify()
@@ -686,6 +730,8 @@ func (m *meetingController) refreshTail(ctx context.Context, a *activeMeeting) e
 	}
 	m.view.Tail = append(m.view.Tail, page.Records...)
 	for len(m.view.Tail) > 20 || meetingTailBytes(m.view.Tail) > 128<<10 {
+		m.view.TailOlder = true
+		a.tailOlder = true
 		m.view.Tail = m.view.Tail[1:]
 	}
 	m.mu.Unlock()

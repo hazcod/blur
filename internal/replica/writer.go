@@ -1,6 +1,7 @@
 package replica
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -36,8 +37,18 @@ var ErrDisabled = errors.New("replica: sync is off")
 
 // Exporter is the store surface the writer needs.
 type Exporter interface {
-	ExportObservations(ctx context.Context, after time.Time, maxCount, maxBytes int) ([]durable.ExportedObservation, bool, error)
+	ExportReplicaObservations(ctx context.Context, generation string, after []byte, maxCount, maxBytes int) (durable.ReplicaExportPage, error)
+	AcknowledgeReplicaExport(context.Context, string, []durable.ExportedObservation, bool) error
+	CurrentReplicaObservations(context.Context, []durable.ExportedObservation) ([]bool, error)
 	DeletionChanges(context.Context, uint64, int) (durable.DeletionChangePage, error)
+}
+
+type CaptureExporter interface {
+	ExportReplicaCaptureParts(context.Context, string, string, int, int) (durable.ReplicaCaptureExportPage, error)
+	ExportedReplicaCaptureParts(context.Context, string, []durable.ExportedCapturePart) ([]bool, error)
+	CurrentReplicaCaptureParts(context.Context, []durable.ExportedCapturePart) ([]bool, error)
+	AcknowledgeReplicaCaptureExport(context.Context, string, []durable.ExportedCapturePart, bool) error
+	ReplicaCaptureImported(context.Context, string, string) (bool, error)
 }
 
 // Writer exports one segment per Flush into <folder>/<device>/<seq>.seg.
@@ -71,17 +82,29 @@ func watermarkTime(nanos int64) time.Time {
 	return time.Unix(0, nanos).UTC()
 }
 
-// Flush writes at most one segment containing observations and tombstones
-// newer than the watermarks, then advances them. It reports whether more
-// content remains. It writes nothing while memory is changing.
-func (w *Writer) Flush(ctx context.Context) (more bool, err error) {
+// Flush processes one bounded observation-order page and at most one immutable
+// segment. Exact revision receipts and the physical cursor control export;
+// watermarks are compatibility diagnostics. It writes nothing while memory
+// is changing and reports whether the current sweep has more work.
+func (w *Writer) Flush(parent context.Context) (more bool, err error) {
 	if w == nil || w.Store == nil || w.State == nil || w.Resolve == nil {
 		return false, ErrDisabled
 	}
-	st := w.State.Get()
-	if !st.Enabled {
-		return false, ErrDisabled
+	if parent == nil {
+		return false, ErrFormat
 	}
+	w.State.exportMu.Lock()
+	defer w.State.exportMu.Unlock()
+	if w.State.Get().OutboxInvalid {
+		if err := w.State.InvalidateOutbox(); err != nil {
+			return false, err
+		}
+	}
+	ctx, st, done, err := w.State.beginOperation(parent, true)
+	if err != nil {
+		return false, err
+	}
+	defer done()
 	device, ok := ParseDeviceID(st.DeviceID)
 	if !ok {
 		return false, ErrFormat
@@ -94,50 +117,6 @@ func (w *Writer) Flush(ctx context.Context) (more bool, err error) {
 			return false, ErrMemoryChanging
 		}
 	}
-	items, more, err := w.Store.ExportObservations(ctx, watermarkTime(st.ObsWatermark), flushMaxObservations, flushMaxBytes)
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		for _, item := range items {
-			clear(item.Record)
-		}
-	}()
-	deletions, err := w.Store.DeletionChanges(ctx, st.TombSequence, durable.MaxDeletionChangePage)
-	if err != nil {
-		return false, err
-	}
-	var records []Record
-	obsMark, tombMark := st.ObsWatermark, st.TombWatermark
-	tombSequence := deletions.Next
-	more = more || deletions.HasMore
-	imported, err := w.importedIDs(ctx, items)
-	if err != nil {
-		return false, err
-	}
-	for i, item := range items {
-		obsMark = max(obsMark, item.CapturedAt.UnixNano())
-		if imported[i] {
-			continue // came from another device; it already has it
-		}
-		records = append(records, Record{Kind: KindObservation, At: item.CapturedAt, Observation: item.Record})
-	}
-	for _, change := range deletions.Changes {
-		t := change.Tombstone
-		records = append(records, Record{Kind: KindTombstone, At: t.At, SourceID: t.SourceID})
-		tombMark = max(tombMark, t.At.UnixNano())
-	}
-	if len(records) == 0 {
-		if obsMark != st.ObsWatermark || tombSequence != st.TombSequence {
-			// Only imported content was scanned: advance so it is not rescanned.
-			err = w.State.Update(func(s *State) {
-				s.ObsWatermark = max(s.ObsWatermark, obsMark)
-				s.TombWatermark = max(s.TombWatermark, tombMark)
-				s.TombSequence = max(s.TombSequence, tombSequence)
-			})
-		}
-		return more && err == nil, err
-	}
 	target, err := w.Resolve(ctx)
 	if err != nil {
 		return false, err
@@ -146,36 +125,292 @@ func (w *Writer) Flush(ctx context.Context) (more bool, err error) {
 		defer target.Release()
 	}
 	defer clear(target.Key)
+	if st.Pending != nil {
+		return w.replayPending(ctx, st, target, current)
+	}
+	if st.CapturePending != nil {
+		return w.replayCapturePending(ctx, st, target, current)
+	}
+	// Recover public v1 segments left by an older writer after its state commit
+	// failed. Never replace their identities; receipts will resend any uncertain
+	// captures under the next sequence, where old peers deduplicate safely.
+	dir := filepath.Join(target.Dir, st.DeviceID)
 	seq := st.LastSeq + 1
-	sealed, err := SealSegment(target.Key, device, seq, records, nil)
+	if st.LastSeq >= 999999999999 {
+		return false, ErrFormat
+	}
+	old, readErr := readBoundedFile(filepath.Join(dir, segmentName(seq)), int64(MaxSegmentPlaintext+headerSize+64))
+	if readErr == nil {
+		defer clear(old)
+		header, records, openErr := OpenSegment(target.Key, old)
+		defer clearRecords(records)
+		if openErr != nil {
+			return false, openErr
+		}
+		if FormatDeviceID(header.DeviceID) != st.DeviceID || header.Seq != seq {
+			return false, ErrFormat
+		}
+		if !current() {
+			return false, ErrMemoryChanging
+		}
+		err = w.State.updateCurrent(ctx, st, func(s *State) { s.LastSeq = seq })
+		return err == nil, err
+	}
+	if !os.IsNotExist(readErr) {
+		return false, readErr
+	}
+	if _, err := os.Stat(filepath.Join(dir, "."+segmentName(seq)+".icloud")); err == nil {
+		return false, ErrFolderNotReady
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	page, err := w.Store.ExportReplicaObservations(ctx, st.DeviceID, st.ObservationCursor, flushMaxObservations, flushMaxBytes)
+	items, more := page.Items, page.HasMore
 	if err != nil {
 		return false, err
 	}
+	defer clearExportItems(items)
+	deletions, err := w.Store.DeletionChanges(ctx, st.TombSequence, durable.MaxDeletionChangePage)
+	if err != nil {
+		return false, err
+	}
+	more = more || deletions.HasMore
+	imported, err := w.importedIDs(ctx, items)
+	if err != nil {
+		return false, err
+	}
+	p := pendingExport{tombSequence: deletions.Next, obsMark: st.ObsWatermark, tombMark: st.TombWatermark, nextCursor: page.Next}
+	var skipped []durable.ExportedObservation
+	for i, item := range items {
+		p.obsMark = max(p.obsMark, item.CapturedAt.UnixNano())
+		if imported[i] {
+			skipped = append(skipped, item)
+			continue
+		}
+		p.items = append(p.items, item)
+		p.records = append(p.records, Record{Kind: KindObservation, At: item.CapturedAt, Observation: item.Record})
+	}
+	if len(skipped) > 0 {
+		err = w.State.withCurrent(ctx, st, func() error { return w.Store.AcknowledgeReplicaExport(ctx, st.DeviceID, skipped, true) })
+		if err != nil {
+			return false, err
+		}
+	}
+	for _, change := range deletions.Changes {
+		t := change.Tombstone
+		p.records = append(p.records, Record{Kind: KindTombstone, At: t.At, SourceID: t.SourceID})
+		p.tombMark = max(p.tombMark, t.At.UnixNano())
+	}
+	if len(p.records) == 0 {
+		err = w.State.updateCurrent(ctx, st, func(s *State) {
+			s.ObsWatermark = p.obsMark
+			s.TombWatermark = p.tombMark
+			s.TombSequence = p.tombSequence
+			s.ObservationCursor = append([]byte(nil), p.nextCursor...)
+		})
+		if err != nil || more {
+			return more && err == nil, err
+		}
+		return w.flushCaptures(ctx, w.State.Get(), target, current)
+	}
+	p.segment, err = SealSegment(target.Key, device, seq, p.records, nil)
+	if err != nil {
+		return false, err
+	}
+	defer clear(p.segment)
 	if !current() {
 		return false, ErrMemoryChanging
 	}
-	dir := filepath.Join(target.Dir, st.DeviceID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err = w.stagePending(ctx, st, target.Key, seq, p); err != nil {
 		return false, err
 	}
-	if err := writeFileAtomic(dir, segmentName(seq), sealed); err != nil {
+	st = w.State.Get()
+	_, err = w.replayPending(ctx, st, target, current)
+	return more && err == nil, err
+}
+
+func clearExportItems(items []durable.ExportedObservation) {
+	for _, item := range items {
+		clear(item.Record)
+	}
+}
+func clearRecords(records []Record) {
+	for _, record := range records {
+		clear(record.Observation)
+		clear(record.Summary)
+		clear(record.Part)
+	}
+}
+
+func (w *Writer) stagePending(ctx context.Context, st State, key []byte, seq uint64, p pendingExport) error {
+	sealed, err := encodePending(key, p)
+	if err != nil {
+		return err
+	}
+	defer clear(sealed)
+	return w.State.withCurrent(ctx, st, func() error {
+		dir := filepath.Dir(w.State.path)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		hash := outboxHash(sealed)
+		path := w.State.outboxPath(st.DeviceID, hash)
+		if err := writeFileAtomic(dir, filepath.Base(path), sealed); err != nil {
+			return err
+		}
+		next := cloneState(w.State.st)
+		next.Pending = &PendingState{Sequence: seq, Hash: hash}
+		if err := writeStateFile(w.State.path, next); err != nil {
+			// Rename may have succeeded even if directory durability failed.
+			// Keep both sealed versions until a durable state selects one.
+			return err
+		}
+		w.State.st = next
+		if st.Pending != nil && st.Pending.Hash != hash {
+			_ = os.Remove(w.State.outboxPath(st.DeviceID, st.Pending.Hash))
+		}
+		return nil
+	})
+}
+
+func (w *Writer) replayPending(ctx context.Context, st State, target Target, current func() bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
 		return false, err
+	}
+	if st.Pending == nil || st.Pending.Sequence != st.LastSeq+1 {
+		return false, ErrFormat
+	}
+	sealed, err := readBoundedFile(w.State.outboxPath(st.DeviceID, st.Pending.Hash), int64(MaxSegmentPlaintext+headerSize+64+33+32*flushMaxObservations+64))
+	if err != nil {
+		if os.IsNotExist(err) {
+			if st.ConfigVersion == ^uint64(0) {
+				return false, ErrFormat
+			}
+			// Privacy invalidation may have erased every private byte before
+			// its state commit failed. Never reuse that uncertain public identity.
+			id, generationErr := NewDeviceID()
+			if generationErr != nil {
+				return false, generationErr
+			}
+			err = w.State.updateCurrent(ctx, st, func(s *State) {
+				s.DeviceID, s.Pending = id, nil
+				s.LastSeq, s.TombSequence = 0, 0
+				s.ObsWatermark, s.TombWatermark = 0, 0
+				s.ObservationCursor = nil
+				s.ConfigVersion++
+			})
+			return err == nil, err
+		}
+		return false, err
+	}
+	defer clear(sealed)
+	if outboxHash(sealed) != st.Pending.Hash {
+		return false, ErrAuth
+	}
+	p, err := decodePending(target.Key, sealed, st.DeviceID, st.Pending.Sequence)
+	if err != nil {
+		return false, err
+	}
+	defer p.clear()
+	dir := filepath.Join(target.Dir, st.DeviceID)
+	name := segmentName(st.Pending.Sequence)
+	published, readErr := readBoundedFile(filepath.Join(dir, name), int64(MaxSegmentPlaintext+headerSize+64))
+	defer clear(published)
+	if readErr == nil {
+		if !bytes.Equal(published, p.segment) {
+			return false, ErrFormat
+		}
+	} else if !os.IsNotExist(readErr) {
+		return false, readErr
+	} else {
+		if _, err := os.Stat(filepath.Join(dir, "."+name+".icloud")); err == nil {
+			return false, ErrFolderNotReady
+		} else if !os.IsNotExist(err) {
+			return false, err
+		}
+		valid, err := w.Store.CurrentReplicaObservations(ctx, p.items)
+		if err != nil {
+			return false, err
+		}
+		changed, index := false, 0
+		var records []Record
+		var items []durable.ExportedObservation
+		for _, record := range p.records {
+			if record.Kind == KindObservation {
+				if !valid[index] {
+					changed = true
+					index++
+					continue
+				}
+				items = append(items, p.items[index])
+				index++
+			}
+			records = append(records, record)
+		}
+		if changed {
+			// Target absence was proved above. Drop stale observations before first
+			// publication; retain tombstones and the same unused contiguous sequence.
+			device, _ := ParseDeviceID(st.DeviceID)
+			replacement, err := SealSegment(target.Key, device, st.Pending.Sequence, records, nil)
+			if err != nil {
+				return false, err
+			}
+			clear(p.segment)
+			p.segment = replacement
+			p.records = records
+			p.items = items
+			if !current() {
+				return false, ErrMemoryChanging
+			}
+			if err = w.stagePending(ctx, st, target.Key, st.Pending.Sequence, p); err != nil {
+				return false, err
+			}
+			st = w.State.Get()
+		}
+		err = w.State.withCurrent(ctx, st, func() error {
+			if !current() {
+				return ErrMemoryChanging
+			}
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
+			return publishImmutable(dir, name, p.segment)
+		})
+		if err != nil {
+			return false, err
+		}
 	}
 	now := time.Now
 	if w.Now != nil {
 		now = w.Now
 	}
-	if err := w.State.Update(func(s *State) {
-		s.LastSeq = seq
-		s.ObsWatermark = obsMark
-		s.TombWatermark = tombMark
-		s.TombSequence = tombSequence
-		s.LastBackupAt = now().UTC()
-	}); err != nil {
+	err = w.State.withCurrent(ctx, st, func() error {
+		if !current() {
+			return ErrMemoryChanging
+		}
+		if err := w.Store.AcknowledgeReplicaExport(ctx, st.DeviceID, p.items, false); err != nil {
+			return err
+		}
+		next := cloneState(w.State.st)
+		next.LastSeq = st.Pending.Sequence
+		next.Pending = nil
+		next.ObsWatermark = p.obsMark
+		next.TombWatermark = p.tombMark
+		next.TombSequence = p.tombSequence
+		next.ObservationCursor = append([]byte(nil), p.nextCursor...)
+		next.LastBackupAt = now().UTC()
+		if err := writeStateFile(w.State.path, next); err != nil {
+			return err
+		}
+		w.State.st = next
+		return nil
+	})
+	if err != nil {
 		return false, err
 	}
-	slog.Info("replica segment written", "result", "ok", "records", len(records))
-	return more, nil
+	_ = os.Remove(w.State.outboxPath(st.DeviceID, st.Pending.Hash))
+	slog.Info("replica segment written", "result", "ok", "records", len(p.records))
+	return true, nil // replay may have been followed by new local captures
 }
 
 // importedIDs flags exported items whose content was imported from another
@@ -221,6 +456,9 @@ func writeFileAtomic(dir, name string, data []byte) error {
 	}
 	if err == nil {
 		err = os.Rename(tmpName, filepath.Join(dir, name))
+	}
+	if err == nil {
+		err = syncDirectory(dir)
 	}
 	if err != nil {
 		_ = os.Remove(tmpName)

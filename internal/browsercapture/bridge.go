@@ -38,15 +38,19 @@ type ObservationSink interface {
 type CommitPolicy func(context.Context, capture.SanitizedObservation, func(context.Context) error) error
 
 type Receiver struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	grants   *localapi.GrantStore
-	sink     ObservationSink
-	enabled  func() bool
-	clock    func() time.Time
-	paused   bool
-	inFlight int
-	policy   CommitPolicy
+	mu            sync.Mutex
+	cond          *sync.Cond
+	grants        *localapi.GrantStore
+	sink          ObservationSink
+	enabled       func() bool
+	clock         func() time.Time
+	paused        bool
+	inFlight      int
+	policy        CommitPolicy
+	documentsMu   sync.Mutex
+	documents     map[string]*documentJob
+	onObservation func(capture.SanitizedObservation, time.Time)
+	onDocument    func(capture.CaptureSummary, bool)
 
 	droppedShort atomic.Uint64
 }
@@ -112,7 +116,7 @@ func (r *Receiver) Accept(ctx context.Context, wire []byte) error {
 	}()
 
 	var envelope bridgeEnvelope
-	if err := decodeStrict(wire, &envelope); err != nil || envelope.Version != 1 || len(envelope.Payload) == 0 || len(envelope.Payload) > MaxPageBytes+MaxTitleBytes+MaxURLBytes+4096 {
+	if err := decodeStrict(wire, &envelope); err != nil || (envelope.Version != 1 && envelope.Version != 2) || len(envelope.Payload) == 0 || len(envelope.Payload) > MaxPageBytes+MaxTitleBytes+MaxURLBytes+4096 {
 		return errInvalidFrame
 	}
 	var page Snapshot
@@ -135,33 +139,67 @@ func (r *Receiver) Accept(ctx context.Context, wire []byte) error {
 		return errInvalidFrame
 	}
 	observedAt := r.clock()
+	if envelope.Version == 2 {
+		selector, err := validateDocumentSnapshot(page, observedAt)
+		if err != nil {
+			return err
+		}
+		var work documentWork
+		write := func(writeCtx context.Context) error {
+			var err error
+			work, err = r.persistDocument(writeCtx, page, selector, observedAt)
+			return err
+		}
+		if r.policy != nil {
+			err = r.policy(ctx, selector, write)
+		} else {
+			err = write(ctx)
+		}
+		r.finishDocumentWork(work)
+		return err
+	}
 	observation, err := Sanitize(page, true, observedAt)
 	if err != nil {
 		return ErrRejected
 	}
-	write := func(writeCtx context.Context) error { return r.persist(writeCtx, observation, observedAt) }
-	if r.policy != nil {
-		return r.policy(ctx, observation, write)
+	committed := false
+	write := func(writeCtx context.Context) error {
+		var err error
+		committed, err = r.persistObservation(writeCtx, observation, observedAt)
+		return err
 	}
-	return write(ctx)
+	if r.policy != nil {
+		err = r.policy(ctx, observation, write)
+	} else {
+		err = write(ctx)
+	}
+	if committed {
+		r.notifyObservation(observation, observedAt)
+	}
+	return err
 }
 
 func (r *Receiver) persist(ctx context.Context, observation capture.SanitizedObservation, observedAt time.Time) error {
+	_, err := r.persistObservation(ctx, observation, observedAt)
+	return err
+}
+
+func (r *Receiver) persistObservation(ctx context.Context, observation capture.SanitizedObservation, observedAt time.Time) (bool, error) {
 	if ctx == nil {
-		return ErrRejected
+		return false, ErrRejected
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	r.mu.Lock()
 	allowed := !r.paused && r.enabled()
 	r.mu.Unlock()
 	if !allowed {
-		return ErrReceiverPaused
+		return false, ErrReceiverPaused
 	}
 	if !capture.MeetsMinimumContent(observation.AppID(), observation.Text()) {
 		r.droppedShort.Add(1)
-		return nil
+		return false, nil
 	}
 	var err error
 	if sink, ok := r.sink.(interface {
@@ -176,10 +214,10 @@ func (r *Receiver) persist(ctx context.Context, observation capture.SanitizedObs
 		if recorder, ok := r.sink.(interface {
 			RecordObservationSighting(context.Context, capture.SanitizedObservation, time.Time) error
 		}); ok {
-			return recorder.RecordObservationSighting(ctx, observation, observedAt)
+			err = recorder.RecordObservationSighting(ctx, observation, observedAt)
 		}
 	}
-	return err
+	return err == nil, err
 }
 
 func (r *Receiver) Pause() {
@@ -192,6 +230,29 @@ func (r *Receiver) Pause() {
 		r.cond.Wait()
 	}
 	r.mu.Unlock()
+	r.closeDocuments()
+}
+
+// Configure notifications before starting the server. Notifications run after
+// policy admission has returned and only for committed new content or visits.
+func (r *Receiver) SetNotifications(observation func(capture.SanitizedObservation, time.Time), document func(capture.CaptureSummary, bool)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inFlight == 0 && !r.paused {
+		r.onObservation, r.onDocument = observation, document
+	}
+}
+
+func (r *Receiver) notifyObservation(observation capture.SanitizedObservation, at time.Time) {
+	r.mu.Lock()
+	notify := r.onObservation
+	r.mu.Unlock()
+	if notify != nil {
+		notify(observation, at)
+	}
 }
 
 func decodeStrict(data []byte, out any) error {

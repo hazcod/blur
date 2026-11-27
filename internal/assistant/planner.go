@@ -2,7 +2,6 @@ package assistant
 
 import (
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -118,6 +117,7 @@ var locativeWords = map[string]struct{}{
 type appEntry struct{ id, name string }
 
 var builtinApps = map[string]appEntry{
+	"voice note": {"sh.blur.meetings", "Voice notes"}, "voice notes": {"sh.blur.meetings", "Voice notes"},
 	"whatsapp": {"net.whatsapp.WhatsApp", "WhatsApp"}, "slack": {"com.tinyspeck.slackmacgap", "Slack"},
 	"safari": {"com.apple.Safari", "Safari"}, "chrome": {"com.google.Chrome", "Chrome"}, "google chrome": {"com.google.Chrome", "Chrome"},
 	"orion": {"com.kagi.kagimacos", "Orion"},
@@ -224,6 +224,7 @@ func matchApps(q string, ws []word, apps []KnownApp) (ids, names, domains []stri
 					prevOK := false
 					if i > 0 {
 						_, prevOK = locativeWords[ws[i-1].s]
+						prevOK = prevOK || ws[i-1].s == "uit" && dutchRecallGrammar(q, ws).active
 					}
 					nextOK := i+1 < len(ws) && ws[i+1].s == "app"
 					if !prevOK && !nextOK {
@@ -340,6 +341,12 @@ func parseUnit(w string) byte {
 		return 'm'
 	case "day", "days":
 		return 'd'
+	case "week", "weeks":
+		return 'w'
+	case "month", "months":
+		return 'M'
+	case "year", "years":
+		return 'y'
 	}
 	return 0
 }
@@ -348,9 +355,12 @@ func parseUnit(w string) byte {
 // now.Location() with Start inclusive and End exclusive. The returned words are
 // those consumed by the window ("7" in "last 7 days", "november" in
 // "8 november afternoon") so they do not become search terms.
-func detectScope(ws []word, now time.Time) (Scope, []string) {
+func detectScope(ws []word, now time.Time, allWords []word) (Scope, []string) {
 	mk := func(start, end time.Time, label string) Scope {
 		return Scope{Start: start, End: end, Label: label, Explicit: true}
+	}
+	if scope, used, ok := relativePeriodScope(ws, now, allWords); ok {
+		return scope, used
 	}
 	for i := 0; i+1 < len(ws); i++ {
 		if ws[i].s != "last" && ws[i].s != "past" {
@@ -362,20 +372,14 @@ func detectScope(ws []word, now time.Time) (Scope, []string) {
 			}
 			return mk(now.Add(-time.Minute), now, "last minute"), nil
 		}
-		if i+2 < len(ws) {
-			if n, err := strconv.Atoi(ws[i+1].s); err == nil && n >= 1 {
-				switch unit := parseUnit(ws[i+2].s); {
-				case unit == 'h' && n <= 720:
-					return mk(now.Add(-time.Duration(n)*time.Hour), now, "last "+ws[i+1].s+" hours"), []string{ws[i+1].s}
-				case unit == 'm' && n <= 10080:
-					return mk(now.Add(-time.Duration(n)*time.Minute), now, "last "+ws[i+1].s+" minutes"), []string{ws[i+1].s}
-				case unit == 'd' && n <= 366:
-					return mk(now.AddDate(0, 0, -n), now, "last "+ws[i+1].s+" days"), []string{ws[i+1].s}
-				}
-			}
-		}
+	}
+	if scope, used, ok := calendarDayScope(ws, now, allWords); ok {
+		return scope, used
 	}
 	if scope, used, ok := dayPartScope(ws, now); ok {
+		return scope, used
+	}
+	if scope, used, ok := calendarPeriodScope(ws, now, allWords); ok {
 		return scope, used
 	}
 	sinceMonday := (int(now.Weekday()) + 6) % 7
@@ -397,17 +401,27 @@ func detectScope(ws []word, now time.Time) (Scope, []string) {
 	case hasWord(ws, "yesterday"):
 		return mk(dayStart(now, -1), dayStart(now, 0), "yesterday"), nil
 	}
-	for i, w := range ws {
+	// Prefer an explicit weekday phrase to a weekday used inside a topic
+	// noun phrase ("my Monday appointment ... on Thursday"). Bare weekday
+	// searches remain supported when no explicit phrase was given.
+	weekdayScopeWords := ws
+	for i := 1; i < len(ws); i++ {
+		if _, day := weekdayWords[ws[i].s]; day && hasWord(ws[i-1:i], "on", "last", "this") {
+			weekdayScopeWords = ws[i-1 : i+1]
+			break
+		}
+	}
+	for i, w := range weekdayScopeWords {
 		wd, ok := weekdayWords[w.s]
 		if !ok {
 			continue
 		}
 		back := (int(now.Weekday()) - int(wd) + 7) % 7
-		if back == 0 && i > 0 && ws[i-1].s == "last" {
+		if back == 0 && i > 0 && weekdayScopeWords[i-1].s == "last" {
 			back = 7
 		}
 		name := strings.ToUpper(w.s[:1]) + w.s[1:]
-		return mk(dayStart(now, -back), dayStart(now, -back+1), "on "+name), nil
+		return mk(dayStart(now, -back), dayStart(now, -back+1), "on "+name), []string{w.s}
 	}
 	switch {
 	case hasWord(ws, "today"):
@@ -427,6 +441,7 @@ func detectScope(ws []word, now time.Time) (Scope, []string) {
 func detectTimeKind(ws []word) bool {
 	switch {
 	case hasSeq(ws, "how", "much", "time"), hasSeq(ws, "how", "long"), hasSeq(ws, "time", "spent"),
+		hasSeq(ws, "screen", "time") && hasWord(ws, "my", "our", "total"),
 		hasSeq(ws, "how", "many", "hours"), hasSeq(ws, "how", "many", "minutes"), hasSeq(ws, "how", "many", "hrs"):
 		return true
 	}
@@ -813,6 +828,7 @@ func memoryLookupCandidate(plan Plan, apps []KnownApp) (Plan, bool) {
 		return Plan{}, false
 	}
 	plan.Kind, plan.Terms, plan.MatchOnly = kind, terms, true
+	plan.NumberedSubjects = numberedSubjects(plan.Question, terms)
 	if kind == KindEntity {
 		plan.Entity = truncateUTF8(strings.TrimSpace(subject), 128)
 	}
@@ -831,7 +847,12 @@ func IsFollowUp(question string) bool {
 	if len(ws) == 0 || len(ws) > 8 {
 		return false
 	}
+	if dutchDateFollowup(ws) {
+		return true
+	}
 	switch ws[0].s {
+	case "en", "ook":
+		return dutchRecallGrammar(question, ws).active
 	case "and", "also", "then", "but", "plus", "same", "more", "else", "ok", "okay", "now":
 		return true
 	case "in", "on", "from", "at", "during", "for", "only", "just":
@@ -860,7 +881,7 @@ func IsFollowUp(question string) bool {
 // IsGroundedFollowUp recognises bounded references to the preceding answer.
 // Explicit new text or a new named subject must keep its own request route.
 func IsGroundedFollowUp(question string) bool {
-	return classifyGroundedFollowup(question) != followupNone
+	return originalSourceFollowup(question) || classifyGroundedFollowup(question) != followupNone
 }
 
 type groundedFollowupKind uint8
@@ -951,6 +972,10 @@ func planTerms(q string, consumed map[string]struct{}, scopeFound bool) ([]strin
 	}
 	// consumed holds planner words (folded, possessives intact); terms are in
 	// NormalizeTokens space, so compare through the one shared fold.
+	dutch := dutchRecallGrammar(q, splitWords(q)).active
+	if dutch {
+		consumed = withWords(consumed, dutchRequestWords...)
+	}
 	used := make(map[string]struct{}, 2*len(consumed))
 	for word := range consumed {
 		used[word] = struct{}{}
@@ -972,7 +997,7 @@ func planTerms(q string, consumed map[string]struct{}, scopeFound bool) ([]strin
 		// A source-type noun such as "email" is a useful fallback for a
 		// source-only question, but it should not become a required exact
 		// token when the user also supplied the real topic ("integrity emails").
-		if term == "email" || term == "emails" {
+		if term == "email" || term == "emails" || dutch && (term == "mail" || term == "mails") {
 			sourceTypeTerms = append(sourceTypeTerms, term)
 			continue
 		}

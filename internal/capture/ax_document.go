@@ -20,6 +20,12 @@ type axDocumentText interface {
 	release()
 }
 
+// A text reader can perform bounded verification without emitting another copy
+// of the text. Charge that native work to this round and to progress detection.
+type axDocumentTextWork struct{ bytes int }
+
+func (*axDocumentTextWork) Error() string { return "capture: document verification advanced" }
+
 type axDocumentProgress struct {
 	Done, StructureLimited bool
 	Advanced               bool
@@ -108,6 +114,7 @@ func (c *axDocumentCursor) readInRound(ctx, round context.Context, limits Limits
 	}
 	// Structural work that does not enter a new node (empty pages/cycles)
 	// also has a per-round ceiling.
+	workBytes := 0
 	for steps := 0; steps < limits.MaxNodes*8+MaxCaptureDepth*4+16; steps++ {
 		if len(c.stack) == 0 {
 			c.done = true
@@ -116,19 +123,26 @@ func (c *axDocumentCursor) readInRound(ctx, round context.Context, limits Limits
 			break
 		}
 		f := c.stack[len(c.stack)-1]
-		if p.Bytes >= limits.MaxBytes || f.phase == 0 && p.Nodes >= limits.MaxNodes {
+		if p.Bytes+workBytes >= limits.MaxBytes || f.phase == 0 && p.Nodes >= limits.MaxNodes {
 			break
 		}
 		beforePhase, beforeStack, beforeNext, beforePage, beforePending, beforeChildren, beforeLimited := f.phase, len(c.stack), f.nextChild, f.pageIndex, len(f.pending), len(f.children), c.limited
 		var n, b int
-		n, b, err = c.step(round, ctx, min(c.maxDepth, limits.MaxDepth), limits.MaxBytes-p.Bytes, emit)
+		remaining := limits.MaxBytes - p.Bytes - workBytes
+		n, b, err = c.step(round, ctx, min(c.maxDepth, limits.MaxDepth), remaining, emit)
 		p.Advanced = p.Advanced || n > 0 || b > 0 || beforePhase != f.phase || beforeStack != len(c.stack) || beforeNext != f.nextChild || beforePage != f.pageIndex || beforePending != len(f.pending) || beforeChildren != len(f.children) || beforeLimited != c.limited
 		p.Nodes += n
 		p.Bytes += b
 		if err != nil {
+			var work *axDocumentTextWork
 			if ctx.Err() != nil {
 				err = ctx.Err()
 				c.close()
+			} else if errors.As(err, &work) && work.bytes > 0 && work.bytes <= min(remaining, axDocumentTextRange-1) {
+				workBytes += work.bytes
+				p.Advanced = true
+				err = nil
+				continue
 			} else if errors.Is(err, errAXDocumentYield) || errors.Is(err, context.DeadlineExceeded) && round.Err() != nil {
 				err = nil
 			} else {

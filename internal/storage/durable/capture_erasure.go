@@ -24,6 +24,7 @@ func (j sourceErasure) valid() bool {
 		j.Part < 0 || j.Part != 0 && j.Phase != 8 ||
 		j.PartPhase < 0 || j.PartPhase > 8 || j.PartPhase != 0 && j.Phase != 8 ||
 		j.PartAfter != "" && (j.Phase != 8 || j.PartPhase != 2 || !validOpaqueID(j.PartAfter)) ||
+		j.RangeID != "" && (j.Phase != 8 || !validHash(j.RangeID)) || j.RangePhase < 0 || j.RangePhase > 8 || j.RangePhase != 0 && j.RangeID == "" || j.RangeAfter != "" && (j.RangePhase != 2 || !validOpaqueID(j.RangeAfter)) ||
 		j.VisitPage < 0 || j.VisitPage != 0 && j.Phase != 9 ||
 		j.VisitRow < 0 || j.VisitRow >= captureVisitRows || j.VisitRow != 0 && j.Phase != 9 ||
 		j.StageAfter != "" && (j.Phase != 10 && j.Phase != 13 || !validHash(j.StageAfter)) {
@@ -146,6 +147,7 @@ func (s *Store) prepareCaptureErasureLocked(ctx context.Context, j sourceErasure
 	}
 	for after := ""; ; {
 		var id string
+		var selected bool
 		if err := s.captureErasureViewLocked(ctx, func(r bolt.Reader) error {
 			var err error
 			id, err = s.captureNextEditionReader(r, j.Family, after)
@@ -159,15 +161,18 @@ func (s *Store) prepareCaptureErasureLocked(ctx context.Context, j sourceErasure
 			if !found || j.Family != "" && summary.Header().FamilyID() != j.Family {
 				return ErrCorrupt
 			}
-			if !j.selects(edition.LastSeen) {
-				return nil
-			}
-			return s.prepareSourceErasureReader(ctx, r, id, prepare)
+			selected = j.selects(edition.LastSeen)
+			return nil
 		}); err != nil {
 			return err
 		}
 		if id == "" {
 			return nil
+		}
+		if selected {
+			if err := s.prepareSourceErasureLocked(ctx, id, prepare); err != nil {
+				return err
+			}
 		}
 		after = id
 	}

@@ -51,6 +51,12 @@ func (w *Worker) rollupLoop() {
 		if err := w.ProcessRollups(w.ctx); err != nil && w.ctx.Err() == nil && !errors.Is(err, ErrWorkerDisabled) {
 			delay = rollupRetryDelay
 		}
+		w.rollupMu.Lock()
+		more := w.rollupContinue
+		w.rollupMu.Unlock()
+		if more && delay == rollupInterval {
+			delay = 2 * time.Second
+		}
 		if !timer.Stop() {
 			select {
 			case <-timer.C:
@@ -109,6 +115,7 @@ func (w *Worker) ProcessRollups(ctx context.Context) error {
 	}
 	w.rollupMu.Lock()
 	defer w.rollupMu.Unlock()
+	w.rollupContinue = false
 	if !w.enabled() {
 		w.setRollupStatus(RollupSkippedNoLocalProvider, 0, 0)
 		return nil
@@ -119,6 +126,17 @@ func (w *Worker) ProcessRollups(ctx context.Context) error {
 		return nil
 	}
 	now := w.rollupNow()
+	if work, ok := w.repository.(RollupWorkRepository); ok {
+		if _, err := work.PrepareChronicleRollupWork(ctx, zone); !errors.Is(err, ErrWorkerUnavailable) {
+			if err == nil {
+				err = w.processQueuedRollups(ctx, repo, work, gen, loc, zone, now)
+			}
+			if err != nil {
+				w.recordRollupError(err)
+			}
+			return err
+		}
+	}
 	if !w.rollupBackfilled {
 		if err := w.backfillRollups(ctx, repo, loc, zone, now); err != nil {
 			w.recordRollupError(err)
@@ -262,11 +280,7 @@ func (w *Worker) backfillRollups(ctx context.Context, repo RollupRepository, loc
 				} else if found {
 					continue
 				}
-				placeholder, err := NewRollupPlaceholder(id, zone)
-				if err != nil {
-					return err
-				}
-				if err := repo.PutChronicleRollup(ctx, placeholder); err != nil {
+				if err := repo.MarkChronicleRollupDirty(ctx, id, zone); err != nil {
 					return err
 				}
 			}
@@ -297,6 +311,9 @@ func (w *Worker) refreshDayRollup(ctx context.Context, repo RollupRepository, ge
 		return false, ErrInvalid
 	}
 	var hours []RollupChild
+	// Fractional-offset zones cannot be represented exactly by whole UTC
+	// hours. Leave boundary facts to primary evidence, never the wrong day.
+	sampled := day.Start.Minute() != 0 || day.End.Minute() != 0 || day.Start.Second() != 0 || day.End.Second() != 0
 	after := ""
 	for page := 0; page < 8; page++ {
 		rows, next, err := repo.ListChronicles(ctx, day.Start, day.End, after, rollupPageSize)
@@ -304,6 +321,10 @@ func (w *Worker) refreshDayRollup(ctx context.Context, repo RollupRepository, ge
 			return false, err
 		}
 		for _, row := range rows {
+			if row.Start.Before(day.Start) || row.End.After(day.End) || !row.End.After(row.Start) {
+				sampled = true
+				continue
+			}
 			if strings.TrimSpace(row.Text) == "" || len(row.SourceIDs) == 0 {
 				continue
 			}
@@ -325,11 +346,12 @@ func (w *Worker) refreshDayRollup(ctx context.Context, repo RollupRepository, ge
 			return false, err
 		}
 		if hadText {
-			return false, w.markWeekDirty(ctx, repo, cleared)
+			return false, w.markAncestorsDirty(ctx, repo, cleared)
 		}
 		return false, nil
 	}
 	input := NewRollupInput(RollupLevelDay, hours)
+	input.Omitted = input.Omitted || sampled
 	label := "Day " + day.PeriodKey + " (" + day.Start.In(loc).Weekday().String() + "), times in " + zone
 	return w.storeRollup(ctx, repo, gen, day, input, label)
 }
@@ -356,7 +378,7 @@ func (w *Worker) refreshWeekRollup(ctx context.Context, repo RollupRepository, g
 			continue
 		}
 		d := day.Start.In(loc)
-		children = append(children, RollupChild{ID: day.ID, Label: d.Format("Mon 2006-01-02"), Text: day.Text, SourceIDs: day.SourceIDs})
+		children = append(children, RollupChild{ID: day.ID, Label: d.Format("Mon 2006-01-02"), Text: day.Text, SourceIDs: day.SourceIDs, Sampled: day.Sampled || day.CoverageVersion == 0})
 	}
 	if len(children) == 0 {
 		cleared := clearRollup(week)
@@ -371,7 +393,48 @@ func (w *Worker) refreshWeekRollup(ctx context.Context, repo RollupRepository, g
 func clearRollup(r Rollup) Rollup {
 	r.Text, r.InputHash, r.Model, r.GeneratedAt = "", "", "", time.Time{}
 	r.ChildIDs, r.SourceIDs = nil, nil
+	r.CoverageVersion, r.Sampled = 0, false
 	return r
+}
+
+func (w *Worker) refreshCalendarRollup(ctx context.Context, repo RollupRepository, gen RollupGenerator, period Rollup, loc *time.Location, zone string, now time.Time) (bool, error) {
+	period, ok := rebaseRollup(period, loc, zone)
+	if !ok || period.Level != RollupLevelMonth && period.Level != RollupLevelYear {
+		return false, ErrInvalid
+	}
+	if now.Before(period.End) {
+		return false, nil
+	}
+	childLevel := RollupLevelDay
+	if period.Level == RollupLevelYear {
+		childLevel = RollupLevelMonth
+	}
+	rows, err := listAllRollups(ctx, repo, childLevel, period.Start, period.End)
+	if err != nil {
+		return false, err
+	}
+	var children []RollupChild
+	for _, child := range rows {
+		_, _, start, end, valid := RollupPeriod(child.ID, loc)
+		if !valid || child.Dirty || child.Zone != zone || !child.Start.Equal(start) || !child.End.Equal(end) {
+			return false, nil // discovery/child generation must settle first
+		}
+		if child.Start.Before(period.Start) || child.End.After(period.End) {
+			return false, ErrInvalid
+		}
+		if child.Text == "" || len(child.SourceIDs) == 0 {
+			continue
+		}
+		children = append(children, RollupChild{ID: child.ID, Label: child.PeriodKey, Text: child.Text, SourceIDs: child.SourceIDs, Sampled: child.Sampled || child.CoverageVersion == 0})
+	}
+	if len(children) == 0 {
+		cleared := clearRollup(period)
+		cleared.Dirty = false
+		return false, repo.PutChronicleRollup(ctx, cleared)
+	}
+	input := NewRollupInput(period.Level, children)
+	label := period.Level + " " + period.PeriodKey + " (calendar boundaries in " + zone + ")"
+	return w.storeRollup(ctx, repo, gen, period, input, label)
 }
 
 // storeRollup regenerates a rollup unless its input is unchanged. The bool
@@ -392,6 +455,7 @@ func (w *Worker) storeRollup(ctx context.Context, repo RollupRepository, gen Rol
 	}
 	rollup.Text, rollup.InputHash, rollup.Model = text, hash, modelName
 	rollup.ChildIDs, rollup.SourceIDs = input.ChildIDs(), input.SourceIDs()
+	rollup.CoverageVersion, rollup.Sampled = RollupCoverageVersion, input.Omitted
 	rollup.GeneratedAt, rollup.Dirty = w.rollupNow(), false
 	if err := ValidateRollup(rollup); err != nil {
 		return false, err
@@ -401,23 +465,26 @@ func (w *Worker) storeRollup(ctx context.Context, repo RollupRepository, gen Rol
 	}
 	w.recordAttempt(nil)
 	w.logger.Info("chronicle rollup stored", "result", "stored", "level", rollup.Level, "source_count", len(rollup.SourceIDs))
-	if rollup.Level == RollupLevelDay {
-		if err := w.markWeekDirty(ctx, repo, rollup); err != nil {
-			return true, err
-		}
+	if err := w.markAncestorsDirty(ctx, repo, rollup); err != nil {
+		return true, err
 	}
 	return true, nil
 }
 
-// markWeekDirty queues the ISO week containing a regenerated day.
-func (w *Worker) markWeekDirty(ctx context.Context, repo RollupRepository, day Rollup) error {
-	key, ok := WeekKeyForDate(day.PeriodKey)
+// markAncestorsDirty queues every parent of a regenerated child.
+func (w *Worker) markAncestorsDirty(ctx context.Context, repo RollupRepository, child Rollup) error {
+	parents, ok := RollupAncestorIDs(child.ID)
 	if !ok {
 		return ErrInvalid
 	}
 	// A store-side flag flip: never a read-modify-write of the whole week, which
 	// could put back text that was cleared in between.
-	return repo.MarkChronicleRollupDirty(ctx, WeekRollupID(key), day.Zone)
+	for _, id := range parents {
+		if err := repo.MarkChronicleRollupDirty(ctx, id, child.Zone); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // generateRollupText applies the same local-only background policy as hourly

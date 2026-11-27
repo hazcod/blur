@@ -212,6 +212,8 @@ func (d *desktop) openMemoryMeeting(meeting meetings.Meeting) {
 }
 
 func (d *desktop) selectMemoryMeeting(meeting meetings.Meeting) {
+	d.memoryUI.voiceSourceRequest++ // A new selection supersedes queued source links.
+	d.meetingUI.reading = false
 	if d.memoryUI.recap.id != "" && d.memoryUI.recap.id != meeting.ID {
 		resumeEditor := d.memoryUI.recap.resumeEditor
 		d.invalidateVoiceRecap()

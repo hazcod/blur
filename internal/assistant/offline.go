@@ -12,7 +12,8 @@ import (
 // generated a synthesis. It shares the validated, bounded passage selection
 // with model answers and keeps complete originals available for inspection.
 func quotedEvidenceAnswer(question string, plan Plan, evidence []Evidence, diagnosis Diagnosis, contextLimit int) (Result, error) {
-	packed, err := packContextWithOptions(question, evidence, nil, contextLimit-MaxAnswerTokens-PromptTemplateReserve, contextOptions{balanced: plan.Kind == KindRecap, sampled: diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && diagnosis.Chronological})
+	subjects := technicalContextSubjects(plan, evidence)
+	packed, err := packContextWithOptions(question, evidence, nil, contextLimit-MaxAnswerTokens-PromptTemplateReserve, contextOptions{balanced: plan.Kind == KindRecap || len(subjects) > 0, sampled: diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && diagnosis.Chronological, technicalSubjects: subjects})
 	if err != nil {
 		return Result{}, err
 	}
@@ -72,7 +73,7 @@ func quotedEvidenceAnswer(question string, plan Plan, evidence []Evidence, diagn
 	if partial {
 		text.WriteString("\n\nSome sources were only partially captured. Open a source to inspect the saved content.")
 	}
-	answer, err := ValidateAnswer(ModelAnswer{Text: text.String(), SourceIDs: packed.SourceIDs}, packed.SourceIDs)
+	answer, err := ValidateAnswer(ModelAnswer{Text: technicalCoverageCopy(text.String(), packed.MissingTechnicalSubjects), SourceIDs: packed.SourceIDs}, packed.SourceIDs)
 	if err != nil {
 		return Result{}, err
 	}
@@ -81,7 +82,7 @@ func quotedEvidenceAnswer(question string, plan Plan, evidence []Evidence, diagn
 }
 
 func memoryCoverageLimited(plan Plan, diagnosis Diagnosis, packed PackedContext) bool {
-	return packed.AssociationUnverified || diagnosis.VoiceAssociationUnverified || diagnosis.VoiceRecallLimited || diagnosis.LibraryRecallLimited || diagnosis.SemanticIssue != "" || packed.Omitted > 0 || packed.Truncated > 0 || plan.Kind == KindRecap && diagnosis.RecapSampled
+	return len(packed.MissingTechnicalSubjects) > 0 || packed.AssociationUnverified || diagnosis.VoiceAssociationUnverified || diagnosis.VoiceRecallLimited || diagnosis.LibraryRecallLimited || diagnosis.SemanticIssue != "" || packed.Omitted > 0 || packed.Truncated > 0 || plan.Kind == KindRecap && (diagnosis.RecapSampled || diagnosis.RollupsDirty > 0)
 }
 
 // Never retain or display the rejected model answer. Recovery has no model call

@@ -153,6 +153,7 @@ func TestChronicleRollupRoundTripBoundsAndReopen(t *testing.T) {
 	}
 
 	// A store written with rollups reopens unchanged at the same schema.
+	schemaBefore := store.state.schemaVer
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -161,8 +162,9 @@ func TestChronicleRollupRoundTripBoundsAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
-	if OpenSchemaVersion != 7 {
-		t.Fatalf("schema version changed to %d", OpenSchemaVersion)
+	// Rollups retain their payload and authenticated reader floor on reopen.
+	if reopened.state.schemaVer != schemaBefore || schemaBefore != OpenSchemaVersion {
+		t.Fatalf("schema changed on reopen: before=%d after=%d current=%d", schemaBefore, reopened.state.schemaVer, OpenSchemaVersion)
 	}
 	again, found, err := reopened.GetChronicleRollup(ctx, "week:2026-W46")
 	if err != nil || !found || again.Text != week.Text {

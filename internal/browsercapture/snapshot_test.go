@@ -11,7 +11,7 @@ func TestSanitizeAcceptsOnlyCurrentActiveNonPrivateSafariPage(t *testing.T) {
 	page := Snapshot{
 		Browser: SafariBundleID, URL: "https://docs.example.test/plan?token=url-secret#private-fragment",
 		Title: "Quarterly plan", Text: "Owner: Sam\nPassword: page-secret", Active: true,
-		PrivacyKnown: true, CapturedAt: now,
+		PrivacyKnown: true, Complete: true, CapturedAt: now,
 	}
 	observation, err := Sanitize(page, true, now)
 	if err != nil {
@@ -37,7 +37,7 @@ func TestSanitizeRejectsUnapprovedOrNonCurrentPage(t *testing.T) {
 	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	base := Snapshot{
 		Browser: SafariBundleID, URL: "https://example.test/", Title: "Page", Text: "Body",
-		Active: true, PrivacyKnown: true, CapturedAt: now,
+		Active: true, PrivacyKnown: true, Complete: true, CapturedAt: now,
 	}
 	tests := []struct {
 		name    string
@@ -69,7 +69,7 @@ func TestSanitizeRecordsPageTitleAsWindowTitle(t *testing.T) {
 	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	page := Snapshot{
 		Browser: SafariBundleID, URL: "https://tiiny.ai/pocket", Title: "Tiiny Pocket | Personal AI Infrastructure for Local LLMs",
-		Text: "Body", Active: true, PrivacyKnown: true, CapturedAt: now,
+		Text: "Body", Active: true, PrivacyKnown: true, Complete: true, CapturedAt: now,
 	}
 	observation, err := Sanitize(page, true, now)
 	if err != nil || observation.Title() != page.Title {

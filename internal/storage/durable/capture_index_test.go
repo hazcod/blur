@@ -212,7 +212,8 @@ func TestPublishedCaptureIndexDensePartUsesPagedTermsAndDeletesSourcePostingsAnd
 func TestPublishedCaptureIndexRequiresWriterSeven(t *testing.T) {
 	s := openReplicaTestStore(t)
 	_ = captureWorkerForTest(t, s)
-	if OpenSchemaVersion != 7 {
+	// The current reader floor also covers pending/progress/compaction erasure.
+	if OpenSchemaVersion < 9 {
 		t.Fatal("capture index erasure has no newer writer boundary")
 	}
 	if err := s.readIdentityWithSchemaLimit(context.Background(), 6); !errors.Is(err, ErrUnsupportedSchema) {

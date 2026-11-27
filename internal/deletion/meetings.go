@@ -28,13 +28,18 @@ func (s *Service) DeleteMeeting(ctx context.Context, id string) error {
 	if !ok {
 		return ErrUnavailable
 	}
-	// Hold scheduling across the entire multi-source journal. On restart a
-	// committed journal may already have removed task reverse links, so clearing
-	// pending notices before recovery also covers that case. Release wakes the
-	// reminder service; it rebuilds only surviving future/open durable tasks.
+	// Hold scheduling across the entire multi-source journal. The specialized
+	// guard authenticates the bounded native snapshot even during recovery and
+	// preserves unrelated pending/delivered notices, including due one-shots.
 	if held, _ := ctx.Value(allNotificationGuardKey{}).(bool); !held {
 		if cleanup := s.notificationCleanup(); cleanup != nil {
-			release, err := cleanup.GuardAll(ctx)
+			guard := cleanup.GuardAll
+			if targeted, ok := cleanup.(interface {
+				GuardMeeting(context.Context, string) (func(), error)
+			}); ok {
+				guard = func(ctx context.Context) (func(), error) { return targeted.GuardMeeting(ctx, id) }
+			}
+			release, err := guard(ctx)
 			if err != nil {
 				return err
 			}
@@ -59,11 +64,11 @@ func (s *Service) DeleteMeeting(ctx context.Context, id string) error {
 
 func (s *Service) prepareMeetingSources(ctx context.Context, store meetingDeleter, id string, cutoff time.Time) error {
 	var after uint64
-	limits := meetings.DefaultLimits()
-	remaining := limits.MaxSegments + limits.MaxNotes
 	// Pages contain a bounded amount of plaintext. The store's opaque cursor
 	// may advance over previously deleted rows even when a page contains none.
-	for pages := 0; pages <= limits.MaxSegments+limits.MaxNotes; pages++ {
+	// Session admission does not impose a lifetime row limit, so preparation
+	// follows the advancing cursor until the saved archive ends or is canceled.
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -71,7 +76,7 @@ func (s *Service) prepareMeetingSources(ctx context.Context, store meetingDelete
 		if err != nil {
 			return err
 		}
-		if len(page.Records) > meetings.MaxPageRows || len(page.Records) > remaining || page.Next < after || page.More && page.Next <= after {
+		if len(page.Records) > meetings.MaxPageRows || page.Next < after || page.More && page.Next <= after {
 			return ErrUnavailable
 		}
 		previous := after
@@ -95,13 +100,11 @@ func (s *Service) prepareMeetingSources(ctx context.Context, store meetingDelete
 			}
 			previous = row.Sequence
 		}
-		remaining -= len(page.Records)
 		if !page.More {
 			return nil
 		}
 		after = page.Next
 	}
-	return ErrUnavailable
 }
 
 func validMeetingDeletionID(id string) bool {

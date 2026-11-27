@@ -360,6 +360,27 @@ func (r sourceVerifiedRepository) MarkChronicleRollupDirty(ctx context.Context, 
 	return inner.MarkChronicleRollupDirty(ctx, id, zone)
 }
 
+func (r sourceVerifiedRepository) PrepareChronicleRollupWork(ctx context.Context, zone string) (chronicle.RollupWorkStatus, error) {
+	if inner, ok := r.inner.(chronicle.RollupWorkRepository); ok {
+		return inner.PrepareChronicleRollupWork(ctx, zone)
+	}
+	return chronicle.RollupWorkStatus{}, chronicle.ErrWorkerUnavailable
+}
+
+func (r sourceVerifiedRepository) NextChronicleRollupWork(ctx context.Context, level, zone string) (chronicle.RollupWorkItem, bool, error) {
+	if inner, ok := r.inner.(chronicle.RollupWorkRepository); ok {
+		return inner.NextChronicleRollupWork(ctx, level, zone)
+	}
+	return chronicle.RollupWorkItem{}, false, chronicle.ErrWorkerUnavailable
+}
+
+func (r sourceVerifiedRepository) ChronicleRollupWorkStatus(ctx context.Context) (chronicle.RollupWorkStatus, error) {
+	if inner, ok := r.inner.(chronicle.RollupWorkRepository); ok {
+		return inner.ChronicleRollupWorkStatus(ctx)
+	}
+	return chronicle.RollupWorkStatus{}, chronicle.ErrWorkerUnavailable
+}
+
 func (r sourceVerifiedRepository) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup) error {
 	inner, ok := r.rollups()
 	if !ok {

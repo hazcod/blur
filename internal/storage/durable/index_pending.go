@@ -25,7 +25,7 @@ const (
 type pagedSearchProgress struct{ Indexed, Total, ErasedPages uint32 }
 
 func encodePagedSearchReverse(progress pagedSearchProgress, sourceBytes int, refs []searchIndexRef) ([]byte, error) {
-	if progress.Indexed > progress.Total || progress.Total > capture.MaxObservationTextBytes+128+253 || progress.ErasedPages > (progress.Indexed+exactIndexBatchTerms-1)/exactIndexBatchTerms || progress.Indexed < progress.Total && progress.Indexed%exactIndexBatchTerms != 0 || len(refs) > 2 {
+	if progress.Indexed > progress.Total || uint64(progress.ErasedPages) > (uint64(progress.Indexed)+exactIndexBatchTerms-1)/exactIndexBatchTerms || progress.Indexed < progress.Total && progress.Indexed%exactIndexBatchTerms != 0 || len(refs) > 2 {
 		return nil, ErrCorrupt
 	}
 	for _, ref := range refs {
@@ -56,7 +56,7 @@ func decodePagedSearchReverse(encoded []byte) (pagedSearchProgress, int, []searc
 	if err != nil {
 		return progress, 0, nil, err
 	}
-	if progress.Indexed > progress.Total || progress.Total > capture.MaxObservationTextBytes+128+253 || progress.ErasedPages > (progress.Indexed+exactIndexBatchTerms-1)/exactIndexBatchTerms || progress.Indexed < progress.Total && progress.Indexed%exactIndexBatchTerms != 0 || len(refs) > 2 {
+	if progress.Indexed > progress.Total || uint64(progress.ErasedPages) > (uint64(progress.Indexed)+exactIndexBatchTerms-1)/exactIndexBatchTerms || progress.Indexed < progress.Total && progress.Indexed%exactIndexBatchTerms != 0 || len(refs) > 2 {
 		return progress, 0, nil, ErrCorrupt
 	}
 	for _, ref := range refs {
@@ -307,8 +307,8 @@ func (tx *searchIndexTx) removePagedSearchBatchLocked(sourceID string, drain boo
 	if err != nil {
 		return false, err
 	}
-	pages := (progress.Indexed + exactIndexBatchTerms - 1) / exactIndexBatchTerms
-	if progress.ErasedPages < pages {
+	pages := (uint64(progress.Indexed) + exactIndexBatchTerms - 1) / exactIndexBatchTerms
+	if uint64(progress.ErasedPages) < pages {
 		if !drain {
 			return false, nil
 		}
@@ -380,7 +380,7 @@ func (s *Store) readSearchTermProof(reader bolt.Reader, sourceID string, digest 
 	}
 	plain, err := s.open(key, s.exactNamespace("search-proof-v1"), encoded)
 	defer clear(plain)
-	if err != nil || len(plain) != 2 || plain[0] != 1 || plain[1] == 0 || plain[1]&^searchFieldMask != 0 {
+	if err != nil || !(len(plain) == 2 && plain[0] == 1 || s.captureSearch && len(plain) == 6 && plain[0] == 2) || plain[1] == 0 || plain[1]&^searchFieldMask != 0 {
 		return searchIndexRef{}, false, used, false, ErrCorrupt
 	}
 	return searchIndexRef{kind: searchIndexTerm, digest: digest, fields: plain[1]}, true, used, false, nil

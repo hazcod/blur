@@ -108,6 +108,9 @@ func (s *Store) PutSemanticDocument(ctx context.Context, document semantic.Docum
 				return tx.failLocked(&storage.StoreError{Code: storage.Invalid})
 			}
 		}
+		if err := tx.removeSemanticProgressLocked(document.SourceID); err != nil {
+			return tx.failLocked(err)
+		}
 		if err := tx.putIndexValueLocked(semanticNamespace, document.SourceID, encoded); err != nil {
 			return tx.failLocked(err)
 		}
@@ -358,6 +361,9 @@ func (tx *Tx) removeSemanticSource(sourceID string) error {
 	defer tx.mu.Unlock()
 	if err := tx.checkLocked(); err != nil {
 		return tx.failLocked(err)
+	}
+	if err := tx.removeSemanticProgressLocked(sourceID); err != nil {
+		return err
 	}
 	_, found, err := tx.store.readSemanticOrder(tx.writer, sourceID)
 	if err != nil {

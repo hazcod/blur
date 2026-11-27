@@ -70,8 +70,10 @@ func (d *desktop) beginVoiceRecap(meeting meetings.Meeting, reveal bool) {
 		return
 	}
 	id := meeting.ID
-	epoch, stable := d.client.BeginMemoryRead()
+	read, stable := d.client.beginVoicePublication()
 	if !stable {
+		d.meetingUI.status = voiceReadChangedCopy
+		d.app.RequestUpdate()
 		return
 	}
 	resumeEditor := d.noteUI.open || d.memoryUI.recap.resumeEditor
@@ -81,7 +83,7 @@ func (d *desktop) beginVoiceRecap(meeting meetings.Meeting, reveal bool) {
 		d.hideQuickPanel()
 	}
 	started := false
-	if !d.client.PublishMemoryRead(epoch, func() {
+	if !read.publish(d.client, func() {
 		if !reveal && (d.page != "Ask" || d.noteUI.open || !d.memoryUI.meetingDetail || d.meetingUI.selected != id) {
 			return
 		}
@@ -96,6 +98,8 @@ func (d *desktop) beginVoiceRecap(meeting meetings.Meeting, reveal bool) {
 		}
 		started = true
 	}) {
+		d.meetingUI.status = voiceReadChangedCopy
+		d.app.RequestUpdate()
 		return
 	}
 	if !started {
@@ -117,7 +121,7 @@ func (d *desktop) beginVoiceRecap(meeting meetings.Meeting, reveal bool) {
 	}
 	go func() {
 		defer cancel()
-		d.runFinishedVoiceRecap(ctx, id, epoch, request, generation, voiceRecapMaxPages)
+		d.runFinishedVoiceRecap(ctx, id, read, request, generation, voiceRecapMaxPages)
 	}()
 }
 
@@ -126,7 +130,7 @@ func (d *desktop) voiceRecapCurrent(id string, request, generation uint64) bool 
 	return u.id == id && u.request == request && generation == d.memoryGeneration && u.generation == generation
 }
 
-func (d *desktop) runFinishedVoiceRecap(ctx context.Context, id string, epoch, request, generation uint64, pageLimit int) {
+func (d *desktop) runFinishedVoiceRecap(ctx context.Context, id string, read memoryReadPublication, request, generation uint64, pageLimit int) {
 	var after uint64
 	for step := 0; step < pageLimit; step++ {
 		result, page, err := d.client.SummarizeLocalMeetingPage(ctx, id, after)
@@ -134,28 +138,29 @@ func (d *desktop) runFinishedVoiceRecap(ctx context.Context, id string, epoch, r
 		invalid := errors.Is(err, assistant.ErrSummaryInvalidResponse)
 		unusable := insufficient || invalid
 		if err != nil && !unusable {
-			d.finishVoiceRecap(id, epoch, request, generation, err)
+			d.finishVoiceRecap(id, read, request, generation, err)
 			return
 		}
 		if unusable && len(page.Records) == 0 {
-			d.finishVoiceRecap(id, epoch, request, generation, err)
+			d.finishVoiceRecap(id, read, request, generation, err)
 			return
 		}
 		if len(page.Records) == 0 || page.Next <= after {
-			d.finishVoiceRecap(id, epoch, request, generation, ErrInvalidRequest)
+			d.finishVoiceRecap(id, read, request, generation, ErrInvalidRequest)
 			return
 		}
 		if !unusable && (result.Answer.InsufficientEvidence || result.Answer.Text == "" || result.Direct || result.General || result.GenerationIssue != "" || len(result.Sources) == 0) {
-			d.finishVoiceRecap(id, epoch, request, generation, assistant.ErrAnswer)
+			d.finishVoiceRecap(id, read, request, generation, assistant.ErrAnswer)
 			return
 		}
 		part := voiceRecapPart{result: result, first: page.Records[0].Sequence, last: page.Records[len(page.Records)-1].Sequence}
 		more, count := page.More, uint64(len(page.Records))
+		emptyCopy := meetingSummaryErrorCopy(assistant.ErrSummaryInsufficientEvidence, effectiveProvider(d.client.LocalAISettings()))
 		d.app.Post(func() {
 			if !d.voiceRecapCurrent(id, request, generation) {
 				return
 			}
-			if !d.client.PublishMemoryRead(epoch, func() {
+			if !read.publish(d.client, func() {
 				u := &d.memoryUI.recap
 				if unusable {
 					u.skipped += count
@@ -175,13 +180,15 @@ func (d *desktop) runFinishedVoiceRecap(ctx context.Context, id string, epoch, r
 						u.status = fmt.Sprintf("The model could not summarize %d saved passages. Those words remain in the transcript below.", u.skipped)
 					}
 					if len(u.parts) == 0 {
-						u.status = meetingSummaryErrorCopy(assistant.ErrSummaryInsufficientEvidence, effectiveProvider(d.client.LocalAISettings()))
+						u.status = emptyCopy
 					}
 					if u.invalid > 0 {
 						u.status = fmt.Sprintf("The model returned an unverifiable recap for %d saved passages. Those words remain in the transcript below.", u.invalid)
 					}
 				}
 			}) {
+				d.rejectChangedVoiceRecap()
+				d.app.RequestUpdate()
 				return
 			}
 			d.app.RequestUpdate()
@@ -191,17 +198,18 @@ func (d *desktop) runFinishedVoiceRecap(ctx context.Context, id string, epoch, r
 		}
 		after = page.Next
 	}
-	d.finishVoiceRecap(id, epoch, request, generation, errVoiceRecapLimit)
+	d.finishVoiceRecap(id, read, request, generation, errVoiceRecapLimit)
 }
 
 var errVoiceRecapLimit = errors.New("voice recap processing limit")
 
-func (d *desktop) finishVoiceRecap(id string, epoch, request, generation uint64, err error) {
+func (d *desktop) finishVoiceRecap(id string, read memoryReadPublication, request, generation uint64, err error) {
+	errorCopy := meetingSummaryErrorCopy(err, effectiveProvider(d.client.LocalAISettings()))
 	d.app.Post(func() {
 		if !d.voiceRecapCurrent(id, request, generation) {
 			return
 		}
-		if !d.client.PublishMemoryRead(epoch, func() {
+		if !read.publish(d.client, func() {
 			u := &d.memoryUI.recap
 			u.loading, u.partial = false, true
 			if u.cancel != nil {
@@ -209,16 +217,35 @@ func (d *desktop) finishVoiceRecap(id string, epoch, request, generation uint64,
 				u.cancel = nil
 			}
 			switch {
+			case errors.Is(err, ErrMemoryChanging):
+				u.parts, u.complete = nil, false
+				d.meetingUI.transcript = meetings.RecordPage{}
+				u.status = voiceReadChangedCopy
 			case errors.Is(err, errVoiceRecapLimit), errors.Is(err, context.DeadlineExceeded):
 				u.status = "This recap reached its processing limit. Later saved passages are not included; the full transcript remains below."
 			default:
-				u.status = meetingSummaryErrorCopy(err, effectiveProvider(d.client.LocalAISettings()))
+				u.status = errorCopy
 			}
 		}) {
-			return
+			d.rejectChangedVoiceRecap()
 		}
 		d.app.RequestUpdate()
 	})
+}
+
+// Called only after the request/note check. Retire every queued page of the
+// changed read, keeping drafts and recording controls untouched.
+func (d *desktop) rejectChangedVoiceRecap() {
+	u := &d.memoryUI.recap
+	if u.cancel != nil {
+		u.cancel()
+		u.cancel = nil
+	}
+	u.request++
+	u.loading, u.complete, u.partial = false, false, true
+	u.parts = nil
+	u.status = voiceReadChangedCopy
+	d.meetingUI.transcript = meetings.RecordPage{}
 }
 
 func meetingSummaryErrorCopy(err error, provider string) string {

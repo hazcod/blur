@@ -335,6 +335,9 @@ func (d *desktop) inspectedLibraryView() ui.View {
 		d.app.RequestUpdate()
 	}), wrapLabel(entity.Name).Style(styleSectionTitle), wrapLabel(inferredContext(*entity)).Style(styleMeta)}
 	rows = append(rows, d.librarySubjectAccount(*entity, true)...)
+	if entity.FactsHasMore {
+		rows = append(rows, flatButton("Load more learned details").Enabled(!d.libraryInspectLoading && !d.loading).OnClick(func() { d.loadMoreInferredFacts(entity.ID) }))
+	}
 	if len(entity.ActivitySourceIDs) > 0 {
 		rows = append(rows, recapSectionTitle("Original sources"))
 		for i, sourceID := range entity.ActivitySourceIDs {
@@ -383,6 +386,36 @@ func (d *desktop) inspectedLibraryView() ui.View {
 		rows = append(rows, flatButton("Remove entry").Enabled(!d.loading).OnClick(func() { d.pendingDeleteKnowledge = entity.ID; d.app.RequestUpdate() }))
 	}
 	return surfaceBox(14, 8, hugButtons(rows)...)
+}
+
+func (d *desktop) loadMoreInferredFacts(id string) {
+	entity := d.libraryInspect
+	if d.client == nil || entity == nil || entity.ID != id || !entity.FactsHasMore || entity.FactsNext == "" || d.libraryInspectLoading {
+		return
+	}
+	d.libraryInspectLoading = true
+	d.libraryInspectRequest++
+	request, after := d.libraryInspectRequest, entity.FactsNext
+	d.app.RequestUpdate()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		page, err := d.client.InferredFactPage(ctx, id, after, knowledge.MaxPageSize)
+		d.app.Post(func() {
+			if request != d.libraryInspectRequest {
+				return
+			}
+			d.libraryInspectLoading = false
+			if err != nil || d.libraryInspect == nil || d.libraryInspect.ID != id {
+				d.status = "More Library details could not be loaded. Refresh the entry and retry."
+			} else {
+				d.libraryInspect.Facts = append(d.libraryInspect.Facts, page.Facts...)
+				d.libraryInspect.FactsNext = page.Next
+				d.libraryInspect.FactsHasMore = page.HasMore
+			}
+			d.app.RequestUpdate()
+		})
+	}()
 }
 
 func (d *desktop) inspectLibraryEntity(id string, offset int) {

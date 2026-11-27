@@ -19,6 +19,7 @@ var ErrCaptureClosed = errors.New("durable store: capture closed")
 
 type CaptureEdition struct {
 	Summary       capture.CaptureSummary
+	Publication   string
 	LastSeen      time.Time
 	Visits        int64
 	firstSourceID string
@@ -55,7 +56,7 @@ func (s *Store) captureUpdate(ctx context.Context, fn func(*Tx) error) error {
 	})
 }
 func captureEditionValue(r captureEditionRecord, summary capture.CaptureSummary) CaptureEdition {
-	return CaptureEdition{Summary: summary, LastSeen: time.Unix(0, r.LastSeen).UTC(), Visits: r.Visits, firstSourceID: capturePartSourceID(summary.ContentID(), r.Publication, 0)}
+	return CaptureEdition{Summary: summary, Publication: r.Publication, LastSeen: time.Unix(0, r.LastSeen).UTC(), Visits: r.Visits, firstSourceID: capturePartSourceID(summary.ContentID(), r.Publication, 0)}
 }
 
 func (s *Store) BeginCapture(ctx context.Context, header capture.CaptureHeader) error {
@@ -190,8 +191,22 @@ func (s *Store) publishCaptureAndCleanup(ctx context.Context, summary capture.Ca
 }
 
 func (s *Store) publishCaptureWithHook(ctx context.Context, summary capture.CaptureSummary, afterWrites func() error) (CaptureEdition, error) {
+	return s.publishCaptureWithPublicationHook(ctx, summary, "", afterWrites)
+}
+
+// PublishCaptureWithPublication imports an authenticated remote publication
+// while preserving its publication-scoped source identities. Replays of the
+// same edition/publication are idempotent; a conflicting publication fails.
+func (s *Store) PublishCaptureWithPublication(ctx context.Context, summary capture.CaptureSummary, publication string) (CaptureEdition, error) {
+	if !validHash(publication) {
+		return CaptureEdition{}, &storage.StoreError{Code: storage.Invalid}
+	}
+	return s.publishCaptureWithPublicationHook(ctx, summary, publication, nil)
+}
+
+func (s *Store) publishCaptureWithPublicationHook(ctx context.Context, summary capture.CaptureSummary, publication string, afterWrites func() error) (CaptureEdition, error) {
 	var result CaptureEdition
-	if summary.ValidateForAdmission() != nil {
+	if summary.ValidateForAdmission() != nil || publication != "" && !validHash(publication) {
 		return result, &storage.StoreError{Code: storage.Invalid}
 	}
 	header := summary.Header()
@@ -217,6 +232,12 @@ func (s *Store) publishCaptureWithHook(ctx context.Context, summary capture.Capt
 			if !found {
 				return ErrCorrupt
 			}
+			if publication != "" && r.Publication != publication {
+				return ErrCaptureConflict
+			}
+			if err := tx.ensureCaptureFirstSourceLocked(receipt.EditionID, r, stored); err != nil {
+				return err
+			}
 			result = captureEditionValue(r, stored)
 			return nil
 		}
@@ -236,12 +257,16 @@ func (s *Store) publishCaptureWithHook(ctx context.Context, summary capture.Capt
 		}
 		if !exists {
 			r = captureEditionRecord{Version: 1, IndexVersion: captureIndexVersion, Summary: summaryBytes, Owner: header.CaptureID(), LastSeen: header.CapturedAt().UnixNano()}
-			var publication [32]byte
-			if _, err := rand.Read(publication[:]); err != nil {
-				return ErrTransaction
+			if publication == "" {
+				var generated [32]byte
+				if _, err := rand.Read(generated[:]); err != nil {
+					return ErrTransaction
+				}
+				r.Publication = hex.EncodeToString(generated[:])
+				clear(generated[:])
+			} else {
+				r.Publication = publication
 			}
-			r.Publication = hex.EncodeToString(publication[:])
-			clear(publication[:])
 			if err := tx.captureLinkEditionLocked(summary.ContentID(), header.FamilyID(), &r); err != nil {
 				return err
 			}
@@ -250,6 +275,9 @@ func (s *Store) publishCaptureWithHook(ctx context.Context, summary capture.Capt
 				return ErrCorrupt
 			}
 		}
+		if publication != "" && r.Publication != publication {
+			return ErrCaptureConflict
+		}
 		if err := tx.captureAppendVisitLocked(summary.ContentID(), header, &r); err != nil {
 			return err
 		}
@@ -257,6 +285,9 @@ func (s *Store) publishCaptureWithHook(ctx context.Context, summary capture.Capt
 			return err
 		}
 		if err := tx.capturePutJSONLocked("edition:"+summary.ContentID(), r, captureMetaBytes); err != nil {
+			return err
+		}
+		if err := tx.ensureCaptureFirstSourceLocked(summary.ContentID(), r, stored); err != nil {
 			return err
 		}
 		if afterWrites != nil {

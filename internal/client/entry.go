@@ -156,14 +156,6 @@ func (c *Client) resolveEntry(parent context.Context, input string, state EntryS
 		result.Action = intent.Action{Kind: intent.Ask, Text: input}
 		return result, nil
 	}
-	// Project-scoped outstanding-work questions have a dedicated structured
-	// retriever. Route them before intent inference so a generic topic search
-	// cannot turn an incidental project page into purported open work.
-	if creation, _ := classifyQuickInput(input); creation != quickInputTask && assistant.IsOutstandingQuestion(input) {
-		stage = "outstanding_work"
-		result.Action = intent.Action{Kind: intent.Ask, Text: input, Mode: "memory"}
-		return result, nil
-	}
 	if message := entryDataClarification(input); message != "" {
 		result.Action.Kind, result.Message = intent.Clarify, message
 		return result, nil
@@ -194,6 +186,22 @@ func (c *Client) resolveEntry(parent context.Context, input string, state EntryS
 			result.Answer = &assistant.Result{Answer: answer.Answer, Sources: answer.Sources, Targets: answer.Targets, Direct: true, Plan: assistant.Plan{Kind: assistant.KindLookup, Question: input}}
 			return result, nil
 		}
+		result.Action = intent.Action{Kind: intent.Ask, Text: input, Mode: "memory"}
+		return result, nil
+	}
+	// A source lookup has no task or scheduling authority, including while a
+	// reminder draft is waiting for a title or a date.
+	if browseTopics {
+		if query, ok := entryFindQuery(input); ok {
+			stage = "local_source_lookup"
+			result.SearchQuery = query
+			return result, nil
+		}
+	}
+	// Project-scoped outstanding-work questions have a dedicated structured
+	// retriever. Keep explicit source commands above this topical heuristic.
+	if creation, _ := classifyQuickInput(input); creation != quickInputTask && assistant.IsOutstandingQuestion(input) {
+		stage = "outstanding_work"
 		result.Action = intent.Action{Kind: intent.Ask, Text: input, Mode: "memory"}
 		return result, nil
 	}

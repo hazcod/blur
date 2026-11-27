@@ -56,6 +56,15 @@ func (c *Client) PersonalAnswerContext(ctx context.Context, plan assistant.Plan)
 			result.Targets = answer.Targets
 		}
 	}
+	if len(plan.TechnicalSubjects) > 0 {
+		facts := result.Facts[:0]
+		for _, item := range result.Facts {
+			if technicalSubjectSupport(plan.TechnicalSubjects, item.Text) {
+				facts = append(facts, item)
+			}
+		}
+		result.Facts = facts
+	}
 	return result, nil
 }
 
@@ -149,6 +158,9 @@ type ProfileResult struct {
 }
 
 func askEvidenceCaption(source assistant.Evidence) string {
+	if source.Layer == assistant.LayerCompaction {
+		return "Generated summary of saved source text. Original text is available."
+	}
 	if source.Origin == assistant.OriginUserCorrection {
 		return "Your correction in Library."
 	}
@@ -162,6 +174,20 @@ func askEvidenceCaption(source assistant.Evidence) string {
 		}
 		return caption
 	}
+	if name := recapEvidenceName(source.Layer); name != "" {
+		caption := name + "."
+		if len(source.SourceIDs) != 0 {
+			unit := "saved sources"
+			if len(source.SourceIDs) == 1 {
+				unit = "saved source"
+			}
+			caption += " Based on " + strconv.Itoa(len(source.SourceIDs)) + " " + unit + "."
+		}
+		if source.CoverageLimited {
+			caption += " Input coverage is limited."
+		}
+		return caption
+	}
 	name := source.AppName
 	if name == "" {
 		name = displayAppName(source.AppID)
@@ -171,6 +197,22 @@ func askEvidenceCaption(source assistant.Evidence) string {
 		caption += ". Only part of the original content was captured."
 	}
 	return caption
+}
+
+func recapEvidenceName(layer assistant.Layer) string {
+	switch layer {
+	case assistant.LayerHour:
+		return "Hour recap"
+	case assistant.LayerDay:
+		return "Day recap"
+	case assistant.LayerWeek:
+		return "Week recap"
+	case assistant.LayerMonth:
+		return "Month recap"
+	case assistant.LayerYear:
+		return "Year recap"
+	}
+	return ""
 }
 
 func (c *Client) profileRepository() (profile.Repository, bool) {
@@ -329,10 +371,7 @@ func (c *Client) commitExplicitMemory(epoch uint64, write func() error) (uint64,
 		c.memoryMutationEpoch++
 	}
 	committed := c.memoryMutationEpoch
-	cancels := make([]context.CancelFunc, 0, len(c.activeAsks))
-	for _, cancel := range c.activeAsks {
-		cancels = append(cancels, cancel)
-	}
+	cancels := c.askCancellations()
 	invalidate := c.memoryInvalidator
 	select {
 	case c.memoryChanges <- struct{}{}:

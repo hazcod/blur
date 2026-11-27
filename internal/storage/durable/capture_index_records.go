@@ -4,24 +4,39 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"github.com/hazcod/blur/internal/capture"
 	"math"
 
 	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
 
 const captureIndexVersion = 1
+const captureIndexContentFormat = 7
 const captureIndexBackfillKey = "index-backfill"
 const captureIndexPendingKey = "index-pending"
 
 type captureIndexBackfill struct {
 	Version int
 	Next    string
+	Format  int `json:",omitempty"`
 }
 type captureIndexPart struct {
 	Version                int
 	EditionID, Publication string
 	Index                  int64
 	Bytes                  int
+	Format                 int    `json:",omitempty"`
+	Range                  bool   `json:",omitempty"`
+	Start, End, LastPart   int64  `json:",omitempty"`
+	Next                   string `json:",omitempty"`
+	MetadataIndexed        int    `json:",omitempty"`
+}
+
+func (r captureIndexPart) sourceID() string {
+	if r.Range {
+		return capture.CaptureRangeSourceID(r.EditionID, r.Publication, r.Start, r.End)
+	}
+	return capturePartSourceID(r.EditionID, r.Publication, r.Index)
 }
 
 func capturePartSourceID(id, publication string, index int64) string {
@@ -35,13 +50,22 @@ func capturePartSourceID(id, publication string, index int64) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r captureEditionRecord) validIndex(id string, parts int64) bool {
-	if r.TimelineVersion < 0 || r.TimelineVersion > 1 {
+	if r.IndexRangeQueued < 0 || r.IndexRangeQueued > captureRangeQueueMax || r.IndexRangeQueued > 0 && r.IndexFormat != captureIndexContentFormat {
+		return false
+	}
+	if r.TimelineVersion < 0 || r.TimelineVersion > 1 || !validCaptureIndexFormat(r.IndexFormat) {
+		return false
+	}
+	if r.IndexStream != nil && (r.IndexFormat != captureIndexContentFormat || !r.IndexStream.Valid()) || r.IndexRangeWork != nil && (r.IndexFormat != captureIndexContentFormat || !r.IndexRangeWork.valid(parts)) {
 		return false
 	}
 	if r.IndexVersion == 0 {
-		return r.IndexPart == 0 && r.IndexVisits == 0 && !r.IndexQueued && r.IndexPrev == "" && r.IndexNext == ""
+		return r.IndexFormat == 0 && r.IndexPart == 0 && r.IndexVisits == 0 && !r.IndexQueued && r.IndexPrev == "" && r.IndexNext == ""
 	}
 	return r.IndexVersion == captureIndexVersion && r.IndexPart >= 0 && r.IndexPart <= parts && r.IndexVisits >= 0 && r.IndexVisits <= r.Visits && captureOptionalID(r.IndexPrev) && captureOptionalID(r.IndexNext) && r.IndexPrev != id && r.IndexNext != id && (r.IndexQueued || r.IndexPrev == "" && r.IndexNext == "")
+}
+func validCaptureIndexFormat(format int) bool {
+	return format == 0 || format >= int(searchIndexStructureVersion) && format <= captureIndexContentFormat
 }
 func (s *Store) captureIndexBackfillReader(reader bolt.Reader) (captureIndexBackfill, bool, error) {
 	var r captureIndexBackfill
@@ -49,18 +73,18 @@ func (s *Store) captureIndexBackfillReader(reader bolt.Reader) (captureIndexBack
 	if err != nil || !found {
 		return r, found, err
 	}
-	if r.Version != captureIndexVersion || !captureOptionalID(r.Next) {
+	if r.Version != captureIndexVersion || !captureOptionalID(r.Next) || !validCaptureIndexFormat(r.Format) {
 		return r, false, ErrCorrupt
 	}
 	return r, true, nil
 }
 func (s *Store) captureIndexPartReader(reader bolt.Reader, id string) (captureIndexPart, bool, error) {
 	var r captureIndexPart
-	found, err := s.captureReadJSON(reader, "index-part:"+id, 512, &r)
+	found, err := s.captureReadJSON(reader, "index-part:"+id, 768, &r)
 	if err != nil || !found {
 		return r, found, err
 	}
-	if r.Version != captureIndexVersion || !validHash(r.EditionID) || !validHash(r.Publication) || r.Index < 0 || r.Bytes < 1 || r.Bytes > 32<<10 || capturePartSourceID(r.EditionID, r.Publication, r.Index) != id {
+	if r.Version != captureIndexVersion || !validHash(r.EditionID) || !validHash(r.Publication) || r.Index < 0 || r.Bytes < 1 || r.MetadataIndexed < 0 || r.MetadataIndexed > 128+253 || r.MetadataIndexed != 0 && r.Format != captureIndexContentFormat || !validCaptureIndexFormat(r.Format) || r.sourceID() != id || r.Range && (r.Start < 0 || r.End <= r.Start || r.End-r.Start != int64(r.Bytes) || r.LastPart <= r.Index || !captureOptionalID(r.Next) || r.Next == id || r.Format != captureIndexContentFormat) || !r.Range && (r.Bytes > 32<<10 || r.Start != 0 || r.End != 0 || r.LastPart != 0 || r.Next != "") {
 		return r, false, ErrCorrupt
 	}
 	return r, true, nil
@@ -71,6 +95,24 @@ func (s *Store) captureIndexPartReader(reader bolt.Reader, id string) (captureIn
 func (tx *Tx) queueCaptureIndexLocked(id string, r *captureEditionRecord, parts int64) error {
 	if r.IndexVersion == 0 {
 		r.IndexVersion = captureIndexVersion
+	}
+	if r.IndexFormat != captureIndexContentFormat {
+		if r.IndexRangeWork != nil && r.IndexRangeWork.CoreTerms > 0 {
+			if err := tx.deleteIndexValueLocked(captureNS, captureRangeCoreKey(id, r.Publication)); err != nil {
+				return err
+			}
+		}
+		if r.IndexRangeQueued > 0 {
+			if err := tx.deleteIndexValueLocked(captureNS, captureRangeQueueKey(id, r.Publication)); err != nil {
+				return err
+			}
+		}
+		// Old part mappings retain the format of their proofs. Rewind only
+		// derived progress; the worker erases/rebuilds each part in batches.
+		r.IndexPart, r.IndexFormat = 0, captureIndexContentFormat
+		r.IndexStream = nil
+		r.IndexRangeWork = nil
+		r.IndexRangeQueued = 0
 	}
 	if r.IndexQueued || r.IndexPart == parts && r.IndexVisits == r.Visits {
 		return nil

@@ -346,6 +346,7 @@ type desktop struct {
 	settingsGroup                 string
 	report                        activity.ReportResult
 	reportReady                   bool
+	reportAppOffset               int
 	note                          string
 	quickInput                    string
 	quickTaskSubmission           *taskSubmission
@@ -462,6 +463,7 @@ type desktop struct {
 	askDocumentProgress           assistant.DocumentProgress
 	askHasDocumentProgress        bool
 	askSourcesExpanded            bool
+	recapSources                  recapSourceViewState
 	askRequestID                  uint64
 	askCancel                     context.CancelFunc
 	answers                       map[string]string
@@ -649,6 +651,9 @@ func (d *desktop) navigatePage(page string) {
 			d.askQuestion = d.query
 		}
 		page = "Ask"
+	}
+	if page != "Ask" {
+		d.clearRecapSources()
 	}
 	d.page, d.status = page, ""
 	if page == "Ask" && !d.memoryUI.loaded && !d.memoryUI.loading {
@@ -881,6 +886,7 @@ func (d *desktop) askView() ui.View {
 			d.cancelVoiceRecapForNavigation()
 			d.askQuestion, d.query = value, value
 			d.askResult = nil
+			d.clearRecapSources()
 			d.searchHits, d.searchComplete, d.searchFailed = nil, false, false
 			d.searchSummaries = nil
 			d.searchIndexingPending, d.searchCoverageLimited = false, false
@@ -944,6 +950,9 @@ func (d *desktop) askView() ui.View {
 			if source.AppName == "Library" {
 				sourceLabel = "Library"
 			}
+			if name := recapEvidenceName(source.Layer); name != "" {
+				sourceLabel = name
+			}
 			if source.AppID == "sh.blur.notes" {
 				if title, body, found := markdownNoteHeading(source.Text); found {
 					sourceLabel = "Note: " + title
@@ -990,6 +999,9 @@ func (d *desktop) askView() ui.View {
 			}
 			if source.Origin == assistant.OriginTask {
 				sourceRows = append(sourceRows, flatButton("Review tasks").Enabled(!d.loading).OnClick(func() { d.page = "Tasks"; d.loadTaskPage(""); d.app.RequestUpdate() }))
+			}
+			if originals := d.recapSavedSourcesView(source); originals != nil {
+				sourceRows = append(sourceRows, originals)
 			}
 			block := ui.VBox(sourceRows...).Spacing(6).CrossAlign(layout.CrossStretch)
 			if source.Layer == assistant.LayerSource {
@@ -1128,6 +1140,7 @@ func (d *desktop) askMemoryWithDraftRevision(quickDraftRevision uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), askOperationTimeout(question))
 	d.askCancel = cancel
 	d.askLoading, d.status, d.askResult = true, "", nil
+	d.clearRecapSources()
 	d.askHasDocumentProgress = false
 	d.askDocumentProgress = assistant.DocumentProgress{}
 	d.expandedSourceID = ""
@@ -1160,6 +1173,9 @@ func (d *desktop) askMemoryWithDraftRevision(quickDraftRevision uint64) {
 			d.askCancel = nil
 			d.askLoading = false
 			d.askHasDocumentProgress = false
+			if err == nil && result.Publication != nil && !result.Publication.Publish(func() { d.askResult = &result }) {
+				err = ErrMemoryChanging
+			}
 			if err != nil {
 				d.status = askErrorMessage(err, effectiveProvider(d.client.LocalAISettings()))
 				if d.quickAskPending {
@@ -1170,7 +1186,9 @@ func (d *desktop) askMemoryWithDraftRevision(quickDraftRevision uint64) {
 				}
 				d.resizeQuickPanel(d.quickPanelExpanded())
 			} else {
-				d.askResult = &result
+				if result.Publication == nil {
+					d.askResult = &result
+				}
 				if d.quickAskPending {
 					d.quickConversation = appendQuickConversation(d.quickConversation, d.askQuestion, result)
 					if d.quickUI.draftRevision == quickDraftRevision {
@@ -1206,6 +1224,7 @@ func (d *desktop) invalidateAsk() {
 	if d == nil {
 		return
 	}
+	d.clearRecapSources()
 	d.askRequestID++
 	if d.askCancel != nil {
 		d.askCancel()
@@ -1342,12 +1361,31 @@ func (d *desktop) timeReportView() ui.View {
 		for _, bucket := range d.report.Apps {
 			largest = max(largest, bucket.Duration)
 		}
-		for _, bucket := range d.report.Apps {
+		const appPageSize = 20
+		offset := max(0, d.reportAppOffset)
+		if offset >= len(d.report.Apps) {
+			offset = 0
+		}
+		end := min(len(d.report.Apps), offset+appPageSize)
+		for _, bucket := range d.report.Apps[offset:end] {
 			name := bucket.Key
 			if name == "" {
 				name = "Unclassified app"
 			}
 			byApp = append(byApp, d.reportAppRow(name, bucket.Duration, largest))
+		}
+		if len(d.report.Apps) > appPageSize {
+			byApp = append(byApp, ui.HBox(
+				flatButton("Previous apps").Enabled(offset > 0).OnClick(func() {
+					d.reportAppOffset = max(0, offset-appPageSize)
+					d.app.RequestUpdate()
+				}),
+				wrapLabel(fmt.Sprintf("%d–%d of %d apps", offset+1, end, len(d.report.Apps))).Style(modern.MutedText),
+				flatButton("Next apps").Enabled(end < len(d.report.Apps)).OnClick(func() {
+					d.reportAppOffset = end
+					d.app.RequestUpdate()
+				}),
+			).Spacing(10).CrossAlign(layout.CrossCenter))
 		}
 		children = append(children, hairline(), section("By app", byApp...))
 	}
@@ -1403,28 +1441,32 @@ func (d *desktop) loadActivityReport() {
 	d.app.RequestUpdate()
 	start, end, zone := d.reportStart, d.reportEnd, d.reportZone
 	memoryGeneration := d.memoryGeneration
-	memoryEpoch, stable := d.client.BeginMemoryRead()
+	_, stable := d.client.BeginMemoryRead()
 	if !stable {
 		d.loading, d.status = false, ""
 		return
 	}
 	go func() {
-		report, err := d.client.ActivityReport(start, end, zone)
+		report, read, err := d.client.readActivityReport(context.Background(), start, end, zone)
 		d.app.Post(func() {
-			if !currentMemoryRead(memoryGeneration, d.memoryGeneration) {
+			if !currentMemoryRead(memoryGeneration, d.memoryGeneration) || d.reportStart != start || d.reportEnd != end || d.reportZone != zone || d.page != "Time" {
 				d.loading = false
 				d.app.RequestUpdate()
 				return
 			}
-			if !d.client.PublishMemoryRead(memoryEpoch, func() {
+			if err != nil {
 				d.loading = false
-				if err != nil {
-					d.status = friendlyError(err)
-				} else {
-					d.report, d.reportReady, d.status = report, true, ""
-				}
+				d.status = friendlyError(err)
+				d.app.RequestUpdate()
+				return
+			}
+			if !read.publish(d.client, func() {
+				d.loading = false
+				d.report, d.reportReady, d.status = report, true, ""
+				d.reportAppOffset = 0
 			}) {
 				d.loading = false
+				d.status = friendlyError(ErrMemoryChanging)
 				d.app.RequestUpdate()
 				return
 			}
@@ -3670,7 +3712,7 @@ func (d *desktop) invalidateMemoryViews() {
 		return
 	}
 	d.memoryGeneration++
-	d.invalidateNoteDocumentView()
+	d.invalidateNoteDocumentMemoryView()
 	d.invalidateVoiceRecap()
 	d.cancelMemoryEntry()
 	d.memoryUI.entry = EntryState{}

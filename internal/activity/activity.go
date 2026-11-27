@@ -344,6 +344,69 @@ type ReportResult struct {
 	Apps, Domains, Projects, Topics []Bucket
 }
 
+// StartOfDate returns the earliest instant of a local date, or the next date
+// when a civil date was skipped entirely. Midnight may be absent or repeated.
+// As with time.Date, zone must be non-nil and calendar fields are normalized.
+func StartOfDate(year int, month time.Month, day int, zone *time.Location) time.Time {
+	date := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	localDate := func(at time.Time) time.Time {
+		y, m, d := at.In(zone).Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	}
+	cursor := time.Date(year, month, day, 12, 0, 0, 0, zone)
+	// A nonexistent noon can normalize into the preceding civil date.
+	for localDate(cursor).Before(date) {
+		_, next := cursor.ZoneBounds()
+		if next.IsZero() || !next.After(cursor) {
+			break
+		}
+		cursor = next
+	}
+	var first time.Time
+	for {
+		_, offset := cursor.Zone()
+		start, _ := cursor.ZoneBounds()
+		first = date.Add(-time.Duration(offset) * time.Second).In(zone)
+		if !start.IsZero() && first.Before(start) {
+			first = start
+		}
+		if start.IsZero() || localDate(start.Add(-time.Nanosecond)).Before(date) {
+			return first
+		}
+		cursor = start.Add(-time.Nanosecond)
+	}
+}
+
+// SplitDays conserves a segment's duration across actual local dates. A zone
+// transition may skip or repeat midnight, so stop at offset transitions as well
+// as the next midnight under the current offset. Every stop advances in UTC.
+func SplitDays(s Segment, zone *time.Location) ([]Day, error) {
+	if zone == nil || s.Validate() != nil {
+		return nil, ErrInvalid
+	}
+	days := map[string]int64{}
+	for cursor := s.WallStart; cursor.Before(s.WallEnd); {
+		local := cursor.In(zone)
+		y, m, d := local.Date()
+		_, offset := local.Zone()
+		next := time.Date(y, m, d+1, 0, 0, 0, 0, time.UTC).Add(-time.Duration(offset) * time.Second)
+		stop := s.WallEnd
+		if next.Before(stop) {
+			stop = next
+		}
+		_, transition := local.ZoneBounds()
+		if !transition.IsZero() && transition.After(cursor) && transition.Before(stop) {
+			stop = transition
+		}
+		if !stop.After(cursor) {
+			return nil, ErrInvalid
+		}
+		days[local.Format("2006-01-02")] += int64(stop.Sub(cursor))
+		cursor = stop
+	}
+	return mapDays(days), nil
+}
+
 // Report splits metadata ranges by local calendar date, including DST days.
 // Its exact duration is conserved across the total, day, and dimension buckets.
 func Report(segments []Segment, zone *time.Location) (ReportResult, error) {
@@ -364,18 +427,12 @@ func Report(segments []Segment, zone *time.Location) (ReportResult, error) {
 		domains[s.Domain] += s.Duration
 		projects[s.Project] += s.Duration
 		topics[s.Topic] += s.Duration
-		cursor := s.WallStart.In(zone)
-		end := s.WallEnd.In(zone)
-		for cursor.Before(end) {
-			y, m, d := cursor.Date()
-			next := time.Date(y, m, d+1, 0, 0, 0, 0, zone)
-			stop := end
-			if next.Before(stop) {
-				stop = next
-			}
-			ns := int64(stop.Sub(cursor))
-			days[fmt.Sprintf("%04d-%02d-%02d", y, m, d)] += ns
-			cursor = stop
+		parts, err := SplitDays(s, zone)
+		if err != nil {
+			return ReportResult{}, err
+		}
+		for _, day := range parts {
+			days[day.Date] += day.Duration
 		}
 	}
 	result.Days = mapDays(days)

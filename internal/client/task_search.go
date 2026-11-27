@@ -35,13 +35,17 @@ type taskSearchPage struct {
 // searchTasks ranks only current task titles. State and scheduling evidence is
 // assembled from a fresh read of each winner, never from an immutable note.
 func (c *Client) searchTasks(ctx context.Context, question string, terms []string, scope semantic.Query, limit int, matchOnly bool, linkedSourceIDs ...string) (taskSearchPage, error) {
+	return c.searchTasksMode(ctx, question, terms, scope, limit, matchOnly, false, linkedSourceIDs...)
+}
+
+func (c *Client) searchTasksMode(ctx context.Context, question string, terms []string, scope semantic.Query, limit int, matchOnly, exactOnly bool, linkedSourceIDs ...string) (taskSearchPage, error) {
 	linkedSources := make(map[string]struct{}, len(linkedSourceIDs))
 	for _, id := range linkedSourceIDs {
 		if id != "" {
 			linkedSources[id] = struct{}{}
 		}
 	}
-	return c.searchTaskCandidates(ctx, question, terms, scope, limit, matchOnly, nil, false, linkedSources)
+	return c.searchTaskCandidates(ctx, question, terms, scope, limit, matchOnly, nil, exactOnly, linkedSources)
 }
 
 func (c *Client) searchTaskCandidates(ctx context.Context, question string, terms []string, scope semantic.Query, limit int, matchOnly bool, taskFilter *taskQuery, exactOnly bool, linkedSources map[string]struct{}) (taskSearchPage, error) {

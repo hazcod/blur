@@ -13,11 +13,14 @@ struct MeetingAudioClock {
     let sampleRate: Double
     private(set) var next: Int64 = 0
     mutating func place(milliseconds: Double, frames: Int) throws -> CMTime {
-        guard milliseconds.isFinite, milliseconds >= 0, milliseconds <= 86400000, frames > 0, frames <= 65536,
+        guard meetingAudioTimestamp(milliseconds) != nil, frames > 0, frames <= 65536,
               sampleRate >= 8000, sampleRate <= 192000, sampleRate.rounded() == sampleRate else { throw MeetingAudioFailure(code: "audio_format") }
-        let proposed = Int64((milliseconds * sampleRate / 1000).rounded())
-        let start = proposed < next + Int64(sampleRate / 20) ? next : proposed
-        next = start + Int64(frames)
+        guard let proposed = Int64(exactly: (milliseconds * sampleRate / 1000).rounded()) else { throw MeetingAudioFailure(code: "audio_clock") }
+        let (threshold, thresholdOverflow) = next.addingReportingOverflow(Int64(sampleRate / 20))
+        let start = thresholdOverflow || proposed < threshold ? next : proposed
+        let (end, overflow) = start.addingReportingOverflow(Int64(frames))
+        guard !overflow else { throw MeetingAudioFailure(code: "audio_clock") }
+        next = end
         return CMTime(value: start, timescale: CMTimeScale(sampleRate))
     }
 }
@@ -77,7 +80,8 @@ struct MeetingAudioResultIdentity {
     mutating func event(text: String, range: CMTimeRange, finalStream: Bool, isFinal: Bool) throws -> MeetingAudioEvent {
         let start = CMTimeGetSeconds(range.start) * 1000
         let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range)) * 1000
-        guard start.isFinite, end.isFinite, start >= 0, end >= start, end <= 86400000, !text.isEmpty, text.utf8.count <= 16384 else { throw MeetingAudioFailure(code: "transcript_limit") }
+        guard let startMS = meetingAudioTimestamp(start), let endMS = meetingAudioTimestamp(end), end >= start,
+              !text.isEmpty, text.utf8.count <= 16384 else { throw MeetingAudioFailure(code: "transcript_limit") }
         if finalStream && !isFinal { throw MeetingAudioFailure(code: "transcription_failed") }
         let identity: String
         let revision: UInt64
@@ -90,7 +94,7 @@ struct MeetingAudioResultIdentity {
         }
         // Preserve the producer's boundaries (rounded only to the ABI's ms
         // resolution). Preview boundaries may move in either direction.
-        return MeetingAudioEvent(version: 1, sessionID: sessionID, epoch: epoch, kind: finalStream ? "transcript" : "preview", track: track, segmentID: identity, revision: revision, startMS: Int64(start.rounded()), endMS: Int64(end.rounded()), final: finalStream, text: text)
+        return MeetingAudioEvent(version: 1, sessionID: sessionID, epoch: epoch, kind: finalStream ? "transcript" : "preview", track: track, segmentID: identity, revision: revision, startMS: startMS, endMS: endMS, final: finalStream, text: text)
     }
 }
 
@@ -211,6 +215,6 @@ private final class MeetingAudioConverterInput: @unchecked Sendable {
 func meetingAudioMilliseconds(hostTime: CMTime, origin: CMTime) throws -> Double {
     guard hostTime.isNumeric, origin.isNumeric else { throw MeetingAudioFailure(code: "audio_clock") }
     let milliseconds = CMTimeGetSeconds(CMTimeSubtract(hostTime, origin)) * 1000
-    guard milliseconds.isFinite, milliseconds >= 0, milliseconds <= 86400000 else { throw MeetingAudioFailure(code: "audio_clock") }
+    guard meetingAudioTimestamp(milliseconds) != nil else { throw MeetingAudioFailure(code: "audio_clock") }
     return milliseconds
 }

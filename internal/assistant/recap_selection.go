@@ -14,7 +14,7 @@ func TimeDistributedEvidence(input []Evidence, limit int) ([]Evidence, bool) {
 	byID := map[string]Evidence{}
 	for _, item := range input {
 		old, found := byID[item.SourceID]
-		if !found || item.Layer > old.Layer || item.Layer == old.Layer && item.CapturedAt.After(old.CapturedAt) {
+		if !found || layerPriority(item.Layer) > layerPriority(old.Layer) || item.Layer == old.Layer && item.CapturedAt.After(old.CapturedAt) {
 			byID[item.SourceID] = item
 		}
 	}
@@ -81,7 +81,7 @@ func DayBalancedEvidence(input []Evidence, limit int, zone *time.Location) ([]Ev
 	byID := map[string]Evidence{}
 	for _, item := range input {
 		old, found := byID[item.SourceID]
-		if !found || item.Layer > old.Layer || item.Layer == old.Layer && item.CapturedAt.After(old.CapturedAt) {
+		if !found || layerPriority(item.Layer) > layerPriority(old.Layer) || item.Layer == old.Layer && item.CapturedAt.After(old.CapturedAt) {
 			byID[item.SourceID] = item
 		}
 	}
@@ -173,7 +173,7 @@ func spreadOrder(n int) []int {
 func chronologicalOrder(evidence []Evidence) []Evidence {
 	var leading, rest []Evidence
 	for _, item := range evidence {
-		if item.Layer >= LayerDay {
+		if item.Layer >= LayerDay && item.Layer != LayerCompaction {
 			leading = append(leading, item)
 		} else {
 			rest = append(rest, item)

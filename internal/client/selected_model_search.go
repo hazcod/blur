@@ -364,6 +364,13 @@ func (c *Client) selectedModelPage(ctx context.Context, question string, exact s
 }
 
 func (c *Client) selectedModelPageUsingQueries(ctx context.Context, question string, exact search.ExactPage, scope semantic.Query, limit int, rewritten []string, minimum ...float32) (search.ExactPage, error) {
+	// The exact index requires every normalized query term to be present. A
+	// long, specific natural-language question that already has an all-term
+	// match is strong evidence on its own; spending two model round trips to
+	// paraphrase and re-rank it leaves no budget for the actual answer.
+	if len(rewritten) == 0 && len(exact.Hits) > 0 && preciseExactRecallQuestion(question) {
+		return exact, nil
+	}
 	exact.CoverageLimited = true // Reformulations and excerpts cannot prove complete coverage.
 	if len(exact.Hits) == 0 && len(rewritten) == 0 && assistant.IsGroundedFollowUp(question) {
 		// A context-dependent rewrite request cannot identify saved evidence on
@@ -535,6 +542,15 @@ func (c *Client) selectedModelPageUsingQueries(ctx context.Context, question str
 	return fuseSearchPages(exact, hits, limit, threshold), nil
 }
 
+func preciseExactRecallQuestion(question string) bool {
+	topic, err := assistant.QuestionSearchQuery(question)
+	if err != nil {
+		return false
+	}
+	terms, err := search.NormalizeTokens(topic, search.MaxTerms)
+	return err == nil && len(terms) >= 4
+}
+
 // mergeRecentRecallCandidates reserves part of the bounded relevance prompt
 // for the newest matching-window sources. Exact ranking can otherwise crowd
 // out a just-captured Slack message with older passages that happen to repeat
@@ -614,6 +630,9 @@ func (c *Client) selectedRecentRecallCandidates(ctx context.Context, scope seman
 	if start.IsZero() {
 		start = end.AddDate(0, 0, -planWindowDays)
 	}
+	if end.Sub(start) > storage.MaxObservationWindow {
+		return c.browseSearchScope(ctx, assistant.Plan{Scope: assistant.Scope{Start: start, End: end}, AppIDs: scope.AppIDs, Domains: scope.Domains}, recallCandidates)
+	}
 	if !end.After(start) || end.Sub(start) > storage.MaxObservationWindow {
 		return search.ExactPage{}, nil
 	}
@@ -658,6 +677,10 @@ func (c *Client) selectedRecallCandidatesFromQueries(ctx context.Context, scope 
 	if err != nil {
 		return search.ExactPage{}, err
 	}
+	windows, err := c.recallSearchWindows(ctx, scope)
+	if err != nil {
+		return search.ExactPage{}, err
+	}
 	queries := make([][]string, 0, len(rewritten))
 	seenQueries := map[string]bool{}
 	for _, query := range rewritten {
@@ -680,12 +703,13 @@ func (c *Client) selectedRecallCandidatesFromQueries(ctx context.Context, scope 
 	lexicalLimit := max(1, recallCandidates/2)
 	for _, terms := range queries {
 		for _, filter := range filters {
-			page, err := c.data.SearchExact(ctx, search.ExactQuery{Terms: terms, AppID: filter.app, Domain: filter.domain, ExcludeAppIDs: []string{appidentity.BundleID}, CapturedStart: scope.Start, CapturedEnd: scope.End, ScopeSourceIDs: scope.ScopeSourceIDs, TopK: recallCandidates, MaxRows: recallCandidates * 16, MaxBytes: search.MaxIndexBytes})
+			page, err := c.searchExactWindows(ctx, search.ExactQuery{Terms: terms, AppID: filter.app, Domain: filter.domain, ExcludeAppIDs: []string{appidentity.BundleID}, TopK: recallCandidates, MaxRows: recallCandidates * 16, MaxBytes: search.MaxIndexBytes}, windows)
 			if err != nil {
 				return search.ExactPage{}, err
 			}
 			result.IndexingPending = result.IndexingPending || page.IndexingPending
 			result.HasMore = result.HasMore || page.HasMore
+			result.CoverageLimited = result.CoverageLimited || page.CoverageLimited
 			for _, hit := range page.Hits {
 				if !seen[hit.SourceID] && len(result.Hits) < lexicalLimit {
 					seen[hit.SourceID] = true
@@ -694,6 +718,13 @@ func (c *Client) selectedRecallCandidatesFromQueries(ctx context.Context, scope 
 				}
 			}
 		}
+	}
+	if scope.End.Sub(scope.Start) > storage.MaxObservationWindow {
+		recent, err := c.selectedRecentRecallCandidates(ctx, scope)
+		if err != nil {
+			return search.ExactPage{}, err
+		}
+		return mergeRecentRecallCandidates(result, recent), nil
 	}
 	if len(result.Hits) > 0 {
 		// Keep recent captures in the candidate set even when a reformulated

@@ -42,7 +42,7 @@ func TestUnixServerAcceptsAuthenticatedBoundedFrameAndStopsCleanly(t *testing.T)
 	if err != nil || info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("socket not private: %v %v", info, err)
 	}
-	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test","text":"body text that is comfortably long enough to keep","active":true,"privacy_known":true,"private":false,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
+	payload := []byte(`{"browser":"com.apple.safari","url":"https://example.test","text":"body text that is comfortably long enough to keep","active":true,"privacy_known":true,"private":false,"complete":true,"captured_at":"` + now.Format(time.RFC3339Nano) + `"}`)
 	digest := sha256.Sum256(payload)
 	proof, _ := localapi.NewProof(grant, localapi.ScopeCaptureIngest, digest, now, nil)
 	frame, _ := json.Marshal(struct {
@@ -70,6 +70,13 @@ func TestUnixServerAcceptsAuthenticatedBoundedFrameAndStopsCleanly(t *testing.T)
 	}
 	if err := client.Send(ctx, frame); err != nil {
 		t.Fatal(err)
+	}
+	reply, err := client.Receive(ctx)
+	var ack struct {
+		OK bool `json:"ok"`
+	}
+	if err != nil || json.Unmarshal(reply, &ack) != nil || !ack.OK {
+		t.Fatalf("committed frame was not acknowledged: %s %v", reply, err)
 	}
 	_ = client.Close()
 	deadline := time.Now().Add(time.Second)

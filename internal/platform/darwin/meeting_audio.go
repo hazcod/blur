@@ -408,7 +408,9 @@ func decodeMeetingAudioBatch(data []byte, id string) ([]MeetingAudioEvent, error
 				return nil, ErrMeetingAudioInvalid
 			}
 		case "transcript", "preview":
-			if event.Epoch == 0 || event.Level != nil || event.State != "" || event.Error != "" || event.Availability != nil || (event.Track != "microphone" && event.Track != "system") || !meetingAudioID(event.SegmentID) || event.Revision == 0 || event.StartMS == nil || event.EndMS == nil || *event.StartMS < 0 || *event.EndMS < *event.StartMS || *event.EndMS > 86400000 || event.Final == nil || strings.TrimSpace(event.Text) == "" || len(event.Text) > 16384 {
+			// Offsets become time.Duration nanoseconds in the meeting engine.
+			// Bound that conversion, rather than imposing a session lifetime cap.
+			if event.Epoch == 0 || event.Level != nil || event.State != "" || event.Error != "" || event.Availability != nil || (event.Track != "microphone" && event.Track != "system") || !meetingAudioID(event.SegmentID) || event.Revision == 0 || event.StartMS == nil || event.EndMS == nil || *event.StartMS < 0 || *event.EndMS < *event.StartMS || *event.EndMS > math.MaxInt64/int64(time.Millisecond) || event.Final == nil || strings.TrimSpace(event.Text) == "" || len(event.Text) > 16384 {
 				return nil, ErrMeetingAudioInvalid
 			}
 			if *event.Final != (event.Kind == "transcript") {

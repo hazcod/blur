@@ -88,7 +88,12 @@ func TestHandleMCPReadRejectsMalformedRollupLevelAndPeriod(t *testing.T) {
 	client := NewClient(&testData{})
 	client.chronicles = rollupLookupChronicles{}
 	for _, raw := range []string{
-		`{"level":"month","period":"2026-11"}`,
+		`{"level":"quarter","period":"2026-11"}`,
+		`{"level":"month","period":"2026-13"}`,
+		`{"level":"month","period":"2026-1"}`,
+		`{"level":"month","period":"2026-11-10"}`,
+		`{"level":"year","period":"2026-11"}`,
+		`{"level":"year","period":"0000"}`,
 		`{"level":"day"}`,
 		`{"level":"day","period":"2026-13-01"}`,
 		`{"level":"day","period":"2026-02-30"}`,

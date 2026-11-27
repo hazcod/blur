@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/capture"
+	"github.com/hazcod/blur/internal/search"
 	"github.com/hazcod/blur/internal/storage"
 	"github.com/hazcod/blur/internal/storage/physical/bolt"
 )
@@ -43,13 +44,17 @@ type captureEditionRecord struct {
 	Owner, Prev, Next, FamilyPrev, FamilyNext string
 	Publication                               string
 	LastSeen, Visits                          int64
-	IndexVersion                              int    `json:",omitempty"`
-	IndexPart                                 int64  `json:",omitempty"`
-	IndexVisits                               int64  `json:",omitempty"`
-	IndexQueued                               bool   `json:",omitempty"`
-	IndexPrev                                 string `json:",omitempty"`
-	IndexNext                                 string `json:",omitempty"`
-	TimelineVersion                           int    `json:",omitempty"`
+	IndexVersion                              int                        `json:",omitempty"`
+	IndexFormat                               int                        `json:",omitempty"`
+	IndexPart                                 int64                      `json:",omitempty"`
+	IndexVisits                               int64                      `json:",omitempty"`
+	IndexQueued                               bool                       `json:",omitempty"`
+	IndexPrev                                 string                     `json:",omitempty"`
+	IndexNext                                 string                     `json:",omitempty"`
+	TimelineVersion                           int                        `json:",omitempty"`
+	IndexStream                               *search.CaptureTokenStream `json:",omitempty"`
+	IndexRangeWork                            *captureRangeWork          `json:",omitempty"`
+	IndexRangeQueued                          int                        `json:",omitempty"`
 }
 type captureReceipt struct {
 	Version             int

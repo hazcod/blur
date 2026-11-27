@@ -54,6 +54,12 @@ func (s *Store) captureQuerySource(reader bolt.Reader, id string, sourceBytes in
 		return edition, summary, false, nil
 	}
 	expected := mapping.Bytes + len(summary.Header().AppID()) + len(summary.Header().Domain())
+	if mapping.Range {
+		expected = 0
+		if mapping.Bytes > capture.MaxObservationTextBytes {
+			return edition, summary, false, search.ErrIndexBudget
+		}
+	}
 	if expected != sourceBytes {
 		return edition, summary, false, ErrCorrupt
 	}

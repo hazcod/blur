@@ -12,9 +12,9 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 ## Local macOS builds
 
 - The active macOS implementation is integrated into `main`. Build from the
-  root checkout; no linked worktree is required. The source uses schema-7
-  memory. Preserve existing memory and never replace the app with an older
-  storage reader.
+  root checkout; no linked worktree is required. The source uses schema-9
+  memory with atomic in-place migration of existing schema-7/8 memory. Preserve
+  existing memory and never replace the app with an older storage reader.
 
 - Build the user's app with `make macos-app-stable`, including from worktrees.
 - Always replace `~/Downloads/Blur.app`, using `com.hazcod.blur` and its existing

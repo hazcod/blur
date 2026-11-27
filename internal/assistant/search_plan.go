@@ -100,6 +100,9 @@ func searchGrammar(question string) (string, []string, error) {
 func searchScopeWords(grammar string, words []word) []word {
 	var result []word
 	for _, w := range words {
+		if strings.TrimSpace(grammar[w.start:w.end]) == "" {
+			continue
+		}
 		start, end := w.start, w.end
 		for start > 0 && grammar[start-1] > ' ' {
 			start--

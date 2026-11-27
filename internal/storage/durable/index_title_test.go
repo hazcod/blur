@@ -129,7 +129,7 @@ func TestDurableIndexTitleSurvivesReopen(t *testing.T) {
 // A store whose index was built before titles and folding existed carries the
 // previous format marker. Opening it must return promptly with the work queued
 // (pending), and the background indexer must then make titles and folded
-// tokens searchable, with no data lost and schema 7 untouched.
+// tokens searchable, with no data lost or additional schema transition.
 func TestDurableIndexFormatBumpRebuildsThroughPendingBackfill(t *testing.T) {
 	path := t.TempDir() + "/previous-format.db"
 	key := durableTestKey(t, 0x64)
@@ -159,6 +159,7 @@ func TestDurableIndexFormatBumpRebuildsThroughPendingBackfill(t *testing.T) {
 		t.Fatal(err)
 	}
 	clear(previous)
+	schemaBefore := store.state.schemaVer
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -168,8 +169,9 @@ func TestDurableIndexFormatBumpRebuildsThroughPendingBackfill(t *testing.T) {
 		t.Fatalf("a store written at the previous index format must open: %v", err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
-	if store.state.schemaVer != OpenSchemaVersion || OpenSchemaVersion != 7 {
-		t.Fatalf("schema = %d (open %d), must stay 7", store.state.schemaVer, OpenSchemaVersion)
+	// Rebuilding the index preserves the current authenticated reader floor.
+	if store.state.schemaVer != schemaBefore || schemaBefore != OpenSchemaVersion {
+		t.Fatalf("index rebuild changed schema: before=%d after=%d current=%d", schemaBefore, store.state.schemaVer, OpenSchemaVersion)
 	}
 	if pending, err := store.ExactIndexPending(ctx); err != nil || !pending {
 		t.Fatalf("after open the rebuild must be pending: pending=%t err=%v", pending, err)
@@ -217,7 +219,7 @@ func TestDurableIndexFormatBumpRebuildsThroughPendingBackfill(t *testing.T) {
 }
 
 // A store whose capture-part index was marked at the previous content version
-// keeps opening (the capture-part index is not rebuilt by this bump).
+// keeps opening while bounded background migration updates derived tokens.
 func TestCapturePartIndexMarkerFromPreviousFormatStillOpens(t *testing.T) {
 	path := t.TempDir() + "/capture-part-marker.db"
 	key := durableTestKey(t, 0x65)

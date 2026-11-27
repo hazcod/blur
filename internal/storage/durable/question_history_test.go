@@ -252,6 +252,7 @@ func TestStoresWithoutQuestionHistoryOpenUnchanged(t *testing.T) {
 	ctx := context.Background()
 	s, path := openQuestionStore(t)
 	putQuestionSource(t, s, "A store that never recorded a question.", time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC))
+	schemaBefore := s.state.schemaVer
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +265,8 @@ func TestStoresWithoutQuestionHistoryOpenUnchanged(t *testing.T) {
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("rows=%d err=%v", len(rows), err)
 	}
-	if OpenSchemaVersion != 7 {
-		t.Fatalf("schema = %d, want 7", OpenSchemaVersion)
+	// Absence of question history preserves the authenticated reader floor.
+	if reopened.state.schemaVer != schemaBefore || schemaBefore != OpenSchemaVersion {
+		t.Fatalf("question history changed schema: before=%d after=%d current=%d", schemaBefore, reopened.state.schemaVer, OpenSchemaVersion)
 	}
 }

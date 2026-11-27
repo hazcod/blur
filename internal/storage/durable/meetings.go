@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,7 +30,6 @@ const (
 	meetingListNS        = "meeting-list-v1"
 	meetingMetaNS        = "meeting-meta-v1"
 	meetingAppID         = "sh.blur.meetings"
-	maxLiveMeetings      = 4096
 	meetingScanRows      = 256
 	meetingMetadataBytes = 4096
 )
@@ -48,6 +49,8 @@ type meetingRecord struct {
 }
 
 var _ meetings.Repository = (*Store)(nil)
+var _ meetings.RecordLookup = (*Store)(nil)
+var _ meetings.AgendaTailReader = (*Store)(nil)
 
 func (s *Store) Capabilities() meetings.SinkCapabilities {
 	if s == nil || s.state == nil {
@@ -116,8 +119,8 @@ func (s *Store) meetingHeaderReader(r bolt.Reader, id string) (meetingHeader, bo
 	if err != nil || !found {
 		return h, found, err
 	}
-	limits := meetings.DefaultLimits()
-	if decodeCanonicalJSON(raw, &h) != nil || h.Meeting.ID != id || h.Meeting.Validate() != nil || !validCaptureTime(h.Meeting.StartedAt) || !h.Meeting.EndedAt.IsZero() && !validCaptureTime(h.Meeting.EndedAt) || h.Order == 0 || h.Order >= 1<<48 || h.LastSequence >= 1<<48 || h.Finals < 0 || h.Finals > limits.MaxSegments || h.Notes < 0 || h.Notes > limits.MaxNotes || h.Meeting.RecordCount != uint64(h.Finals+h.Notes) || h.Meeting.RecordCount > h.LastSequence || h.TranscriptBytes < 0 || h.TranscriptBytes > limits.MaxTranscriptBytes || h.ManualBytes < 0 || h.ManualBytes > limits.MaxManualBytes {
+	maxInt := int(^uint(0) >> 1)
+	if decodeCanonicalJSON(raw, &h) != nil || h.Meeting.ID != id || h.Meeting.Validate() != nil || !validCaptureTime(h.Meeting.StartedAt) || !h.Meeting.EndedAt.IsZero() && !validCaptureTime(h.Meeting.EndedAt) || h.Order == 0 || h.Order >= 1<<48 || h.LastSequence >= 1<<48 || h.Finals < 0 || h.Notes < 0 || h.Finals > maxInt-h.Notes || h.Meeting.RecordCount != uint64(h.Finals+h.Notes) || h.Meeting.RecordCount > h.LastSequence || h.TranscriptBytes < 0 || h.ManualBytes < 0 {
 		return meetingHeader{}, false, ErrCorrupt
 	}
 	return h, true, nil
@@ -129,7 +132,7 @@ func (s *Store) meetingDirectoryReader(r bolt.Reader) (meetingDirectory, error) 
 	if err != nil || !found {
 		return d, err
 	}
-	if decodeCanonicalJSON(raw, &d) != nil || d.Last >= 1<<48 || d.Live > d.Last || d.Live > maxLiveMeetings {
+	if decodeCanonicalJSON(raw, &d) != nil || d.Last >= 1<<48 || d.Live > d.Last {
 		return d, ErrCorrupt
 	}
 	return d, nil
@@ -207,7 +210,7 @@ func (s *Store) PutMeeting(ctx context.Context, m meetings.Meeting, expected uin
 			if err != nil {
 				return err
 			}
-			if d.Live >= maxLiveMeetings || d.Last >= 1<<48-1 {
+			if d.Last >= 1<<48-1 {
 				return meetings.ErrLimit
 			}
 			d.Last++
@@ -301,7 +304,7 @@ func validateMeetingRecord(h meetingHeader, r meetings.Record) (string, time.Tim
 		for _, id := range h.Meeting.Tracks {
 			track = track || id == e.TrackID
 		}
-		if e.Kind != meetings.Final || e.SessionID != r.SessionID || !track || !meetingID(e.SegmentID, 64) || e.Revision == 0 || e.Start < 0 || e.End < e.Start || e.End > l.MaxDuration || !meetingText(e.Text) || len(e.Text) > l.MaxEventBytes || r.Key != r.SessionID+"/transcript/"+e.TrackID+"/"+e.SegmentID || r.Note != (meetings.ManualNoteInput{}) {
+		if e.Kind != meetings.Final || e.SessionID != r.SessionID || !track || !meetingID(e.SegmentID, 64) || e.Revision == 0 || e.Start < 0 || e.End < e.Start || !meetingText(e.Text) || len(e.Text) > l.MaxEventBytes || r.Key != r.SessionID+"/transcript/"+e.TrackID+"/"+e.SegmentID || r.Note != (meetings.ManualNoteInput{}) {
 			return "", time.Time{}, meetings.ErrInvalid
 		}
 		return e.Text, end, nil
@@ -381,7 +384,8 @@ func (s *Store) Append(ctx context.Context, r meetings.Record) (meetings.Receipt
 			return meetings.ErrState
 		}
 		l := meetings.DefaultLimits()
-		if h.LastSequence >= 1<<48-1 || r.Kind == meetings.TranscriptFinal && (h.Finals >= l.MaxSegments || h.TranscriptBytes+len(text) > l.MaxTranscriptBytes) || r.Kind == meetings.UserNote && (h.Notes >= l.MaxNotes || h.ManualBytes+len(text) > l.MaxManualBytes) {
+		maxInt := int(^uint(0) >> 1)
+		if h.LastSequence >= 1<<48-1 || h.Finals >= maxInt-h.Notes {
 			tx.mu.Unlock()
 			return meetings.ErrLimit
 		}
@@ -397,7 +401,7 @@ func (s *Store) Append(ctx context.Context, r meetings.Record) (meetings.Receipt
 			return meetings.ErrInvalid
 		}
 		savedBytes := len(observation.Text())
-		if r.Kind == meetings.TranscriptFinal && h.TranscriptBytes+savedBytes > l.MaxTranscriptBytes || r.Kind == meetings.UserNote && h.ManualBytes+savedBytes > l.MaxManualBytes {
+		if r.Kind == meetings.TranscriptFinal && savedBytes > maxInt-h.TranscriptBytes || r.Kind == meetings.UserNote && savedBytes > maxInt-h.ManualBytes {
 			tx.mu.Unlock()
 			return meetings.ErrLimit
 		}
@@ -441,6 +445,199 @@ func (s *Store) Append(ctx context.Context, r meetings.Record) (meetings.Receipt
 	}
 	return receipt, nil
 }
+
+// LookupRecord resolves a stable key against the original payload and current
+// erasure fences. It never creates evidence. An existing unfinished exact-index
+// receipt is completed before returning the same searchable receipt as Append.
+func (s *Store) LookupRecord(ctx context.Context, r meetings.Record) (meetings.Receipt, bool, error) {
+	if ctx == nil || !meetingID(r.SessionID, 64) || len(r.Key) > 256 {
+		return meetings.Receipt{}, false, meetings.ErrInvalid
+	}
+	var receipt meetings.Receipt
+	var observation capture.SanitizedObservation
+	found, pending := false, false
+	err := s.view(ctx, func(reader bolt.Reader) error {
+		if fenced, err := s.meetingFenceReader(reader, meetingFenceNS, r.SessionID); err != nil {
+			return err
+		} else if fenced {
+			return meetings.ErrDeleted
+		}
+		h, live, err := s.meetingHeaderReader(reader, r.SessionID)
+		if err != nil || !live {
+			return err
+		}
+		if _, _, err := validateMeetingRecord(h, r); err != nil {
+			return err
+		}
+		key := s.meetingDigest("key", []byte(r.Key))
+		if fenced, err := s.meetingFenceReader(reader, meetingRowFenceNS, key); err != nil {
+			return err
+		} else if fenced {
+			return meetings.ErrDeleted
+		}
+		row, live, err := s.meetingRowReader(reader, key)
+		if err != nil || !live {
+			return err
+		}
+		encoded := mustJSON(r)
+		digest := s.meetingDigest("payload", encoded)
+		clear(encoded)
+		if row.Digest != digest {
+			return meetings.ErrConflict
+		}
+		metadata := r
+		metadata.Event.Text, metadata.Note.Text = "", ""
+		storedMetadata, expectedMetadata := mustJSON(row.Record), mustJSON(metadata)
+		matches := bytes.Equal(storedMetadata, expectedMetadata)
+		clear(storedMetadata)
+		clear(expectedMetadata)
+		if !matches || row.Sequence > h.LastSequence {
+			return ErrCorrupt
+		}
+		observation, live, err = s.getObservationReader(reader, row.SourceID)
+		if err != nil {
+			return err
+		}
+		if !live || observation.AppID() != meetingAppID || observation.Domain() != key+".meeting.local" || len(observation.Text()) != row.Bytes {
+			return ErrCorrupt
+		}
+		for _, link := range [][2]string{
+			{meetingSourceNS, row.SourceID},
+			{meetingOrderNS, meetingOrderID(r.SessionID, row.Sequence)},
+		} {
+			raw, linked, err := s.readIndexValueReader(reader, link[0], link[1], 64)
+			matches := string(raw) == key
+			clear(raw)
+			if err != nil {
+				return err
+			}
+			if !linked || !matches {
+				return ErrCorrupt
+			}
+		}
+		pendingKey := s.pendingSearchKey(row.SourceID)
+		defer clear(pendingKey)
+		pending, err = reader.Has(pendingKey)
+		if err != nil {
+			return mapStorePhysicalError(err)
+		}
+		receipt.SourceID, found = row.SourceID, true
+		return nil
+	})
+	if err != nil {
+		return meetings.Receipt{}, false, err
+	}
+	if found && pending {
+		if err := s.indexMeetingObservation(ctx, observation); err != nil {
+			if errors.Is(err, ErrSourceDeleted) {
+				return meetings.Receipt{}, false, meetings.ErrDeleted
+			}
+			return meetings.Receipt{}, false, err
+		}
+	}
+	return receipt, found, nil
+}
+
+// ReadyAgendaTail authenticates eligibility and reads a bounded display tail
+// from the same snapshot. Historical ordinal holes never expand startup work;
+// the last allocated ordinal remains the cursor for future append polling.
+func (s *Store) ReadyAgendaTail(ctx context.Context, id string, p meetings.PageRequest) (meetings.AgendaTail, error) {
+	p, err := p.Normalized()
+	if ctx == nil || err != nil || !meetingID(id, 64) || p.After != 0 {
+		return meetings.AgendaTail{}, meetings.ErrInvalid
+	}
+	limit, maxBytes := min(p.Limit, 20), min(p.MaxBytes, 128<<10)
+	var out meetings.AgendaTail
+	err = s.view(ctx, func(reader bolt.Reader) error {
+		if fenced, err := s.meetingFenceReader(reader, meetingFenceNS, id); err != nil {
+			return err
+		} else if fenced {
+			return meetings.ErrDeleted
+		}
+		h, found, err := s.meetingHeaderReader(reader, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return meetings.ErrNotFound
+		}
+		if h.Meeting.State != meetings.Ready || h.Finals != 0 || !h.Meeting.RecordingStartedAt.IsZero() || !h.Meeting.EndedAt.IsZero() {
+			return meetings.ErrState
+		}
+		out.Meeting, out.Cursor = h.Meeting, h.LastSequence
+		seq, used := h.LastSequence, 0
+		for scanned := 0; seq > 0 && scanned < meetingScanRows && len(out.Records) < limit; scanned++ {
+			raw, linked, err := s.readIndexValueReader(reader, meetingOrderNS, meetingOrderID(id, seq), 64)
+			key := string(raw)
+			clear(raw)
+			if err != nil {
+				return err
+			}
+			if linked {
+				if !validHash(key) {
+					return ErrCorrupt
+				}
+				row, live, err := s.meetingRowReader(reader, key)
+				if err != nil {
+					return err
+				}
+				if !live || row.Sequence != seq || row.Record.SessionID != id || row.Record.Kind != meetings.UserNote {
+					return ErrCorrupt
+				}
+				if fenced, err := s.meetingFenceReader(reader, meetingRowFenceNS, key); err != nil {
+					return err
+				} else if fenced {
+					return ErrCorrupt
+				}
+				o, live, err := s.getObservationReader(reader, row.SourceID)
+				if err != nil {
+					return err
+				}
+				if !live || o.AppID() != meetingAppID || o.Domain() != key+".meeting.local" || row.Bytes != len(o.Text()) {
+					return ErrCorrupt
+				}
+				reverse, live, err := s.readIndexValueReader(reader, meetingSourceNS, row.SourceID, 64)
+				matches := string(reverse) == key
+				clear(reverse)
+				if err != nil {
+					return err
+				}
+				if !live || !matches {
+					return ErrCorrupt
+				}
+				r := row.Record
+				r.Note.Text = o.Text()
+				if _, _, err := validateMeetingRecord(h, r); err != nil {
+					return ErrCorrupt
+				}
+				stored := meetings.StoredRecord{Sequence: seq, Record: r, SourceID: row.SourceID}
+				encoded := mustJSON(stored)
+				size := len(encoded)
+				clear(encoded)
+				if size > maxBytes-used {
+					if len(out.Records) == 0 {
+						return meetings.ErrLimit
+					}
+					break
+				}
+				used += size
+				out.Records = append(out.Records, stored)
+			}
+			seq--
+		}
+		out.Older = uint64(len(out.Records)) < h.Meeting.RecordCount
+		if seq == 0 && out.Older {
+			return ErrCorrupt
+		}
+		slices.Reverse(out.Records)
+		return nil
+	})
+	if err != nil {
+		return meetings.AgendaTail{}, err
+	}
+	return out, nil
+}
+
 func (s *Store) MeetingRecords(ctx context.Context, id string, p meetings.PageRequest) (meetings.RecordPage, error) {
 	p, err := p.Normalized()
 	if ctx == nil || err != nil || !meetingID(id, 64) {

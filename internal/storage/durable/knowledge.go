@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"sort"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/hazcod/blur/internal/knowledge"
@@ -645,7 +646,11 @@ func (tx *Tx) deleteKnowledgeRecord(namespace, id string) error {
 	if err := tx.checkLocked(); err != nil {
 		return tx.failLocked(err)
 	}
-	return tx.deleteEntryLocked(key)
+	err := tx.deleteEntryLocked(key)
+	if err == nil && strings.HasPrefix(namespace, "meeting-") {
+		tx.voiceDirty = true
+	}
+	return err
 }
 func knowledgeNames(e knowledge.Entity) []string {
 	names := append([]string{e.Name}, e.Aliases...)

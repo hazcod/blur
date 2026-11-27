@@ -82,8 +82,11 @@ func (tx *Tx) indexCaptureTimelineLocked(id string, at time.Time) error {
 			return err
 		}
 	}
+	if int64(meta.count) == maxTimelineCounter {
+		return &storage.StoreError{Code: storage.Incomplete}
+	}
 	if len(rows) == observationTimelinePageSize {
-		if meta.pages == maxObservationTimelinePages {
+		if int64(meta.pages) == maxTimelineCounter {
 			return &storage.StoreError{Code: storage.Incomplete}
 		}
 		meta.pages++

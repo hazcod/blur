@@ -162,6 +162,7 @@ type Checkpoint struct {
 }
 
 type Repository interface {
+	ProgressRepository
 	EncryptedAtRest() bool
 	PutSemanticDocument(context.Context, Document) error
 	GetSemanticDocument(context.Context, string) (Document, bool, error)

@@ -61,6 +61,17 @@ func TestMatchPassageKeepsCombiningMarksInsideWords(t *testing.T) {
 	}
 }
 
+func TestMatchPassageFoldsLettersWithoutDecomposition(t *testing.T) {
+	long := strings.Repeat("unrelated filler. ", 400) + "Then Søren Krag reviewed the Strauß contract. " + strings.Repeat("more filler. ", 400)
+	start, end := MatchPassage(long, []string{"soren", "strauss"}, 128)
+	if start <= 0 || end <= start || end-start > 128 || !strings.Contains(long[start:end], "Søren Krag reviewed the Strauß") {
+		t.Fatal(start, end)
+	}
+	if start, end := MatchPassage("Søren", []string{"Søren"}, 64); start != 0 || end == 0 {
+		t.Fatal(start, end)
+	}
+}
+
 func FuzzMatchPassageOffsets(f *testing.F) {
 	f.Add("beginning 日本語 résumé tail", "résumé", 64)
 	f.Add("a a a alpha beta", "alpha", 8)

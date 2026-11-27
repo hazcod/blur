@@ -214,13 +214,13 @@ func TestFinishedVoiceRecapProcessingLimitNeverClaimsWholeNote(t *testing.T) {
 	c, _, _, meeting := summaryFixture(t, 51)
 	app := &meetingOperationTestApp{posted: make(chan func(), 128)}
 	d := &desktop{app: app, client: c, page: "Ask", tokens: themePalette(false)}
-	epoch, stable := c.BeginMemoryRead()
+	read, stable := c.beginVoicePublication()
 	if !stable {
 		t.Fatal("fixture memory unstable")
 	}
 	d.memoryUI.recap = voiceRecapViewState{id: meeting.ID, request: 1, loading: true, total: 51}
 	d.selectMemoryMeeting(meeting)
-	go d.runFinishedVoiceRecap(context.Background(), meeting.ID, epoch, 1, 0, 1)
+	go d.runFinishedVoiceRecap(context.Background(), meeting.ID, read, 1, 0, 1)
 	finishVoiceRecapWork(t, app, d)
 	u := &d.memoryUI.recap
 	_, _, text := memoryWidgetTree(t, d)

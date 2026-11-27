@@ -19,6 +19,13 @@ const maxRecapChroniclePages = 32 // the supported 31-day range holds at most 74
 // recapEvidenceWithDiagnosis also reports how many in-scope day or week
 // rollups are waiting to be regenerated.
 func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.Plan, start, end time.Time, segments []activity.Segment, diagnosis *assistant.Diagnosis) ([]assistant.Evidence, bool, error) {
+	if end.Sub(start) > storage.MaxObservationWindow {
+		return c.longRecapEvidence(ctx, plan, start, end, diagnosis)
+	}
+	return c.recapEvidenceWindow(ctx, plan, start, end, segments, diagnosis, assistant.MaxEvidenceSources)
+}
+
+func (c *Client) recapEvidenceWindow(ctx context.Context, plan assistant.Plan, start, end time.Time, segments []activity.Segment, diagnosis *assistant.Diagnosis, rawLimit int) ([]assistant.Evidence, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -67,7 +74,7 @@ func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.
 				// time-distributed selection and falsely labels the recap as that
 				// raw capture. Bind the citation to this exact recap instead.
 				id := syntheticID("chronicle", row.HourID, row.Start.UTC().Format(time.RFC3339Nano), row.End.UTC().Format(time.RFC3339Nano), row.Text)
-				candidates = append(candidates, assistant.Evidence{SourceID: id, Text: row.Text, Layer: assistant.LayerHour, CapturedAt: row.Start, EndAt: row.End})
+				candidates = append(candidates, assistant.Evidence{SourceID: id, Text: row.Text, Layer: assistant.LayerHour, CapturedAt: row.Start, EndAt: row.End, SourceIDs: append([]string(nil), row.SourceIDs...), CoverageLimited: hourRecapCoverageLimited(row)})
 			}
 			if next == "" {
 				break
@@ -81,10 +88,13 @@ func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.
 
 	var raw []assistant.Evidence
 	sampled := false
+	for _, row := range rollups {
+		sampled = sampled || row.CoverageLimited
+	}
 	seenRaw := map[string]bool{}
-	for bin := 0; bin < assistant.MaxEvidenceSources; bin++ {
-		from := start.Add(end.Sub(start) * time.Duration(bin) / assistant.MaxEvidenceSources)
-		to := start.Add(end.Sub(start) * time.Duration(bin+1) / assistant.MaxEvidenceSources)
+	for bin := 0; bin < rawLimit; bin++ {
+		from := start.Add(end.Sub(start) * time.Duration(bin) / time.Duration(rawLimit))
+		to := start.Add(end.Sub(start) * time.Duration(bin+1) / time.Duration(rawLimit))
 		if !to.After(from) {
 			continue
 		}
@@ -102,18 +112,22 @@ func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.
 	}
 	// Sparse periods should not waste the remaining source slots. Preserve the
 	// distributed picks and only fill unused slots from recent evidence.
-	if len(raw) < assistant.MaxEvidenceSources {
-		items, more, err := c.recentPlanEvidenceWithCoverage(ctx, plan, start, end, segments, assistant.MaxEvidenceSources)
+	if len(raw) < rawLimit {
+		items, more, err := c.recentPlanEvidenceWithCoverage(ctx, plan, start, end, segments, rawLimit)
 		if err != nil {
 			return nil, false, err
 		}
 		sampled = sampled || more
 		for _, item := range items {
-			if !seenRaw[item.SourceID] && len(raw) < assistant.MaxEvidenceSources {
+			if !seenRaw[item.SourceID] && len(raw) < rawLimit {
 				raw = append(raw, item)
 				seenRaw[item.SourceID] = true
 			}
 		}
+	}
+	raw, err = c.compactRecapSources(ctx, raw)
+	if err != nil {
+		return nil, false, err
 	}
 	candidates = append(candidates, raw...)
 	// Sign-in screens are chrome; hour recaps and other captures in the same
@@ -122,21 +136,9 @@ func (c *Client) recapEvidenceWithDiagnosis(ctx context.Context, plan assistant.
 	var leading []assistant.Evidence
 	rollupLimited := false
 	if len(rollups) > 0 {
-		var weeks, days []assistant.Evidence
-		for _, item := range rollups {
-			if item.Layer == assistant.LayerWeek {
-				weeks = append(weeks, item)
-			} else {
-				days = append(days, item)
-			}
-		}
-		var weekLimited, dayLimited bool
-		leading, weekLimited = assistant.TimeDistributedEvidence(weeks, maxRollupRecapItems)
-		var chosen []assistant.Evidence
-		chosen, dayLimited = assistant.TimeDistributedEvidence(days, maxRollupRecapItems-len(leading))
-		leading = append(leading, chosen...)
-		rollupLimited = weekLimited || dayLimited
+		leading, rollupLimited = selectRecapSummaries(rollups)
 	}
+
 	var selected []assistant.Evidence
 	var limited bool
 	if end.Sub(start) > 24*time.Hour {

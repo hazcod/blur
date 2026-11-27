@@ -22,6 +22,9 @@ type sourceErasure struct {
 	Part        int64  `json:"part,omitempty"`
 	PartPhase   int    `json:"part_phase,omitempty"`
 	PartAfter   string `json:"part_after,omitempty"`
+	RangeID     string `json:"range_id,omitempty"`
+	RangePhase  int    `json:"range_phase,omitempty"`
+	RangeAfter  string `json:"range_after,omitempty"`
 	VisitPage   int64  `json:"visit_page,omitempty"`
 	VisitRow    int64  `json:"visit_row,omitempty"`
 	StageAfter  string `json:"stage_after,omitempty"`
@@ -71,7 +74,7 @@ func (s *Store) DeleteSourceRecordBeforeWithPrepare(ctx context.Context, sourceI
 	if !validCaptureTime(cutoff) {
 		return false, &storage.StoreError{Code: storage.Invalid}
 	}
-	return s.deleteSourceStagedIf(ctx, sourceID, nil, func(reader bolt.Reader) (bool, error) {
+	return s.deleteSourceStagedPreparedIf(ctx, sourceID, nil, func(reader bolt.Reader) (bool, error) {
 		resolvedID, _, err := s.resolveCaptureSourceReader(reader, sourceID)
 		if err != nil {
 			return false, err
@@ -103,14 +106,15 @@ func (s *Store) DeleteSourceRecordBeforeWithPrepare(ctx context.Context, sourceI
 		// After checking captures, a missing primary cannot be a newer capture.
 		// Still cascade through
 		// authenticated legacy derivatives rather than leaving orphaned text.
-		if err := s.prepareSourceErasureReader(ctx, reader, sourceID, prepare); err != nil {
-			return false, err
-		}
 		return true, nil
-	})
+	}, prepare)
 }
 
 func (s *Store) deleteSourceStagedIf(ctx context.Context, sourceID string, afterStep func() error, admit func(bolt.Reader) (bool, error)) (bool, error) {
+	return s.deleteSourceStagedPreparedIf(ctx, sourceID, afterStep, admit, nil)
+}
+
+func (s *Store) deleteSourceStagedPreparedIf(ctx context.Context, sourceID string, afterStep func() error, admit func(bolt.Reader) (bool, error), prepare func(string, []tasks.Item) error) (bool, error) {
 	if ctx == nil || !validHash(sourceID) {
 		return false, &storage.StoreError{Code: storage.Invalid}
 	}
@@ -177,6 +181,11 @@ func (s *Store) deleteSourceStagedIf(ctx context.Context, sourceID string, after
 			if !allowed {
 				return false, nil
 			}
+		}
+		if err := s.prepareSourceErasureLocked(ctx, sourceID, prepare); err != nil {
+			return false, err
+		}
+		if admit != nil {
 			// Most conditional deletions (including absent-source replays) fit
 			// one transaction. Keep the gate and preparation decision, and use
 			// resumable stages only after a classified atomic budget failure.
@@ -417,6 +426,9 @@ func (tx *Tx) eraseSourceStep(journal *sourceErasure) (bool, error) {
 		journal.Part = 0
 		journal.PartPhase = 0
 		journal.PartAfter = ""
+		journal.RangeID = ""
+		journal.RangePhase = 0
+		journal.RangeAfter = ""
 		journal.VisitPage = 0
 		journal.StageAfter = ""
 	}
@@ -427,6 +439,11 @@ func (tx *Tx) eraseOneInferredSource(sourceID string) (bool, error) {
 	tx.mu.Lock()
 	progress, found, err := tx.store.readEnrichmentProgress(tx.writer, sourceID)
 	if err != nil {
+		tx.mu.Unlock()
+		return false, err
+	}
+	if found && progress.CompactionSlots > 0 {
+		err := tx.eraseOneSourceCompaction(&progress)
 		tx.mu.Unlock()
 		return false, err
 	}

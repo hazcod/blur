@@ -96,6 +96,56 @@ func TestLatestSecurityNewsIsATopicLookupWithoutFreshnessExactTerm(t *testing.T)
 	}
 }
 
+func TestRetrievalCommandsKeepMemoryIntentWithoutMatchingSources(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	for _, question := range []string{"Find voyagerpacket", "Search for voyagerpacket", "look up voyagerpacket", "Pull up voyagerpacket", "please find voyagerpacket", "Could you search for voyagerpacket?"} {
+		plan, err := PlanQuestion(question, now, nil)
+		if err != nil || plan.Kind != KindLookup || !plan.MatchOnly || strings.Join(plan.Terms, " ") != "voyagerpacket" {
+			t.Fatalf("search imperative lost memory intent: %q plan=%+v err=%v", question, plan, err)
+		}
+	}
+	for _, question := range []string{"Findings about voyagerpacket", "Explain how to find voyagerpacket", "What is TLS?", "Find a way to solve the equation", "Find out why the sky is blue", "Search the web for restaurants", "Search the internet for restaurants"} {
+		plan, err := PlanQuestion(question, now, nil)
+		if err != nil || plan.Kind != KindGeneral {
+			t.Fatalf("non-command became a memory search: %q plan=%+v err=%v", question, plan, err)
+		}
+	}
+}
+
+func TestStoredRecordLocationsKeepMemoryIntentWithoutMatchingSources(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	for _, question := range []string{
+		"Where is the record for voyagerpacket?",
+		"Where's that record of voyagerpacket?",
+		"Where are the records about voyagerpacket?",
+		"Where is our record on voyagerpacket?",
+	} {
+		plan, err := PlanQuestion(question, now, nil)
+		if err != nil || plan.Kind != KindLookup || !plan.MatchOnly || strings.Join(plan.Terms, " ") != "voyagerpacket" || !QuestionSeeksPersonalMemory(question) {
+			t.Fatalf("stored record location lost memory intent: %q plan=%+v err=%v", question, plan, err)
+		}
+	}
+	for _, question := range []string{"Where is the record player made?", "What is the world record for running?", "Where are records manufactured?", "Where is Paris?"} {
+		plan, err := PlanQuestion(question, now, nil)
+		if err != nil || plan.Kind != KindGeneral {
+			t.Fatalf("general location became a memory search: %q plan=%+v err=%v", question, plan, err)
+		}
+	}
+}
+
+func TestSearchStoredRecordLocationKeepsQuotedTopic(t *testing.T) {
+	for _, question := range []string{"Where are the records about voyagerpacket?", `Where are the records about "voyagerpacket"?`} {
+		plan, err := PlanSearch(question, time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC), nil)
+		if err != nil || !plan.MatchOnly || strings.Join(plan.Terms, " ") != "voyagerpacket" {
+			t.Fatalf("stored-record grammar narrowed the topic: %q plan=%+v err=%v", question, plan, err)
+		}
+	}
+	plan, err := PlanQuestion("Where are the records about", time.Now(), nil)
+	if err != nil || plan.Kind != KindGeneral {
+		t.Fatalf("incomplete record prefix became a personal lookup: %+v %v", plan, err)
+	}
+}
+
 func TestWholeDocumentRequestsAreExplicitAndKeepTopicTerms(t *testing.T) {
 	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
 	whole := []struct {

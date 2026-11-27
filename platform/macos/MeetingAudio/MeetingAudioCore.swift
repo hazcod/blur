@@ -2,6 +2,14 @@ import Foundation
 import CoreFoundation
 
 struct MeetingAudioFailure: Error { let code: String }
+// The ABI carries milliseconds; Go converts them to signed nanosecond durations.
+// This is a representation boundary, not a recording-session duration policy.
+let meetingAudioMaximumMilliseconds: Int64 = Int64.max / 1_000_000
+func meetingAudioTimestamp(_ milliseconds: Double) -> Int64? {
+    guard milliseconds.isFinite, milliseconds >= 0, milliseconds <= Double(meetingAudioMaximumMilliseconds),
+          let rounded = Int64(exactly: milliseconds.rounded()), rounded <= meetingAudioMaximumMilliseconds else { return nil }
+    return rounded
+}
 struct MeetingAudioConfiguration: Sendable {
     let kind: String
     let sessionID: String

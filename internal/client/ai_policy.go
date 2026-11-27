@@ -43,12 +43,7 @@ func (c *Client) configureAIPolicy(ctx context.Context, settings LocalAISettings
 	c.invalidateNoteProcessing()
 	// Do not use NotifyMemoryChanging: model consent is independent of the
 	// encrypted memory epoch, source caches, and their mutation notifications.
-	c.memoryChangeMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(c.activeAsks))
-	for _, cancel := range c.activeAsks {
-		cancels = append(cancels, cancel)
-	}
-	c.memoryChangeMu.Unlock()
+	cancels := c.askCancellations()
 	for _, cancel := range cancels {
 		cancel()
 	}

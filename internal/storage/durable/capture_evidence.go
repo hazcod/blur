@@ -60,6 +60,10 @@ func (s *Store) sourceEvidenceReader(reader bolt.Reader, id string) (capture.Evi
 	if edition.Publication != mapping.Publication {
 		return capture.Evidence{}, time.Time{}, false, nil
 	}
+	if mapping.Range {
+		evidence, err := s.captureRangeEvidenceReader(reader, mapping, edition, summary)
+		return evidence, summary.Header().CapturedAt(), err == nil, err
+	}
 	part, err := s.captureMemberPartReader(reader, edition, summary, mapping.Index)
 	if err != nil {
 		return capture.Evidence{}, time.Time{}, false, err

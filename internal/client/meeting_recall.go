@@ -15,6 +15,53 @@ import (
 
 const voiceRecallHorizon = 2 * time.Hour
 
+func recordedAnswerNeedsPublication(result assistant.Result) bool {
+	plan := result.Plan
+	if asksRecordedContent(plan) {
+		return true
+	}
+	if plan.ReferenceQuestion != "" {
+		plan.Question = plan.ReferenceQuestion
+		if asksRecordedContent(plan) {
+			return true
+		}
+	}
+	for _, source := range result.Sources {
+		if source.AppID == "sh.blur.meetings" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) recordedAnswerVoiceOnly(ctx context.Context, result assistant.Result) (bool, error) {
+	reader, ok := c.data.(meetingSourceReader)
+	kinds, knowsKind := c.data.(meetingRecordKindReader)
+	if !ok || !knowsKind {
+		return false, nil
+	}
+	for _, source := range result.Sources {
+		if source.AppID != "sh.blur.meetings" || !strings.HasSuffix(source.Domain, ".meeting.local") {
+			return false, nil
+		}
+		meeting, found, err := reader.MeetingForSource(ctx, source.SourceID)
+		if err != nil {
+			return false, err
+		}
+		if !found || meeting.Validate() != nil {
+			return false, nil
+		}
+		kind, live, err := kinds.MeetingRecordKindForSource(ctx, source.SourceID)
+		if err != nil {
+			return false, err
+		}
+		if !live || kind != meetings.TranscriptFinal && kind != meetings.UserNote {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func recordedSessionWord(word string) bool {
 	switch word {
 	case "meeting", "meetings", "call", "calls", "standup", "sync", "session", "sessions",
@@ -30,9 +77,11 @@ func voiceRecallTopics(plan assistant.Plan) map[string]bool {
 	for _, term := range plan.Terms {
 		switch term {
 		case "video", "videos", "youtube", "recording", "recordings", "transcript", "transcripts", "voice", "note", "notes",
+			"spraaknotitie", "spraaknotities", "voicenotitie", "voicenotities", "opname", "opnames",
 			"discuss", "discussed", "discussing", "talk", "talked", "talking", "say", "said", "saying", "content", "about",
 			"recap", "recapped", "recapping", "action", "item", "items", "key", "point", "points", "takeaway", "takeaways", "outcome", "outcomes",
 			"commitment", "commitments", "promise", "promises", "promised", "settle", "settled", "assigned", "assignment", "assignments", "owner", "owners",
+			"agree", "agreed", "decide", "decided", "decision", "decisions", "cover", "covered", "explain", "explained", "speaker", "presenter",
 			"watch", "watched", "watching", "listen", "listened", "listening":
 			continue
 		}
@@ -81,12 +130,30 @@ func asksRecordedContent(plan assistant.Plan) bool {
 			content = true
 		}
 	}
-	return media && content || strings.Contains(strings.ToLower(plan.Question), "voice note")
+	return media && content || savedVoiceNoteReference(plan.Question)
 }
 
-func asksAboutNamedSession(plan assistant.Plan) bool {
+func asksAboutSavedRecording(plan assistant.Plan) bool {
+	question := strings.ToLower(plan.Question)
+	if savedVoiceNoteReference(question) {
+		return true
+	}
 	for _, word := range strings.Fields(strings.ToLower(plan.Question)) {
-		if recordedSessionWord(strings.Trim(word, "!?.,:;()[]{}\"'")) {
+		word = strings.Trim(word, "!?.,:;()[]{}\"'")
+		if recordedSessionWord(word) || word == "recording" || word == "recordings" || word == "transcript" || word == "transcripts" {
+			return true
+		}
+	}
+	return false
+}
+
+func savedVoiceNoteReference(question string) bool {
+	if strings.Contains(strings.ToLower(question), "voice note") {
+		return true
+	}
+	for _, word := range strings.Fields(strings.ToLower(question)) {
+		switch strings.Trim(word, "!?.,:;()[]{}\"'") {
+		case "spraaknotitie", "spraaknotities", "voicenotitie", "voicenotities", "opname", "opnames":
 			return true
 		}
 	}
@@ -94,19 +161,37 @@ func asksAboutNamedSession(plan assistant.Plan) bool {
 }
 
 // A website filter describes captured browser pages, not the provenance of
-// separately recorded audio. For explicit video/recording recall, inspect a
-// bounded recent transcript page instead of treating browser chrome as speech.
-// The website association remains explicitly unverified in the model payload.
+// separately recorded audio. Explicit saved-source requests use the archive;
+// ambiguous video recall uses a bounded recent transcript page, with unverified
+// website association. Browser chrome never becomes spoken content.
 func (c *Client) recordedContentEvidence(ctx context.Context, plan assistant.Plan) ([]assistant.Evidence, bool, error) {
 	if !asksRecordedContent(plan) || !c.CanUseMeetings() {
 		return nil, false, nil
 	}
+	read, stable := c.beginVoicePublication()
+	if !stable || read.fence == nil && plan.Scope.End.Sub(plan.Scope.Start) > searchWindowSpan {
+		return nil, false, ErrMemoryChanging
+	}
+	evidence, limited, err := c.readRecordedContentEvidence(ctx, plan)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if !read.publish(c, func() {}) {
+		return nil, false, ErrMemoryChanging
+	}
+	return evidence, limited, nil
+}
+
+func (c *Client) readRecordedContentEvidence(ctx context.Context, plan assistant.Plan) ([]assistant.Evidence, bool, error) {
 	start, end := plan.Scope.Start, plan.Scope.End
 	now := c.askClock()
 	// An explicit meeting reference identifies saved meeting content. The short
 	// horizon is only a heuristic for associating a recording with nearby video
 	// activity when the user asks about a video without naming a meeting.
-	if start.IsZero() && !asksAboutNamedSession(plan) {
+	if start.IsZero() && !asksAboutSavedRecording(plan) {
 		start = now.Add(-voiceRecallHorizon)
 	}
 	if end.IsZero() || end.After(now) {
@@ -116,7 +201,7 @@ func (c *Client) recordedContentEvidence(ctx context.Context, plan assistant.Pla
 		return nil, false, nil
 	}
 	topics := voiceRecallTopics(plan)
-	if asksAboutNamedSession(plan) && len(topics) > 0 {
+	if asksAboutSavedRecording(plan) && (len(topics) > 0 || !plan.Scope.IsZero()) {
 		indexed, limited, err := c.indexedMeetingTopicEvidence(ctx, plan, topics, start, end)
 		if err != nil {
 			return nil, false, err
@@ -178,11 +263,14 @@ func (c *Client) recordedContentEvidence(ctx context.Context, plan assistant.Pla
 				if item.CapturedAt.Before(start) || !item.CapturedAt.Before(end) {
 					continue
 				}
+				if !technicalSubjectSupport(plan.TechnicalSubjects, item.Text, meeting.Title) {
+					continue
+				}
 				item.AppName = "Voice transcript (" + row.Record.Event.TrackID + ")"
 				// A named meeting directly identifies its transcript. Video recall
 				// still carries an uncertain association because the recording may
 				// not correspond to the visible video.
-				item.AssociationUnverified = !asksAboutNamedSession(plan)
+				item.AssociationUnverified = !asksAboutSavedRecording(plan)
 				matched = matched || voiceRecallTopicMatch(item.Text, topics)
 				if len(evidence) == assistant.MaxEvidenceItems {
 					copy(evidence, evidence[1:])
@@ -217,24 +305,45 @@ func (c *Client) indexedMeetingTopicEvidence(ctx context.Context, plan assistant
 		terms = append(terms, term)
 	}
 	sort.Strings(terms)
-	if len(terms) == 0 || c.data == nil {
+	if len(plan.TechnicalSubjects) > 0 {
+		terms = plan.LiteralTerms
+	}
+	if c.data == nil {
 		return nil, false, nil
 	}
-	if start.IsZero() {
-		// The index treats a half-open time range as a complete pair. An
-		// unconstrained meeting query should search the full encrypted index.
-		end = time.Time{}
+	var page search.ExactPage
+	var err error
+	if len(terms) == 0 {
+		// A dated archive request is a browse of saved voice sources, not the
+		// newest six sessions. Reuse the bounded shared source-window reader.
+		voicePlan := assistant.Plan{AppIDs: []string{"sh.blur.meetings"}, Scope: assistant.Scope{Start: start, End: end}}
+		page, err = c.browseSearchScope(ctx, voicePlan, planEvidenceItems)
+	} else {
+		windows := singleSearchWindow(searchScopeWindow{})
+		if !start.IsZero() {
+			windows, err = splitSearchWindows(start, end)
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		// Voice sources already have immutable recording times; no foreground
+		// activity membership scan is needed to query their source index.
+		pool := planEvidenceItems
+		if len(plan.TechnicalSubjects) > 0 {
+			pool = planLookupPool
+		}
+		page, err = c.searchExactWindows(ctx, search.ExactQuery{
+			Terms: terms, AppID: "sh.blur.meetings", TopK: pool,
+			MaxRows: min(search.MaxIndexRows, pool*16), MaxBytes: search.MaxIndexBytes,
+		}, windows)
+		if err == nil && !plan.Literal {
+			scope := semantic.Query{Limit: planEvidenceItems, AppIDs: []string{"sh.blur.meetings"}, Start: start, End: end}
+			if start.IsZero() {
+				scope.End = time.Time{}
+			}
+			page, err = c.hybridAskPage(ctx, plan.Question, page, scope, planEvidenceItems)
+		}
 	}
-	exact, err := c.data.SearchExact(ctx, search.ExactQuery{
-		Terms: terms, AppID: "sh.blur.meetings", CapturedStart: start, CapturedEnd: end,
-		TopK: planEvidenceItems, MaxRows: min(search.MaxIndexRows, planEvidenceItems*16), MaxBytes: search.MaxIndexBytes,
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	page, err := c.hybridAskPage(ctx, plan.Question, exact, semantic.Query{
-		Limit: planEvidenceItems, AppIDs: []string{"sh.blur.meetings"}, Start: start, End: end,
-	}, planEvidenceItems)
 	if err != nil {
 		return nil, false, err
 	}
@@ -244,7 +353,8 @@ func (c *Client) indexedMeetingTopicEvidence(ctx context.Context, plan assistant
 		return nil, false, err
 	}
 	reader, ok := c.data.(meetingSourceReader)
-	if !ok {
+	kinds, knowsKind := c.data.(meetingRecordKindReader)
+	if !ok || !knowsKind {
 		return nil, page.HasMore || page.CoverageLimited || page.IndexingPending, nil
 	}
 	evidence := make([]assistant.Evidence, 0, len(hits))
@@ -259,10 +369,27 @@ func (c *Client) indexedMeetingTopicEvidence(ctx context.Context, plan assistant
 		if !found || meeting.Validate() != nil {
 			continue
 		}
+		if !technicalSubjectSupport(plan.TechnicalSubjects, hit.Text, meeting.Title) {
+			continue
+		}
+		kind, live, err := kinds.MeetingRecordKindForSource(ctx, hit.SourceID)
+		if err != nil {
+			return nil, false, err
+		}
+		if !live {
+			continue
+		}
 		item := newEvidence(hit.SourceID, hit.AppID, hit.Domain, hit.Text)
-		item.AppName = "Meeting: " + meeting.Title
-		if strings.TrimSpace(meeting.Title) == "" {
-			item.AppName = "Voice note"
+		switch kind {
+		case meetings.TranscriptFinal:
+			item.AppName = "Meeting transcript"
+		case meetings.UserNote:
+			item.AppName = "Meeting manual note"
+		default:
+			continue
+		}
+		if strings.TrimSpace(meeting.Title) != "" {
+			item.AppName += ": " + meeting.Title
 		}
 		item.CapturedAt, item.TimeUnknown = hit.CapturedAt, hit.TimeUnknown
 		evidence = append(evidence, item)

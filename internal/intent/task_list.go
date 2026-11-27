@@ -29,6 +29,9 @@ func TaskListRequest(input string) (TaskListRead, bool) {
 		return TaskListRead{}, false
 	}
 	q = strings.TrimSpace(strings.TrimRight(q, "?!."))
+	if read, ok := dutchTaskListRequest(q); ok {
+		return read, true
+	}
 	for _, suffix := range []string{", please", " please"} {
 		q = strings.TrimSpace(strings.TrimSuffix(q, suffix))
 	}

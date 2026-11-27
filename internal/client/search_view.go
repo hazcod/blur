@@ -84,6 +84,14 @@ func searchStatusLine(hits, summaries int, relaxed, more bool) string {
 func summaryHeading(summary MemorySummaryHit) string {
 	start, end := summary.Start.In(time.Local), summary.End.In(time.Local)
 	switch summary.Level {
+	case "month":
+		period, err := time.Parse("2006-01", summary.Period)
+		if err == nil {
+			return "Month summary · " + period.Format("Jan 2006")
+		}
+		return "Month summary"
+	case "year":
+		return "Year summary · " + summary.Period
 	case "day":
 		return "Day summary · " + start.Format("2 Jan")
 	case "week":
@@ -169,6 +177,9 @@ func summaryRow(summary MemorySummaryHit, terms []string) ui.View {
 	}
 	if summary.Dirty {
 		rows = append(rows, wrapLabel("This recap is waiting to be refreshed.").Style(styleMeta))
+	}
+	if summary.CoverageLimited {
+		rows = append(rows, wrapLabel("Limited coverage: this recap may omit saved activity.").Style(styleMeta))
 	}
 	return ui.VBox(rows...).Spacing(6).CrossAlign(layout.CrossStretch)
 }

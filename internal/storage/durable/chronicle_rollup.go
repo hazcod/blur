@@ -65,6 +65,10 @@ func validRollupID(id string) bool {
 		return chronicle.ValidDayKey(id[len("day:"):])
 	case strings.HasPrefix(id, "week:"):
 		return chronicle.ValidWeekKey(id[len("week:"):])
+	case strings.HasPrefix(id, "month:"):
+		return chronicle.ValidMonthKey(id[len("month:"):])
+	case strings.HasPrefix(id, "year:"):
+		return chronicle.ValidYearKey(id[len("year:"):])
 	}
 	return false
 }
@@ -73,12 +77,12 @@ func rollupShard(id string) string {
 	if strings.HasPrefix(id, "day:") {
 		return id[:len("day:")+7] // day:YYYY-MM
 	}
-	week := id[len("week:"):]
-	return "week:" + week[:4]
+	level, key, _ := strings.Cut(id, ":")
+	return level + ":" + key[:4] // <=53weeks,12months or1year
 }
 
 func (s *Store) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup) error {
-	if ctx == nil || chronicle.ValidateRollup(rollup) != nil {
+	if ctx == nil || !validRollupID(rollup.ID) || chronicle.ValidateRollup(rollup) != nil {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
 	encoded, err := json.Marshal(rollup)
@@ -88,6 +92,22 @@ func (s *Store) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup)
 	}
 	defer clear(encoded)
 	return s.Update(ctx, func(tx *Tx) error {
+		if _, pending, err := s.chronicleErasureReader(tx.writer); err != nil {
+			return err
+		} else if pending {
+			return nil
+		}
+		_, zone := s.rollupLocation()
+		if rollup.Zone != zone {
+			return nil
+		}
+		epoch, err := s.rollupEpochReader(tx.writer)
+		if err != nil {
+			return err
+		}
+		if rollup.Epoch != epoch {
+			return nil
+		}
 		old, found, err := tx.readRollup(rollup.ID)
 		if err != nil {
 			return err
@@ -100,12 +120,17 @@ func (s *Store) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup)
 		if rollup.Revision != old.Revision {
 			return nil
 		}
+		if _, pending, err := s.rollupCleanupReader(tx.writer, rollup.ID); err != nil {
+			return err
+		} else if pending {
+			return nil
+		}
 		// A rollup may only cite sources that still exist at write time, so a
 		// source erased while it was being generated is never re-linked.
 		admission := &chronicleAdmissionReader{Reader: tx.writer}
 		defer admission.close()
 		for _, sourceID := range rollup.SourceIDs {
-			_, _, found, err := s.sourceEvidenceReader(admission, sourceID)
+			_, found, err := s.sourceAdmissionReader(admission, sourceID)
 			if err != nil {
 				return err
 			}
@@ -116,9 +141,13 @@ func (s *Store) PutChronicleRollup(ctx context.Context, rollup chronicle.Rollup)
 		admission.close()
 		if !found {
 			rollup.Revision = 0
-			return tx.writeRollup(rollup, nil)
+			if err := tx.writeRollup(rollup, nil); err != nil {
+				return err
+			}
+		} else if err := tx.writeRollup(rollup, &old); err != nil {
+			return err
 		}
-		return tx.writeRollup(rollup, &old)
+		return tx.markRollupAncestorsDirty(rollup.ID, rollup.Zone)
 	})
 }
 
@@ -129,6 +158,11 @@ func (s *Store) GetChronicleRollup(ctx context.Context, id string) (chronicle.Ro
 	var rollup chronicle.Rollup
 	var found bool
 	err := s.view(ctx, func(reader bolt.Reader) error {
+		if _, pending, err := s.chronicleErasureReader(reader); err != nil {
+			return err
+		} else if pending {
+			return nil
+		}
 		var err error
 		rollup, found, err = s.readRollupReader(reader, id)
 		return err
@@ -143,13 +177,18 @@ func (s *Store) GetChronicleRollup(ctx context.Context, id string) (chronicle.Ro
 // half-open range, in ascending ID order. after is the last ID of the previous
 // page; the returned cursor is empty on the last page.
 func (s *Store) ListChronicleRollups(ctx context.Context, level string, start, end time.Time, after string, limit int) ([]chronicle.Rollup, string, error) {
-	if ctx == nil || level != chronicle.RollupLevelDay && level != chronicle.RollupLevelWeek || start.IsZero() || end.IsZero() || !start.Before(end) || end.Sub(start) > maxRollupRange || limit < 1 || limit > 64 || after != "" && (!validRollupID(after) || !strings.HasPrefix(after, level+":")) {
+	if ctx == nil || !chronicle.ValidRollupLevel(level) || start.IsZero() || end.IsZero() || !start.Before(end) || end.Sub(start) > maxRollupRange || limit < 1 || limit > 64 || after != "" && (!validRollupID(after) || !strings.HasPrefix(after, level+":")) {
 		return nil, "", &storage.StoreError{Code: storage.Invalid}
 	}
 	start, end = start.UTC(), end.UTC()
 	var rows []chronicle.Rollup
 	var next string
 	err := s.view(ctx, func(reader bolt.Reader) error {
+		if _, pending, err := s.chronicleErasureReader(reader); err != nil {
+			return err
+		} else if pending {
+			return nil
+		}
 		shards, err := s.readRollupShardsReader(reader)
 		if err != nil {
 			return err
@@ -211,6 +250,13 @@ func rollupShardOverlaps(shard string, first, last time.Time) bool {
 		}
 		// An ISO week can start in the previous calendar year.
 		from, to = year.AddDate(0, 0, -7), year.AddDate(1, 0, 7)
+	case strings.HasPrefix(shard, "month:"), strings.HasPrefix(shard, "year:"):
+		_, key, _ := strings.Cut(shard, ":")
+		year, err := time.Parse("2006", key)
+		if err != nil {
+			return false
+		}
+		from, to = year, year.AddDate(1, 0, 0)
 	default:
 		return false
 	}
@@ -245,7 +291,12 @@ func (tx *Tx) readRollup(id string) (chronicle.Rollup, bool, error) {
 
 // writeRollup persists a rollup together with its shard and source links.
 func (tx *Tx) writeRollup(rollup chronicle.Rollup, old *chronicle.Rollup) error {
-	if chronicle.ValidateRollup(rollup) != nil {
+	epoch, err := tx.store.rollupEpochReader(tx.writer)
+	if err != nil {
+		return err
+	}
+	rollup.Epoch = epoch
+	if !validRollupID(rollup.ID) || chronicle.ValidateRollup(rollup) != nil {
 		return &storage.StoreError{Code: storage.Invalid}
 	}
 	encoded, err := json.Marshal(rollup)
@@ -258,13 +309,23 @@ func (tx *Tx) writeRollup(rollup chronicle.Rollup, old *chronicle.Rollup) error 
 	if old != nil {
 		prior = old.SourceIDs
 	}
-	if err := tx.syncRollupSources(rollup.ID, prior, rollup.SourceIDs); err != nil {
+	cleanup, pending, err := tx.store.rollupCleanupReader(tx.writer, rollup.ID)
+	if err != nil {
+		return err
+	}
+	if pending && old == nil {
+		return ErrCorrupt
+	}
+	if err := tx.syncRollupSources(rollup.ID, rollupSourcesWithCleanup(prior, cleanup.SourceIDs), rollupSourcesWithCleanup(rollup.SourceIDs, cleanup.SourceIDs)); err != nil {
 		return err
 	}
 	if old == nil {
 		if err := tx.addRollupShard(rollup.ID); err != nil {
 			return err
 		}
+	}
+	if err := tx.syncRollupWork(rollup.ID, rollup.Dirty); err != nil {
+		return err
 	}
 	return tx.PutIndexRecord(chronicleRollupNS, rollup.ID, encoded)
 }
@@ -273,7 +334,50 @@ func (tx *Tx) writeRollup(rollup chronicle.Rollup, old *chronicle.Rollup) error 
 // changed, creating a dirty placeholder when the day has no rollup yet.
 func (tx *Tx) markChronicleDayDirty(hourStart time.Time) error {
 	loc, zone := tx.store.rollupLocation()
-	id := chronicle.DayRollupID(chronicle.DayKeyAt(hourStart, loc))
+	seen := map[string]bool{}
+	for _, at := range []time.Time{hourStart, hourStart.Add(time.Hour - time.Nanosecond)} {
+		day := chronicle.DayRollupID(chronicle.DayKeyAt(at, loc))
+		ancestors, _ := chronicle.RollupAncestorIDs(day)
+		for _, id := range append([]string{day}, ancestors...) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			if err := tx.markRollupDirty(id, zone); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (tx *Tx) markRollupAncestorsDirty(id, zone string) error {
+	ancestors, ok := chronicle.RollupAncestorIDs(id)
+	if !ok {
+		return ErrCorrupt
+	}
+	for _, parent := range ancestors {
+		if err := tx.markRollupDirty(parent, zone); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tx *Tx) markRollupWeekDirty(date, zone string) error {
+	week, ok := chronicle.WeekKeyForDate(date)
+	if !ok {
+		return ErrCorrupt
+	}
+	return tx.markRollupDirty(chronicle.WeekRollupID(week), zone)
+}
+
+func (tx *Tx) markRollupDirty(id, zone string) error {
+	if _, pending, err := tx.store.chronicleErasureReader(tx.writer); err != nil {
+		return err
+	} else if pending {
+		return nil
+	}
 	rollup, found, err := tx.readRollup(id)
 	if err != nil {
 		return err
@@ -303,6 +407,11 @@ func (s *Store) MarkChronicleRollupDirty(ctx context.Context, id, zone string) e
 		return &storage.StoreError{Code: storage.Invalid}
 	}
 	return s.Update(ctx, func(tx *Tx) error {
+		if _, pending, err := s.chronicleErasureReader(tx.writer); err != nil {
+			return err
+		} else if pending {
+			return nil
+		}
 		rollup, found, err := tx.readRollup(id)
 		if err != nil {
 			return err
@@ -326,10 +435,10 @@ func (tx *Tx) invalidateRollupsCoveringHour(hourStart time.Time) error {
 	loc, _ := tx.store.rollupLocation()
 	var ids []string
 	add := func(date string) {
-		ids = append(ids, chronicle.DayRollupID(date))
-		if week, ok := chronicle.WeekKeyForDate(date); ok {
-			ids = append(ids, chronicle.WeekRollupID(week))
-		}
+		day := chronicle.DayRollupID(date)
+		parents, _ := chronicle.RollupAncestorIDs(day)
+		ids = append(ids, day)
+		ids = append(ids, parents...)
 	}
 	// A rollup is dated in its own zone, so look around the UTC date as well
 	// as at the current local date; coverage is checked against its bounds.
@@ -337,6 +446,7 @@ func (tx *Tx) invalidateRollupsCoveringHour(hourStart time.Time) error {
 		add(hourStart.UTC().AddDate(0, 0, offset).Format("2006-01-02"))
 	}
 	add(chronicle.DayKeyAt(hourStart, loc))
+	add(chronicle.DayKeyAt(hourStart.Add(time.Hour-time.Nanosecond), loc))
 	seen := map[string]bool{}
 	for _, id := range ids {
 		if seen[id] {
@@ -347,15 +457,10 @@ func (tx *Tx) invalidateRollupsCoveringHour(hourStart time.Time) error {
 		if err != nil {
 			return err
 		}
-		if !found || hourStart.Before(rollup.Start) || !hourStart.Before(rollup.End) {
+		if !found || !hourStart.Add(time.Hour).After(rollup.Start) || !hourStart.Before(rollup.End) {
 			continue
 		}
-		old := rollup
-		rollup.Text, rollup.InputHash, rollup.Model, rollup.GeneratedAt = "", "", "", time.Time{}
-		rollup.ChildIDs, rollup.SourceIDs = nil, nil
-		rollup.Dirty = true
-		rollup.Revision++
-		if err := tx.writeRollup(rollup, &old); err != nil {
+		if err := tx.stageRollupCleanup(&rollup, false); err != nil {
 			return err
 		}
 	}
@@ -499,20 +604,7 @@ func (tx *Tx) syncRollupSources(id string, prior, current []string) error {
 		if slices.Contains(current, source) {
 			continue
 		}
-		ids, found, err := tx.readRollupSources(source)
-		if err != nil {
-			return err
-		}
-		if !found {
-			continue
-		}
-		ids = removeString(ids, id)
-		if len(ids) == 0 {
-			err = tx.deleteKnowledgeRecord(chronicleRollupSourceNS, source)
-		} else {
-			err = tx.PutIndexRecord(chronicleRollupSourceNS, source, mustJSON(ids))
-		}
-		if err != nil {
+		if _, err := tx.unlinkRollupSource(source, id); err != nil {
 			return err
 		}
 	}
@@ -520,19 +612,7 @@ func (tx *Tx) syncRollupSources(id string, prior, current []string) error {
 		if slices.Contains(prior, source) {
 			continue
 		}
-		ids, _, err := tx.readRollupSources(source)
-		if err != nil {
-			return err
-		}
-		i := sort.SearchStrings(ids, id)
-		if i < len(ids) && ids[i] == id {
-			continue
-		}
-		if len(ids) >= maxRollupsPerSource {
-			return &storage.StoreError{Code: storage.Invalid}
-		}
-		ids = slices.Insert(ids, i, id)
-		if err := tx.PutIndexRecord(chronicleRollupSourceNS, source, mustJSON(ids)); err != nil {
+		if err := tx.appendRollupSourceYear(source, id); err != nil {
 			return err
 		}
 	}
@@ -544,77 +624,51 @@ func (tx *Tx) syncRollupSources(id string, prior, current []string) error {
 // the erased capture) and becomes dirty so it is regenerated from the hour
 // recaps that remain. A bounded number of rollups is handled per call.
 func (tx *Tx) removeRollupsForSourceBatch(source string) (bool, error) {
+	emptyVisits := 0
 	for range rollupSourceDropBatch {
-		ids, found, err := tx.readRollupSources(source)
+		id, done, err := tx.nextRollupSourceEdge(source, &emptyVisits)
 		if err != nil {
 			return false, err
 		}
-		if !found || len(ids) == 0 {
-			return true, nil
+		if done || id == "" {
+			return done, nil
 		}
-		id := ids[0]
 		rollup, exists, err := tx.readRollup(id)
 		if err != nil {
 			return false, err
 		}
-		if !exists || !slices.Contains(rollup.SourceIDs, source) {
+		cleanup, pending, err := tx.store.rollupCleanupReader(tx.writer, id)
+		if err != nil {
+			return false, err
+		}
+		if !exists || !slices.Contains(rollup.SourceIDs, source) && (!pending || !slices.Contains(cleanup.SourceIDs, source)) {
 			return false, ErrCorrupt
 		}
-		old := rollup
-		rollup.SourceIDs = removeString(slices.Clone(rollup.SourceIDs), source)
-		rollup.Text, rollup.InputHash, rollup.Model, rollup.GeneratedAt = "", "", "", time.Time{}
-		rollup.Dirty = true
-		if err := tx.writeRollup(rollup, &old); err != nil {
+		if err := tx.stageRollupCleanup(&rollup, false); err != nil {
+			return false, err
+		}
+		cleanup, _, err = tx.store.rollupCleanupReader(tx.writer, id)
+		if err != nil {
+			return false, err
+		}
+		removed, err := tx.unlinkRollupSource(source, id)
+		if err != nil {
+			return false, err
+		}
+		if !removed {
+			return false, ErrCorrupt
+		}
+		cleanup.SourceIDs = removeString(slices.Clone(cleanup.SourceIDs), source)
+		if err := tx.putRollupCleanup(id, cleanup, true); err != nil {
 			return false, err
 		}
 	}
-	_, found, err := tx.readRollupSources(source)
-	return !found, err
-}
-
-func (tx *Tx) deleteRollup(id string) error {
-	rollup, found, err := tx.readRollup(id)
-	if err != nil || !found {
-		return err
-	}
-	if err := tx.syncRollupSources(id, rollup.SourceIDs, nil); err != nil {
-		return err
-	}
-	if err := tx.removeRollupShardEntry(id); err != nil {
-		return err
-	}
-	return tx.deleteKnowledgeRecord(chronicleRollupNS, id)
+	_, done, err := tx.nextRollupSourceEdge(source, &emptyVisits)
+	return done, err
 }
 
 // DeleteAllChronicleRollups removes every day and week rollup. It is part of
 // deleting all recaps, since rollups are derived from them.
 func (s *Store) DeleteAllChronicleRollups(ctx context.Context) error {
-	if ctx == nil {
-		return &storage.StoreError{Code: storage.Invalid}
-	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		var ids []string
-		err := s.view(ctx, func(reader bolt.Reader) error {
-			shards, err := s.readRollupShardsReader(reader)
-			if err != nil || len(shards) == 0 {
-				return err
-			}
-			ids, err = s.readRollupShardReader(reader, shards[0])
-			return err
-		})
-		if err != nil {
-			return err
-		}
-		if len(ids) == 0 {
-			return nil
-		}
-		for _, id := range ids {
-			if err := s.Update(ctx, func(tx *Tx) error { return tx.deleteRollup(id) }); err != nil {
-				return err
-			}
-		}
-	}
+	return s.eraseChronicles(ctx, false)
 }

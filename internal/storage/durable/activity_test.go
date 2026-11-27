@@ -3,7 +3,6 @@ package durable
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hazcod/blur/internal/activity"
+	"github.com/hazcod/blur/internal/capture"
 	"github.com/hazcod/blur/internal/storage"
 )
 
@@ -69,7 +69,7 @@ func TestListActivitySegmentsForDateUsesStableBoundedPages(t *testing.T) {
 	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	for i := range 65 {
 		id := fmt.Sprintf("seg-%03d", i)
-		segment := activity.Segment{ID: id, WallStart: start.Add(time.Duration(i) * time.Minute), WallEnd: start.Add(time.Duration(i+1) * time.Minute), Duration: int64(time.Minute), AppID: "editor", SourceIDs: []string{fmt.Sprintf("%064x", i+1)}}
+		segment := activity.Segment{ID: id, WallStart: start.Add(time.Duration(i) * time.Minute), WallEnd: start.Add(time.Duration(i+1) * time.Minute), Duration: int64(time.Minute), AppID: "editor"}
 		if err := store.PutActivitySegment(ctx, segment); err != nil {
 			t.Fatal(err)
 		}
@@ -114,8 +114,15 @@ func TestDeleteObservationRecordRemovesLinkedActivitySegments(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
-	source := repeatHex("a")
 	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
+	observation, err := capture.SanitizeObservation("editor", "", "Source with repeated contiguous activity.", 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservationAt(ctx, observation, start); err != nil {
+		t.Fatal(err)
+	}
+	source := observation.ContentID()
 	segment := activity.Segment{ID: "activity-linked", WallStart: start, WallEnd: start.Add(time.Minute), Duration: int64(time.Minute), AppID: "editor", SourceIDs: []string{source}}
 	if err := store.PutActivitySegment(ctx, segment); err != nil {
 		t.Fatal(err)
@@ -131,7 +138,14 @@ func TestDeleteObservationRecordRemovesLinkedActivitySegments(t *testing.T) {
 	if err != nil || len(coalesced) != 1 || coalesced[0].ID != segment.ID || coalesced[0].Duration != int64(101*time.Minute) {
 		t.Fatalf("contiguous repeated-source activity was not coalesced: %#v err=%v", coalesced, err)
 	}
-	keptSource := repeatHex("d")
+	keptObservation, err := capture.SanitizeObservation("editor", "", "Separate source whose activity must remain.", 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObservationAt(ctx, keptObservation, start); err != nil {
+		t.Fatal(err)
+	}
+	keptSource := keptObservation.ContentID()
 	kept := activity.Segment{ID: "activity-kept", WallStart: start.Add(time.Minute), WallEnd: start.Add(2 * time.Minute), Duration: int64(time.Minute), AppID: "editor", SourceIDs: []string{keptSource}}
 	if err := store.PutActivitySegment(ctx, kept); err != nil {
 		t.Fatal(err)
@@ -198,9 +212,8 @@ func storeCode(err error, code storage.ErrorCode) bool {
 	return errors.As(err, &e) && e.Code == code
 }
 
-// A source cited by more than maxSegmentsPerSource non-adjacent segments must
-// not make writes fail: the extra segments persist without the source link.
-func TestActivitySourceSegmentCapPersistsExtraSegmentsWithoutSourceLink(t *testing.T) {
+// Non-adjacent visits retain every source link beyond the legacy index page.
+func TestActivitySourceSegmentsPreserveLinksBeyondLegacyPage(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenDurable(durableTestPath(t), durableTestKey(t, 0x63), CreateNew)
 	if err != nil {
@@ -208,7 +221,7 @@ func TestActivitySourceSegmentCapPersistsExtraSegmentsWithoutSourceLink(t *testi
 	}
 	defer func(close func() error) { _ = close() }(store.Close)
 	start := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
-	const total = maxSegmentsPerSource + 6
+	const total = legacyActivitySourceIDs + 6
 	for i := 0; i < total; i++ {
 		// Gaps prevent coalescing, as when the user alternates between contexts.
 		at := start.Add(time.Duration(2*i) * time.Minute)
@@ -238,26 +251,20 @@ func TestActivitySourceSegmentCapPersistsExtraSegmentsWithoutSourceLink(t *testi
 			linked++
 		}
 	}
-	if linked != maxSegmentsPerSource {
-		t.Fatalf("linked segments = %d, want %d", linked, maxSegmentsPerSource)
+	if linked != total {
+		t.Fatalf("linked segments = %d, want %d", linked, total)
 	}
-	for _, segment := range stored {
-		if segment.ID == fmt.Sprintf("segment-%03d", maxSegmentsPerSource) && len(segment.SourceIDs) != 0 {
-			t.Fatalf("segment past the cap kept source link %v", segment.SourceIDs)
-		}
-	}
-	var ids []string
 	if err := store.Update(ctx, func(tx *Tx) error {
-		encoded, found, err := tx.readIndexValue(activitySourceNamespace, "source-01", 8192)
-		if err != nil || !found {
-			return fmt.Errorf("source index found=%v err=%v", found, err)
+		list, err := tx.activitySourceList(activitySourceNamespace, "source-01")
+		if err != nil {
+			return err
 		}
-		return json.Unmarshal(encoded, &ids)
+		if list.Count != total {
+			return fmt.Errorf("source index has %d entries, want %d", list.Count, total)
+		}
+		return nil
 	}); err != nil {
 		t.Fatal(err)
-	}
-	if len(ids) != maxSegmentsPerSource {
-		t.Fatalf("source index has %d entries, want %d", len(ids), maxSegmentsPerSource)
 	}
 }
 

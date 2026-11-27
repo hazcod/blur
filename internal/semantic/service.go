@@ -598,8 +598,27 @@ func (s *Service) indexSource(ctx context.Context, index *Index, epoch uint64, i
 			return nil
 		}
 	}
+	// A complete publication may have committed just before an earlier pass
+	// lost its deadline while updating the in-memory graph.
+	saved, found, err := s.repository.GetSemanticDocument(ctx, source.SourceID())
+	if err != nil {
+		return err
+	}
+	if found {
+		if saved.Model.Key() == identity.Key() {
+			defer clearDocument(saved)
+			if !s.current(epoch) || !s.canRead() || ctx.Err() != nil {
+				return context.Canceled
+			}
+			return index.AddDocument(ctx, saved)
+		}
+		clearDocument(saved)
+	}
 	document, err := s.buildCapture(ctx, identity, source, at)
 	if err != nil {
+		if errors.Is(err, ErrSourceGone) {
+			return nil
+		}
 		return err
 	}
 	defer clearDocument(document)
@@ -633,8 +652,32 @@ func (s *Service) buildCapture(ctx context.Context, identity Model, source captu
 		document.SkipReason = SkipEmpty
 		return document, nil
 	}
-	document.Chunks = make([]Chunk, 0, len(spans))
-	for first := 0; first < len(spans); {
+	progress, found, err := s.repository.GetSemanticProgress(ctx, document.SourceID, identity.Key())
+	if err != nil {
+		return Document{}, err
+	}
+	if found {
+		saved := progress.Document
+		matches := saved.Model.Key() == identity.Key() && saved.SourceID == document.SourceID &&
+			saved.AppID == document.AppID && saved.Domain == document.Domain &&
+			saved.CapturedAt.Equal(document.CapturedAt) && saved.TextBytes == document.TextBytes &&
+			len(saved.Chunks) <= len(spans)
+		for i, chunk := range saved.Chunks {
+			if !matches || chunk.Start != spans[i].Start || chunk.End != spans[i].End {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			document.Chunks = saved.Chunks
+		} else {
+			clearDocument(saved)
+		}
+	}
+	if document.Chunks == nil {
+		document.Chunks = make([]Chunk, 0, len(spans))
+	}
+	for first := len(document.Chunks); first < len(spans); {
 		budget, err := s.backgroundBudget(ctx)
 		if err != nil {
 			clearDocument(document)
@@ -676,6 +719,10 @@ func (s *Service) buildCapture(ctx context.Context, identity Model, source captu
 			document.Chunks = append(document.Chunks, Chunk{Start: span.Start, End: span.End, Vector: vector})
 		}
 		first += len(input)
+		if err := s.repository.PutSemanticProgress(ctx, Progress{Document: document}); err != nil {
+			clearDocument(document)
+			return Document{}, err
+		}
 	}
 	return document, nil
 }
@@ -721,6 +768,9 @@ func (s *Service) Search(parent context.Context, question string, query Query) (
 		}); ok {
 			query.resolveCapturedAt = resolver.ObservationSightingAt
 		}
+		if query.End.Sub(query.Start) > storage.MaxObservationWindow {
+			query.resolveCapturedAt = boundedSightingResolver(query.resolveCapturedAt)
+		}
 	}
 	hits, err := index.Search(ctx, query)
 	if err != nil {
@@ -752,6 +802,32 @@ func (s *Service) Search(parent context.Context, question string, query Query) (
 		return nil, ErrUnavailable
 	}
 	return hits, nil
+}
+
+// Keep the durable sighting primitive's range bound. Resolve newest first so
+// unchanged documents retain the latest actual visit within a long scope,
+// without re-embedding the query for every child window.
+func boundedSightingResolver(resolve func(context.Context, string, time.Time, time.Time) (time.Time, bool, error)) func(context.Context, string, time.Time, time.Time) (time.Time, bool, error) {
+	if resolve == nil {
+		return nil
+	}
+	return func(ctx context.Context, id string, start, end time.Time) (time.Time, bool, error) {
+		for to := end; to.After(start); {
+			if err := ctx.Err(); err != nil {
+				return time.Time{}, false, err
+			}
+			from := to.Add(-28 * 24 * time.Hour)
+			if from.Before(start) {
+				from = start
+			}
+			at, found, err := resolve(ctx, id, from, to)
+			if err != nil || found {
+				return at, found, err
+			}
+			to = from
+		}
+		return time.Time{}, false, nil
+	}
 }
 
 // RankCandidates returns cosine scores in the same order as texts. It does not

@@ -87,7 +87,12 @@ func entryQuotedQuestion(input string) bool {
 }
 
 func entryEmptyPrefixClarification(input string) string {
-	head, body, found := strings.Cut(pasteRequestBody(input), ":")
+	request := pasteRequestBody(input)
+	switch strings.TrimSpace(strings.TrimSuffix(request, ":")) {
+	case "find", "search", "search for", "look for":
+		return "What would you like to find?"
+	}
+	head, body, found := strings.Cut(request, ":")
 	if !found || strings.TrimSpace(body) != "" {
 		return ""
 	}
@@ -116,4 +121,32 @@ func entryReadOnlyQuestion(input string) bool {
 		}
 	}
 	return true
+}
+
+// Explicit source-finding commands use the same indexed route as bare topic
+// text. Factual questions and contextual references retain the answer planner.
+func entryFindQuery(input string) (string, bool) {
+	q := strings.TrimSpace(input)
+	lower := strings.ToLower(q)
+	for _, prefix := range []string{"find:", "find ", "search for:", "search for ", "search:", "search ", "look for:", "look for "} {
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		body := strings.TrimSpace(q[len(prefix):])
+		if body == "" || intent.Question(body) || strings.HasPrefix(strings.ToLower(body), "out ") {
+			return "", false
+		}
+		words := strings.Fields(strings.ToLower(body))
+		switch strings.Trim(words[0], "!?.,:;") {
+		case "it", "that", "this", "them", "those", "these":
+			return "", false
+		}
+		for _, reference := range []string{"the same ", "the original"} {
+			if strings.HasPrefix(strings.ToLower(body), reference) {
+				return "", false
+			}
+		}
+		return body, true
+	}
+	return "", false
 }

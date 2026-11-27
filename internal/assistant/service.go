@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,7 @@ type RuleGeneralGenerator interface {
 const GenerationInvalidResponse = "invalid_response"
 
 type Result struct {
+	Publication           PublicationGuard `json:"-"`
 	GenerationIssue       string
 	CoverageLimited       bool // recap retrieval or model context omitted/excerpted saved evidence
 	IndexingPending       bool
@@ -192,6 +194,30 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	var previous *Turn
 	grounded := false
 	followup := classifyGroundedFollowup(question)
+	contextFollowup := false
+	if followup == followupNone && originalSourceFollowup(question) {
+		followup = followupAnswer
+	}
+	contextScopeFollowup := mode != "general" && followup == followupNone && len(history) > 0 && history[len(history)-1].Plan.ContextFollowup &&
+		!plan.Scope.IsZero() && len(plan.Terms) == 0 && len(plan.AppIDs)+len(plan.Domains) == 0 && IsFollowUp(question)
+	if contextScopeFollowup {
+		followup, contextFollowup = followupAnswer, true
+	}
+	if mode != "general" && followup == followupNone && len(history) > 0 {
+		matched, matchErr := s.citedAttributeFollowup(ctx, question, plan, history[len(history)-1])
+		if matchErr != nil {
+			return Result{}, matchErr
+		}
+		if matched {
+			followup = followupAnswer
+			contextFollowup = true
+		}
+	}
+	// A newly named identifier requests a fresh subject-bound lookup, even
+	// when pronoun grammar would ordinarily rewrite the preceding citations.
+	if len(plan.TechnicalSubjects) > 0 {
+		followup = followupNone
+	}
 	if mode != "general" && len(history) > 0 && followup != followupNone {
 		last := &history[len(history)-1]
 		if !last.General && last.Plan.Kind != KindGeneral {
@@ -204,10 +230,27 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 			}
 			current := plan
 			plan = last.Plan
+			plan.TechnicalComparison = plan.TechnicalComparison && !technicalRelationshipQuestion(question, plan.TechnicalSubjects)
+			if plan.EventTime {
+				plan.EventSubjectTerms = eventSubjectTerms(plan)
+			}
 			plan.WholeDocument = false // follow-ups use cited-source retrieval, not a new full scan
 			plan.SubjectFollowup = followup == followupSubject && !citedOnly
+			plan.ContextFollowup = contextFollowup
+			if contextFollowup && !contextScopeFollowup {
+				plan.Terms, err = planTerms(question, nil, false)
+				if err != nil {
+					return Result{}, err
+				}
+			}
 			plan.Question = question
 			plan.Scope.Explicit = false
+			if current.EventTime {
+				plan.EventTime, plan.MatchOnly, plan.Scope = true, true, Scope{}
+			}
+			if len(current.NumberedSubjects) > 0 {
+				plan.NumberedSubjects = slices.Clone(current.NumberedSubjects)
+			}
 			if !current.Scope.IsZero() {
 				plan.Scope = current.Scope
 			}
@@ -239,10 +282,15 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	}
 	if !grounded && len(history) > 0 && IsFollowUp(question) {
 		prev := history[len(history)-1].Plan
+		explicitSource := len(plan.AppIDs)+len(plan.Domains) > 0
 		if plan.Kind == KindGeneral {
 			plan = followUpPlan(plan, prev)
 		} else {
 			plan = plan.Inherit(prev)
+			plan = inheritContentContinuation(plan, prev)
+		}
+		if explicitSource {
+			plan.ReferenceQuestion, plan.ContextFollowup = "", false
 		}
 	}
 	if mode == "general" {
@@ -255,6 +303,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 		if err != nil {
 			return Result{}, err
 		}
+		plan.NumberedSubjects = numberedSubjects(question, plan.Terms)
 	}
 	if direct, ok := s.retriever.(DirectAnswerer); ok && !grounded {
 		stage = "direct_answer"
@@ -263,7 +312,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 			return Result{}, err
 		}
 		if handled {
-			return Result{Answer: answer.Answer, Sources: answer.Sources, Targets: answer.Targets, Direct: true, Plan: plan}, nil
+			return Result{Answer: answer.Answer, Sources: answer.Sources, Targets: answer.Targets, Publication: answer.Publication, Direct: true, Plan: plan, CoverageLimited: answer.CoverageLimited, IndexingPending: answer.IndexingPending}, nil
 		}
 	}
 	var resolvedRetrieval *Retrieval
@@ -289,7 +338,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	}
 	var personal PersonalContext
 	retrievalPlan := plan
-	if grounded {
+	if plan.ReferenceQuestion != "" {
 		retrievalPlan.Question = plan.ReferenceQuestion
 	}
 	if s.personalContext {
@@ -324,7 +373,7 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	} else if resolvedRetrieval != nil {
 		retrieval = *resolvedRetrieval
 	} else if pr, ok := s.retriever.(PlanRetriever); ok {
-		retrieval, err = pr.RetrievePlan(ctx, plan)
+		retrieval, err = pr.RetrievePlan(ctx, retrievalPlan)
 	} else {
 		retrieval.Evidence, err = s.retriever.Retrieve(ctx, question)
 	}
@@ -355,10 +404,16 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	}
 	evidence := append(append([]Evidence(nil), personal.Facts...), retrieval.Evidence...)
 	if len(evidence) == 0 {
-		if grounded {
-			return Result{Answer: Answer{Text: "I can’t verify the saved sources for that earlier answer now. Name the person, project, or text you want me to check.", InsufficientEvidence: true}, Plan: plan, IndexingPending: retrieval.Diagnosis.IndexingPending}, nil
+		if len(retrieval.Diagnosis.MissingTechnicalSubjects) > 0 {
+			if !validTechnicalSubjects(retrieval.Diagnosis.MissingTechnicalSubjects) {
+				return Result{}, ErrContext
+			}
+			return Result{Answer: Answer{Text: technicalCoverageCopy("", retrieval.Diagnosis.MissingTechnicalSubjects), InsufficientEvidence: true}, Plan: plan, IndexingPending: retrieval.Diagnosis.IndexingPending, CoverageLimited: true}, nil
 		}
-		return Result{Answer: Answer{Text: EmptyAnswerText(plan, retrieval.Diagnosis), InsufficientEvidence: true}, Plan: plan, IndexingPending: retrieval.Diagnosis.IndexingPending, CoverageLimited: retrieval.Diagnosis.SemanticIssue != "" || retrieval.Diagnosis.VoiceRecallLimited}, nil
+		if grounded {
+			return Result{Answer: Answer{Text: "I can’t verify the saved sources for that earlier answer now. Name the person, project, or text you want me to check.", InsufficientEvidence: true}, Plan: plan, IndexingPending: retrieval.Diagnosis.IndexingPending, CoverageLimited: retrieval.Diagnosis.SemanticIssue != "" || retrieval.Diagnosis.VoiceRecallLimited || retrieval.Diagnosis.LibraryRecallLimited}, nil
+		}
+		return Result{Answer: Answer{Text: EmptyAnswerText(plan, retrieval.Diagnosis), InsufficientEvidence: true}, Plan: plan, IndexingPending: retrieval.Diagnosis.IndexingPending, CoverageLimited: retrieval.Diagnosis.SemanticIssue != "" || retrieval.Diagnosis.VoiceRecallLimited || plan.Kind == KindRecap && (retrieval.Diagnosis.RecapSampled || retrieval.Diagnosis.RollupsDirty > 0)}, nil
 	}
 	if grounded && (s.memoryGenerationDisabled || s.generator == nil || s.counter == nil) && isWhenQuestion(question) {
 		if result, ok := capturedWhenAnswer(plan, retrieval.Evidence, history[len(history)-1].SourceIDs, retrieval.Diagnosis, now.Location()); ok {
@@ -394,9 +449,10 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 	var conversationTurns, conversationTruncated int
 	var inputTokens int
 	byteBudget := inputBudget
+	subjects := technicalContextSubjects(plan, evidence)
 	for attempt := 0; ; attempt++ {
 		var memory memoryContext
-		memory, err = packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological})
+		memory, err = packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap || len(subjects) > 0, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological, technicalSubjects: subjects})
 		packed = memory.PackedContext
 		conversationTurns, conversationTruncated = memory.Turns, memory.ConversationTruncated
 		if err != nil {
@@ -444,6 +500,9 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 		return Result{}, err
 	}
 	answer, err := ValidateAnswer(modelAnswer, packed.SourceIDs)
+	if err == nil && !technicalAnswerGrounded(answer, packed) {
+		err = ErrAnswer
+	}
 	if err != nil {
 		logGroundedAnswerFailure(slog.Default(), err, len(packed.SourceIDs))
 		return invalidGeneratedEvidence(ctx, question, plan, evidence, retrieval, personal, s.contextLimit, packed, inputTokens)
@@ -476,9 +535,10 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 				retrieval.Diagnosis.TaskSearchLimited = retrieval.Diagnosis.TaskSearchLimited || expanded.Diagnosis.TaskSearchLimited
 				retrieval.Diagnosis.VoiceRecallLimited = retrieval.Diagnosis.VoiceRecallLimited || expanded.Diagnosis.VoiceRecallLimited
 				evidence = append(evidence, expanded.Evidence...)
+				subjects = technicalContextSubjects(plan, evidence)
 				byteBudget = inputBudget
 				for attempt := 0; ; attempt++ {
-					memory, packErr := packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological})
+					memory, packErr := packMemoryConversationWithOptions(question, evidence, personal.WritingRules, previous, byteBudget, contextOptions{balanced: plan.Kind == KindRecap || len(subjects) > 0, sampled: retrieval.Diagnosis.RecapSampled, chronological: plan.Kind == KindRecap && retrieval.Diagnosis.Chronological, technicalSubjects: subjects})
 					if packErr != nil {
 						return Result{}, packErr
 					}
@@ -523,6 +583,9 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 					return Result{}, err
 				}
 				answer, err = ValidateAnswer(modelAnswer, packed.SourceIDs)
+				if err == nil && !technicalAnswerGrounded(answer, packed) {
+					err = ErrAnswer
+				}
 				if err != nil {
 					logGroundedAnswerFailure(slog.Default(), err, len(packed.SourceIDs))
 					return invalidGeneratedEvidence(ctx, question, plan, evidence, retrieval, personal, s.contextLimit, packed, inputTokens)
@@ -530,6 +593,20 @@ func (s *Service) askWithHistoryMode(ctx context.Context, question string, histo
 			}
 		}
 	}
+	if answer.InsufficientEvidence && len(packed.TechnicalSubjects) > 0 {
+		// A missing subject cannot erase independently verified work for the
+		// other requested subjects. Show the actual saved passages instead.
+		result, quoteErr := quotedEvidenceAnswer(question, plan, evidence, retrieval.Diagnosis, s.contextLimit)
+		if quoteErr != nil {
+			return Result{}, quoteErr
+		}
+		result.InputTokens, result.SentItems, result.SentBytes = inputTokens, len(packed.SourceIDs), packed.InputBytes
+		result.AppliedRules, result.PreferencesOmitted = packed.AppliedRules, personal.Omitted+packed.OmittedRules
+		result.ConversationTurns, result.ConversationTruncated = conversationTurns, conversationTruncated
+		result.Targets = citedTargets(result.Answer.SourceIDs, append(append([]TargetRef(nil), personal.Targets...), retrieval.Targets...))
+		return result, nil
+	}
+	answer.Text = technicalCoverageCopy(answer.Text, packed.MissingTechnicalSubjects)
 	byID := make(map[string]Evidence, len(evidence))
 	for _, item := range evidence {
 		if _, exists := byID[item.SourceID]; !exists {
@@ -591,9 +668,20 @@ func followUpPlan(plan, prev Plan) Plan {
 	if prev.Kind == KindGeneral {
 		return plan
 	}
+	if next, ok := eventDateContinuation(plan, prev); ok {
+		return next.Inherit(prev)
+	}
 	next := prev
+	next.TechnicalComparison = next.TechnicalComparison && !technicalRelationshipQuestion(plan.Question, next.TechnicalSubjects)
+	continueTechnical := technicalContinuation(plan) || technicalComparisonContinuation(plan, prev)
+	if next.EventTime {
+		next.EventSubjectTerms = eventSubjectTerms(prev)
+	}
 	next.Question = plan.Question
 	next.Scope.Explicit = false
+	if plan.EventTime {
+		next.EventTime, next.MatchOnly, next.Scope = true, true, Scope{}
+	}
 	if !plan.Scope.IsZero() {
 		next.Scope = plan.Scope
 	}
@@ -605,6 +693,28 @@ func followUpPlan(plan, prev Plan) Plan {
 	}
 	if len(plan.Terms) > 0 {
 		next.Terms = plan.Terms
+		next.NumberedSubjects = slices.Clone(plan.NumberedSubjects)
+		if !continueTechnical {
+			next.ReferenceQuestion = ""
+		}
+	}
+	if len(plan.TechnicalSubjects) > 0 {
+		next.TechnicalSubjects = slices.Clone(plan.TechnicalSubjects)
+		next.TechnicalComparison = plan.TechnicalComparison
+		next.LiteralTerms = slices.Clone(plan.LiteralTerms)
+		next.Literal, next.MatchOnly = true, true
+		if len(plan.Terms) == 0 {
+			next.Terms = slices.Clone(plan.LiteralTerms)
+		}
+	}
+	if len(plan.TechnicalSubjects) == 0 && len(next.TechnicalSubjects) > 0 && !continueTechnical {
+		next.TechnicalSubjects, next.LiteralTerms = nil, nil
+		next.TechnicalComparison = false
+		next.Literal = false
+		next.ReferenceQuestion = ""
+	}
+	if len(next.TechnicalSubjects) > 0 {
+		next.Terms = slices.Clone(next.LiteralTerms)
 	}
 	return next
 }
@@ -617,6 +727,12 @@ func EmptyAnswerText(plan Plan, d Diagnosis) string {
 	}
 	if d.IndexingPending {
 		return "Some saved content is still being indexed. I found no matches in the indexed content yet; ask again shortly."
+	}
+	if plan.Kind == KindRecap && d.RollupsDirty > 0 {
+		return "Saved calendar recaps are waiting to be refreshed. I couldn’t verify current evidence for this period yet."
+	}
+	if plan.Kind == KindRecap && d.RecapSampled {
+		return "I found no evidence in the sampled parts of that period. Other saved activity may be outside the sample; try a shorter date range."
 	}
 	if plan.Kind == KindLookup || plan.Kind == KindEntity {
 		if d.LibraryRecallLimited {
@@ -742,6 +858,9 @@ func providerInputBudget(ctx context.Context, counter TokenCounter, configuredLi
 // QuestionSeeksPersonalMemory reports whether a question likely refers to the
 // user's own past activity and should therefore search saved memory.
 func QuestionSeeksPersonalMemory(question string) bool {
+	if dutchRecallGrammar(question, splitWords(question)).memory {
+		return true
+	}
 	var prev string
 	for _, word := range strings.Fields(question) {
 		word = strings.ToLower(strings.Trim(word, "!?.,:;()[]{}\"'"))

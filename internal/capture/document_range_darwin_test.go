@@ -6,6 +6,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf16"
 )
 
@@ -13,19 +14,24 @@ func TestDocumentRangeOnlyReadsFullSourceBeyondVisibleTail(t *testing.T) {
 	raw := strings.Repeat("technical 日本語 notes🙂 ", 2000) + "TAIL_FULL_RANGE"
 	f := &alternateTextFixture{text: raw, mode: "range", count: int64(len(utf16.Encode([]rune(raw)))), visible: &nativeTextRange{Location: 10, Length: 20}}
 	n, _ := alternateNativeText(t, f)
-	text, err := n.openText(context.Background())
-	if err != nil || text == nil {
+	cursor, err := newAXDocumentCursor(&nativeRangeCursorFixture{n}, 4, func(context.Context) error { return nil }, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	defer text.release()
+	defer cursor.close()
 	var got strings.Builder
 	for count := 0; count < 10000; count++ {
-		piece, done, err := text.read(context.Background(), 128)
+		progress, err := cursor.read(context.Background(), Limits{MaxBytes: 128, MaxNodes: 8, MaxDepth: 4, MaxDuration: time.Second}, func(_ context.Context, piece string, _ bool) error {
+			got.WriteString(piece)
+			return nil
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		got.WriteString(piece)
-		if done {
+		if progress.StructureLimited {
+			t.Fatal("known complete range not reported")
+		}
+		if progress.Done {
 			break
 		}
 		if count == 9999 {
@@ -34,9 +40,6 @@ func TestDocumentRangeOnlyReadsFullSourceBeyondVisibleTail(t *testing.T) {
 	}
 	if got.String() != raw {
 		t.Fatalf("lost reported full range: got=%d want=%d", got.Len(), len(raw))
-	}
-	if partial, ok := text.(interface{ coverageLimited() bool }); !ok || partial.coverageLimited() {
-		t.Fatal("known complete range not reported")
 	}
 }
 func TestDocumentRangeRejectsLengthOrSensitivityChange(t *testing.T) {

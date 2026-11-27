@@ -58,10 +58,12 @@ const (
 // a small byte budget carries a broad picture first. The model is the last
 // step of Ask and only ever sees this small labelled selection.
 type Evidence struct {
-	AssociationUnverified bool // selected by time; not proof of the requested website, video, or meeting identity
-	TimeUnknown           bool // original capture time was lost; a retention baseline is not a sighting
-	Partial               bool // the source capture omitted original content, independently of model excerpting
-	TermsRelaxed          bool // a lookup match that contains some, not all, of the question's terms
+	TechnicalSubjects     []string // exact subjects supported by this selected passage
+	AssociationUnverified bool     // selected by time; not proof of the requested website, video, or meeting identity
+	TimeUnknown           bool     // original capture time was lost; a retention baseline is not a sighting
+	Partial               bool     // the source capture omitted original content, independently of model excerpting
+	CoverageLimited       bool     // a derived summary sampled or has unknown input coverage
+	TermsRelaxed          bool     // partial lexical support: missing terms or an unverified numbered-topic relationship
 	SourceID              string
 	AppID                 string
 	AppName               string // display name of the app, optional
@@ -69,6 +71,7 @@ type Evidence struct {
 	Text                  string
 	MatchStart            int // byte span of the best semantic passage; zero End uses full text
 	MatchEnd              int
+	MatchSpans            [][2]int // ordered, disjoint original byte spans; rendered with explicit excerpt separators
 	Layer                 Layer    // LayerSource (zero), LayerHour, LayerDay, LayerWeek, or LayerDigest
 	SourceIDs             []string // capture sources a derived day or week recap summarizes; provenance only
 	Origin                EvidenceOrigin
@@ -91,33 +94,40 @@ type DocumentProvenance struct {
 // is the exact UTF-8 wire size, not a universal token count. A provider adapter
 // must verify tokenizer-specific admission before sending it to a model.
 type PackedContext struct {
-	Transcript            bool
-	AssociationUnverified bool
-	System                string
-	User                  string
-	SourceIDs             []string
-	Omitted               int
-	Truncated             int
-	InputBytes            int
-	AppliedRules          int
-	OmittedRules          int
+	TechnicalSubjects        []string
+	MissingTechnicalSubjects []string
+	TechnicalSources         map[string][]string
+	Transcript               bool
+	AssociationUnverified    bool
+	System                   string
+	User                     string
+	SourceIDs                []string
+	Omitted                  int
+	Truncated                int
+	InputBytes               int
+	AppliedRules             int
+	OmittedRules             int
 }
 
 type contextPayload struct {
-	Transcript   bool             `json:"saved_transcript,omitempty"`
-	Sampled      bool             `json:"sampled_time_window,omitempty"`
-	Question     string           `json:"question"`
-	Evidence     []packedEvidence `json:"evidence"`
-	Omitted      int              `json:"omitted_sources,omitempty"`
-	Truncated    int              `json:"truncated_sources,omitempty"`
-	WritingRules []string         `json:"writing_rules,omitempty"`
+	TechnicalSubjects        []string         `json:"requested_technical_subjects,omitempty"`
+	MissingTechnicalSubjects []string         `json:"uncovered_technical_subjects,omitempty"`
+	Transcript               bool             `json:"saved_transcript,omitempty"`
+	Sampled                  bool             `json:"sampled_time_window,omitempty"`
+	Question                 string           `json:"question"`
+	Evidence                 []packedEvidence `json:"evidence"`
+	Omitted                  int              `json:"omitted_sources,omitempty"`
+	Truncated                int              `json:"truncated_sources,omitempty"`
+	WritingRules             []string         `json:"writing_rules,omitempty"`
 }
 
 type packedEvidence struct {
+	TechnicalSubjects     []string       `json:"technical_subjects,omitempty"`
 	Label                 string         `json:"label"`
 	AssociationUnverified bool           `json:"association_unverified,omitempty"`
 	TimeUnknown           bool           `json:"capture_time_unknown,omitempty"`
 	Partial               bool           `json:"partial_capture,omitempty"`
+	CoverageLimited       bool           `json:"summary_coverage_limited,omitempty"`
 	TermsRelaxed          bool           `json:"some_terms_match,omitempty"`
 	AppID                 string         `json:"app_id,omitempty"`
 	App                   string         `json:"app,omitempty"`
@@ -143,11 +153,17 @@ func packContextWithBudget(question string, evidence []Evidence, rules []string,
 	return packContextWithOptions(question, evidence, rules, inputLimit, contextOptions{})
 }
 
-type contextOptions struct{ balanced, sampled, transcript, repair, chronological bool }
+type contextOptions struct {
+	balanced, sampled, transcript, repair, chronological bool
+	technicalSubjects                                    []string
+}
 
 func packContextWithOptions(question string, evidence []Evidence, rules []string, inputLimit int, options contextOptions) (PackedContext, error) {
 	question, err := normalizeQuestion(question)
 	if err != nil || len(evidence) == 0 {
+		return PackedContext{}, ErrContext
+	}
+	if !validTechnicalSubjects(options.technicalSubjects) {
 		return PackedContext{}, ErrContext
 	}
 	if options.chronological {
@@ -163,7 +179,7 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 	if options.transcript {
 		itemLimit = MaxTranscriptItems
 	}
-	payload := contextPayload{Transcript: options.transcript, Question: question, WritingRules: append([]string(nil), rules...), Sampled: options.sampled}
+	payload := contextPayload{TechnicalSubjects: options.technicalSubjects, Transcript: options.transcript, Question: question, WritingRules: append([]string(nil), rules...), Sampled: options.sampled}
 	seen := make(map[string]struct{}, min(len(evidence), itemLimit))
 	allowedSourceIDs := make([]string, 0, min(len(evidence), itemLimit))
 	used := ruleBytes
@@ -171,6 +187,9 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 	previousTranscriptApp := ""
 	for i := 0; i < limit; i++ {
 		item := evidence[i]
+		if !validTechnicalSubjects(item.TechnicalSubjects) {
+			return PackedContext{}, ErrContext
+		}
 		if item.Origin != "" && item.Origin != OriginUserCorrection && item.Origin != OriginInferred && item.Origin != OriginUserFact && item.Origin != OriginTask && item.Origin != OriginRelatedProject {
 			return PackedContext{}, ErrContext
 		}
@@ -187,14 +206,19 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 		}
 		available := MaxEvidenceBytes - used
 		if options.balanced {
-			available /= max(1, min(limit-i, itemLimit-len(payload.Evidence)))
-		}
-		relevant := item.Text
-		if item.MatchEnd != 0 {
-			if item.MatchStart < 0 || item.MatchEnd <= item.MatchStart || item.MatchEnd > len(item.Text) || !utf8.ValidString(item.Text[item.MatchStart:item.MatchEnd]) {
-				return PackedContext{}, ErrContext
+			if len(options.technicalSubjects) > 0 {
+				weight, remaining, weightErr := technicalPassageWeight(evidence[i:limit], options.technicalSubjects, seen, itemLimit-len(payload.Evidence))
+				if weightErr != nil {
+					return PackedContext{}, weightErr
+				}
+				available = available * weight / remaining
+			} else {
+				available /= max(1, min(limit-i, itemLimit-len(payload.Evidence)))
 			}
-			relevant = item.Text[item.MatchStart:item.MatchEnd]
+		}
+		relevant, err := evidencePassageText(item)
+		if err != nil {
+			return PackedContext{}, err
 		}
 		if options.transcript && len(relevant) > available && len(payload.Evidence) > 0 {
 			// Preserve a consecutive prefix. The caller can advance only past
@@ -207,7 +231,14 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 			payload.Omitted++
 			continue
 		}
-		packed := packedEvidence{AssociationUnverified: item.AssociationUnverified, TimeUnknown: item.TimeUnknown, AppID: item.AppID, App: item.AppName, Domain: item.Domain, Layer: layerName(item.Layer), Origin: item.Origin, Time: evidenceTime(item), Text: text, Partial: item.Partial, TermsRelaxed: item.TermsRelaxed, Truncated: item.Partial || len(text) != len(item.Text)}
+		packed := packedEvidence{AssociationUnverified: item.AssociationUnverified, TimeUnknown: item.TimeUnknown, AppID: item.AppID, App: item.AppName, Domain: item.Domain, Layer: layerName(item.Layer), Origin: item.Origin, Time: evidenceTime(item), Text: text, Partial: item.Partial, CoverageLimited: item.CoverageLimited, TermsRelaxed: item.TermsRelaxed, Truncated: item.Partial || len(text) != len(item.Text)}
+		// Only requested labels can enter the wire. Revalidate them against
+		// the actual clipped text below before granting citation coverage.
+		for _, subject := range options.technicalSubjects {
+			if containsString(item.TechnicalSubjects, subject) {
+				packed.TechnicalSubjects = append(packed.TechnicalSubjects, subject)
+			}
+		}
 		packed.Label = "S" + strconv.Itoa(len(payload.Evidence)+1)
 		if options.transcript {
 			// Track changes retain authorship. Repeating immutable app/domain
@@ -234,10 +265,15 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 	// Text bounds alone do not bound the wire: escaping and metadata also
 	// consume input. Reduce the least-ranked material against serialized bytes.
 	for {
+		technicalSources, missing := packedTechnicalCoverage(payload, allowedSourceIDs)
+		payload.MissingTechnicalSubjects = missing
 		for i := range payload.Evidence {
 			payload.Evidence[i].Label = "S" + strconv.Itoa(i+1)
 		}
 		system := systemPrompt
+		if len(payload.TechnicalSubjects) > 0 {
+			system += " Answer each technical subject with its own supporting labels. State uncovered subjects as unknown."
+		}
 		if options.transcript {
 			system = transcriptSummarySystemPrompt
 			if options.repair {
@@ -254,7 +290,7 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 		}
 		for _, item := range payload.Evidence {
 			if item.TermsRelaxed {
-				system += " An item with some_terms_match contains only some of the question's words. Treat it as a closest match, not proof of the full question, and say so when you rely on it."
+				system += " An item with some_terms_match has partial lexical support for the question: words may be missing, or a subject's relationship to its number may be unverified. Treat it as a closest match, not proof of the full question, and say so when you rely on it."
 				break
 			}
 		}
@@ -267,7 +303,7 @@ func packContextWithOptions(question string, evidence []Evidence, rules []string
 		}
 		inputBytes := len(system) + len(user)
 		if inputBytes <= inputLimit {
-			return PackedContext{Transcript: options.transcript, AssociationUnverified: associationUnverified, System: system, User: string(user), SourceIDs: allowedSourceIDs, Omitted: payload.Omitted, Truncated: payload.Truncated, InputBytes: inputBytes, AppliedRules: len(payload.WritingRules), OmittedRules: len(rules) - len(payload.WritingRules)}, nil
+			return PackedContext{TechnicalSubjects: options.technicalSubjects, MissingTechnicalSubjects: missing, TechnicalSources: technicalSources, Transcript: options.transcript, AssociationUnverified: associationUnverified, System: system, User: string(user), SourceIDs: allowedSourceIDs, Omitted: payload.Omitted, Truncated: payload.Truncated, InputBytes: inputBytes, AppliedRules: len(payload.WritingRules), OmittedRules: len(rules) - len(payload.WritingRules)}, nil
 		}
 		if options.balanced {
 			// Share serialized-wire reductions before dropping a time period.
@@ -427,12 +463,27 @@ func truncateUTF8(value string, maxBytes int) string {
 // before raw captures, keeping retrieval rank within each layer. It returns
 // the input when already ordered.
 func layerOrder(evidence []Evidence) []Evidence {
-	if sort.SliceIsSorted(evidence, func(i, j int) bool { return evidence[i].Layer > evidence[j].Layer }) {
+	if sort.SliceIsSorted(evidence, func(i, j int) bool { return layerPriority(evidence[i].Layer) > layerPriority(evidence[j].Layer) }) {
 		return evidence
 	}
 	ordered := append([]Evidence(nil), evidence...)
-	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Layer > ordered[j].Layer })
+	sort.SliceStable(ordered, func(i, j int) bool { return layerPriority(ordered[i].Layer) > layerPriority(ordered[j].Layer) })
 	return ordered
+}
+
+func layerPriority(l Layer) int {
+	switch l {
+	case LayerDigest:
+		return 6
+	case LayerYear:
+		return 5
+	case LayerMonth:
+		return 4
+	case LayerCompaction:
+		return 0
+	default:
+		return int(l)
+	}
 }
 
 func layerName(l Layer) string {
@@ -445,6 +496,12 @@ func layerName(l Layer) string {
 		return "week"
 	case LayerDigest:
 		return "digest"
+	case LayerMonth:
+		return "month"
+	case LayerYear:
+		return "year"
+	case LayerCompaction:
+		return "source_compaction"
 	}
 	return ""
 }

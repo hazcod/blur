@@ -32,9 +32,10 @@ import (
 )
 
 const (
-	// Schema 7 requires capture-part and exact-visit index erasure.
-	// Older clients must reject the store rather than leave derived capture rows.
-	OpenSchemaVersion = 7
+	// Schema 10 owns paged inferred Library facts and source links. Older
+	// readers cannot see or erase overflow pages, so reject them before recovery.
+	// Existing primary and derivative payload ciphertext remains unchanged.
+	OpenSchemaVersion = 10
 	valueVersion      = 1
 	recordRevision    = 1
 	storedValueHeader = 1 + 4
@@ -116,17 +117,20 @@ type Store struct {
 }
 
 type storeState struct {
-	mu          sync.RWMutex
-	knowledgeMu sync.RWMutex
-	taskMu      sync.RWMutex
-	profileMu   sync.RWMutex
-	noteMu      sync.Mutex
-	db          *bolt.DB
-	codec       *recordcodec.Codec
-	idKey       []byte
-	manifestKey []byte
-	storeID     [16]byte
-	schemaVer   uint32
+	mu                    sync.RWMutex
+	publicationMu         sync.RWMutex
+	publicationEpoch      uint64
+	voicePublicationEpoch uint64
+	knowledgeMu           sync.RWMutex
+	taskMu                sync.RWMutex
+	profileMu             sync.RWMutex
+	noteMu                sync.Mutex
+	db                    *bolt.DB
+	codec                 *recordcodec.Codec
+	idKey                 []byte
+	manifestKey           []byte
+	storeID               [16]byte
+	schemaVer             uint32
 	// Immutable after OpenDurable publishes the store. This retention baseline
 	// is not proof of a historical capture at the same timestamp.
 	captureTimeBaseline time.Time
@@ -149,6 +153,7 @@ type Tx struct {
 	failure             error
 	active              bool
 	dirty               bool
+	voiceDirty          bool
 	exactInline         []capture.SanitizedObservation
 	importedObservation bool
 }
@@ -387,7 +392,7 @@ func (s *Store) validateAndMigrate(ctx context.Context, migrationHook func() err
 	}
 	for version < OpenSchemaVersion {
 		switch version {
-		case 1, 2, 3, 4, 5, 6:
+		case 1, 2, 3, 4, 5, 6, 7, 8:
 			if err := s.migrateSchema(ctx, version, OpenSchemaVersion, migrationHook); err != nil {
 				return err
 			}
@@ -727,7 +732,11 @@ func (s *Store) Update(ctx context.Context, callback func(*Tx) error) error {
 
 // updateLocked requires state.mu to be held; recovery uses its exclusive lock.
 func (s *Store) updateLocked(ctx context.Context, callback func(*Tx) error) error {
+	s.state.publicationMu.Lock()
+	defer s.state.publicationMu.Unlock()
 	var callbackErr error
+	var dirty bool
+	var voiceDirty bool
 	err := s.state.db.Update(ctx, func(writer bolt.Writer) error {
 		tx := &Tx{store: s, writer: writer, active: true}
 		tx.importedObservation, _ = ctx.Value(importedObservationKey{}).(bool)
@@ -747,6 +756,8 @@ func (s *Store) updateLocked(ctx context.Context, callback func(*Tx) error) erro
 		if tx.failure == nil && callbackError != nil {
 			tx.failure = sanitizeCallbackError(callbackError)
 		}
+		dirty = tx.dirty
+		voiceDirty = tx.voiceDirty
 		if tx.failure == nil {
 			if err := tx.flushManifestLocked(); err != nil {
 				tx.failure = err
@@ -762,6 +773,12 @@ func (s *Store) updateLocked(ctx context.Context, callback func(*Tx) error) erro
 	})
 	if callbackErr != nil {
 		return callbackErr
+	}
+	if err == nil && dirty {
+		s.state.publicationEpoch++
+		if voiceDirty {
+			s.state.voicePublicationEpoch++
+		}
 	}
 	return mapStorePhysicalError(err)
 }
@@ -781,6 +798,9 @@ func sanitizeCallbackError(err error) error {
 	}
 	if errors.Is(err, ErrDeletionPending) {
 		return ErrDeletionPending
+	}
+	if errors.Is(err, errChronicleErasurePending) {
+		return errChronicleErasurePending
 	}
 	if errors.Is(err, ErrSourceDeleted) {
 		return ErrSourceDeleted
@@ -1370,7 +1390,11 @@ func (tx *Tx) putRecordLocked(kind byte, namespace, logicalID string, plaintext 
 		return err
 	}
 	defer clear(envelope)
-	return tx.writeEntryLocked(recordKey, envelope, replace)
+	err = tx.writeEntryLocked(recordKey, envelope, replace)
+	if err == nil && kind == kindIndex && strings.HasPrefix(namespace, "index:meeting-") {
+		tx.voiceDirty = true
+	}
+	return err
 }
 
 func validNamespace(namespace string) bool {

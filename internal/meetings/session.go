@@ -101,6 +101,15 @@ type SinkCapabilities struct {
 	AtomicIdempotent bool
 }
 
+// RecordLookup is the durable identity index used for session continuation.
+// It checks the original immutable payload and deletion fences atomically.
+// A matching live key returns its original receipt; a different payload returns
+// ErrConflict and an erased key returns ErrDeleted. An absent key returns false.
+// Lookup must not create or restore evidence.
+type RecordLookup interface {
+	LookupRecord(context.Context, Record) (Receipt, bool, error)
+}
+
 // Sink is a trusted adapter port, not an encryption implementation. New fails
 // closed unless the adapter explicitly declares both required guarantees.
 type Sink interface {
@@ -108,6 +117,9 @@ type Sink interface {
 	Append(context.Context, Record) (Receipt, error)
 }
 
+// Zero cumulative limits are unlimited when the sink implements RecordLookup.
+// A nonzero cumulative limit is an explicit caller-selected work budget. Sinks
+// without a durable identity index use finite legacy defaults instead.
 type Limits struct {
 	MaxSegments        int
 	MaxEventBytes      int
@@ -134,6 +146,8 @@ type ManualNote struct {
 	SourceID string
 }
 
+// Snapshot contains the live tail for durable-indexed sessions. Complete
+// evidence belongs to Repository.MeetingRecords and must be read in pages.
 type Snapshot struct {
 	SessionID string
 	State     State

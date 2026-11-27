@@ -101,6 +101,25 @@ type RecordPage struct {
 	More    bool
 }
 
+// AgendaTail is a bounded live view, independent of forward history pages.
+// Cursor is the last allocated ordinal, including erased slots, and is used
+// only for subsequent append polling. Older means earlier ordinal slots remain
+// outside this tail; full evidence remains available through MeetingRecords.
+type AgendaTail struct {
+	Meeting Meeting
+	Records []StoredRecord
+	Cursor  uint64
+	Older   bool
+}
+
+// AgendaTailReader authenticates Ready/no-recording/no-final eligibility and
+// returns metadata and a newest-first-selected tail from one repository view.
+// Records are returned in ascending ordinal order. Work is bounded even when
+// old deleted slots prevent filling the requested live tail.
+type AgendaTailReader interface {
+	ReadyAgendaTail(context.Context, string, PageRequest) (AgendaTail, error)
+}
+
 // Repository embeds the explicit authenticated-encryption/idempotency sink
 // contract. PutMeeting creates Revision 1 with expected=0; updates supply the
 // previous revision and its successor. RecordCount is never caller-controlled.

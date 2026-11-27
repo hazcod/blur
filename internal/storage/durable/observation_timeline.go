@@ -16,15 +16,16 @@ import (
 )
 
 const (
-	observationTimelineNS         = "observation-time"
-	observationTimelineSourceNS   = "observation-time-src"
-	observationTimelineMarkerID   = "observation-timeline-v1"
-	observationTimelinePageSize   = 64
-	maxObservationTimelinePages   = 1024
-	maxObservationTimelineRows    = observationTimelinePageSize * maxObservationTimelinePages
-	observationTimelineEntryBytes = 104 // content hash, nanoseconds, keyed app/domain digests
-	maxObservationTimelinePage    = 5 + observationTimelinePageSize*observationTimelineEntryBytes
-	maxObservationTimelineReads   = bolt.MaxReadTransactionOps - storage.MaxObservationPageRows*4 - 8
+	observationTimelineNS       = "observation-time"
+	observationTimelineSourceNS = "observation-time-src"
+	observationTimelineMarkerID = "observation-timeline-v1"
+	observationTimelinePageSize = 64
+	// Scan one authenticated directory page per transaction. Sparse windows
+	// skip hours in bounded groups so callers can continue fairly.
+	maxObservationTimelineEmptyHoursPerQuantum = 64
+	maxTimelineCounter                         = int64(^uint32(0)) // binary metadata representation
+	observationTimelineEntryBytes              = 104               // content hash, nanoseconds, keyed app/domain digests
+	maxObservationTimelinePage                 = 5 + observationTimelinePageSize*observationTimelineEntryBytes
 )
 
 type captureWindowCandidate struct {
@@ -35,146 +36,206 @@ type captureWindowCandidate struct {
 
 type observationTimelineMeta struct{ pages, count int }
 
-// ListObservationWindow reads primary evidence independently of activity and
-// summarisation. Hour directories and pages are authenticated and encrypted;
-// physical keys reveal neither timestamps nor source identities. Dense ranges
-// fail explicitly at the metadata budget instead of returning a partial rank.
-func (s *Store) ListObservationWindow(ctx context.Context, request storage.ObservationWindowRequest) (storage.ObservationWindow, error) {
-	if ctx == nil || !storage.ValidObservationWindow(request) {
-		return storage.ObservationWindow{}, &storage.StoreError{Code: storage.Invalid}
-	}
-	page := storage.ObservationWindow{Observations: make([]capture.SanitizedObservation, 0, request.Limit), CapturedAt: make([]time.Time, 0, request.Limit)}
+// observationTimelineScanCursor is an in-process continuation for one bounded
+// timeline scan quantum. It is separate from the public cursor, which pages
+// globally ranked observations.
+type observationTimelineScanCursor struct {
+	hour        time.Time
+	lastHour    time.Time
+	page        int
+	pages       int
+	expected    int
+	rowsRead    int
+	hourSeen    map[string]struct{}
+	initialized bool
+	done        bool
+}
+
+func newObservationTimelineScanCursor(start, end time.Time) observationTimelineScanCursor {
+	return observationTimelineScanCursor{hour: end.Add(-time.Nanosecond).UTC().Truncate(time.Hour), lastHour: start.UTC().Truncate(time.Hour)}
+}
+
+// observationTimelineQuantum reads no more than one directory page in a
+// physical read transaction. The caller carries the cursor and deduplication
+// state across quanta before publishing any ranked result.
+func (s *Store) observationTimelineQuantum(ctx context.Context, namespace string, cursor observationTimelineScanCursor) ([]captureWindowCandidate, observationTimelineScanCursor, error) {
+	var entries []captureWindowCandidate
 	err := s.viewWithReadLimit(ctx, bolt.MaxReadTransactionOps, func(reader bolt.Reader) error {
-		appDigest := s.searchLookupDigest(searchIndexApp, request.AppID)
-		hostDigest := s.searchLookupDigest(searchIndexDomain, request.Domain)
-		excluded := make(map[[32]byte]struct{}, len(request.ExcludeAppIDs))
-		for _, app := range request.ExcludeAppIDs {
-			excluded[s.searchLookupDigest(searchIndexApp, app)] = struct{}{}
-		}
-		start, end := request.Start.UTC(), request.End.UTC()
-		firstHour, lastHour := end.Add(-time.Nanosecond).Truncate(time.Hour), start.Truncate(time.Hour)
-		// Re-scan newer partitions before applying the cursor: a source may
-		// have an older visit that must not reappear on a later page.
-		candidates := make([]captureWindowCandidate, 0, request.Limit+1)
-		seen := make(map[string]struct{})
-		inspected := 0
-		reads := 0
-		for hourStart := firstHour; !hourStart.Before(lastHour); hourStart = hourStart.Add(-time.Hour) {
+		for skipped := 0; skipped < maxObservationTimelineEmptyHoursPerQuantum; skipped++ {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			hourID := observationTimelineHourID(hourStart)
-			if reads >= maxObservationTimelineReads {
-				return &storage.StoreError{Code: storage.Incomplete}
+			if cursor.done || cursor.hour.Before(cursor.lastHour) {
+				cursor.done = true
+				return nil
 			}
-			reads++
-			encoded, found, err := s.readIndexValueReader(reader, observationTimelineNS, hourID, 9)
-			if err != nil {
-				return err
-			}
-			if !found {
-				continue
-			}
-			meta, err := decodeObservationTimelineMeta(encoded)
-			clear(encoded)
-			if err != nil {
-				return err
-			}
-			if meta.count > maxObservationTimelineRows-inspected {
-				return &storage.StoreError{Code: storage.Incomplete}
-			}
-			if meta.count == 0 {
-				continue
-			}
-			hourRows := 0
-			hourSeen := make(map[string]struct{})
-			for index := 0; index < meta.pages; index++ {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				if reads >= maxObservationTimelineReads {
-					return &storage.StoreError{Code: storage.Incomplete}
-				}
-				reads++
-				encoded, found, err := s.readIndexValueReader(reader, observationTimelineNS, observationTimelinePageID(hourID, index), maxObservationTimelinePage)
+			hourID := observationTimelineHourID(cursor.hour)
+			if !cursor.initialized {
+				encoded, found, err := s.readIndexValueReader(reader, namespace, hourID, 9)
 				if err != nil {
 					return err
 				}
 				if !found {
-					return ErrCorrupt
+					cursor.hour = cursor.hour.Add(-time.Hour)
+					continue
 				}
-				entries, err := decodeObservationTimelinePage(encoded, hourID)
+				meta, err := decodeObservationTimelineMeta(encoded)
 				clear(encoded)
 				if err != nil {
 					return err
 				}
-				hourRows += len(entries)
-				if hourRows > meta.count {
-					return ErrCorrupt
-				}
-				for _, entry := range entries {
-					if _, duplicate := hourSeen[entry.id]; duplicate {
+				cursor.pages, cursor.expected, cursor.page, cursor.rowsRead, cursor.initialized = meta.pages, meta.count, 0, 0, true
+				cursor.hourSeen = make(map[string]struct{}, observationTimelinePageSize)
+				if meta.count == 0 {
+					if meta.pages != 1 {
 						return ErrCorrupt
 					}
-					hourSeen[entry.id] = struct{}{}
-					if _, duplicate := seen[entry.id]; duplicate {
-						continue
-					}
-					if !entry.at.Before(end) || !s.IsObservationTimeKnown(entry.at) {
-						if reads >= maxObservationTimelineReads {
-							return &storage.StoreError{Code: storage.Incomplete}
-						}
-						reads++
-						at, found, err := s.sightingAtBeforeReader(reader, entry.id, entry.at, end)
-						if err != nil {
-							return err
-						}
-						if !found {
-							continue
-						}
-						entry.at = at
-					}
-					if entry.at.Before(start) || !entry.at.Before(end) {
-						continue
-					}
-					if request.AppID != "" && entry.appDigest != appDigest || request.Domain != "" && entry.hostDigest != hostDigest {
-						continue
-					}
-					if _, skip := excluded[entry.appDigest]; skip {
-						continue
-					}
-					if entry.appDigest == s.searchLookupDigest(searchIndexApp, "sh.blur.notes") {
-						current, err := s.isCurrentNoteSourceReader(reader, entry.id)
-						if err != nil {
-							return err
-						}
-						if !current {
-							continue
-						}
-					}
-					seen[entry.id] = struct{}{}
-					if !request.BeforeCapturedAt.IsZero() && (!entry.at.Before(request.BeforeCapturedAt) && (!entry.at.Equal(request.BeforeCapturedAt) || entry.id >= request.BeforeSourceID)) {
-						continue
-					}
-					candidates = append(candidates, entry)
+					cursor.hour = cursor.hour.Add(-time.Hour)
+					cursor.initialized = false
+					continue
 				}
 			}
-			if hourRows != meta.count {
+			encoded, found, err := s.readIndexValueReader(reader, namespace, observationTimelinePageID(hourID, cursor.page), maxObservationTimelinePage)
+			if err != nil {
+				return err
+			}
+			if !found {
 				return ErrCorrupt
 			}
-			inspected += hourRows
-			// All remaining partitions are older. One extra candidate proves
-			// continuation without scanning irrelevant historical hours.
-			if len(candidates) > request.Limit {
-				break
+			entries, err = decodeObservationTimelinePage(encoded, hourID)
+			clear(encoded)
+			if err != nil {
+				return err
 			}
+			for _, entry := range entries {
+				if _, duplicate := cursor.hourSeen[entry.id]; duplicate {
+					return ErrCorrupt
+				}
+				cursor.hourSeen[entry.id] = struct{}{}
+			}
+			cursor.rowsRead += len(entries)
+			cursor.page++
+			if cursor.page == cursor.pages {
+				if cursor.rowsRead != cursor.expected {
+					return ErrCorrupt
+				}
+				cursor.hour = cursor.hour.Add(-time.Hour)
+				cursor.initialized = false
+				cursor.hourSeen = nil
+			}
+			return nil
 		}
-		sort.Slice(candidates, func(i, j int) bool {
-			if !candidates[i].at.Equal(candidates[j].at) {
-				return candidates[i].at.After(candidates[j].at)
+		return nil
+	})
+	if err != nil {
+		return nil, cursor, err
+	}
+	if cursor.hour.Before(cursor.lastHour) {
+		cursor.done = true
+	}
+	return entries, cursor, nil
+}
+
+// ListObservationWindow reads primary evidence independently of activity and
+// summarisation. It scans authenticated directory pages in bounded read
+// quanta, carrying deduplication state until global ordering is known.
+func (s *Store) ListObservationWindow(ctx context.Context, request storage.ObservationWindowRequest) (storage.ObservationWindow, error) {
+	if s == nil || s.state == nil {
+		return storage.ObservationWindow{}, &storage.StoreError{Code: storage.Closed}
+	}
+	s.state.publicationMu.RLock()
+	defer s.state.publicationMu.RUnlock()
+	return s.listObservationWindow(ctx, request)
+}
+
+// listObservationWindow requires publicationMu.RLock for the full multi-
+// transaction scan so no writer can change editions between scan quanta.
+func (s *Store) listObservationWindow(ctx context.Context, request storage.ObservationWindowRequest) (storage.ObservationWindow, error) {
+	if ctx == nil || !storage.ValidObservationWindow(request) {
+		return storage.ObservationWindow{}, &storage.StoreError{Code: storage.Invalid}
+	}
+	page := storage.ObservationWindow{Observations: make([]capture.SanitizedObservation, 0, request.Limit), CapturedAt: make([]time.Time, 0, request.Limit)}
+	appDigest := s.searchLookupDigest(searchIndexApp, request.AppID)
+	hostDigest := s.searchLookupDigest(searchIndexDomain, request.Domain)
+	excluded := make(map[[32]byte]struct{}, len(request.ExcludeAppIDs))
+	for _, app := range request.ExcludeAppIDs {
+		excluded[s.searchLookupDigest(searchIndexApp, app)] = struct{}{}
+	}
+	start, end := request.Start.UTC(), request.End.UTC()
+	cursor := newObservationTimelineScanCursor(start, end)
+	candidates := make([]captureWindowCandidate, 0, request.Limit+1)
+	keep := request.Limit + 1
+	seen := make(map[string]struct{})
+	for !cursor.done {
+		if err := ctx.Err(); err != nil {
+			return storage.ObservationWindow{}, err
+		}
+		entries, next, err := s.observationTimelineQuantum(ctx, observationTimelineNS, cursor)
+		if err != nil {
+			return storage.ObservationWindow{}, err
+		}
+		cursor = next
+		if len(entries) == 0 {
+			continue
+		}
+		err = s.viewWithReadLimit(ctx, bolt.MaxReadTransactionOps, func(reader bolt.Reader) error {
+			for _, entry := range entries {
+				if _, duplicate := seen[entry.id]; duplicate {
+					continue
+				}
+				if !entry.at.Before(end) || !s.IsObservationTimeKnown(entry.at) {
+					at, found, err := s.sightingAtBeforeReader(reader, entry.id, entry.at, end)
+					if err != nil {
+						return err
+					}
+					if !found {
+						continue
+					}
+					entry.at = at
+				}
+				if entry.at.Before(start) || !entry.at.Before(end) || request.AppID != "" && entry.appDigest != appDigest || request.Domain != "" && entry.hostDigest != hostDigest {
+					continue
+				}
+				if _, skip := excluded[entry.appDigest]; skip {
+					continue
+				}
+				if entry.appDigest == s.searchLookupDigest(searchIndexApp, "sh.blur.notes") {
+					current, err := s.isCurrentNoteSourceReader(reader, entry.id)
+					if err != nil {
+						return err
+					}
+					if !current {
+						continue
+					}
+				}
+				seen[entry.id] = struct{}{}
+				if !request.BeforeCapturedAt.IsZero() && (!entry.at.Before(request.BeforeCapturedAt) && (!entry.at.Equal(request.BeforeCapturedAt) || entry.id >= request.BeforeSourceID)) {
+					continue
+				}
+				candidates = append(candidates, entry)
+				if len(candidates) > keep {
+					sort.Slice(candidates, func(i, j int) bool {
+						if !candidates[i].at.Equal(candidates[j].at) {
+							return candidates[i].at.After(candidates[j].at)
+						}
+						return candidates[i].id > candidates[j].id
+					})
+					candidates = candidates[:keep]
+				}
 			}
-			return candidates[i].id > candidates[j].id
+			return nil
 		})
+		if err != nil {
+			return storage.ObservationWindow{}, err
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].at.Equal(candidates[j].at) {
+			return candidates[i].at.After(candidates[j].at)
+		}
+		return candidates[i].id > candidates[j].id
+	})
+	err := s.viewWithReadLimit(ctx, bolt.MaxReadTransactionOps, func(reader bolt.Reader) error {
 		for _, candidate := range candidates {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -267,8 +328,11 @@ func (tx *Tx) appendObservationTimelineLocked(observation capture.SanitizedObser
 			return "", err
 		}
 	}
+	if int64(meta.count) == maxTimelineCounter {
+		return "", &storage.StoreError{Code: storage.Incomplete}
+	}
 	if len(entries) == observationTimelinePageSize {
-		if meta.pages == maxObservationTimelinePages {
+		if int64(meta.pages) == maxTimelineCounter {
 			return "", &storage.StoreError{Code: storage.Incomplete}
 		}
 		meta.pages++
@@ -362,7 +426,7 @@ func parseObservationTimelinePageID(id string) (string, int, error) {
 		return "", 0, ErrCorrupt
 	}
 	page, err := strconv.Atoi(id[separator+1:])
-	if err != nil || page < 0 || page >= maxObservationTimelinePages || observationTimelinePageID(id[:separator], page) != id {
+	if err != nil || page < 0 || int64(page) >= maxTimelineCounter || observationTimelinePageID(id[:separator], page) != id {
 		return "", 0, ErrCorrupt
 	}
 	return id[:separator], page, nil
@@ -381,7 +445,7 @@ func decodeObservationTimelineMeta(encoded []byte) (observationTimelineMeta, err
 		return observationTimelineMeta{}, ErrCorrupt
 	}
 	meta := observationTimelineMeta{pages: int(binary.BigEndian.Uint32(encoded[1:5])), count: int(binary.BigEndian.Uint32(encoded[5:9]))}
-	if meta.pages < 1 || meta.pages > maxObservationTimelinePages || meta.count > meta.pages*observationTimelinePageSize {
+	if meta.pages < 1 || int64(meta.pages) > maxTimelineCounter || meta.count < 0 || int64(meta.count) > int64(meta.pages)*observationTimelinePageSize {
 		return observationTimelineMeta{}, ErrCorrupt
 	}
 	return meta, nil

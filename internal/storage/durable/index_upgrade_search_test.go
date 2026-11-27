@@ -8,11 +8,8 @@ import (
 
 // Search after upgrading a store that holds both a plain observation and a
 // published multipart capture, both marked at the previous format. The
-// observation index is rebuilt; the capture-part index keeps its marker and
-// pages. Chosen fix: decodeSearchIndexState accepts the structure-version
-// marker for the capture-part scope, so open writes nothing to old stores and
-// every existing capture-part page stays decodable (rewriting the marker at
-// open would also work but adds a write to every upgrade for no benefit).
+// observation index is rebuilt; the capture-part index schedules bounded
+// background work. Structurally compatible pages remain readable throughout.
 func TestSearchAfterFormatUpgradeFindsObservationsAndPublishedCaptures(t *testing.T) {
 	ctx := context.Background()
 	path, key := durableTestPath(t), durableTestKey(t, 0x66)

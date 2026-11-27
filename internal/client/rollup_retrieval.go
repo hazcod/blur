@@ -28,7 +28,7 @@ func wholeLocalDays(start, end time.Time, zone *time.Location) (days, weeks map[
 	if day.Before(start) {
 		day = time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, zone)
 	}
-	for range 40 {
+	for range 402 {
 		next := time.Date(day.Year(), day.Month(), day.Day()+1, 0, 0, 0, 0, zone)
 		if next.After(end) {
 			break
@@ -52,6 +52,10 @@ func wholeLocalDays(start, end time.Time, zone *time.Location) (days, weeks map[
 // not repeated. A window with no whole local day, or any app/domain filter,
 // yields nothing and the caller falls back to hour recaps and raw captures.
 func (c *Client) recapRollups(ctx context.Context, plan assistant.Plan, start, end time.Time) (items []assistant.Evidence, covered []recapSpan, dirty int, err error) {
+	return c.recapRollupsForLevels(ctx, plan, start, end, []string{chronicle.RollupLevelYear, chronicle.RollupLevelMonth, chronicle.RollupLevelWeek, chronicle.RollupLevelDay})
+}
+
+func (c *Client) recapRollupsForLevels(ctx context.Context, plan assistant.Plan, start, end time.Time, levels []string) (items []assistant.Evidence, covered []recapSpan, dirty int, err error) {
 	if c.chronicles == nil || len(plan.AppIDs)+len(plan.Domains) > 0 {
 		return nil, nil, 0, nil
 	}
@@ -63,13 +67,25 @@ func (c *Client) recapRollups(ctx context.Context, plan assistant.Plan, start, e
 	if len(days) == 0 {
 		return nil, nil, 0, nil
 	}
-	for _, level := range []string{chronicle.RollupLevelWeek, chronicle.RollupLevelDay} {
-		if level == chronicle.RollupLevelWeek && len(weeks) == 0 {
+	months, years := map[string]recapSpan{}, map[string]recapSpan{}
+	for _, span := range days {
+		day := span.start.In(zone)
+		if day.Day() != 1 {
 			continue
 		}
-		periods := days
-		if level == chronicle.RollupLevelWeek {
-			periods = weeks
+		if to := day.AddDate(0, 1, 0); !to.After(end) {
+			months[day.Format("2006-01")] = recapSpan{day.UTC(), to.UTC()}
+		}
+		if day.Month() == time.January {
+			if to := day.AddDate(1, 0, 0); !to.After(end) {
+				years[day.Format("2006")] = recapSpan{day.UTC(), to.UTC()}
+			}
+		}
+	}
+	for _, level := range levels {
+		periods := map[string]map[string]recapSpan{chronicle.RollupLevelDay: days, chronicle.RollupLevelWeek: weeks, chronicle.RollupLevelMonth: months, chronicle.RollupLevelYear: years}[level]
+		if len(periods) == 0 {
+			continue
 		}
 		rows, next, listErr := c.chronicles.ListChronicleRollups(ctx, level, start.UTC(), end.UTC(), "", 64)
 		if listErr != nil {
@@ -86,6 +102,9 @@ func (c *Client) recapRollups(ctx context.Context, plan assistant.Plan, start, e
 			}
 			if row.Dirty {
 				dirty++
+				// Stale parents cannot cover current child recaps or establish
+				// current saved state while regeneration is pending.
+				continue
 			}
 			if strings.TrimSpace(row.Text) == "" || len(row.SourceIDs) == 0 {
 				continue
@@ -93,14 +112,33 @@ func (c *Client) recapRollups(ctx context.Context, plan assistant.Plan, start, e
 			layer := assistant.LayerDay
 			if level == chronicle.RollupLevelWeek {
 				layer = assistant.LayerWeek
+			} else if level == chronicle.RollupLevelMonth {
+				layer = assistant.LayerMonth
+			} else if level == chronicle.RollupLevelYear {
+				layer = assistant.LayerYear
 			}
 			// A rollup is its own derived source, bound to this exact text.
 			id := syntheticID("chronicle-rollup", row.ID, row.Start.UTC().Format(time.RFC3339Nano), row.End.UTC().Format(time.RFC3339Nano), row.Text)
-			items = append(items, assistant.Evidence{SourceID: id, Text: row.Text, Layer: layer, CapturedAt: row.Start.In(zone), EndAt: row.End.In(zone), SourceIDs: append([]string(nil), row.SourceIDs...)})
+			items = append(items, assistant.Evidence{SourceID: id, Text: row.Text, Layer: layer, CapturedAt: row.Start.In(zone), EndAt: row.End.In(zone), SourceIDs: append([]string(nil), row.SourceIDs...), CoverageLimited: row.Sampled || row.CoverageVersion == 0})
 			covered = append(covered, span)
 		}
 	}
 	return items, covered, dirty, nil
+}
+
+func selectRecapSummaries(items []assistant.Evidence) (selected []assistant.Evidence, limited bool) {
+	for _, layer := range []assistant.Layer{assistant.LayerYear, assistant.LayerMonth, assistant.LayerWeek, assistant.LayerDay, assistant.LayerHour} {
+		var group []assistant.Evidence
+		for _, item := range items {
+			if item.Layer == layer {
+				group = append(group, item)
+			}
+		}
+		chosen, omitted := assistant.TimeDistributedEvidence(group, maxRollupRecapItems-len(selected))
+		selected = append(selected, chosen...)
+		limited = limited || omitted
+	}
+	return selected, limited
 }
 
 func coveredByRollup(covered []recapSpan, start, end time.Time) bool {
